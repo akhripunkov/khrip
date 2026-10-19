@@ -8,7 +8,7 @@ RUNS=${RUNS:-5}
 B=build
 mkdir -p "$B"
 
-(cd ../.. && ./build.sh >/dev/null && build/khc -o bench/compute/$B/khrip lib/std.kh bench/compute/khrip/compute.kh)
+(cd ../.. && ./build.sh >/dev/null && build/khc -o bench/compute/$B/khrip bench/compute/khrip/compute.kh)
 (cd go && go build -o "../$B/go" .)
 dotnet publish csharp -c Release -o "$B/csharp" --nologo -v q >/dev/null
 dotnet publish csharp -c Release -p:PublishAot=true -o "$B/csharp-aot" --nologo -v q >/dev/null

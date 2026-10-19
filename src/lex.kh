@@ -1,0 +1,507 @@
+// ============================================================================
+// Лексер: исходный текст → список токенов.
+//
+// Интерполяция разворачивается прямо здесь: "a{x}b" превращается в токены
+// ( "a" + __to_str ( x ) + "b" ). Интерполяцией считается { сразу перед буквой
+// или _; остальные { в строке — обычные символы, \{ — всегда символ.
+// ============================================================================
+
+const T_EOF = 0
+const T_IDENT = 1
+const T_INT = 2
+const T_STR = 3
+const T_FN = 10
+const T_LET = 11
+const T_VAR = 12
+const T_CONST = 13
+const T_IF = 14
+const T_ELSE = 15
+const T_WHILE = 16
+const T_RETURN = 17
+const T_BREAK = 18
+const T_CONTINUE = 19
+const T_TYPE = 20
+const T_FOR = 21
+const T_IN = 22
+const T_TRUE = 23
+const T_FALSE = 24
+const T_NONE = 25
+const T_STORE = 26
+const T_ROUTE = 27
+const T_TEST = 28
+const T_EXPECT = 29
+const T_CALL = 30
+const T_EQ = 256
+const T_NE = 257
+const T_LE = 258
+const T_GE = 259
+const T_ANDAND = 260
+const T_OROR = 261
+const T_SHL = 262
+const T_SHR = 263
+const T_ARROW = 264
+const T_DOTDOT = 265
+const T_PLUSEQ = 266
+const T_MINUSEQ = 267
+const T_STAREQ = 268
+const T_DOTDOTEQ = 269
+const T_QQ = 270
+const T_ELLIPSIS = 271
+const T_SLASHEQ = 272
+const T_PERCENTEQ = 273
+const T_FATARROW = 274
+const T_PLUSPLUS = 275
+const T_MINUSMINUS = 276
+
+type Token {
+    kind: int
+    val: int
+    text: str
+    line: int
+    col: int
+    file: int
+}
+
+type SrcFile {
+    path: str
+    text: str
+    is_lib: bool
+}
+
+var toks: [Token]
+var files: [SrcFile]
+var strlits: [str]
+
+var lx_text: str
+var lx_p: int
+var lx_line: int
+var lx_line_start: int
+var lx_file: int
+
+fn is_alpha(c: int) -> bool {
+    return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_'
+}
+
+fn is_digit(c: int) -> bool {
+    return c >= '0' && c <= '9'
+}
+
+fn is_ident_char(c: int) -> bool {
+    return is_alpha(c) || is_digit(c)
+}
+
+fn keyword_kind(s: str) -> int {
+    let n = s.len()
+    if n < 2 || n > 8 {
+        return T_IDENT
+    }
+    if s == "fn" {
+        return T_FN
+    }
+    if s == "let" {
+        return T_LET
+    }
+    if s == "var" {
+        return T_VAR
+    }
+    if s == "if" {
+        return T_IF
+    }
+    if s == "else" {
+        return T_ELSE
+    }
+    if s == "return" {
+        return T_RETURN
+    }
+    if s == "for" {
+        return T_FOR
+    }
+    if s == "in" {
+        return T_IN
+    }
+    if s == "while" {
+        return T_WHILE
+    }
+    if s == "true" {
+        return T_TRUE
+    }
+    if s == "false" {
+        return T_FALSE
+    }
+    if s == "none" {
+        return T_NONE
+    }
+    if s == "type" {
+        return T_TYPE
+    }
+    if s == "const" {
+        return T_CONST
+    }
+    if s == "break" {
+        return T_BREAK
+    }
+    if s == "continue" {
+        return T_CONTINUE
+    }
+    if s == "store" {
+        return T_STORE
+    }
+    if s == "route" {
+        return T_ROUTE
+    }
+    if s == "test" {
+        return T_TEST
+    }
+    if s == "expect" {
+        return T_EXPECT
+    }
+    if s == "call" {
+        return T_CALL
+    }
+    return T_IDENT
+}
+
+fn add_tok(kind: int, val: int, start: int, len: int) {
+    toks.push(Token {
+        kind: kind,
+        val: val,
+        text: lx_text[start..start + len],
+        line: lx_line,
+        col: start - lx_line_start + 1,
+        file: lx_file
+    })
+}
+
+// Синтетический токен (из интерполяции) с текстом и местом исходной строки.
+fn add_tok_text(kind: int, val: int, text: str, start: int) {
+    toks.push(Token {
+        kind: kind,
+        val: val,
+        text: text,
+        line: lx_line,
+        col: start - lx_line_start + 1,
+        file: lx_file
+    })
+}
+
+fn lex_error(msg: str, start: int) {
+    report_at(lx_file, lx_line, start - lx_line_start + 1, msg, "")
+}
+
+fn three_char_kind(a: int, b: int, c: int) -> int {
+    if a == '.' && b == '.' && c == '.' {
+        return T_ELLIPSIS
+    }
+    if a == '.' && b == '.' && c == '=' {
+        return T_DOTDOTEQ
+    }
+    return 0
+}
+
+fn two_char_kind(a: int, b: int) -> int {
+    if b == '=' {
+        if a == '=' {
+            return T_EQ
+        }
+        if a == '!' {
+            return T_NE
+        }
+        if a == '<' {
+            return T_LE
+        }
+        if a == '>' {
+            return T_GE
+        }
+        if a == '+' {
+            return T_PLUSEQ
+        }
+        if a == '-' {
+            return T_MINUSEQ
+        }
+        if a == '*' {
+            return T_STAREQ
+        }
+        if a == '/' {
+            return T_SLASHEQ
+        }
+        if a == '%' {
+            return T_PERCENTEQ
+        }
+        return 0
+    }
+    if a == '&' && b == '&' {
+        return T_ANDAND
+    }
+    if a == '|' && b == '|' {
+        return T_OROR
+    }
+    if a == '<' && b == '<' {
+        return T_SHL
+    }
+    if a == '>' && b == '>' {
+        return T_SHR
+    }
+    if a == '-' && b == '>' {
+        return T_ARROW
+    }
+    if a == '.' && b == '.' {
+        return T_DOTDOT
+    }
+    if a == '?' && b == '?' {
+        return T_QQ
+    }
+    if a == '=' && b == '>' {
+        return T_FATARROW
+    }
+    if a == '+' && b == '+' {
+        return T_PLUSPLUS
+    }
+    if a == '-' && b == '-' {
+        return T_MINUSMINUS
+    }
+    return 0
+}
+
+fn is_single(c: int) -> bool {
+    return c == '(' || c == ')' || c == '{' || c == '}' || c == '[' || c == ']' || c == ',' || c == ':' || c == '.' || c == '+' || c == '-' || c == '*' || c == '/' || c == '%' || c == '&' || c == '|' || c == '^' || c == '~' || c == '!' || c == '<' || c == '>' || c == '=' || c == '?' || c == ';'
+}
+
+// Один символ литерала с экранированием; lx_p сдвигается.
+fn lex_char(end: int) -> int {
+    let start = lx_p
+    let c = lx_text[lx_p]
+    lx_p += 1
+    if c != '\\' {
+        return c
+    }
+    if lx_p >= end {
+        lex_error("unfinished escape sequence", start)
+        return 0
+    }
+    let e = lx_text[lx_p]
+    lx_p += 1
+    if e == 'n' {
+        return 10
+    }
+    if e == 't' {
+        return 9
+    }
+    if e == 'r' {
+        return 13
+    }
+    if e == '0' {
+        return 0
+    }
+    if e == '\\' || e == '\'' || e == '"' || e == '\{' || e == '}' {
+        return e
+    }
+    lex_error("unknown escape sequence; use \\n \\t \\r \\0 \\\\ \\\" \\' or \\\{", start)
+    return e
+}
+
+fn lex_number(end: int) -> int {
+    var v = 0
+    if lx_text[lx_p] == '0' && lx_p + 1 < end && (lx_text[lx_p + 1] == 'x' || lx_text[lx_p + 1] == 'X') {
+        lx_p += 2
+        while lx_p < end {
+            let c = lx_text[lx_p]
+            var d = -1
+            if is_digit(c) {
+                d = c - '0'
+            } else if c >= 'a' && c <= 'f' {
+                d = c - 'a' + 10
+            } else if c >= 'A' && c <= 'F' {
+                d = c - 'A' + 10
+            } else if c != '_' {
+                break
+            }
+            if d >= 0 {
+                v = v * 16 + d
+            }
+            lx_p += 1
+        }
+        return v
+    }
+    while lx_p < end && (is_digit(lx_text[lx_p]) || lx_text[lx_p] == '_') {
+        let c = lx_text[lx_p]
+        if c != '_' {
+            if v > 922337203685477580 {
+                lex_error("integer literal is too large", lx_p)
+                v = 0
+            }
+            v = v * 10 + (c - '0')
+        }
+        lx_p += 1
+    }
+    return v
+}
+
+fn add_strlit(s: str) -> int {
+    strlits.push(s)
+    return strlits.len() - 1
+}
+
+// Позиция закрывающей } выражения внутри строки (начало — сразу после {).
+fn interp_end(from: int, end: int) -> int {
+    var depth = 0
+    var i = from
+    while i < end {
+        let c = lx_text[i]
+        if c == '"' || c == '\n' {
+            return -1
+        }
+        if c == '\{' {
+            depth += 1
+        }
+        if c == '}' {
+            if depth == 0 {
+                return i
+            }
+            depth -= 1
+        }
+        i += 1
+    }
+    return -1
+}
+
+fn lex_string(end: int) {
+    let start = lx_p
+    lx_p += 1
+    let b = buf_new(32)
+    var parts = 0
+    while true {
+        if lx_p >= end || lx_text[lx_p] == '\n' {
+            lex_error("unterminated string; close it with \" on the same line", start)
+            return
+        }
+        let c = lx_text[lx_p]
+        if c == '"' {
+            lx_p += 1
+            break
+        }
+        if c == '\{' && lx_p + 1 < end && is_alpha(lx_text[lx_p + 1]) {
+            let close = interp_end(lx_p + 1, end)
+            if close < 0 {
+                lex_error("unclosed \{ in string; write \\\{ for a literal brace", lx_p)
+                return
+            }
+            if parts == 0 {
+                add_tok_text('(', 0, "(", start)
+            } else {
+                add_tok_text('+', 0, "+", start)
+            }
+            add_tok_text(T_STR, add_strlit(buf_str(b)), "\"...\"", start)
+            buf_clear(b)
+            add_tok_text('+', 0, "+", start)
+            add_tok_text(T_IDENT, 0, "__to_str", start)
+            add_tok_text('(', 0, "(", start)
+            lx_p += 1
+            lex_range(close)
+            add_tok_text(')', 0, ")", start)
+            lx_p = close + 1
+            parts += 1
+            continue
+        }
+        buf_byte(b, lex_char(end))
+    }
+    if parts == 0 {
+        add_tok(T_STR, add_strlit(buf_str(b)), start, lx_p - start)
+        return
+    }
+    if b.len > 0 {
+        add_tok_text('+', 0, "+", start)
+        add_tok_text(T_STR, add_strlit(buf_str(b)), "\"...\"", start)
+    }
+    add_tok_text(')', 0, ")", start)
+}
+
+fn lex_range(end: int) {
+    while lx_p < end {
+        let c = lx_text[lx_p]
+        if c == '\n' {
+            lx_p += 1
+            lx_line += 1
+            lx_line_start = lx_p
+            continue
+        }
+        if c == ' ' || c == '\t' || c == '\r' {
+            lx_p += 1
+            continue
+        }
+        if c == '/' && lx_p + 1 < end && lx_text[lx_p + 1] == '/' {
+            while lx_p < end && lx_text[lx_p] != '\n' {
+                lx_p += 1
+            }
+            continue
+        }
+        let start = lx_p
+        if is_alpha(c) {
+            while lx_p < end && is_ident_char(lx_text[lx_p]) {
+                lx_p += 1
+            }
+            let word = lx_text[start..lx_p]
+            add_tok(keyword_kind(word), 0, start, lx_p - start)
+            continue
+        }
+        if is_digit(c) {
+            let v = lex_number(end)
+            add_tok(T_INT, v, start, lx_p - start)
+            continue
+        }
+        if c == '\'' {
+            lx_p += 1
+            if lx_p >= end {
+                lex_error("unterminated character literal", start)
+                return
+            }
+            let v = lex_char(end)
+            if lx_p >= end || lx_text[lx_p] != '\'' {
+                lex_error("character literal must contain exactly one character; use \"...\" for strings", start)
+                while lx_p < end && lx_text[lx_p] != '\'' && lx_text[lx_p] != '\n' {
+                    lx_p += 1
+                }
+            }
+            lx_p += 1
+            add_tok(T_INT, v, start, lx_p - start)
+            continue
+        }
+        if c == '"' {
+            lex_string(end)
+            continue
+        }
+        if lx_p + 2 < end {
+            let k3 = three_char_kind(c, lx_text[lx_p + 1], lx_text[lx_p + 2])
+            if k3 != 0 {
+                lx_p += 3
+                add_tok(k3, 0, start, 3)
+                continue
+            }
+        }
+        if lx_p + 1 < end {
+            let k = two_char_kind(c, lx_text[lx_p + 1])
+            if k != 0 {
+                lx_p += 2
+                add_tok(k, 0, start, 2)
+                continue
+            }
+        }
+        if is_single(c) {
+            lx_p += 1
+            if c != ';' {
+                add_tok(c, 0, start, 1)
+            }
+            continue
+        }
+        lex_error("unexpected character '" + lx_text[start..start + 1] + "'", start)
+        lx_p += 1
+    }
+}
+
+fn lex_file(fi: int) {
+    lx_file = fi
+    lx_text = files[fi].text
+    lx_p = 0
+    lx_line = 1
+    lx_line_start = 0
+    lex_range(lx_text.len())
+}

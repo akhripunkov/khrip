@@ -2,25 +2,34 @@
 const ANSWER = 42
 const NEG = -7
 const CH = 'A'
-var counter: i64
-var start: i64 = 1000
-var minus: i64 = -1
+const NAME = "khrip"
+const ON = true
+var counter: int
+var start: int = 1000
+var minus: int = -1
+var names: [str]
+var title: str = NAME + "!"
 
-fn bump() -> i64 {
-    counter = counter + 1
+fn bump() -> int {
+    counter += 1
     return counter
 }
 
-fn main() -> i64 {
-    println_int(ANSWER)
-    println_int(NEG)
-    println_int(CH)
-    println_int(start)
-    println_int(minus)
+fn main() {
+    print(ANSWER)
+    print(NEG)
+    print(CH)
+    print(NAME)
+    print(ON)
+    print(start)
+    print(minus)
     bump()
     bump()
-    println_int(bump())
-    start = start + counter
-    println_int(start)
-    return 0
+    print(bump())
+    start += counter
+    print(start)
+    names.push("a")
+    names.push("b")
+    print(names.len())
+    print(title)
 }

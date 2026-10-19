@@ -1,0 +1,5 @@
+// expect: str has no method 'length'
+// expect: hint: use .len()
+fn main() {
+    print("abc".length())
+}

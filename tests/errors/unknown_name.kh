@@ -1,4 +1,4 @@
-// expect: unknown_name.kh:3: error: unknown name (near 'foo')
-fn main() -> i64 {
+// expect: unknown_name.kh:3:12: error: unknown name 'foo'
+fn main() -> int {
     return foo
 }

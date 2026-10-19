@@ -1,0 +1,45 @@
+// ============================================================================
+// API-слой: route, store, test. Заполняется на шаге v0.4.
+// ============================================================================
+
+var routes: [int]
+var route_ctx: int
+
+fn lib_files() -> [str] {
+    var names: [str] = []
+    names.push("core.kh")
+    names.push("rt.kh")
+    return names
+}
+
+fn prescan_api(k: int) {
+    error_tok(tok(), "route and test are not supported yet", "")
+}
+
+fn compile_api() {
+}
+
+fn route_return(at: Token, has_value: bool) {
+}
+
+fn store_touch() {
+}
+
+fn store_write(t: int) {
+}
+
+fn is_store_value(t: int) -> bool {
+    return false
+}
+
+fn parse_expect() {
+    error_tok(tok(), "expect is only allowed inside test blocks", "")
+    advance()
+    parse_expr(ty_err)
+}
+
+fn parse_call_expr() -> int {
+    error_tok(tok(), "call is only allowed inside test blocks", "")
+    advance()
+    return ty_err
+}

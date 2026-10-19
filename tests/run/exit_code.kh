@@ -1,7 +1,7 @@
 // exit: 7
-// Код возврата main становится кодом выхода процесса.
-fn main(argc: i64, argv: i64) -> i64 {
-    println_int(argc)
-    println_int(load8(load64(argv)) != 0)
+// Код возврата main — код выхода процесса.
+fn main() -> int {
+    print(args().len())
+    print(args()[0].len() > 0)
     return 7
 }

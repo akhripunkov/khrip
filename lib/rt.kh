@@ -1,0 +1,23 @@
+// Рантайм программ, собранных khc: точка входа и контекст потока.
+
+const SYS_ARCH_PRCTL = 158
+const ARCH_SET_FS = 0x1002
+
+// Компилятор начинает программу с «mov rdi, rsp; call __entry».
+fn __entry(sp: int) {
+    __thread_init()
+    __argc = load64(sp)
+    __argv = sp + 8
+    __init_globals()
+    exit(__main())
+}
+
+// Контекст потока: регион памяти и указатель на себя в fs:[0].
+fn __thread_init() {
+    let ctx = __mmap(CTX_SIZE)
+    store64(ctx + CTX_SELF, ctx)
+    syscall(SYS_ARCH_PRCTL, ARCH_SET_FS, ctx)
+}
+
+fn __panic_recover() {
+}

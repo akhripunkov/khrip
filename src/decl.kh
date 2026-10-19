@@ -1,0 +1,570 @@
+// ============================================================================
+// Объявления верхнего уровня и таблица имён. Предварительный проход собирает
+// все типы, функции, глобальные переменные и константы до компиляции тел,
+// поэтому порядок объявлений в программе не важен.
+// ============================================================================
+
+const SK_FN = 1
+const SK_STRUCT = 2
+const SK_GLOBAL = 3
+const SK_CONST = 4
+
+const FK_USER = 0
+const FK_ROUTE = 1
+const FK_TEST = 2
+const FK_GEN = 3
+
+type Param {
+    name: str
+    ty: int
+}
+
+type Func {
+    name: str
+    params: [Param]
+    ret: int
+    tok: int
+    body: int
+    body_end: int
+    code: int
+    kind: int
+    inline_ok: bool
+    is_lib: bool
+    used: bool
+    size: int
+}
+
+type Global {
+    name: str
+    ty: int
+    addr: int
+    init: int
+    tok: int
+    is_store: bool
+}
+
+type Const {
+    name: str
+    ty: int
+    val: int
+}
+
+var funcs: [Func]
+var globals: [Global]
+var consts: [Const]
+var sym_map: StrMap = smap_new()
+var sym_kinds: [int]
+var sym_idxs: [int]
+
+var pos: int
+
+fn tok() -> Token {
+    return toks[pos]
+}
+
+fn kind() -> int {
+    return toks[pos].kind
+}
+
+fn kind_at(i: int) -> int {
+    if i >= toks.len() {
+        return T_EOF
+    }
+    return toks[i].kind
+}
+
+fn advance() {
+    if toks[pos].kind != T_EOF {
+        pos += 1
+    }
+}
+
+fn tok_desc(k: int) -> str {
+    if k == T_EOF {
+        return "end of file"
+    }
+    if k == T_IDENT {
+        return "a name"
+    }
+    if k == T_INT {
+        return "a number"
+    }
+    if k == T_STR {
+        return "a string"
+    }
+    if k < 128 {
+        return "'" + __str_from_byte(k) + "'"
+    }
+    if k == T_ARROW {
+        return "'->'"
+    }
+    if k == T_IN {
+        return "'in'"
+    }
+    return "a token"
+}
+
+fn tok_show(t: Token) -> str {
+    if t.kind == T_EOF {
+        return "end of file"
+    }
+    return "'" + t.text + "'"
+}
+
+fn expect_tok(k: int) -> bool {
+    if kind() == k {
+        advance()
+        return true
+    }
+    var hint = ""
+    if k == '{' && kind() == ':' {
+        hint = "Khrip blocks use braces, not a colon"
+    }
+    syntax_error(tok(), "expected " + tok_desc(k) + ", found " + tok_show(tok()), hint)
+    return false
+}
+
+fn expect_ident() -> Token {
+    let t = tok()
+    if t.kind == T_IDENT {
+        advance()
+        return t
+    }
+    var hint = ""
+    if t.kind >= T_FN && t.kind <= T_CALL {
+        hint = "'" + t.text + "' is a keyword and cannot be used as a name"
+    }
+    syntax_error(t, "expected a name, found " + tok_show(t), hint)
+    return t
+}
+
+// Индекс парной закрывающей скобки для открывающей в позиции i.
+fn matching_close(i: int) -> int {
+    var depth = 0
+    var j = i
+    while j < toks.len() {
+        let k = toks[j].kind
+        if k == '(' || k == '[' || k == '\{' {
+            depth += 1
+        } else if k == ')' || k == ']' || k == '}' {
+            depth -= 1
+            if depth == 0 {
+                return j
+            }
+        } else if k == T_EOF {
+            return j
+        }
+        j += 1
+    }
+    return toks.len() - 1
+}
+
+// ---- Таблица имён ----
+
+fn sym_find(name: str) -> int {
+    return smap_get(sym_map, name)
+}
+
+fn sym_add(name: str, kind: int, idx: int, t: Token) -> bool {
+    if smap_get(sym_map, name) >= 0 {
+        error_tok(t, "'" + name + "' is already defined", "")
+        return false
+    }
+    sym_kinds.push(kind)
+    sym_idxs.push(idx)
+    smap_put(sym_map, name, sym_kinds.len() - 1)
+    return true
+}
+
+fn sym_kind(s: int) -> int {
+    return sym_kinds[s]
+}
+
+fn sym_idx(s: int) -> int {
+    return sym_idxs[s]
+}
+
+fn func_find(name: str) -> int {
+    let s = sym_find(name)
+    if s < 0 || sym_kinds[s] != SK_FN {
+        return -1
+    }
+    return sym_idxs[s]
+}
+
+// Внутренняя функция библиотеки, которую вызывает сгенерированный код.
+fn rt_func(name: str) -> int {
+    let f = func_find(name)
+    if f < 0 {
+        error_tok(tok(), "internal: missing runtime function " + name, "")
+        return 0
+    }
+    funcs[f].used = true
+    return f
+}
+
+// ---- Типы в объявлениях ----
+
+fn generic_ok() -> bool {
+    return files[tok().file].is_lib
+}
+
+// int | bool | str | Имя | [T] | map[K, V] | T?
+fn parse_type() -> int {
+    var t = ty_err
+    let start = tok()
+    if kind() == '[' {
+        advance()
+        let e = parse_type()
+        expect_tok(']')
+        t = ty_list(e)
+    } else if kind() == T_IDENT {
+        let name = start.text
+        advance()
+        if name == "int" {
+            t = ty_int
+        } else if name == "bool" {
+            t = ty_bool
+        } else if name == "str" {
+            t = ty_str
+        } else if name == "map" {
+            if expect_tok('[') {
+                let k = parse_type()
+                expect_tok(',')
+                let v = parse_type()
+                expect_tok(']')
+                if k != ty_int && k != ty_str && k != ty_err {
+                    error_tok(start, "map keys must be int or str, not " + ty_name(k), "")
+                }
+                t = ty_map(k, v)
+            }
+        } else if (name == "T" || name == "K" || name == "V") && generic_ok() {
+            t = ty_make(K_GEN, name[0], 0)
+        } else {
+            let s = struct_find(name)
+            if s >= 0 {
+                t = ty_struct(s)
+            } else {
+                error_tok(start, "unknown type '" + name + "'", type_hint(name))
+            }
+        }
+    } else {
+        syntax_error(start, "expected a type, found " + tok_show(start), "types are int, bool, str, [T], map[K, V], T? or a type name")
+    }
+    if kind() == '?' {
+        advance()
+        t = ty_opt(t)
+    }
+    return t
+}
+
+// ---- Предварительный проход ----
+
+var struct_state: [int]
+var struct_tok: [int]
+
+fn prescan_struct_name() {
+    advance()
+    let name = expect_ident()
+    if name.kind != T_IDENT {
+        return
+    }
+    var fs: [Field] = []
+    structs.push(StructT { name: name.text, fields: fs, tok: pos })
+    struct_state.push(0)
+    struct_tok.push(pos)
+    sym_add(name.text, SK_STRUCT, structs.len() - 1, name)
+}
+
+// Поля структуры s; ...Другая подставляет поля другой структуры.
+fn prescan_struct_fields(s: int) {
+    if struct_state[s] == 2 {
+        return
+    }
+    if struct_state[s] == 1 {
+        error_tok(toks[struct_tok[s]], "type '" + structs[s].name + "' includes itself through ...", "")
+        return
+    }
+    struct_state[s] = 1
+    let saved = pos
+    pos = struct_tok[s]
+    if expect_tok('\{') {
+        while kind() != '}' && kind() != T_EOF {
+            panic_mode = false
+            if kind() == T_ELLIPSIS {
+                advance()
+                let other = expect_ident()
+                let o = struct_find(other.text)
+                if o < 0 {
+                    error_tok(other, "unknown type '" + other.text + "'", "")
+                } else {
+                    prescan_struct_fields(o)
+                    for f in structs[o].fields {
+                        add_field(s, f.name, f.ty, other)
+                    }
+                }
+            } else {
+                let fname = expect_ident()
+                if !expect_tok(':') {
+                    skip_line()
+                    continue
+                }
+                let ft = parse_type()
+                add_field(s, fname.text, ft, fname)
+            }
+            if kind() == ',' {
+                advance()
+            }
+        }
+    }
+    struct_state[s] = 2
+    pos = saved
+}
+
+fn add_field(s: int, name: str, t: int, at: Token) {
+    if field_find(s, name) >= 0 {
+        error_tok(at, "field '" + name + "' is declared twice in '" + structs[s].name + "'", "")
+        return
+    }
+    structs[s].fields.push(Field { name: name, ty: t })
+}
+
+// Пропуск до начала следующей строки.
+fn skip_line() {
+    let line = tok().line
+    while kind() != T_EOF && tok().line == line {
+        advance()
+    }
+}
+
+fn parse_params() -> [Param] {
+    var ps: [Param] = []
+    if !expect_tok('(') {
+        return ps
+    }
+    while kind() != ')' && kind() != T_EOF {
+        let pn = expect_ident()
+        if panic_mode {
+            break
+        }
+        var pt = ty_err
+        if kind() == ':' {
+            advance()
+            pt = parse_type()
+        } else {
+            error_tok(pn, "parameter '" + pn.text + "' needs a type", "write " + pn.text + ": int (or another type)")
+        }
+        ps.push(Param { name: pn.text, ty: pt })
+        if kind() == ',' {
+            advance()
+        } else if kind() != ')' {
+            syntax_error(tok(), "expected ',' or ')' in the parameter list, found " + tok_show(tok()), "")
+            break
+        }
+    }
+    expect_tok(')')
+    return ps
+}
+
+fn prescan_fn(kind_: int) {
+    advance()
+    let name = expect_ident()
+    if name.kind != T_IDENT {
+        return
+    }
+    let ps = parse_params()
+    var ret = ty_void
+    if kind() == T_ARROW {
+        advance()
+        ret = parse_type()
+    } else if kind() == ':' {
+        error_tok(tok(), "the result type is written after ->", "fn " + name.text + "(...) -> int { ... }")
+        advance()
+        parse_type()
+    }
+    let body = pos
+    if kind() != '\{' {
+        syntax_error(tok(), "expected '\{' to start the body of '" + name.text + "'", "")
+        return
+    }
+    let end = matching_close(body)
+    let fi = funcs.len()
+    funcs.push(Func {
+        name: name.text,
+        params: ps,
+        ret: ret,
+        tok: pos - 1,
+        body: body,
+        body_end: end,
+        code: -1,
+        kind: kind_,
+        inline_ok: false,
+        is_lib: files[name.file].is_lib,
+        used: false,
+        size: end - body
+    })
+    sym_add(name.text, SK_FN, fi, name)
+    funcs[fi].inline_ok = can_inline(fi)
+}
+
+// Маленькие нерекурсивные функции без циклов встраиваются в место вызова.
+fn can_inline(fi: int) -> bool {
+    let f = funcs[fi]
+    if f.body_end - f.body > 48 || f.params.len() > 6 || f.kind != FK_USER || f.name == "main" {
+        return false
+    }
+    var i = f.body + 1
+    while i < f.body_end {
+        let k = toks[i].kind
+        if k == T_WHILE || k == T_FOR {
+            return false
+        }
+        if k == T_IDENT && toks[i].text == f.name {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+fn global_slot() -> int {
+    data_align()
+    let addr = DATA_BASE + data_len
+    data_u64(0)
+    return addr
+}
+
+// var имя: тип [= выражение] и store имя: тип [= выражение]
+fn prescan_global(is_store: bool) {
+    let kw = tok()
+    advance()
+    let name_at = pos
+    let name = expect_ident()
+    if name.kind != T_IDENT {
+        return
+    }
+    var t = ty_err
+    if kind() == ':' {
+        advance()
+        t = parse_type()
+    } else {
+        error_tok(name, "global '" + name.text + "' needs a type", "write " + kw.text + " " + name.text + ": int = 0")
+    }
+    var init = -1
+    if kind() == '=' {
+        advance()
+        init = pos
+    }
+    globals.push(Global { name: name.text, ty: t, addr: global_slot(), init: init, tok: name_at, is_store: is_store })
+    sym_add(name.text, SK_GLOBAL, globals.len() - 1, name)
+}
+
+// const ИМЯ = литерал
+fn prescan_const() {
+    advance()
+    let name = expect_ident()
+    if name.kind != T_IDENT || !expect_tok('=') {
+        return
+    }
+    var neg = false
+    if kind() == '-' {
+        neg = true
+        advance()
+    }
+    let v = tok()
+    var t = ty_int
+    var val = v.val
+    if v.kind == T_INT {
+        if neg {
+            val = -val
+        }
+    } else if v.kind == T_STR && !neg {
+        t = ty_str
+        val = strlit(v.val)
+    } else if (v.kind == T_TRUE || v.kind == T_FALSE) && !neg {
+        t = ty_bool
+        val = 0
+        if v.kind == T_TRUE {
+            val = 1
+        }
+    } else {
+        error_tok(v, "a constant must be a number, string or boolean literal", "use a global var for computed values")
+        return
+    }
+    advance()
+    consts.push(Const { name: name.text, ty: t, val: val })
+    sym_add(name.text, SK_CONST, consts.len() - 1, name)
+}
+
+fn decl_hint(t: Token) -> str {
+    if t.text == "func" || t.text == "def" || t.text == "function" || t.text == "fun" {
+        return "declare functions with fn"
+    }
+    if t.text == "struct" || t.text == "class" || t.text == "interface" || t.text == "record" {
+        return "declare types with type Name { field: type }"
+    }
+    if t.text == "import" || t.text == "package" || t.text == "use" || t.text == "include" {
+        return "Khrip has no imports: the standard library and all project files are always available"
+    }
+    if t.kind == T_LET {
+        return "use var name: type = value for globals"
+    }
+    return ""
+}
+
+// Проход по объявлениям верхнего уровня. pass 1 — имена типов, pass 2 — всё остальное.
+fn prescan(pass: int) {
+    var i = 0
+    var depth = 0
+    while toks[i].kind != T_EOF {
+        let k = toks[i].kind
+        if depth == 0 {
+            pos = i
+            panic_mode = false
+            if pass == 1 && k == T_TYPE {
+                prescan_struct_name()
+            } else if pass == 2 {
+                if k == T_FN {
+                    prescan_fn(FK_USER)
+                } else if k == T_VAR {
+                    prescan_global(false)
+                } else if k == T_STORE {
+                    prescan_global(true)
+                } else if k == T_CONST {
+                    prescan_const()
+                } else if k == T_ROUTE || k == T_TEST {
+                    prescan_api(k)
+                } else if k != T_TYPE && starts_decl_error(i) {
+                    error_tok(toks[i], "expected a declaration (fn, type, var, const, store, route or test), found " + tok_show(toks[i]), decl_hint(toks[i]))
+                }
+            }
+        }
+        if k == '(' || k == '[' || k == '\{' {
+            depth += 1
+        } else if k == ')' || k == ']' || k == '}' {
+            depth -= 1
+            if depth < 0 {
+                depth = 0
+            }
+        }
+        i += 1
+    }
+    if pass == 2 {
+        var s = 0
+        while s < structs.len() {
+            prescan_struct_fields(s)
+            s += 1
+        }
+    }
+    pos = 0
+    panic_mode = false
+}
+
+// Сообщать об ошибке только в начале «мусорной» строки верхнего уровня.
+fn starts_decl_error(i: int) -> bool {
+    if i == 0 {
+        return true
+    }
+    let p = toks[i - 1]
+    return p.line != toks[i].line || p.kind == '}'
+}

@@ -1,5 +1,0 @@
-// expect: undefined_fn.kh:3: error: undefined function 'bar'
-fn main() -> i64 {
-    bar(1)
-    return 0
-}

@@ -1,0 +1,203 @@
+// ============================================================================
+// khc — компилятор Khrip-1, написанный на Khrip-1.
+//
+//   khc -o <выход> <файл.kh>...     собрать программу
+//   khc check <файл.kh>...          только проверить
+//   ключи: --json (ошибки в JSON), --test (собрать запуск тестов)
+//
+// Стандартная библиотека (lib/*.kh) подключается сама: каталог lib ищется
+// рядом с исполняемым файлом компилятора (../lib) или в $KHRIP_LIB.
+// ============================================================================
+
+fn version() -> str {
+    return "0.6.0"
+}
+
+fn put16_at(p: int, v: int) {
+    store8(p, v & 255)
+    store8(p + 1, (v >> 8) & 255)
+}
+
+fn put64_at(p: int, v: int) {
+    put32_at(p, v & 0xFFFFFFFF)
+    put32_at(p + 4, (v >> 32) & 0xFFFFFFFF)
+}
+
+// Каталог, где лежит исполняемый файл компилятора.
+fn exe_dir() -> str {
+    let buf = __alloc(4096)
+    let n = syscall(89, __cstr("/proc/self/exe"), buf, 4095)
+    if n <= 0 {
+        return "."
+    }
+    var i = n - 1
+    while i > 0 && load8(buf + i) != '/' {
+        i -= 1
+    }
+    return __str_new(buf, i)
+}
+
+fn find_lib() -> str {
+    return env("KHRIP_LIB") ?? exe_dir() + "/../lib"
+}
+
+fn load_file(path: str, is_lib: bool) -> bool {
+    let text = read_file(path)
+    if text == none {
+        eprint("khc: cannot read " + path)
+        return false
+    }
+    files.push(SrcFile { path: path, text: text ?? "", is_lib: is_lib })
+    return true
+}
+
+// Статический ELF: код с CODE_BASE (вместе с заголовками), данные с DATA_BASE.
+fn write_elf(path: str) -> bool {
+    let code_end = HDR_SIZE + code_len
+    let data_off = (code_end + 0xFFF) & ~0xFFF
+    let total = data_off + data_len
+    let img = __mmap(total + 16)
+    store8(img, 0x7F)
+    store8(img + 1, 'E')
+    store8(img + 2, 'L')
+    store8(img + 3, 'F')
+    store8(img + 4, 2)
+    store8(img + 5, 1)
+    store8(img + 6, 1)
+    put16_at(img + 16, 2)
+    put16_at(img + 18, 0x3E)
+    put32_at(img + 20, 1)
+    put64_at(img + 24, CODE_BASE + HDR_SIZE)
+    put64_at(img + 32, 64)
+    put16_at(img + 52, 64)
+    put16_at(img + 54, 56)
+    put16_at(img + 56, 2)
+    put16_at(img + 58, 64)
+    put32_at(img + 64, 1)
+    put32_at(img + 68, 5)
+    put64_at(img + 72, 0)
+    put64_at(img + 80, CODE_BASE)
+    put64_at(img + 88, CODE_BASE)
+    put64_at(img + 96, code_end)
+    put64_at(img + 104, code_end)
+    put64_at(img + 112, 0x1000)
+    put32_at(img + 120, 1)
+    put32_at(img + 124, 6)
+    put64_at(img + 128, data_off)
+    put64_at(img + 136, DATA_BASE)
+    put64_at(img + 144, DATA_BASE)
+    put64_at(img + 152, data_len)
+    put64_at(img + 160, data_len)
+    put64_at(img + 168, 0x1000)
+    __memcpy(img + HDR_SIZE, code, code_len)
+    __memcpy(img + data_off, data, data_len)
+    return write_file(path, __str_new(img, total), true)
+}
+
+fn resolve_fixups() {
+    for fx in fixups {
+        let target = funcs[fx.func].code
+        if target < 0 {
+            report_at(0, 1, 1, "internal: function '" + funcs[fx.func].name + "' was not compiled", "")
+        } else {
+            patch_rel(fx.at, target)
+        }
+    }
+}
+
+fn usage() -> int {
+    eprint("usage: khc -o <output> <file.kh>...")
+    eprint("       khc check <file.kh>...")
+    eprint("options: --json  report errors as JSON")
+    eprint("         --test  build a runner for test blocks")
+    return 2
+}
+
+fn main() -> int {
+    let argv = args()
+    var out = ""
+    var inputs: [str] = []
+    var test_mode = false
+    var check_only = false
+    var i = 1
+    while i < argv.len() {
+        let a = argv[i]
+        if a == "-o" && i + 1 < argv.len() {
+            out = argv[i + 1]
+            i += 2
+            continue
+        }
+        if a == "--json" {
+            json_errors = true
+        } else if a == "--test" {
+            test_mode = true
+        } else if a == "check" {
+            check_only = true
+        } else if a == "--version" {
+            print("khc " + version())
+            return 0
+        } else {
+            inputs.push(a)
+        }
+        i += 1
+    }
+    if inputs.len() == 0 || (out.len() == 0 && !check_only) {
+        return usage()
+    }
+    types_init()
+    emit_init()
+    sym_map = smap_new()
+    let lib = find_lib()
+    for name in lib_files() {
+        if !load_file(lib + "/" + name, true) {
+            eprint("khc: the standard library was not found; set KHRIP_LIB to the lib directory")
+            return 2
+        }
+    }
+    for path in inputs {
+        if !load_file(path, false) {
+            return 2
+        }
+    }
+    var fi = 0
+    while fi < files.len() {
+        lex_file(fi)
+        fi += 1
+    }
+    lx_file = files.len() - 1
+    add_tok_text(T_EOF, 0, "", lx_p)
+    let init_fn = gen_func("__init_globals", ty_void)
+    let main_fn = gen_func("__main", ty_int)
+    prescan(1)
+    prescan(2)
+    // точка входа: mov rdi, rsp; call __entry; ud2
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0xE7)
+    emit_call(rt_func("__entry"))
+    emit8(0x0F)
+    emit8(0x0B)
+    var f = 0
+    while f < funcs.len() {
+        if funcs[f].body >= 0 {
+            compile_fn(f)
+        }
+        f += 1
+    }
+    compile_api()
+    compile_init_globals(init_fn)
+    compile_main_wrapper(main_fn, test_mode)
+    resolve_fixups()
+    if diags.len() > 0 {
+        print_diags()
+        return 1
+    }
+    if check_only {
+        return 0
+    }
+    if !write_elf(out) {
+        eprint("khc: cannot write " + out)
+        return 1
+    }
+    return 0
+}

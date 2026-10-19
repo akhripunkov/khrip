@@ -1,0 +1,6 @@
+// flags: --json
+// expect: "line":5,"col":18,"message":"expected int, found bool"
+// expect: "hint":""
+fn main() {
+    let x: int = true
+}

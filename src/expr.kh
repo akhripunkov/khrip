@@ -1,0 +1,836 @@
+// ============================================================================
+// Выражения: проверка типов и генерация кода за один проход.
+// Каждая функция разбора оставляет значение в rax и возвращает его тип.
+// ============================================================================
+
+// Коды паник (PANIC_*) — из lib/core.kh.
+
+type Local {
+    name: str
+    ty: int
+    mutable: bool
+    reg: int
+    off: int
+}
+
+var locals: [Local]
+var nlocals: int
+// Локальные ниже этой границы не видны: так встроенное тело не видит
+// переменных вызывающей функции.
+var local_floor: int
+var frame: int
+var used_regs: int
+var plan_mask: int
+var temp_regs: int
+var plan: StrMap = smap_new()
+var cur_fn: int
+var no_struct: bool
+// Ожидаемый тип для [], {} и none без явного типа.
+var want: int
+// Последнее выражение оператора было вызовом.
+var last_was_call: bool
+
+// ---- Локальные переменные ----
+
+fn reg_of(k: int) -> int {
+    if k == 0 {
+        return RBX
+    }
+    return R12 + k - 1
+}
+
+fn new_slot() -> int {
+    frame += 8
+    return -(40 + frame)
+}
+
+fn add_local(name: str, t: int, mutable: bool, reg: int, off: int) -> int {
+    let l = Local { name: name, ty: t, mutable: mutable, reg: reg, off: off }
+    if nlocals < locals.len() {
+        locals[nlocals] = l
+    } else {
+        locals.push(l)
+    }
+    nlocals += 1
+    return nlocals - 1
+}
+
+// Новая локальная: регистр, если её выбрал план, иначе ячейка в кадре.
+fn declare_local(name: str, t: int, mutable: bool) -> int {
+    if inline_depth == 0 {
+        let k = smap_get(plan, name)
+        if k >= 0 {
+            used_regs = used_regs | (1 << k)
+            return add_local(name, t, mutable, reg_of(k), 0)
+        }
+    }
+    return add_local(name, t, mutable, -1, new_slot())
+}
+
+fn find_local(name: str) -> int {
+    var i = nlocals - 1
+    while i >= local_floor {
+        if locals[i].name == name {
+            return i
+        }
+        i -= 1
+    }
+    return -1
+}
+
+fn emit_load_local(li: int) {
+    let l = locals[li]
+    if l.reg >= 0 {
+        emit_mov_rr(RAX, l.reg)
+    } else {
+        emit_load(RAX, RBP, l.off)
+    }
+}
+
+fn emit_store_local(li: int) {
+    let l = locals[li]
+    if l.reg >= 0 {
+        emit_mov_rr(l.reg, RAX)
+    } else {
+        emit_store(RBP, l.off, RAX)
+    }
+}
+
+// Временный регистр для скрытых переменных цикла или -1.
+fn alloc_temp_reg() -> int {
+    if inline_depth > 0 {
+        return -1
+    }
+    var k = 4
+    while k >= 0 {
+        let bit = 1 << k
+        if (plan_mask & bit) == 0 && (temp_regs & bit) == 0 {
+            temp_regs = temp_regs | bit
+            used_regs = used_regs | bit
+            return k
+        }
+        k -= 1
+    }
+    return -1
+}
+
+fn free_temp_reg(k: int) {
+    if k >= 0 {
+        temp_regs = temp_regs & ~(1 << k)
+    }
+}
+
+// Скрытая переменная (счётчик, граница, список) → индекс локальной.
+fn hidden_local(t: int) -> int {
+    let k = alloc_temp_reg()
+    if k >= 0 {
+        return add_local("", t, true, reg_of(k), 0)
+    }
+    return add_local("", t, true, -1, new_slot())
+}
+
+fn release_hidden(li: int) {
+    let r = locals[li].reg
+    if r == RBX {
+        free_temp_reg(0)
+    } else if r >= R12 {
+        free_temp_reg(r - R12 + 1)
+    }
+}
+
+// ---- Глобальные ----
+
+fn emit_load_abs(dst: int, addr: int) {
+    emit8(0x48 | ((dst >> 3) << 2))
+    emit8(0x8B)
+    emit8(0x04 | ((dst & 7) << 3))
+    emit8(0x25)
+    emit32(addr)
+}
+
+fn emit_store_abs(addr: int, src: int) {
+    emit8(0x48 | ((src >> 3) << 2))
+    emit8(0x89)
+    emit8(0x04 | ((src & 7) << 3))
+    emit8(0x25)
+    emit32(addr)
+}
+
+// ---- Паники и проверки ----
+
+// Переход на панику (условие cc). Сам вызов паники выносится в конец функции,
+// чтобы на горячем пути остался один несрабатывающий условный переход.
+type PanicSite {
+    hole: int
+    kind: int
+    where: int
+}
+
+var panic_sites: [PanicSite]
+
+fn emit_panic_jump(cc: int, kind: int, at: Token) {
+    let h = emit_jcc(cc)
+    panic_sites.push(PanicSite { hole: h, kind: kind, where: const_str(files[at.file].path + ":" + at.line.to_str()) })
+}
+
+fn emit_panic(kind: int, at: Token) {
+    emit_mov_imm(RDI, kind)
+    emit_mov_imm(RSI, const_str(files[at.file].path + ":" + at.line.to_str()))
+    emit_call(rt_func("__panic"))
+}
+
+// Вызовы паник для всех отложенных переходов функции.
+fn emit_panic_stubs() {
+    let f = rt_func("__panic")
+    for ps in panic_sites {
+        patch_here(ps.hole)
+        emit_mov_imm(RDI, ps.kind)
+        emit_mov_imm(RSI, ps.where)
+        emit_call(f)
+    }
+    panic_sites.clear()
+}
+
+fn emit_overflow_check(at: Token) {
+    emit_panic_jump(CC_O, PANIC_OVERFLOW, at)
+}
+
+// Индекс в rcx, получатель в rax, длина по смещению 8.
+fn emit_bounds_check(at: Token) {
+    emit_mem(0x3B, RCX, RAX, 8)
+    emit_panic_jump(CC_AE, PANIC_INDEX, at)
+}
+
+// Упаковка int/bool в ячейку для T?.
+fn emit_box() {
+    emit_push(RAX)
+    emit_mov_imm(RDI, 8)
+    emit_call(rt_func("__alloc"))
+    emit_pop(RCX)
+    emit_store(RAX, 0, RCX)
+}
+
+fn mismatch_hint(from: int, to: int) -> str {
+    if tkind(from) == K_OPT && ty_inner(from) == to {
+        return "the value may be none; use x ?? default or let v = x else { return ... }"
+    }
+    if to == ty_bool && from == ty_int {
+        return "compare explicitly, e.g. x != 0"
+    }
+    if to == ty_str && (from == ty_int || from == ty_bool) {
+        return "convert with x.to_str() or interpolation \"\{x}\""
+    }
+    if to == ty_int && from == ty_str {
+        return "parse with s.to_int() ?? 0"
+    }
+    if from == ty_none {
+        return "only optional types accept none; declare the type as " + ty_name(to) + "?"
+    }
+    if tkind(from) == K_VOID {
+        return "this function returns nothing"
+    }
+    return ""
+}
+
+// Значение типа from в rax используется как to: проверка и упаковка.
+fn coerce(from: int, to: int, at: Token) -> int {
+    if from == to || from == ty_err || to == ty_err {
+        return to
+    }
+    if tkind(to) == K_OPT && (from == ty_none || from == ty_inner(to)) {
+        if from != ty_none && !is_ref(from) {
+            emit_box()
+        }
+        return to
+    }
+    error_tok(at, "expected " + ty_name(to) + ", found " + ty_name(from), mismatch_hint(from, to))
+    return ty_err
+}
+
+// ---- Простые правые операнды (без push/pop) ----
+
+const OPK_NONE = 0
+const OPK_IMM = 1
+const OPK_LOCAL = 2
+
+var op_kind: int
+var op_val: int
+var op_ty: int
+
+fn tighter_follows(level: int, k: int) -> bool {
+    if k == '(' || k == '.' || k == '[' || k == '?' {
+        return true
+    }
+    // { после имени — литерал структуры, если он здесь разрешён
+    if k == '\{' && !no_struct {
+        return true
+    }
+    if level >= 2 && is_mul_op(k) {
+        return true
+    }
+    if level >= 3 && is_add_op(k) {
+        return true
+    }
+    return false
+}
+
+// Следующий токен — целый операнд для оператора уровня level (1 — умножение,
+// 2 — сложение, 3 — сравнение)? Ничего не потребляет.
+fn peek_simple(level: int) -> bool {
+    op_kind = OPK_NONE
+    let t = tok()
+    if tighter_follows(level, kind_at(pos + 1)) {
+        return false
+    }
+    if t.kind == T_INT && fits_i32(t.val) {
+        op_kind = OPK_IMM
+        op_val = t.val
+        op_ty = ty_int
+        return true
+    }
+    if t.kind == T_NONE {
+        op_kind = OPK_IMM
+        op_val = 0
+        op_ty = ty_none
+        return true
+    }
+    if t.kind == T_TRUE || t.kind == T_FALSE {
+        op_kind = OPK_IMM
+        op_val = 0
+        if t.kind == T_TRUE {
+            op_val = 1
+        }
+        op_ty = ty_bool
+        return true
+    }
+    if t.kind == T_IDENT {
+        let li = find_local(t.text)
+        if li >= 0 {
+            op_kind = OPK_LOCAL
+            op_val = li
+            op_ty = locals[li].ty
+            return true
+        }
+        let s = sym_find(t.text)
+        if s >= 0 && sym_kind(s) == SK_CONST && consts[sym_idx(s)].ty == ty_int && fits_i32(consts[sym_idx(s)].val) {
+            op_kind = OPK_IMM
+            op_val = consts[sym_idx(s)].val
+            op_ty = ty_int
+            return true
+        }
+    }
+    return false
+}
+
+// Загрузить простой операнд в регистр r.
+fn load_operand(r: int) {
+    if op_kind == OPK_IMM {
+        emit_mov_imm(r, op_val)
+        return
+    }
+    let l = locals[op_val]
+    if l.reg >= 0 {
+        emit_mov_rr(r, l.reg)
+    } else {
+        emit_load(r, RBP, l.off)
+    }
+}
+
+// Операция rax = rax op операнд для + - & | ^ и сравнения (cmp).
+// rr — код «op r/m, r», mr — код «op r, r/m», ext — номер в группе 0x81.
+fn emit_alu_operand(rr: int, mr: int, ext: int) {
+    if op_kind == OPK_IMM {
+        emit_alu_imm(ext, RAX, op_val)
+        return
+    }
+    let l = locals[op_val]
+    if l.reg >= 0 {
+        emit_rr(rr, l.reg, RAX)
+    } else {
+        emit_mem(mr, RAX, RBP, l.off)
+    }
+}
+
+// ---- Арифметика ----
+
+fn alu_rr(op: int) -> int {
+    if op == '+' {
+        return 0x01
+    }
+    if op == '-' {
+        return 0x29
+    }
+    if op == '&' {
+        return 0x21
+    }
+    if op == '|' {
+        return 0x09
+    }
+    return 0x31
+}
+
+fn alu_ext(op: int) -> int {
+    if op == '+' {
+        return 0
+    }
+    if op == '-' {
+        return 5
+    }
+    if op == '&' {
+        return 4
+    }
+    if op == '|' {
+        return 1
+    }
+    return 6
+}
+
+// rax = rax op rcx (rcx — правый операнд) с проверками.
+fn emit_arith_rcx(op: int, at: Token) {
+    if op == '+' || op == '-' || op == '&' || op == '|' || op == '^' {
+        emit_rr(alu_rr(op), RCX, RAX)
+        if op == '+' || op == '-' {
+            emit_overflow_check(at)
+        }
+        return
+    }
+    if op == '*' {
+        emit8(0x48)
+        emit8(0x0F)
+        emit8(0xAF)
+        emit8(0xC1)
+        emit_overflow_check(at)
+        return
+    }
+    if op == T_SHL || op == T_SHR {
+        emit8(0x48)
+        emit8(0xD3)
+        if op == T_SHL {
+            emit8(0xE0)
+        } else {
+            emit8(0xF8)
+        }
+        return
+    }
+    // деление: ноль и MIN / -1 — паника
+    emit8(0x48)
+    emit8(0x85)
+    emit8(0xC9)
+    emit_panic_jump(CC_E, PANIC_DIV_ZERO, at)
+    emit_alu_imm(7, RCX, -1)
+    emit8(0x75)
+    let q = code_len
+    emit8(0)
+    emit_mov_imm(RDX, -9223372036854775807 - 1)
+    emit_rr(0x39, RDX, RAX)
+    emit_panic_jump(CC_E, PANIC_OVERFLOW, at)
+    store8(code + q, code_len - q - 1)
+    here()
+    emit8(0x48)
+    emit8(0x99)
+    emit8(0x48)
+    emit8(0xF7)
+    emit8(0xF9)
+    if op == '%' {
+        emit_mov_rr(RAX, RDX)
+    }
+}
+
+// Правый операнд бинарной операции op над int: простой или через стек.
+fn arith_rhs(op: int, level: int, at: Token) {
+    want = ty_err
+    if peek_simple(level) && is_int_like(op_ty) {
+        advance()
+        if (op == '+' || op == '-' || op == '&' || op == '|' || op == '^') {
+            emit_alu_operand(alu_rr(op), alu_rr(op) + 2, alu_ext(op))
+            if op == '+' || op == '-' {
+                emit_overflow_check(at)
+            }
+            return
+        }
+        if op == '*' && op_kind == OPK_IMM {
+            emit8(0x48)
+            emit8(0x69)
+            emit8(0xC0)
+            emit32(op_val & 0xFFFFFFFF)
+            emit_overflow_check(at)
+            return
+        }
+        if (op == '/' || op == '%') && op_kind == OPK_IMM && op_val > 0 {
+            emit_mov_imm(RCX, op_val)
+            emit8(0x48)
+            emit8(0x99)
+            emit8(0x48)
+            emit8(0xF7)
+            emit8(0xF9)
+            if op == '%' {
+                emit_mov_rr(RAX, RDX)
+            }
+            return
+        }
+        load_operand(RCX)
+        emit_arith_rcx(op, at)
+        return
+    }
+    emit_push(RAX)
+    var rt = 0
+    if level == 1 {
+        rt = parse_unary()
+    } else {
+        rt = parse_mul()
+    }
+    check_int(rt, at, op)
+    emit_mov_rr(RCX, RAX)
+    emit_pop(RAX)
+    emit_arith_rcx(op, at)
+}
+
+fn op_text(op: int) -> str {
+    if op == T_SHL {
+        return "<<"
+    }
+    if op == T_SHR {
+        return ">>"
+    }
+    if op < 128 {
+        return __str_from_byte(op)
+    }
+    return "operator"
+}
+
+fn check_int(t: int, at: Token, op: int) {
+    if t != ty_int && t != ty_err {
+        error_tok(at, "operator " + op_text(op) + " needs int operands, found " + ty_name(t), mismatch_hint(t, ty_int))
+    }
+}
+
+// ---- Уровни приоритета ----
+
+fn parse_expr(w: int) -> int {
+    want = w
+    return parse_coalesce()
+}
+
+// a ?? b — значение a, если оно не none, иначе b. Если b тоже T?, результат T?.
+fn parse_coalesce() -> int {
+    let w = want
+    let lt = parse_or()
+    if kind() != T_QQ {
+        return lt
+    }
+    let at = tok()
+    advance()
+    if tkind(lt) != K_OPT {
+        if lt != ty_err {
+            error_tok(at, "?? needs an optional value on the left, found " + ty_name(lt), "")
+        }
+        want = ty_err
+        parse_coalesce()
+        return lt
+    }
+    let inner = ty_inner(lt)
+    emit_test_rax()
+    let has = emit_jcc(CC_NE)
+    want = inner
+    if tkind(w) == K_OPT {
+        want = w
+    }
+    let rt = parse_coalesce()
+    var result = inner
+    if rt == lt {
+        result = lt
+    } else {
+        coerce(rt, inner, at)
+    }
+    let done = emit_jmp()
+    patch_here(has)
+    if result == inner && !is_ref(inner) {
+        emit_load(RAX, RAX, 0)
+    }
+    patch_here(done)
+    return result
+}
+
+fn parse_or() -> int {
+    let lt = parse_and()
+    if kind() != T_OROR {
+        return lt
+    }
+    check_bool(lt, tok(), "||")
+    var holes: [int] = []
+    while kind() == T_OROR {
+        let at = tok()
+        advance()
+        emit_test_rax()
+        holes.push(emit_jcc(CC_NE))
+        want = ty_err
+        let rt = parse_and()
+        check_bool(rt, at, "||")
+    }
+    let end = emit_jmp()
+    let t = here()
+    for h in holes {
+        patch_rel(h, t)
+    }
+    emit_mov_imm(RAX, 1)
+    patch_here(end)
+    return ty_bool
+}
+
+fn parse_and() -> int {
+    let lt = parse_cmp()
+    if kind() != T_ANDAND {
+        return lt
+    }
+    check_bool(lt, tok(), "&&")
+    var holes: [int] = []
+    while kind() == T_ANDAND {
+        let at = tok()
+        advance()
+        emit_test_rax()
+        holes.push(emit_jcc(CC_E))
+        want = ty_err
+        let rt = parse_cmp()
+        check_bool(rt, at, "&&")
+    }
+    let end = emit_jmp()
+    let f = here()
+    for h in holes {
+        patch_rel(h, f)
+    }
+    emit_mov_imm(RAX, 0)
+    patch_here(end)
+    return ty_bool
+}
+
+fn check_bool(t: int, at: Token, op: str) {
+    if t != ty_bool && t != ty_err {
+        error_tok(at, op + " needs bool operands, found " + ty_name(t), mismatch_hint(t, ty_bool))
+    }
+}
+
+fn is_cmp_op(k: int) -> bool {
+    return k == T_EQ || k == T_NE || k == '<' || k == T_LE || k == '>' || k == T_GE
+}
+
+fn cmp_cc(op: int) -> int {
+    if op == T_EQ {
+        return CC_E
+    }
+    if op == T_NE {
+        return CC_NE
+    }
+    if op == '<' {
+        return CC_L
+    }
+    if op == T_LE {
+        return CC_LE
+    }
+    if op == '>' {
+        return CC_G
+    }
+    return CC_GE
+}
+
+fn equatable(t: int) -> bool {
+    return t == ty_int || t == ty_bool || t == ty_str || t == ty_err
+}
+
+// Сравнение: левый операнд в rax, оператор уже прочитан. Выставляет флаги
+// и возвращает условие, при котором сравнение истинно.
+fn emit_compare(op: int, lt: int, at: Token) -> int {
+    want = ty_err
+    let ordered = op != T_EQ && op != T_NE
+    if lt != ty_str && peek_simple(3) {
+        let rt = op_ty
+        if compare_ok(lt, rt, ordered, at) {
+            advance()
+            if op_kind == OPK_IMM && op_val == 0 && !ordered {
+                emit_test_rax()
+            } else {
+                emit_alu_operand(0x39, 0x3B, 7)
+            }
+            return cmp_cc(op)
+        }
+        advance()
+        return CC_E
+    }
+    emit_push(RAX)
+    let rt = parse_add()
+    let ok = compare_ok(lt, rt, ordered, at)
+    if ok && lt == ty_str && rt == ty_str {
+        emit_mov_rr(RSI, RAX)
+        emit_pop(RDI)
+        if ordered {
+            emit_call(rt_func("__str_cmp"))
+            emit_alu_imm(7, RAX, 0)
+            return cmp_cc(op)
+        }
+        emit_call(rt_func("__str_eq"))
+        emit_test_rax()
+        if op == T_EQ {
+            return CC_NE
+        }
+        return CC_E
+    }
+    emit_mov_rr(RCX, RAX)
+    emit_pop(RAX)
+    emit_rr(0x39, RCX, RAX)
+    return cmp_cc(op)
+}
+
+fn compare_ok(lt: int, rt: int, ordered: bool, at: Token) -> bool {
+    if lt == ty_err || rt == ty_err {
+        return true
+    }
+    if ordered {
+        if (lt == ty_int && rt == ty_int) || (lt == ty_str && rt == ty_str) {
+            return true
+        }
+        error_tok(at, "cannot order " + ty_name(lt) + " and " + ty_name(rt), "< > <= >= work on int and str")
+        return false
+    }
+    if lt == rt && equatable(lt) {
+        return true
+    }
+    if (rt == ty_none && tkind(lt) == K_OPT) || (lt == ty_none && tkind(rt) == K_OPT) {
+        return true
+    }
+    if rt == ty_none || lt == ty_none {
+        error_tok(at, ty_name(lt) + " is never none", "only optional types (T?) can be none")
+        return false
+    }
+    if tkind(lt) == K_OPT || tkind(rt) == K_OPT {
+        error_tok(at, "cannot compare " + ty_name(lt) + " with " + ty_name(rt), "unwrap the optional first: (x ?? default) == y")
+        return false
+    }
+    if lt == rt {
+        error_tok(at, "values of type " + ty_name(lt) + " cannot be compared with ==", "compare their fields instead")
+        return false
+    }
+    error_tok(at, "cannot compare " + ty_name(lt) + " with " + ty_name(rt), mismatch_hint(rt, lt))
+    return false
+}
+
+fn parse_cmp() -> int {
+    let lt = parse_add()
+    if !is_cmp_op(kind()) {
+        return lt
+    }
+    let at = tok()
+    let op = kind()
+    advance()
+    let cc = emit_compare(op, lt, at)
+    emit_setcc(cc)
+    if is_cmp_op(kind()) {
+        error_tok(tok(), "comparisons cannot be chained", "write a < b && b < c")
+    }
+    return ty_bool
+}
+
+fn is_add_op(k: int) -> bool {
+    return k == '+' || k == '-' || k == '|' || k == '^'
+}
+
+fn is_mul_op(k: int) -> bool {
+    return k == '*' || k == '/' || k == '%' || k == T_SHL || k == T_SHR || k == '&'
+}
+
+fn parse_add() -> int {
+    var lt = parse_mul()
+    while is_add_op(kind()) {
+        let at = tok()
+        let op = kind()
+        advance()
+        if op == '+' && lt == ty_str {
+            emit_push(RAX)
+            want = ty_err
+            let rt = parse_mul()
+            if rt != ty_str && rt != ty_err {
+                error_tok(at, "cannot add " + ty_name(rt) + " to str", mismatch_hint(rt, ty_str))
+            }
+            emit_mov_rr(RSI, RAX)
+            emit_pop(RDI)
+            emit_call(rt_func("__str_concat"))
+            continue
+        }
+        check_int(lt, at, op)
+        arith_rhs(op, 2, at)
+        if lt != ty_err {
+            lt = ty_int
+        }
+    }
+    return lt
+}
+
+fn parse_mul() -> int {
+    var lt = parse_unary()
+    while is_mul_op(kind()) {
+        let at = tok()
+        let op = kind()
+        advance()
+        if op == '*' && tkind(lt) == K_LIST {
+            // [x] * n — повторение списка
+            emit_push(RAX)
+            want = ty_err
+            let rt = parse_unary()
+            check_int(rt, at, op)
+            emit_mov_rr(RSI, RAX)
+            emit_pop(RDI)
+            emit_call(rt_func("__list_repeat"))
+            continue
+        }
+        check_int(lt, at, op)
+        arith_rhs(op, 1, at)
+        if lt != ty_err {
+            lt = ty_int
+        }
+    }
+    return lt
+}
+
+fn parse_unary() -> int {
+    let k = kind()
+    let at = tok()
+    if k == '-' {
+        advance()
+        want = ty_err
+        if kind() == T_INT {
+            let v = tok().val
+            advance()
+            emit_mov_imm(RAX, -v)
+            return parse_postfix(ty_int, at)
+        }
+        let t = parse_unary()
+        check_int(t, at, '-')
+        emit8(0x48)
+        emit8(0xF7)
+        emit8(0xD8)
+        emit_overflow_check(at)
+        return ty_int
+    }
+    if k == '!' {
+        advance()
+        want = ty_err
+        let t = parse_unary()
+        check_bool(t, at, "!")
+        emit_alu_imm(6, RAX, 1)
+        return ty_bool
+    }
+    if k == '~' {
+        advance()
+        want = ty_err
+        let t = parse_unary()
+        check_int(t, at, '~')
+        emit8(0x48)
+        emit8(0xF7)
+        emit8(0xD0)
+        return ty_int
+    }
+    if k == T_PLUSPLUS || k == T_MINUSMINUS {
+        syntax_error(at, "Khrip has no ++ and --", "use x += 1")
+        advance()
+        return ty_err
+    }
+    return parse_postfix(parse_atom(), at)
+}

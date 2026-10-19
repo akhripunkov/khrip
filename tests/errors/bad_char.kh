@@ -1,5 +1,0 @@
-// expect: bad_char.kh:3: error: unexpected character
-fn main() -> i64 {
-    let x = 1 @ 2
-    return x
-}

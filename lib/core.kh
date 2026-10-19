@@ -1,0 +1,1247 @@
+// Ядро стандартной библиотеки Khrip: память, строки, списки, словари, вывод.
+// Подключается к каждой программе автоматически.
+//
+// Представление значений (одно машинное слово на значение):
+//   int, bool    — само число;
+//   str          — адрес заголовка {ptr, len}; строки неизменяемы;
+//   [T]          — адрес заголовка {data, len, cap}, data — массив слов;
+//   map[K, V]    — адрес заголовка словаря (см. ниже);
+//   структура    — адрес полей, по 8 байт на поле;
+//   T?           — для ссылочных типов 0 значит none; int? и bool? — адрес ячейки.
+//
+// Функции с префиксом __ — внутренние: их вызывает код, который генерирует
+// компилятор. Методы встроенных типов — функции __str_<имя>, __list_<имя>,
+// __map_<имя>, __int_<имя>: вызов s.contains(x) — это __str_contains(s, x).
+// T, K и V в сигнатурах — тип элемента, ключа и значения получателя.
+
+const SYS_READ = 0
+const SYS_WRITE = 1
+const SYS_OPEN = 2
+const SYS_CLOSE = 3
+const SYS_MMAP = 9
+const SYS_MUNMAP = 11
+const SYS_EXIT = 60
+const SYS_EXIT_GROUP = 231
+
+const STDOUT = 1
+const STDERR = 2
+
+// ---- Контекст потока ----
+// Первое слово контекста — указатель на него самого: компилятор читает текущий
+// контекст как fs:[0]. Остальные поля — состояние выделителя памяти и рантайма.
+
+const CTX_SELF = 0
+const CTX_PTR = 8
+const CTX_END = 16
+const CTX_ARENA = 24
+const CTX_ARENA_START = 32
+const CTX_CATCH = 40
+const CTX_STORE_HELD = 48
+const CTX_WORKER = 56
+const CTX_JMPBUF = 64
+const CTX_SIZE = 256
+
+const CHUNK = 1048576
+const BIG = 262144
+
+// ---- Паники ----
+
+const PANIC_INDEX = 1
+const PANIC_OVERFLOW = 2
+const PANIC_DIV_ZERO = 3
+const PANIC_EMPTY = 4
+const PANIC_SLICE = 5
+const PANIC_UNWRAP = 6
+const PANIC_MEMORY = 7
+
+var __argc: int
+var __argv: int
+
+fn exit(code: int) {
+    syscall(SYS_EXIT_GROUP, code)
+}
+
+// ---- Память ----
+
+fn __mmap(size: int) -> int {
+    let p = syscall(SYS_MMAP, 0, size, 3, 0x22, -1, 0)
+    if p < 0 {
+        __panic(PANIC_MEMORY, "mmap")
+    }
+    return p
+}
+
+// Обнулённая память, выровненная на 16 байт. Мелкие блоки нарезаются из кусков
+// текущего региона потока; освобождения нет — регион сбрасывается целиком.
+fn __alloc(n: int) -> int {
+    let size = (n + 15) & ~15
+    let c = __ctx()
+    let p = load64(c + CTX_PTR)
+    if p + size <= load64(c + CTX_END) {
+        store64(c + CTX_PTR, p + size)
+        return p
+    }
+    return __alloc_slow(c, size)
+}
+
+fn __alloc_slow(c: int, size: int) -> int {
+    if size >= BIG {
+        return __mmap(size)
+    }
+    let p = __mmap(CHUNK)
+    store64(c + CTX_PTR, p + size)
+    store64(c + CTX_END, p + CHUNK)
+    return p
+}
+
+fn __memcpy(dst: int, src: int, n: int) {
+    var i = 0
+    while i + 8 <= n {
+        store64(dst + i, load64(src + i))
+        i += 8
+    }
+    while i < n {
+        store8(dst + i, load8(src + i))
+        i += 1
+    }
+}
+
+// В khc — встроенная (rep stosb).
+fn __memset(dst: int, b: int, n: int) {
+    var i = 0
+    while i < n {
+        store8(dst + i, b)
+        i += 1
+    }
+}
+
+fn __memeq(a: int, b: int, n: int) -> bool {
+    var i = 0
+    while i + 8 <= n {
+        if load64(a + i) != load64(b + i) {
+            return false
+        }
+        i += 8
+    }
+    while i < n {
+        if load8(a + i) != load8(b + i) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// ---- Паника: ошибка во время выполнения ----
+
+fn __panic_text(kind: int) -> str {
+    if kind == PANIC_INDEX {
+        return "index out of range"
+    }
+    if kind == PANIC_OVERFLOW {
+        return "integer overflow"
+    }
+    if kind == PANIC_DIV_ZERO {
+        return "division by zero"
+    }
+    if kind == PANIC_EMPTY {
+        return "empty list"
+    }
+    if kind == PANIC_SLICE {
+        return "slice out of range"
+    }
+    if kind == PANIC_UNWRAP {
+        return "value is none"
+    }
+    if kind == PANIC_MEMORY {
+        return "out of memory"
+    }
+    return "panic"
+}
+
+fn __panic(kind: int, at: str) {
+    eprint("panic: " + __panic_text(kind) + " at " + at)
+    __panic_recover()
+    exit(101)
+}
+
+// ---- Строки ----
+
+fn __str_new(ptr: int, len: int) -> str {
+    let h = __alloc(16)
+    store64(h, ptr)
+    store64(h + 8, len)
+    return __cast(h)
+}
+
+// Копия байтов в новую строку.
+fn __str_copy(ptr: int, len: int) -> str {
+    let p = __alloc(len + 1)
+    __memcpy(p, ptr, len)
+    return __str_new(p, len)
+}
+
+fn __str_ptr(s: str) -> int {
+    let h: int = __cast(s)
+    return load64(h)
+}
+
+fn __str_len(s: str) -> int {
+    let h: int = __cast(s)
+    return load64(h + 8)
+}
+
+fn __str_eq(a: str, b: str) -> bool {
+    let n = __str_len(a)
+    if n != __str_len(b) {
+        return false
+    }
+    return __memeq(__str_ptr(a), __str_ptr(b), n)
+}
+
+// <0, 0 или >0, как strcmp
+fn __str_cmp(a: str, b: str) -> int {
+    let an = __str_len(a)
+    let bn = __str_len(b)
+    let ap = __str_ptr(a)
+    let bp = __str_ptr(b)
+    var i = 0
+    while i < an && i < bn {
+        let d = load8(ap + i) - load8(bp + i)
+        if d != 0 {
+            return d
+        }
+        i += 1
+    }
+    return an - bn
+}
+
+fn __str_concat(a: str, b: str) -> str {
+    let an = __str_len(a)
+    let bn = __str_len(b)
+    let p = __alloc(an + bn + 1)
+    __memcpy(p, __str_ptr(a), an)
+    __memcpy(p + an, __str_ptr(b), bn)
+    return __str_new(p, an + bn)
+}
+
+fn __str_byte(self: str, i: int) -> int {
+    if i < 0 || i >= __str_len(self) {
+        __panic(PANIC_INDEX, "str")
+    }
+    return load8(__str_ptr(self) + i)
+}
+
+// Подстрока [from, to) без копирования байтов.
+fn __str_slice(self: str, from: int, to: int) -> str {
+    if from < 0 || to > __str_len(self) || from > to {
+        __panic(PANIC_SLICE, "str")
+    }
+    return __str_new(__str_ptr(self) + from, to - from)
+}
+
+fn __str_find_from(self: str, sub: str, from: int) -> int {
+    let n = __str_len(self)
+    let m = __str_len(sub)
+    let p = __str_ptr(self)
+    let q = __str_ptr(sub)
+    var i = from
+    while i + m <= n {
+        if __memeq(p + i, q, m) {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+fn __str_find(self: str, sub: str) -> int? {
+    let i = __str_find_from(self, sub, 0)
+    if i < 0 {
+        return none
+    }
+    return i
+}
+
+fn __str_contains(self: str, sub: str) -> bool {
+    return __str_find_from(self, sub, 0) >= 0
+}
+
+fn __str_starts_with(self: str, prefix: str) -> bool {
+    let m = __str_len(prefix)
+    return m <= __str_len(self) && __memeq(__str_ptr(self), __str_ptr(prefix), m)
+}
+
+fn __str_ends_with(self: str, suffix: str) -> bool {
+    let n = __str_len(self)
+    let m = __str_len(suffix)
+    return m <= n && __memeq(__str_ptr(self) + n - m, __str_ptr(suffix), m)
+}
+
+fn __is_space(c: int) -> bool {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+fn __str_trim(self: str) -> str {
+    let p = __str_ptr(self)
+    var a = 0
+    var b = __str_len(self)
+    while a < b && __is_space(load8(p + a)) {
+        a += 1
+    }
+    while b > a && __is_space(load8(p + b - 1)) {
+        b -= 1
+    }
+    return __str_new(p + a, b - a)
+}
+
+fn __str_lower(self: str) -> str {
+    let n = __str_len(self)
+    let src = __str_ptr(self)
+    let p = __alloc(n + 1)
+    var i = 0
+    while i < n {
+        var c = load8(src + i)
+        if c >= 'A' && c <= 'Z' {
+            c += 32
+        }
+        store8(p + i, c)
+        i += 1
+    }
+    return __str_new(p, n)
+}
+
+fn __str_upper(self: str) -> str {
+    let n = __str_len(self)
+    let src = __str_ptr(self)
+    let p = __alloc(n + 1)
+    var i = 0
+    while i < n {
+        var c = load8(src + i)
+        if c >= 'a' && c <= 'z' {
+            c -= 32
+        }
+        store8(p + i, c)
+        i += 1
+    }
+    return __str_new(p, n)
+}
+
+fn __str_split(self: str, sep: str) -> [str] {
+    var parts: [str] = []
+    let m = __str_len(sep)
+    var start = 0
+    if m == 0 {
+        parts.push(self)
+        return parts
+    }
+    while true {
+        let i = __str_find_from(self, sep, start)
+        if i < 0 {
+            break
+        }
+        parts.push(__str_slice(self, start, i))
+        start = i + m
+    }
+    parts.push(__str_slice(self, start, __str_len(self)))
+    return parts
+}
+
+fn __str_replace(self: str, old: str, new: str) -> str {
+    let m = __str_len(old)
+    if m == 0 {
+        return self
+    }
+    let b = buf_new(__str_len(self) + 16)
+    var start = 0
+    while true {
+        let i = __str_find_from(self, old, start)
+        if i < 0 {
+            break
+        }
+        buf_add_raw(b, __str_ptr(self) + start, i - start)
+        buf_add(b, new)
+        start = i + m
+    }
+    buf_add_raw(b, __str_ptr(self) + start, __str_len(self) - start)
+    return buf_str(b)
+}
+
+fn __str_repeat(self: str, n: int) -> str {
+    let b = buf_new(__str_len(self) * n + 1)
+    var i = 0
+    while i < n {
+        buf_add(b, self)
+        i += 1
+    }
+    return buf_str(b)
+}
+
+// Целое без знака или со знаком «-» → значение; -1 в *ok, если не число.
+fn __parse_int(p: int, n: int, ok: int) -> int {
+    store64(ok, 0)
+    if n == 0 || n > 20 {
+        return 0
+    }
+    var i = 0
+    var neg = false
+    if load8(p) == '-' {
+        neg = true
+        i = 1
+        if n == 1 {
+            return 0
+        }
+    }
+    var v = 0
+    while i < n {
+        let c = load8(p + i)
+        if c < '0' || c > '9' {
+            return 0
+        }
+        v = v * 10 + (c - '0')
+        i += 1
+    }
+    store64(ok, 1)
+    if neg {
+        return -v
+    }
+    return v
+}
+
+fn __str_to_int(self: str) -> int? {
+    let ok = __alloc(8)
+    let v = __parse_int(__str_ptr(self), __str_len(self), ok)
+    if load64(ok) == 0 {
+        return none
+    }
+    return v
+}
+
+fn __int_to_str(self: int) -> str {
+    let b = buf_new(24)
+    buf_int(b, self)
+    return buf_str(b)
+}
+
+fn __bool_to_str(self: bool) -> str {
+    if self {
+        return "true"
+    }
+    return "false"
+}
+
+fn __str_to_str(self: str) -> str {
+    return self
+}
+
+// Копия строки с нулевым байтом на конце — для системных вызовов.
+fn __cstr(s: str) -> int {
+    let n = __str_len(s)
+    let p = __alloc(n + 1)
+    __memcpy(p, __str_ptr(s), n)
+    return p
+}
+
+// Строка из байтов с нулём на конце (argv, environ).
+fn __str_from_c(p: int) -> str {
+    var n = 0
+    while load8(p + n) != 0 {
+        n += 1
+    }
+    return __str_new(p, n)
+}
+
+// ---- Буфер для сборки байтов ----
+
+type Buf {
+    data: int
+    len: int
+    cap: int
+}
+
+fn buf_new(cap: int) -> Buf {
+    var c = cap
+    if c < 16 {
+        c = 16
+    }
+    return Buf { data: __alloc(c), len: 0, cap: c }
+}
+
+fn buf_reserve(b: Buf, n: int) {
+    if b.len + n <= b.cap {
+        return
+    }
+    var c = b.cap * 2
+    while c < b.len + n {
+        c *= 2
+    }
+    let p = __alloc(c)
+    __memcpy(p, b.data, b.len)
+    b.data = p
+    b.cap = c
+}
+
+fn buf_add_raw(b: Buf, p: int, n: int) {
+    buf_reserve(b, n)
+    __memcpy(b.data + b.len, p, n)
+    b.len += n
+}
+
+fn buf_add(b: Buf, s: str) {
+    buf_add_raw(b, __str_ptr(s), __str_len(s))
+}
+
+fn buf_byte(b: Buf, c: int) {
+    buf_reserve(b, 1)
+    store8(b.data + b.len, c)
+    b.len += 1
+}
+
+fn buf_int(b: Buf, x: int) {
+    buf_reserve(b, 24)
+    if x == 0 {
+        store8(b.data + b.len, '0')
+        b.len += 1
+        return
+    }
+    var v = x
+    if v < 0 {
+        store8(b.data + b.len, '-')
+        b.len += 1
+    }
+    let tmp = __alloc(24)
+    var i = 24
+    while v != 0 {
+        var d = v % 10
+        if d < 0 {
+            d = -d
+        }
+        i -= 1
+        store8(tmp + i, '0' + d)
+        v = v / 10
+    }
+    __memcpy(b.data + b.len, tmp + i, 24 - i)
+    b.len += 24 - i
+}
+
+fn buf_clear(b: Buf) {
+    b.len = 0
+}
+
+// Содержимое буфера как строка (копия).
+fn buf_str(b: Buf) -> str {
+    return __str_copy(b.data, b.len)
+}
+
+// ---- Списки ----
+// Заголовок: [0] data, [8] len, [16] cap, [24] размер элемента — 8 байт,
+// а у [bool] — 1 байт.
+
+fn __list_new(cap: int, esize: int) -> int {
+    var c = cap
+    if c < 4 {
+        c = 4
+    }
+    let h = __alloc(32)
+    store64(h, __alloc(c * esize))
+    store64(h + 16, c)
+    store64(h + 24, esize)
+    return h
+}
+
+fn __lget(h: int, i: int) -> int {
+    if load64(h + 24) == 1 {
+        return load8(load64(h) + i)
+    }
+    return load64(load64(h) + i * 8)
+}
+
+fn __lset(h: int, i: int, v: int) {
+    if load64(h + 24) == 1 {
+        store8(load64(h) + i, v)
+        return
+    }
+    store64(load64(h) + i * 8, v)
+}
+
+fn __list_grow(h: int, need: int) {
+    var cap = load64(h + 16) * 2
+    while cap < need {
+        cap *= 2
+    }
+    let es = load64(h + 24)
+    let data = __alloc(cap * es)
+    __memcpy(data, load64(h), load64(h + 8) * es)
+    store64(h, data)
+    store64(h + 16, cap)
+}
+
+fn __list_push(self: [T], v: T) {
+    let h: int = __cast(self)
+    let len = load64(h + 8)
+    if len == load64(h + 16) {
+        __list_grow(h, len + 1)
+    }
+    __lset(h, len, __cast(v))
+    store64(h + 8, len + 1)
+}
+
+fn __list_pop(self: [T]) -> T {
+    let h: int = __cast(self)
+    let len = load64(h + 8)
+    if len == 0 {
+        __panic(PANIC_EMPTY, "pop")
+    }
+    store64(h + 8, len - 1)
+    return __cast(__lget(h, len - 1))
+}
+
+fn __list_last(self: [T]) -> T {
+    let h: int = __cast(self)
+    let len = load64(h + 8)
+    if len == 0 {
+        __panic(PANIC_EMPTY, "last")
+    }
+    return __cast(__lget(h, len - 1))
+}
+
+fn __list_clear(self: [T]) {
+    let h: int = __cast(self)
+    store64(h + 8, 0)
+}
+
+fn __list_truncate(self: [T], n: int) {
+    let h: int = __cast(self)
+    if n >= 0 && n < load64(h + 8) {
+        store64(h + 8, n)
+    }
+}
+
+fn __list_insert(self: [T], i: int, v: T) {
+    let h: int = __cast(self)
+    let len = load64(h + 8)
+    if i < 0 || i > len {
+        __panic(PANIC_INDEX, "insert")
+    }
+    if len == load64(h + 16) {
+        __list_grow(h, len + 1)
+    }
+    var j = len
+    while j > i {
+        __lset(h, j, __lget(h, j - 1))
+        j -= 1
+    }
+    __lset(h, i, __cast(v))
+    store64(h + 8, len + 1)
+}
+
+fn __list_remove_at(self: [T], i: int) -> T {
+    let h: int = __cast(self)
+    let len = load64(h + 8)
+    if i < 0 || i >= len {
+        __panic(PANIC_INDEX, "remove_at")
+    }
+    let v = __lget(h, i)
+    var j = i
+    while j + 1 < len {
+        __lset(h, j, __lget(h, j + 1))
+        j += 1
+    }
+    store64(h + 8, len - 1)
+    return __cast(v)
+}
+
+fn __list_reverse(self: [T]) {
+    let h: int = __cast(self)
+    var a = 0
+    var b = load64(h + 8) - 1
+    while a < b {
+        let t = __lget(h, a)
+        __lset(h, a, __lget(h, b))
+        __lset(h, b, t)
+        a += 1
+        b -= 1
+    }
+}
+
+fn __list_copy(self: [T]) -> [T] {
+    let h: int = __cast(self)
+    let len = load64(h + 8)
+    let es = load64(h + 24)
+    let n = __list_new(len, es)
+    __memcpy(load64(n), load64(h), len * es)
+    store64(n + 8, len)
+    return __cast(n)
+}
+
+// [x] * n — список из n повторений.
+fn __list_repeat(self: [T], n: int) -> [T] {
+    let h: int = __cast(self)
+    let len = load64(h + 8)
+    let es = load64(h + 24)
+    var count = n
+    if count < 0 {
+        count = 0
+    }
+    let r = __list_new(len * count, es)
+    let bytes = len * es
+    store64(r + 8, len * count)
+    if len == 1 {
+        // один элемент: память уже обнулена, остальное заполняется
+        let v = __lget(h, 0)
+        if v == 0 {
+            return __cast(r)
+        }
+        if es == 1 {
+            __memset(load64(r), v, count)
+            return __cast(r)
+        }
+        var k = 0
+        let d = load64(r)
+        while k < count {
+            store64(d + k * 8, v)
+            k += 1
+        }
+        return __cast(r)
+    }
+    var i = 0
+    while i < count {
+        __memcpy(load64(r) + i * bytes, load64(h), bytes)
+        i += 1
+    }
+    return __cast(r)
+}
+
+fn __list_join(self: [str], sep: str) -> str {
+    let b = buf_new(64)
+    var i = 0
+    for s in self {
+        if i > 0 {
+            buf_add(b, sep)
+        }
+        buf_add(b, s)
+        i += 1
+    }
+    return buf_str(b)
+}
+
+fn __list_sum(self: [int]) -> int {
+    var total = 0
+    for x in self {
+        total += x
+    }
+    return total
+}
+
+// ---- Ввод и вывод ----
+
+fn __write(fd: int, s: str) {
+    var p = __str_ptr(s)
+    var n = __str_len(s)
+    while n > 0 {
+        let w = syscall(SYS_WRITE, fd, p, n)
+        if w <= 0 {
+            return
+        }
+        p += w
+        n -= w
+    }
+}
+
+// Печатает строку и перевод строки.
+fn print(s: str) {
+    let n = __str_len(s)
+    let p = __alloc(n + 1)
+    __memcpy(p, __str_ptr(s), n)
+    store8(p + n, '\n')
+    __write(STDOUT, __str_new(p, n + 1))
+}
+
+fn eprint(s: str) {
+    let n = __str_len(s)
+    let p = __alloc(n + 1)
+    __memcpy(p, __str_ptr(s), n)
+    store8(p + n, '\n')
+    __write(STDERR, __str_new(p, n + 1))
+}
+
+// Печать без перевода строки.
+fn write(s: str) {
+    __write(STDOUT, s)
+}
+
+fn read_file(path: str) -> str? {
+    let fd = syscall(SYS_OPEN, __cstr(path), 0, 0)
+    if fd < 0 {
+        return none
+    }
+    let b = buf_new(65536)
+    while true {
+        buf_reserve(b, 65536)
+        let n = syscall(SYS_READ, fd, b.data + b.len, b.cap - b.len)
+        if n < 0 {
+            syscall(SYS_CLOSE, fd)
+            return none
+        }
+        if n == 0 {
+            break
+        }
+        b.len += n
+    }
+    syscall(SYS_CLOSE, fd)
+    return __str_new(b.data, b.len)
+}
+
+// Записывает строку в файл; executable — сделать файл исполняемым.
+fn write_file(path: str, content: str, executable: bool) -> bool {
+    var mode = 420
+    if executable {
+        mode = 493
+    }
+    let fd = syscall(SYS_OPEN, __cstr(path), 0x241, mode)
+    if fd < 0 {
+        return false
+    }
+    var p = __str_ptr(content)
+    var n = __str_len(content)
+    while n > 0 {
+        let w = syscall(SYS_WRITE, fd, p, n)
+        if w <= 0 {
+            syscall(SYS_CLOSE, fd)
+            return false
+        }
+        p += w
+        n -= w
+    }
+    syscall(SYS_CLOSE, fd)
+    return true
+}
+
+// Аргументы командной строки, включая имя программы.
+fn args() -> [str] {
+    var list: [str] = []
+    var i = 0
+    while i < __argc {
+        list.push(__str_from_c(load64(__argv + i * 8)))
+        i += 1
+    }
+    return list
+}
+
+fn env(name: str) -> str? {
+    var e = __argv + (__argc + 1) * 8
+    let n = __str_len(name)
+    while load64(e) != 0 {
+        let s = load64(e)
+        if __memeq(s, __str_ptr(name), n) && load8(s + n) == '=' {
+            return __str_from_c(s + n + 1)
+        }
+        e += 8
+    }
+    return none
+}
+
+fn __str_from_byte(c: int) -> str {
+    let p = __alloc(2)
+    store8(p, c)
+    return __str_new(p, 1)
+}
+
+fn __int_abs(self: int) -> int {
+    if self < 0 {
+        return -self
+    }
+    return self
+}
+
+fn __int_min(self: int, other: int) -> int {
+    if other < self {
+        return other
+    }
+    return self
+}
+
+fn __int_max(self: int, other: int) -> int {
+    if other > self {
+        return other
+    }
+    return self
+}
+
+// ---- Списки: срезы, поиск, сортировка ----
+
+fn __list_slice(self: [T], from: int, to: int) -> [T] {
+    let h: int = __cast(self)
+    if from < 0 || to > load64(h + 8) || from > to {
+        __panic(PANIC_SLICE, "list")
+    }
+    let es = load64(h + 24)
+    let n = __list_new(to - from, es)
+    __memcpy(load64(n), load64(h) + from * es, (to - from) * es)
+    store64(n + 8, to - from)
+    return __cast(n)
+}
+
+fn __list_contains_int(self: [int], v: int) -> bool {
+    for x in self {
+        if x == v {
+            return true
+        }
+    }
+    return false
+}
+
+fn __list_contains_str(self: [str], v: str) -> bool {
+    for x in self {
+        if x == v {
+            return true
+        }
+    }
+    return false
+}
+
+fn __list_index_of_int(self: [int], v: int) -> int? {
+    var i = 0
+    for x in self {
+        if x == v {
+            return i
+        }
+        i += 1
+    }
+    return none
+}
+
+fn __list_index_of_str(self: [str], v: str) -> int? {
+    var i = 0
+    for x in self {
+        if x == v {
+            return i
+        }
+        i += 1
+    }
+    return none
+}
+
+// Сортировка слиянием по словам; by_str — сравнивать как строки.
+fn __sort_words(data: int, n: int, by_str: bool) {
+    if n < 2 {
+        return
+    }
+    let tmp = __alloc(n * 8)
+    var width = 1
+    while width < n {
+        var lo = 0
+        while lo < n {
+            var mid = lo + width
+            if mid > n {
+                mid = n
+            }
+            var hi = lo + 2 * width
+            if hi > n {
+                hi = n
+            }
+            var a = lo
+            var b = mid
+            var k = lo
+            while k < hi {
+                var take_a = false
+                if a < mid && b < hi {
+                    let x = load64(data + a * 8)
+                    let y = load64(data + b * 8)
+                    if by_str {
+                        take_a = __str_cmp(__cast(x), __cast(y)) <= 0
+                    } else {
+                        take_a = x <= y
+                    }
+                } else {
+                    take_a = a < mid
+                }
+                if take_a {
+                    store64(tmp + k * 8, load64(data + a * 8))
+                    a += 1
+                } else {
+                    store64(tmp + k * 8, load64(data + b * 8))
+                    b += 1
+                }
+                k += 1
+            }
+            lo += 2 * width
+        }
+        __memcpy(data, tmp, n * 8)
+        width *= 2
+    }
+}
+
+fn __list_sort_int(self: [int]) {
+    let h: int = __cast(self)
+    __sort_words(load64(h), load64(h + 8), false)
+}
+
+fn __list_sort_str(self: [str]) {
+    let h: int = __cast(self)
+    __sort_words(load64(h), load64(h + 8), true)
+}
+
+// ---- Словари ----
+// Записи хранятся по порядку вставки в списках keys, vals и alive (1 — жива);
+// slots — открытая адресация: номер записи + 1, 0 — пусто, -1 — удалено.
+// Заголовок: [0] keys, [8] count, [16] vals, [24] alive, [32] slots, [40] mask,
+// [48] строковые ключи, [56] удалённые записи.
+
+fn __map_new(str_keys: int) -> int {
+    let m = __alloc(64)
+    store64(m, __list_new(8, 8))
+    store64(m + 16, __list_new(8, 8))
+    store64(m + 24, __list_new(8, 8))
+    store64(m + 32, __alloc(16 * 8))
+    store64(m + 40, 15)
+    store64(m + 48, str_keys)
+    return m
+}
+
+fn __map_hash(m: int, k: int) -> int {
+    if load64(m + 48) != 0 {
+        let p = load64(k)
+        let n = load64(k + 8)
+        var h = 5381
+        var i = 0
+        while i < n {
+            h = (h * 33 + load8(p + i)) & 0xFFFFFFFFFFFF
+            i += 1
+        }
+        return h
+    }
+    let lo = k & 0xFFFFFFF
+    let hi = (k >> 28) & 0xFFFFFFF
+    return (lo * 0x9E3779B) ^ (hi * 0x7FEB352) ^ (k >> 56)
+}
+
+fn __map_key_eq(m: int, a: int, b: int) -> bool {
+    if load64(m + 48) != 0 {
+        return __str_eq(__cast(a), __cast(b))
+    }
+    return a == b
+}
+
+fn __word_at(list: int, i: int) -> int {
+    return load64(load64(list) + i * 8)
+}
+
+// Номер записи с ключом k или -1.
+fn __map_find(m: int, k: int) -> int {
+    let slots = load64(m + 32)
+    let mask = load64(m + 40)
+    var i = __map_hash(m, k) & mask
+    while true {
+        let e = load64(slots + i * 8)
+        if e == 0 {
+            return -1
+        }
+        if e > 0 && __map_key_eq(m, __word_at(load64(m), e - 1), k) {
+            return e - 1
+        }
+        i = (i + 1) & mask
+    }
+    return -1
+}
+
+// Номер слота, где лежит запись idx.
+fn __map_slot_of(m: int, k: int, idx: int) -> int {
+    let slots = load64(m + 32)
+    let mask = load64(m + 40)
+    var i = __map_hash(m, k) & mask
+    while load64(slots + i * 8) != idx + 1 {
+        i = (i + 1) & mask
+    }
+    return i
+}
+
+fn __map_place(m: int, k: int, idx: int) {
+    let slots = load64(m + 32)
+    let mask = load64(m + 40)
+    var i = __map_hash(m, k) & mask
+    while load64(slots + i * 8) > 0 {
+        i = (i + 1) & mask
+    }
+    store64(slots + i * 8, idx + 1)
+}
+
+// Перестройка: выбросить удалённые записи и увеличить таблицу.
+fn __map_rehash(m: int) {
+    let keys = load64(m)
+    let vals = load64(m + 16)
+    let alive = load64(m + 24)
+    let n = load64(keys + 8)
+    var w = 0
+    var r = 0
+    while r < n {
+        if __word_at(alive, r) != 0 {
+            store64(load64(keys) + w * 8, __word_at(keys, r))
+            store64(load64(vals) + w * 8, __word_at(vals, r))
+            store64(load64(alive) + w * 8, 1)
+            w += 1
+        }
+        r += 1
+    }
+    store64(keys + 8, w)
+    store64(vals + 8, w)
+    store64(alive + 8, w)
+    store64(m + 56, 0)
+    var size = 16
+    while size < w * 4 {
+        size *= 2
+    }
+    store64(m + 32, __alloc(size * 8))
+    store64(m + 40, size - 1)
+    var i = 0
+    while i < w {
+        __map_place(m, __word_at(keys, i), i)
+        i += 1
+    }
+}
+
+fn __map_set(m: int, k: int, v: int) {
+    let idx = __map_find(m, k)
+    if idx >= 0 {
+        store64(load64(load64(m + 16)) + idx * 8, v)
+        return
+    }
+    let used = load64(load64(m) + 8) + 1
+    if used * 2 > load64(m + 40) {
+        __map_rehash(m)
+    }
+    let keys: [int] = __cast(load64(m))
+    let vals: [int] = __cast(load64(m + 16))
+    let alive: [int] = __cast(load64(m + 24))
+    keys.push(k)
+    vals.push(v)
+    alive.push(1)
+    store64(m + 8, load64(m + 8) + 1)
+    __map_place(m, k, keys.len() - 1)
+}
+
+fn __map_get_ref(m: int, k: int) -> int {
+    let idx = __map_find(m, k)
+    if idx < 0 {
+        return 0
+    }
+    return __word_at(load64(m + 16), idx)
+}
+
+fn __map_get_box(m: int, k: int) -> int {
+    let idx = __map_find(m, k)
+    if idx < 0 {
+        return 0
+    }
+    let b = __alloc(8)
+    store64(b, __word_at(load64(m + 16), idx))
+    return b
+}
+
+fn __map_get_or0(m: int, k: int) -> int {
+    let idx = __map_find(m, k)
+    if idx < 0 {
+        return 0
+    }
+    return __word_at(load64(m + 16), idx)
+}
+
+fn __map_get_or_empty(m: int, k: int) -> int {
+    let idx = __map_find(m, k)
+    if idx < 0 {
+        let e: int = __cast("")
+        return e
+    }
+    return __word_at(load64(m + 16), idx)
+}
+
+fn __map_has(m: int, k: int) -> bool {
+    return __map_find(m, k) >= 0
+}
+
+// Удаляет ключ → значение или 0, если ключа не было.
+fn __map_remove_word(m: int, k: int, found: int) -> int {
+    store64(found, 0)
+    let idx = __map_find(m, k)
+    if idx < 0 {
+        return 0
+    }
+    let s = __map_slot_of(m, k, idx)
+    store64(load64(m + 32) + s * 8, -1)
+    store64(load64(load64(m + 24)) + idx * 8, 0)
+    store64(m + 8, load64(m + 8) - 1)
+    store64(m + 56, load64(m + 56) + 1)
+    store64(found, 1)
+    return __word_at(load64(m + 16), idx)
+}
+
+fn __map_remove_ref(m: int, k: int) -> int {
+    let found = __alloc(8)
+    return __map_remove_word(m, k, found)
+}
+
+fn __map_remove_box(m: int, k: int) -> int {
+    let found = __alloc(8)
+    let v = __map_remove_word(m, k, found)
+    if load64(found) == 0 {
+        return 0
+    }
+    let b = __alloc(8)
+    store64(b, v)
+    return b
+}
+
+fn __map_collect(m: int, which: int, esize: int) -> int {
+    let src = load64(m + which)
+    let alive = load64(m + 24)
+    let n = load64(src + 8)
+    let out = __list_new(load64(m + 8), esize)
+    let outl: [int] = __cast(out)
+    var i = 0
+    while i < n {
+        if __word_at(alive, i) != 0 {
+            outl.push(__word_at(src, i))
+        }
+        i += 1
+    }
+    return out
+}
+
+fn __map_keys(m: int) -> int {
+    return __map_collect(m, 0, 8)
+}
+
+// esize — размер элемента результата: 1 для словарей с bool-значениями.
+fn __map_values(m: int, esize: int) -> int {
+    return __map_collect(m, 16, esize)
+}
+
+fn __map_clear(m: int) {
+    store64(load64(m) + 8, 0)
+    store64(load64(m + 16) + 8, 0)
+    store64(load64(m + 24) + 8, 0)
+    store64(m + 8, 0)
+    store64(m + 56, 0)
+    store64(m + 32, __alloc(16 * 8))
+    store64(m + 40, 15)
+}
+
+fn __list_contains_bool(self: [bool], v: bool) -> bool {
+    for x in self {
+        if x == v {
+            return true
+        }
+    }
+    return false
+}
+
+fn __list_index_of_bool(self: [bool], v: bool) -> int? {
+    var i = 0
+    for x in self {
+        if x == v {
+            return i
+        }
+        i += 1
+    }
+    return none
+}

@@ -1,0 +1,5 @@
+// expect: unknown name 'null'
+// expect: hint: Khrip has no null; use none with an optional type
+fn main() {
+    let x = null
+}

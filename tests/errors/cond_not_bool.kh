@@ -1,0 +1,8 @@
+// expect: condition must be bool, found int
+// expect: hint: compare explicitly, e.g. x != 0
+fn main() {
+    let n = 1
+    if n {
+        print(n)
+    }
+}

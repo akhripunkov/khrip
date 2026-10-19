@@ -1,23 +1,25 @@
-// Арифметика, приоритеты как в Go, переполнение i64.
-fn main() -> i64 {
-    println_int(2 + 3 * 4)
-    println_int((2 + 3) * 4)
-    println_int(10 - 4 - 3)
-    println_int(100 / 7)
-    println_int(100 % 7)
-    println_int(-100 / 7)
-    println_int(-100 % 7)
-    println_int(1 << 20)
-    println_int(-1024 >> 3)
-    println_int(0xFF & 0x0F | 0x30)
-    println_int(6 ^ 3)
-    println_int(~5)
-    println_int(- -7)
-    println_int(1 + 2 == 3)
-    println_int(3 < 2)
-    println_int(9223372036854775807)
-    println_int(-9223372036854775807 - 1)
-    println_int(0x7fffffffffffffff + 1)
-    println_int(123456789 * 1000)
-    return 0
+// Арифметика, приоритеты как в Go, границы int.
+fn main() {
+    print(2 + 3 * 4)
+    print((2 + 3) * 4)
+    print(10 - 4 - 3)
+    print(100 / 7)
+    print(100 % 7)
+    print(-100 / 7)
+    print(-100 % 7)
+    print(1 << 20)
+    print(-1024 >> 3)
+    print(0xFF & 0x0F | 0x30)
+    print(6 ^ 3)
+    print(~5)
+    print(- -7)
+    print(1 + 2 == 3)
+    print(3 < 2)
+    print(9223372036854775807)
+    print(-9223372036854775807 - 1)
+    print(123456789 * 1000)
+    let a = 17
+    let b = 5
+    print(a / b + a % b * 2)
+    print(1_000_000)
 }

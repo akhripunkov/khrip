@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Тесты компилятора.
-#   tests/run/*.kh    — собираются вместе с lib/std.kh (и библиотеками из
-#                       комментария «// libs: ...»), вывод сравнивается с .out,
-#                       код выхода — с комментарием «// exit: N» (по умолчанию 0);
-#   tests/errors/*.kh — не должны компилироваться; сообщение об ошибке должно
-#                       содержать текст из комментария «// expect: ...»;
+#   tests/run/*.kh    — вывод сравнивается с .out, код выхода — с комментарием
+#                       «// exit: N» (по умолчанию 0);
+#   tests/errors/*.kh — не должны компилироваться; вывод компилятора должен
+#                       содержать каждую строку «// expect: ...»; ключи
+#                       компилятора — из «// flags: ...»;
 #   tests/http.sh     — HTTP-сервер на Khrip отвечает правильно.
 # Компилятор берётся из $KHC (по умолчанию build/khc).
 set -uo pipefail
@@ -25,13 +25,11 @@ for src in tests/run/*.kh; do
 	name=$(basename "$src" .kh)
 	want_exit=$(sed -n 's|^// exit: *||p' "$src" | head -1)
 	want_exit=${want_exit:-0}
-	libs=$(sed -n 's|^// libs: *||p' "$src" | head -1)
-	# shellcheck disable=SC2086
-	if ! "$KHC" -o "$tmp/$name" lib/std.kh $libs "$src" 2>"$tmp/$name.err"; then
-		failed "$src" "не скомпилировалось: $(cat "$tmp/$name.err")"
+	if ! "$KHC" -o "$tmp/$name" "$src" >"$tmp/$name.err" 2>&1; then
+		failed "$src" "не скомпилировалось:"$'\n'"$(cat "$tmp/$name.err")"
 		continue
 	fi
-	"$tmp/$name" >"$tmp/$name.out"
+	"$tmp/$name" >"$tmp/$name.out" 2>"$tmp/$name.stderr"
 	got_exit=$?
 	if ! diff -u "tests/run/$name.out" "$tmp/$name.out" >"$tmp/$name.diff"; then
 		failed "$src" "вывод отличается от ожидаемого"
@@ -39,25 +37,34 @@ for src in tests/run/*.kh; do
 		continue
 	fi
 	if [[ "$got_exit" != "$want_exit" ]]; then
-		failed "$src" "код выхода $got_exit, ожидался $want_exit"
+		failed "$src" "код выхода $got_exit, ожидался $want_exit; stderr: $(cat "$tmp/$name.stderr")"
 		continue
 	fi
 	pass=$((pass + 1))
 done
 
 for src in tests/errors/*.kh; do
-	want=$(sed -n 's|^// expect: *||p' "$src" | head -1)
-	if "$KHC" -o "$tmp/err" "$src" 2>"$tmp/err.txt"; then
+	flags=$(sed -n 's|^// flags: *||p' "$src" | head -1)
+	# shellcheck disable=SC2086
+	if "$KHC" check $flags "$src" >"$tmp/err.txt" 2>&1; then
 		failed "$src" "скомпилировалось, а должна быть ошибка"
-	elif ! grep -qF -- "$want" "$tmp/err.txt"; then
-		failed "$src" "ожидалось «$want», получено «$(cat "$tmp/err.txt")»"
-	else
-		pass=$((pass + 1))
+		continue
 	fi
+	ok=1
+	while IFS= read -r want; do
+		if ! grep -qF -- "$want" "$tmp/err.txt"; then
+			failed "$src" "ожидалось «$want», получено:"$'\n'"$(cat "$tmp/err.txt")"
+			ok=0
+			break
+		fi
+	done < <(sed -n 's|^// expect: *||p' "$src")
+	[[ $ok -eq 1 ]] && pass=$((pass + 1))
 done
 
-# shellcheck source=tests/http.sh
-source tests/http.sh
+if [[ -f tests/http.sh ]]; then
+	# shellcheck source=tests/http.sh
+	source tests/http.sh
+fi
 
 echo "тестов пройдено: $pass, провалено: $fail"
 [[ $fail -eq 0 ]]

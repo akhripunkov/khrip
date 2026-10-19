@@ -1,0 +1,9 @@
+// expect: missing fields in Point: y: int
+type Point {
+    x: int
+    y: int
+}
+fn main() {
+    let p = Point { x: 1 }
+    print(p.x)
+}

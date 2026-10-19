@@ -1,4 +1,0 @@
-// expect: missing_paren.kh:4: error: expected ')' (near '}')
-fn main() -> i64 {
-    let x = (1 + 2
-}

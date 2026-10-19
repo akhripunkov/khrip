@@ -1,0 +1,47 @@
+// Словари: вставка, чтение, удаление, порядок вставки, подсчёт.
+fn main() {
+    var ages: map[str, int] = {}
+    ages["ann"] = 30
+    ages["bob"] = 40
+    ages["cid"] = 50
+    print(ages.len())
+    print(ages["bob"] ?? 0)
+    print(ages["zed"] ?? -1)
+    print(ages.has("ann"))
+    print(ages.remove("bob") ?? 0)
+    print(ages.has("bob"))
+    print(ages.len())
+    ages["dan"] = 60
+    for k, v in ages {
+        print("{k}={v}")
+    }
+    var counts: map[str, int] = {}
+    for w in "a b a c b a".split(" ") {
+        counts[w] += 1
+    }
+    for k, v in counts {
+        print("{k}:{v}")
+    }
+    var byid: map[int, str] = {}
+    var i = 0
+    while i < 1000 {
+        byid[i * 7] = i.to_str()
+        i += 1
+    }
+    print(byid.len())
+    print(byid[693] ?? "none")
+    var removed = 0
+    i = 0
+    while i < 1000 {
+        if i % 2 == 0 {
+            byid.remove(i * 7)
+            removed += 1
+        }
+        i += 1
+    }
+    print(byid.len())
+    print(byid.keys()[0])
+    print(byid.values()[1])
+    let m2 = {"x": 1, "y": 2}
+    print(m2["y"] ?? 0)
+}

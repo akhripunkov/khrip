@@ -1,0 +1,2493 @@
+// ============================================================================
+// boot — загрузчик: компилятор подмножества Khrip-1, написанный на Khrip-0.
+//
+// Звено раскрутки между зерном и настоящим компилятором:
+//
+//   bootstrap/khc0.asm → khc0 → boot (этот файл) → khc (src/*.kh) → khc → khc
+//
+// Понимает ровно то, на чём написаны src/*.kh и lib/core.kh: типы int, bool,
+// str, [T], T?, структуры; поля, индексы, методы строк и списков, for, +=,
+// глобальные переменные с инициализацией. Типы нужны ему только чтобы выбрать
+// код (поле структуры, байт строки, сравнение строк); проверяет их настоящий
+// компилятор, когда собирает сам себя.
+//
+// Генерация кода — как в Khrip-0: стековая машина, аргументы в стеке.
+// Запуск: boot -o <выход> <вход.kh>...
+// ============================================================================
+
+// ---- Системные вызовы Linux ----
+
+const SYS_READ = 0
+const SYS_WRITE = 1
+const SYS_OPEN = 2
+const SYS_CLOSE = 3
+const SYS_MMAP = 9
+const SYS_EXIT = 60
+
+// ---- Пределы ----
+
+const SRC_MAX = 16777216
+const FILE_MAX = 256
+const TOK_MAX = 2097152
+const CODE_MAX = 33554432
+const DATA_MAX = 16777216
+const SYM_MAX = 65536
+const LOC_MAX = 4096
+const FIX_MAX = 2097152
+const BRK_MAX = 4096
+const PEND_MAX = 4096
+const STRUCT_MAX = 1024
+const FIELD_MAX = 64
+const TYPE_MAX = 8192
+const INIT_MAX = 4096
+
+// ---- Раскладка исполняемого файла ----
+
+const CODE_BASE = 0x400000
+const HDR_SIZE = 176
+const DATA_BASE = 0x10000000
+
+// ---- Виды токенов (одиночные знаки — своим ASCII-кодом) ----
+
+const T_EOF = 0
+const T_IDENT = 1
+const T_INT = 2
+const T_STR = 3
+const T_FN = 10
+const T_LET = 11
+const T_VAR = 12
+const T_CONST = 13
+const T_IF = 14
+const T_ELSE = 15
+const T_WHILE = 16
+const T_RETURN = 17
+const T_BREAK = 18
+const T_CONTINUE = 19
+const T_TYPE = 20
+const T_FOR = 21
+const T_IN = 22
+const T_TRUE = 23
+const T_FALSE = 24
+const T_NONE = 25
+const T_EQ = 256
+const T_NE = 257
+const T_LE = 258
+const T_GE = 259
+const T_ANDAND = 260
+const T_OROR = 261
+const T_SHL = 262
+const T_SHR = 263
+const T_ARROW = 264
+const T_DOTDOT = 265
+const T_PLUSEQ = 266
+const T_MINUSEQ = 267
+const T_STAREQ = 268
+const T_QQ = 270
+
+// ---- Встроенные функции ----
+
+const B_LOAD8 = 1
+const B_LOAD64 = 2
+const B_STORE8 = 3
+const B_STORE64 = 4
+const B_SYSCALL = 5
+
+// ---- Виды типов ----
+
+const K_INT = 1
+const K_BOOL = 2
+const K_STR = 3
+const K_VOID = 4
+const K_NONE = 5
+const K_LIST = 6
+const K_OPT = 7
+const K_STRUCT = 8
+const K_GEN = 9
+const K_ANY = 10
+
+// ---- Записи таблиц (поля по 8 байт) ----
+
+const FILE_SIZE = 16
+const FL_PATH = 0
+const FL_LINE = 8
+
+const TOK_SIZE = 40
+const TK_KIND = 0
+const TK_VAL = 8
+const TK_PTR = 16
+const TK_LEN = 24
+const TK_LINE = 32
+
+const SYM_SIZE = 64
+const SY_PTR = 0
+const SY_LEN = 8
+const SY_KIND = 16
+const SY_VAL = 24
+const SY_EXTRA = 32
+const SY_TYPE = 40
+
+const S_CONST = 1
+const S_VAR = 2
+const S_FN = 3
+const S_TYPE = 4
+
+const LOC_SIZE = 40
+const LO_PTR = 0
+const LO_LEN = 8
+const LO_OFF = 16
+const LO_MUT = 24
+const LO_TYPE = 32
+
+const FIX_SIZE = 32
+const FX_POS = 0
+const FX_SYM = 8
+const FX_ARGC = 16
+const FX_LINE = 24
+
+const STRUCT_SIZE = 32
+const ST_PTR = 0
+const ST_LEN = 8
+const ST_NFIELDS = 16
+const ST_FIELDS = 24
+
+const FIELD_SIZE = 24
+const FD_PTR = 0
+const FD_LEN = 8
+const FD_TYPE = 16
+
+const TYPE_SIZE = 16
+const TY_KIND = 0
+const TY_A = 8
+
+// ---- Состояние компилятора ----
+
+var src: i64
+var src_len: i64
+var files: i64
+var nfiles: i64
+var next_line: i64
+var lex_p: i64
+var lex_end: i64
+var lex_line: i64
+var toks: i64
+var ntok: i64
+var pos: i64
+var code: i64
+var code_len: i64
+var data: i64
+var data_len: i64
+var syms: i64
+var nsyms: i64
+var locs: i64
+var nlocs: i64
+var frame: i64
+var fixes: i64
+var nfix: i64
+var brks: i64
+var nbrk: i64
+var conts: i64
+var nconts: i64
+var loop_depth: i64
+var pend: i64
+var npend: i64
+var structs: i64
+var nstructs: i64
+var types: i64
+var ntypes: i64
+var inits: i64
+var ninits: i64
+var no_struct: i64
+var name_buf: i64
+var empty_str: i64
+var ty_int: i64
+var ty_bool: i64
+var ty_str: i64
+var ty_void: i64
+var ty_none: i64
+var ty_any: i64
+
+// ============================================================================
+// Основа: память, строки, вывод
+// ============================================================================
+
+fn exit(status: i64) {
+    syscall(SYS_EXIT, status)
+}
+
+fn strlen(s: i64) -> i64 {
+    var n = 0
+    while load8(s + n) != 0 {
+        n = n + 1
+    }
+    return n
+}
+
+fn mem_eq(a: i64, an: i64, b: i64, bn: i64) -> i64 {
+    if an != bn {
+        return 0
+    }
+    var i = 0
+    while i < an {
+        if load8(a + i) != load8(b + i) {
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+fn streq(a: i64, b: i64) -> i64 {
+    return mem_eq(a, strlen(a), b, strlen(b))
+}
+
+fn eprint_n(p: i64, n: i64) {
+    syscall(SYS_WRITE, 2, p, n)
+}
+
+fn eprint(s: i64) {
+    eprint_n(s, strlen(s))
+}
+
+fn eprint_int(x: i64) {
+    if x == 0 {
+        eprint("0")
+        return
+    }
+    let buf = "...................."
+    var i = 20
+    while x > 0 {
+        i = i - 1
+        store8(buf + i, '0' + x % 10)
+        x = x / 10
+    }
+    eprint_n(buf + i, 20 - i)
+}
+
+fn alloc(size: i64) -> i64 {
+    let p = syscall(SYS_MMAP, 0, size, 3, 0x22, -1, 0)
+    if p < 0 {
+        eprint("boot: out of memory\n")
+        exit(1)
+    }
+    return p
+}
+
+fn put16(p: i64, v: i64) {
+    store8(p, v & 255)
+    store8(p + 1, (v >> 8) & 255)
+}
+
+fn put32(p: i64, v: i64) {
+    put16(p, v & 65535)
+    put16(p + 2, (v >> 16) & 65535)
+}
+
+fn put64(p: i64, v: i64) {
+    put32(p, v & 0xFFFFFFFF)
+    put32(p + 4, (v >> 32) & 0xFFFFFFFF)
+}
+
+// ============================================================================
+// Ошибки
+// ============================================================================
+
+fn eprint_location(line: i64) {
+    var i = nfiles - 1
+    while i > 0 && load64(files + i * FILE_SIZE + FL_LINE) > line {
+        i = i - 1
+    }
+    let f = files + i * FILE_SIZE
+    eprint(load64(f + FL_PATH))
+    eprint(":")
+    eprint_int(line - load64(f + FL_LINE) + 1)
+}
+
+fn fatal_at(t: i64, msg: i64) {
+    eprint_location(load64(t + TK_LINE))
+    eprint(": boot error: ")
+    eprint(msg)
+    eprint(" (near '")
+    eprint_n(load64(t + TK_PTR), load64(t + TK_LEN))
+    eprint("')\n")
+    exit(1)
+}
+
+fn fatal(msg: i64) {
+    fatal_at(tk(), msg)
+}
+
+fn fatal_sym(s: i64, line: i64, msg: i64) {
+    eprint_location(line)
+    eprint(": boot error: ")
+    eprint(msg)
+    eprint(" '")
+    eprint_n(load64(s + SY_PTR), load64(s + SY_LEN))
+    eprint("'\n")
+    exit(1)
+}
+
+fn lex_fatal(msg: i64) {
+    eprint_location(lex_line)
+    eprint(": boot error: ")
+    eprint(msg)
+    eprint("\n")
+    exit(1)
+}
+
+fn limit_exceeded() {
+    fatal("compiler limit exceeded")
+}
+
+// ============================================================================
+// Чтение исходников
+// ============================================================================
+
+fn read_file(path: i64) {
+    if nfiles >= FILE_MAX {
+        eprint("boot: too many input files\n")
+        exit(1)
+    }
+    let fd = syscall(SYS_OPEN, path, 0, 0)
+    if fd < 0 {
+        eprint("boot: cannot open ")
+        eprint(path)
+        eprint("\n")
+        exit(1)
+    }
+    let f = files + nfiles * FILE_SIZE
+    store64(f + FL_PATH, path)
+    store64(f + FL_LINE, next_line)
+    nfiles = nfiles + 1
+    let start = src_len
+    while 1 {
+        let room = SRC_MAX - 1 - src_len
+        if room <= 0 {
+            eprint("boot: source too large\n")
+            exit(1)
+        }
+        let n = syscall(SYS_READ, fd, src + src_len, room)
+        if n < 0 {
+            eprint("boot: cannot read input\n")
+            exit(1)
+        }
+        if n == 0 {
+            break
+        }
+        src_len = src_len + n
+    }
+    syscall(SYS_CLOSE, fd)
+    store8(src + src_len, '\n')
+    src_len = src_len + 1
+    var i = start
+    while i < src_len {
+        if load8(src + i) == '\n' {
+            next_line = next_line + 1
+        }
+        i = i + 1
+    }
+}
+
+// ============================================================================
+// Лексер
+// ============================================================================
+
+fn add_tok(kind: i64, val: i64, start: i64, len: i64) {
+    if ntok >= TOK_MAX {
+        lex_fatal("compiler limit exceeded")
+    }
+    let t = toks + ntok * TOK_SIZE
+    store64(t + TK_KIND, kind)
+    store64(t + TK_VAL, val)
+    store64(t + TK_PTR, start)
+    store64(t + TK_LEN, len)
+    store64(t + TK_LINE, lex_line)
+    ntok = ntok + 1
+}
+
+fn is_alpha(c: i64) -> i64 {
+    let l = c | 32
+    return l >= 'a' && l <= 'z' || c == '_'
+}
+
+fn is_digit(c: i64) -> i64 {
+    return c >= '0' && c <= '9'
+}
+
+fn keyword_kind(p: i64, n: i64) -> i64 {
+    if mem_eq(p, n, "fn", 2) {
+        return T_FN
+    }
+    if mem_eq(p, n, "let", 3) {
+        return T_LET
+    }
+    if mem_eq(p, n, "var", 3) {
+        return T_VAR
+    }
+    if mem_eq(p, n, "const", 5) {
+        return T_CONST
+    }
+    if mem_eq(p, n, "if", 2) {
+        return T_IF
+    }
+    if mem_eq(p, n, "else", 4) {
+        return T_ELSE
+    }
+    if mem_eq(p, n, "while", 5) {
+        return T_WHILE
+    }
+    if mem_eq(p, n, "return", 6) {
+        return T_RETURN
+    }
+    if mem_eq(p, n, "break", 5) {
+        return T_BREAK
+    }
+    if mem_eq(p, n, "continue", 8) {
+        return T_CONTINUE
+    }
+    if mem_eq(p, n, "type", 4) {
+        return T_TYPE
+    }
+    if mem_eq(p, n, "for", 3) {
+        return T_FOR
+    }
+    if mem_eq(p, n, "in", 2) {
+        return T_IN
+    }
+    if mem_eq(p, n, "true", 4) {
+        return T_TRUE
+    }
+    if mem_eq(p, n, "false", 5) {
+        return T_FALSE
+    }
+    if mem_eq(p, n, "none", 4) {
+        return T_NONE
+    }
+    return T_IDENT
+}
+
+fn two_char_kind(a: i64, b: i64) -> i64 {
+    if a == '=' && b == '=' {
+        return T_EQ
+    }
+    if a == '!' && b == '=' {
+        return T_NE
+    }
+    if a == '<' && b == '=' {
+        return T_LE
+    }
+    if a == '>' && b == '=' {
+        return T_GE
+    }
+    if a == '&' && b == '&' {
+        return T_ANDAND
+    }
+    if a == '|' && b == '|' {
+        return T_OROR
+    }
+    if a == '<' && b == '<' {
+        return T_SHL
+    }
+    if a == '>' && b == '>' {
+        return T_SHR
+    }
+    if a == '-' && b == '>' {
+        return T_ARROW
+    }
+    if a == '.' && b == '.' {
+        return T_DOTDOT
+    }
+    if a == '+' && b == '=' {
+        return T_PLUSEQ
+    }
+    if a == '-' && b == '=' {
+        return T_MINUSEQ
+    }
+    if a == '*' && b == '=' {
+        return T_STAREQ
+    }
+    if a == '?' && b == '?' {
+        return T_QQ
+    }
+    return 0
+}
+
+fn is_single(c: i64) -> i64 {
+    let s = "(){},:+-*/%&|^~!<>=.[]?"
+    var i = 0
+    while load8(s + i) != 0 {
+        if load8(s + i) == c {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn data_byte(b: i64) {
+    if data_len >= DATA_MAX - 32 {
+        lex_fatal("compiler limit exceeded")
+    }
+    store8(data + data_len, b)
+    data_len = data_len + 1
+}
+
+fn data_align() {
+    data_len = (data_len + 7) & ~7
+}
+
+// Заголовок строки {ptr, len} в сегменте данных → его адрес.
+fn data_str_header(off: i64, len: i64) -> i64 {
+    data_align()
+    let h = data_len
+    put64(data + h, DATA_BASE + off)
+    put64(data + h + 8, len)
+    data_len = data_len + 16
+    return DATA_BASE + h
+}
+
+fn lex_char() -> i64 {
+    if lex_p >= lex_end {
+        lex_fatal("bad escape sequence")
+    }
+    var c = load8(lex_p)
+    lex_p = lex_p + 1
+    if c != '\\' {
+        return c
+    }
+    if lex_p >= lex_end {
+        lex_fatal("bad escape sequence")
+    }
+    c = load8(lex_p)
+    lex_p = lex_p + 1
+    if c == 'n' {
+        return 10
+    }
+    if c == 't' {
+        return 9
+    }
+    if c == 'r' {
+        return 13
+    }
+    if c == '0' {
+        return 0
+    }
+    if c == '\\' || c == '\'' || c == '"' || c == 123 || c == 125 {
+        return c
+    }
+    lex_fatal("bad escape sequence")
+    return 0
+}
+
+fn lex_number() -> i64 {
+    var v = 0
+    if load8(lex_p) == '0' && lex_p + 1 < lex_end && (load8(lex_p + 1) | 32) == 'x' {
+        lex_p = lex_p + 2
+        while lex_p < lex_end {
+            let c = load8(lex_p)
+            let l = c | 32
+            var d = -1
+            if is_digit(c) {
+                d = c - '0'
+            } else if l >= 'a' && l <= 'f' {
+                d = l - 'a' + 10
+            } else if c == '_' {
+                d = -2
+            }
+            if d == -1 {
+                break
+            }
+            if d >= 0 {
+                v = v * 16 + d
+            }
+            lex_p = lex_p + 1
+        }
+        return v
+    }
+    while lex_p < lex_end && (is_digit(load8(lex_p)) || load8(lex_p) == '_') {
+        if load8(lex_p) != '_' {
+            v = v * 10 + load8(lex_p) - '0'
+        }
+        lex_p = lex_p + 1
+    }
+    return v
+}
+
+fn lex() {
+    lex_p = src
+    lex_end = src + src_len
+    lex_line = 1
+    while lex_p < lex_end {
+        let c = load8(lex_p)
+        if c == '\n' {
+            lex_line = lex_line + 1
+            lex_p = lex_p + 1
+            continue
+        }
+        if c == ' ' || c == '\t' || c == '\r' {
+            lex_p = lex_p + 1
+            continue
+        }
+        if c == '/' && lex_p + 1 < lex_end && load8(lex_p + 1) == '/' {
+            while lex_p < lex_end && load8(lex_p) != '\n' {
+                lex_p = lex_p + 1
+            }
+            continue
+        }
+        let start = lex_p
+        if is_alpha(c) {
+            while lex_p < lex_end && (is_alpha(load8(lex_p)) || is_digit(load8(lex_p))) {
+                lex_p = lex_p + 1
+            }
+            add_tok(keyword_kind(start, lex_p - start), 0, start, lex_p - start)
+            continue
+        }
+        if is_digit(c) {
+            let v = lex_number()
+            add_tok(T_INT, v, start, lex_p - start)
+            continue
+        }
+        if c == '\'' {
+            lex_p = lex_p + 1
+            let v = lex_char()
+            if lex_p >= lex_end || load8(lex_p) != '\'' {
+                lex_fatal("bad character literal")
+            }
+            lex_p = lex_p + 1
+            add_tok(T_INT, v, start, lex_p - start)
+            continue
+        }
+        if c == '"' {
+            lex_p = lex_p + 1
+            let off = data_len
+            while 1 {
+                if lex_p >= lex_end || load8(lex_p) == '\n' {
+                    lex_fatal("unterminated string")
+                }
+                if load8(lex_p) == '"' {
+                    break
+                }
+                data_byte(lex_char())
+            }
+            lex_p = lex_p + 1
+            let len = data_len - off
+            data_byte(0)
+            add_tok(T_STR, data_str_header(off, len), start, lex_p - start)
+            continue
+        }
+        if lex_p + 1 < lex_end {
+            let k = two_char_kind(c, load8(lex_p + 1))
+            if k != 0 {
+                lex_p = lex_p + 2
+                add_tok(k, 0, start, 2)
+                continue
+            }
+        }
+        if is_single(c) {
+            lex_p = lex_p + 1
+            add_tok(c, 0, start, 1)
+            continue
+        }
+        lex_fatal("unexpected character")
+    }
+    add_tok(T_EOF, 0, lex_p, 0)
+}
+
+// ============================================================================
+// Токены
+// ============================================================================
+
+fn tk() -> i64 {
+    return toks + pos * TOK_SIZE
+}
+
+fn kind() -> i64 {
+    return load64(tk() + TK_KIND)
+}
+
+fn kind_at(i: i64) -> i64 {
+    return load64(toks + i * TOK_SIZE + TK_KIND)
+}
+
+fn kind_next() -> i64 {
+    return kind_at(pos + 1)
+}
+
+fn advance() {
+    pos = pos + 1
+}
+
+fn expect(k: i64) {
+    if kind() != k {
+        let msg = "expected 'X'"
+        store8(msg + 10, k)
+        fatal(msg)
+    }
+    advance()
+}
+
+fn expect_ident() -> i64 {
+    let t = tk()
+    if load64(t + TK_KIND) != T_IDENT {
+        fatal("expected identifier")
+    }
+    advance()
+    return t
+}
+
+fn is_assign_op(k: i64) -> i64 {
+    return k == '=' || k == T_PLUSEQ || k == T_MINUSEQ || k == T_STAREQ
+}
+
+// Индекс парной закрывающей скобки для открывающей в позиции i.
+fn matching_close(i: i64) -> i64 {
+    var depth = 0
+    var j = i
+    while kind_at(j) != T_EOF {
+        let k = kind_at(j)
+        if k == '(' || k == '[' || k == '{' {
+            depth = depth + 1
+        }
+        if k == ')' || k == ']' || k == '}' {
+            depth = depth - 1
+            if depth == 0 {
+                return j
+            }
+        }
+        j = j + 1
+    }
+    return j
+}
+
+// Есть ли в операторе, начинающемся с текущего токена, присваивание.
+fn stmt_has_assign() -> i64 {
+    let line = load64(tk() + TK_LINE)
+    var depth = 0
+    var j = pos
+    while kind_at(j) != T_EOF {
+        let k = kind_at(j)
+        if depth == 0 && j > pos && load64(toks + j * TOK_SIZE + TK_LINE) != line {
+            return 0
+        }
+        if k == '(' || k == '[' || k == '{' {
+            depth = depth + 1
+        }
+        if k == ')' || k == ']' || k == '}' {
+            if depth == 0 {
+                return 0
+            }
+            depth = depth - 1
+        }
+        if depth == 0 && is_assign_op(k) {
+            return 1
+        }
+        j = j + 1
+    }
+    return 0
+}
+
+// ============================================================================
+// Типы
+// ============================================================================
+
+fn ty_get(k: i64, a: i64) -> i64 {
+    var i = 0
+    while i < ntypes {
+        let t = types + i * TYPE_SIZE
+        if load64(t + TY_KIND) == k && load64(t + TY_A) == a {
+            return i
+        }
+        i = i + 1
+    }
+    if ntypes >= TYPE_MAX {
+        limit_exceeded()
+    }
+    let t = types + ntypes * TYPE_SIZE
+    store64(t + TY_KIND, k)
+    store64(t + TY_A, a)
+    ntypes = ntypes + 1
+    return ntypes - 1
+}
+
+fn ty_kind(t: i64) -> i64 {
+    return load64(types + t * TYPE_SIZE + TY_KIND)
+}
+
+fn ty_a(t: i64) -> i64 {
+    return load64(types + t * TYPE_SIZE + TY_A)
+}
+
+// Индекс структуры для значения типа t (в том числе T?) или -1.
+fn struct_of(t: i64) -> i64 {
+    var x = t
+    if ty_kind(x) == K_OPT {
+        x = ty_a(x)
+    }
+    if ty_kind(x) != K_STRUCT {
+        return -1
+    }
+    return ty_a(x)
+}
+
+fn strip_opt(t: i64) -> i64 {
+    if ty_kind(t) == K_OPT {
+        return ty_a(t)
+    }
+    return t
+}
+
+fn st(i: i64) -> i64 {
+    return structs + i * STRUCT_SIZE
+}
+
+fn field_index(s: i64, name: i64) -> i64 {
+    let p = load64(name + TK_PTR)
+    let n = load64(name + TK_LEN)
+    let fs = load64(st(s) + ST_FIELDS)
+    var i = 0
+    while i < load64(st(s) + ST_NFIELDS) {
+        let f = fs + i * FIELD_SIZE
+        if mem_eq(p, n, load64(f + FD_PTR), load64(f + FD_LEN)) {
+            return i
+        }
+        i = i + 1
+    }
+    fatal_at(name, "unknown field")
+    return 0
+}
+
+fn field_type(s: i64, i: i64) -> i64 {
+    return load64(load64(st(s) + ST_FIELDS) + i * FIELD_SIZE + FD_TYPE)
+}
+
+// int | bool | str | i64 | T | K | V | Имя | [тип] | тип?
+fn parse_type() -> i64 {
+    var t = 0
+    if kind() == '[' {
+        advance()
+        let e = parse_type()
+        expect(']')
+        t = ty_get(K_LIST, e)
+    } else {
+        let name = expect_ident()
+        let p = load64(name + TK_PTR)
+        let n = load64(name + TK_LEN)
+        if mem_eq(p, n, "int", 3) || mem_eq(p, n, "i64", 3) {
+            t = ty_int
+        } else if mem_eq(p, n, "bool", 4) {
+            t = ty_bool
+        } else if mem_eq(p, n, "str", 3) {
+            t = ty_str
+        } else if n == 1 {
+            t = ty_get(K_GEN, load8(p))
+        } else {
+            let si = sym_find(p, n)
+            if si < 0 || load64(sym(si) + SY_KIND) != S_TYPE {
+                fatal_at(name, "unknown type")
+            }
+            t = ty_get(K_STRUCT, load64(sym(si) + SY_VAL))
+        }
+    }
+    if kind() == '?' {
+        advance()
+        t = ty_get(K_OPT, t)
+    }
+    return t
+}
+
+// ============================================================================
+// Таблицы имён
+// ============================================================================
+
+fn sym(i: i64) -> i64 {
+    return syms + i * SYM_SIZE
+}
+
+fn sym_find(p: i64, n: i64) -> i64 {
+    var i = 0
+    while i < nsyms {
+        let s = sym(i)
+        if mem_eq(p, n, load64(s + SY_PTR), load64(s + SY_LEN)) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn sym_add(p: i64, n: i64, kind: i64, val: i64, extra: i64) -> i64 {
+    if nsyms >= SYM_MAX {
+        limit_exceeded()
+    }
+    let s = sym(nsyms)
+    store64(s + SY_PTR, p)
+    store64(s + SY_LEN, n)
+    store64(s + SY_KIND, kind)
+    store64(s + SY_VAL, val)
+    store64(s + SY_EXTRA, extra)
+    store64(s + SY_TYPE, ty_int)
+    nsyms = nsyms + 1
+    return nsyms - 1
+}
+
+fn check_dup(t: i64) {
+    if sym_find(load64(t + TK_PTR), load64(t + TK_LEN)) != -1 {
+        fatal_at(t, "duplicate definition")
+    }
+}
+
+fn fn_sym(p: i64, n: i64) -> i64 {
+    let i = sym_find(p, n)
+    if i == -1 {
+        return sym_add(p, n, S_FN, -1, -1)
+    }
+    if load64(sym(i) + SY_KIND) != S_FN {
+        fatal("not a function")
+    }
+    return i
+}
+
+fn loc(i: i64) -> i64 {
+    return locs + i * LOC_SIZE
+}
+
+fn loc_find(p: i64, n: i64) -> i64 {
+    var i = nlocs
+    while i > 0 {
+        i = i - 1
+        let l = loc(i)
+        if mem_eq(p, n, load64(l + LO_PTR), load64(l + LO_LEN)) {
+            return i
+        }
+    }
+    return -1
+}
+
+fn loc_add(p: i64, n: i64, off: i64, mutable: i64, ty: i64) {
+    if nlocs >= LOC_MAX {
+        limit_exceeded()
+    }
+    let l = loc(nlocs)
+    store64(l + LO_PTR, p)
+    store64(l + LO_LEN, n)
+    store64(l + LO_OFF, off)
+    store64(l + LO_MUT, mutable)
+    store64(l + LO_TYPE, ty)
+    nlocs = nlocs + 1
+}
+
+fn new_slot() -> i64 {
+    frame = frame + 8
+    return -frame
+}
+
+fn fix_add(at: i64, si: i64, argc: i64, line: i64) {
+    if nfix >= FIX_MAX {
+        limit_exceeded()
+    }
+    let f = fixes + nfix * FIX_SIZE
+    store64(f + FX_POS, at)
+    store64(f + FX_SYM, si)
+    store64(f + FX_ARGC, argc)
+    store64(f + FX_LINE, line)
+    nfix = nfix + 1
+}
+
+fn resolve_fixups() {
+    var i = 0
+    while i < nfix {
+        let f = fixes + i * FIX_SIZE
+        let s = sym(load64(f + FX_SYM))
+        let target = load64(s + SY_VAL)
+        if target == -1 {
+            fatal_sym(s, load64(f + FX_LINE), "undefined function")
+        }
+        let argc = load64(f + FX_ARGC)
+        if argc != -1 && argc != load64(s + SY_EXTRA) {
+            fatal_sym(s, load64(f + FX_LINE), "wrong number of arguments for")
+        }
+        patch_rel(load64(f + FX_POS), target)
+        i = i + 1
+    }
+}
+
+// ============================================================================
+// Генерация машинного кода x86-64
+// ============================================================================
+
+fn emit8(b: i64) {
+    if code_len >= CODE_MAX - 16 {
+        limit_exceeded()
+    }
+    store8(code + code_len, b)
+    code_len = code_len + 1
+}
+
+fn emit2(a: i64, b: i64) {
+    emit8(a)
+    emit8(b)
+}
+
+fn emit3(a: i64, b: i64, c: i64) {
+    emit8(a)
+    emit8(b)
+    emit8(c)
+}
+
+fn emit4(a: i64, b: i64, c: i64, d: i64) {
+    emit8(a)
+    emit8(b)
+    emit8(c)
+    emit8(d)
+}
+
+fn emit32(v: i64) {
+    emit8(v & 255)
+    emit8((v >> 8) & 255)
+    emit8((v >> 16) & 255)
+    emit8((v >> 24) & 255)
+}
+
+fn emit64(v: i64) {
+    emit32(v)
+    emit32(v >> 32)
+}
+
+fn patch_rel(at: i64, target: i64) {
+    put32(code + at, target - at - 4)
+}
+
+fn emit_hole() -> i64 {
+    let at = code_len
+    emit32(0)
+    return at
+}
+
+fn emit_jz() -> i64 {
+    emit2(0x0F, 0x84)
+    return emit_hole()
+}
+
+fn emit_jnz() -> i64 {
+    emit2(0x0F, 0x85)
+    return emit_hole()
+}
+
+fn emit_jge() -> i64 {
+    emit2(0x0F, 0x8D)
+    return emit_hole()
+}
+
+fn emit_jmp() -> i64 {
+    emit8(0xE9)
+    return emit_hole()
+}
+
+fn emit_test() {
+    emit3(0x48, 0x85, 0xC0)
+}
+
+fn emit_bool() {
+    emit_test()
+    emit3(0x0F, 0x95, 0xC0)
+    emit3(0x0F, 0xB6, 0xC0)
+}
+
+fn emit_push_rax() {
+    emit8(0x50)
+}
+
+fn emit_pop_rax() {
+    emit8(0x58)
+}
+
+fn emit_pop_swap() {
+    emit3(0x48, 0x89, 0xC1)
+    emit8(0x58)
+}
+
+fn emit_mov_rax_imm(v: i64) {
+    emit2(0x48, 0xB8)
+    emit64(v)
+}
+
+fn emit_load_local(off: i64) {
+    emit3(0x48, 0x8B, 0x85)
+    emit32(off)
+}
+
+fn emit_store_local(off: i64) {
+    emit3(0x48, 0x89, 0x85)
+    emit32(off)
+}
+
+fn emit_load_global(addr: i64) {
+    emit_mov_rax_imm(addr)
+    emit3(0x48, 0x8B, 0x00)
+}
+
+fn emit_store_global(addr: i64) {
+    emit2(0x48, 0xB9)
+    emit64(addr)
+    emit3(0x48, 0x89, 0x01)
+}
+
+fn emit_ret0() {
+    emit2(0x31, 0xC0)
+}
+
+fn emit_epilogue() {
+    emit3(0x48, 0x89, 0xEC)
+    emit8(0x5D)
+    emit8(0xC3)
+}
+
+fn emit_prologue() -> i64 {
+    emit8(0x55)
+    emit3(0x48, 0x89, 0xE5)
+    emit3(0x48, 0x81, 0xEC)
+    return emit_hole()
+}
+
+fn emit_binop(op: i64) {
+    if op == '+' {
+        emit3(0x48, 0x01, 0xC8)
+    } else if op == '-' {
+        emit3(0x48, 0x29, 0xC8)
+    } else if op == '|' {
+        emit3(0x48, 0x09, 0xC8)
+    } else if op == '^' {
+        emit3(0x48, 0x31, 0xC8)
+    } else if op == '&' {
+        emit3(0x48, 0x21, 0xC8)
+    } else if op == '*' {
+        emit2(0x48, 0x0F)
+        emit2(0xAF, 0xC1)
+    } else if op == '/' {
+        emit2(0x48, 0x99)
+        emit3(0x48, 0xF7, 0xF9)
+    } else if op == '%' {
+        emit2(0x48, 0x99)
+        emit3(0x48, 0xF7, 0xF9)
+        emit3(0x48, 0x89, 0xD0)
+    } else if op == T_SHL {
+        emit3(0x48, 0xD3, 0xE0)
+    } else {
+        emit3(0x48, 0xD3, 0xF8)
+    }
+}
+
+fn setcc_code(op: i64) -> i64 {
+    if op == T_EQ {
+        return 0x94
+    }
+    if op == T_NE {
+        return 0x95
+    }
+    if op == '<' {
+        return 0x9C
+    }
+    if op == T_LE {
+        return 0x9E
+    }
+    if op == '>' {
+        return 0x9F
+    }
+    if op == T_GE {
+        return 0x9D
+    }
+    return 0
+}
+
+fn emit_pop_arg(i: i64) {
+    if i == 0 {
+        emit8(0x58)
+    } else if i == 1 {
+        emit8(0x5F)
+    } else if i == 2 {
+        emit8(0x5E)
+    } else if i == 3 {
+        emit8(0x5A)
+    } else if i == 4 {
+        emit2(0x41, 0x5A)
+    } else if i == 5 {
+        emit2(0x41, 0x58)
+    } else {
+        emit2(0x41, 0x59)
+    }
+}
+
+// Вызов функции по символу; аргументы уже в стеке.
+fn emit_call_sym(si: i64, nargs: i64, line: i64) {
+    emit8(0xE8)
+    fix_add(code_len, si, nargs, line)
+    emit32(0)
+    if nargs > 0 {
+        emit3(0x48, 0x81, 0xC4)
+        emit32(nargs * 8)
+    }
+}
+
+// Вызов внутренней функции библиотеки по имени.
+fn emit_call_name(name: i64, nargs: i64) {
+    emit_call_sym(fn_sym(name, strlen(name)), nargs, load64(tk() + TK_LINE))
+}
+
+fn pend_push(at: i64) {
+    if npend >= PEND_MAX {
+        limit_exceeded()
+    }
+    store64(pend + npend * 8, at)
+    npend = npend + 1
+}
+
+fn pend_patch(mark: i64) {
+    while npend > mark {
+        npend = npend - 1
+        patch_rel(load64(pend + npend * 8), code_len)
+    }
+}
+
+// ============================================================================
+// Выражения: каждая функция оставляет значение в rax и возвращает его тип.
+// ============================================================================
+
+fn parse_expr() -> i64 {
+    let t = parse_or()
+    if kind() != T_QQ {
+        return t
+    }
+    // a ?? b для ссылочных типов: none — нулевой адрес
+    advance()
+    emit_test()
+    let has = emit_jnz()
+    parse_expr()
+    patch_rel(has, code_len)
+    return strip_opt(t)
+}
+
+fn parse_or() -> i64 {
+    let t = parse_and()
+    if kind() != T_OROR {
+        return t
+    }
+    emit_bool()
+    let mark = npend
+    while kind() == T_OROR {
+        advance()
+        emit_test()
+        pend_push(emit_jnz())
+        parse_and()
+        emit_bool()
+    }
+    pend_patch(mark)
+    return ty_bool
+}
+
+fn parse_and() -> i64 {
+    let t = parse_cmp()
+    if kind() != T_ANDAND {
+        return t
+    }
+    emit_bool()
+    let mark = npend
+    while kind() == T_ANDAND {
+        advance()
+        emit_test()
+        pend_push(emit_jz())
+        parse_cmp()
+        emit_bool()
+    }
+    pend_patch(mark)
+    return ty_bool
+}
+
+fn parse_cmp() -> i64 {
+    let t = parse_add()
+    let op = kind()
+    let cc = setcc_code(op)
+    if cc == 0 {
+        return t
+    }
+    advance()
+    emit_push_rax()
+    let t2 = parse_add()
+    if ty_kind(t) == K_STR && ty_kind(t2) == K_STR {
+        emit_push_rax()
+        emit_call_name("__str_eq", 2)
+        if op == T_NE {
+            emit4(0x48, 0x83, 0xF0, 0x01)
+        }
+        return ty_bool
+    }
+    emit_pop_swap()
+    emit3(0x48, 0x39, 0xC8)
+    emit3(0x0F, cc, 0xC0)
+    emit3(0x0F, 0xB6, 0xC0)
+    return ty_bool
+}
+
+fn is_add_op(k: i64) -> i64 {
+    return k == '+' || k == '-' || k == '|' || k == '^'
+}
+
+fn is_mul_op(k: i64) -> i64 {
+    return k == '*' || k == '/' || k == '%' || k == T_SHL || k == T_SHR || k == '&'
+}
+
+fn parse_add() -> i64 {
+    let t = parse_mul()
+    while is_add_op(kind()) {
+        let op = kind()
+        advance()
+        emit_push_rax()
+        parse_mul()
+        if op == '+' && ty_kind(t) == K_STR {
+            emit_push_rax()
+            emit_call_name("__str_concat", 2)
+        } else {
+            emit_pop_swap()
+            emit_binop(op)
+        }
+    }
+    return t
+}
+
+fn parse_mul() -> i64 {
+    let t = parse_unary()
+    while is_mul_op(kind()) {
+        let op = kind()
+        advance()
+        emit_push_rax()
+        parse_unary()
+        emit_pop_swap()
+        emit_binop(op)
+    }
+    return t
+}
+
+fn parse_unary() -> i64 {
+    let k = kind()
+    if k == '-' {
+        advance()
+        let t = parse_unary()
+        emit3(0x48, 0xF7, 0xD8)
+        return t
+    }
+    if k == '!' {
+        advance()
+        parse_unary()
+        emit_test()
+        emit3(0x0F, 0x94, 0xC0)
+        emit3(0x0F, 0xB6, 0xC0)
+        return ty_bool
+    }
+    if k == '~' {
+        advance()
+        parse_unary()
+        emit3(0x48, 0xF7, 0xD0)
+        return ty_int
+    }
+    return parse_postfix(parse_atom())
+}
+
+// Значение по имени: локальная, глобальная переменная или константа.
+fn load_name(t: i64) -> i64 {
+    let p = load64(t + TK_PTR)
+    let n = load64(t + TK_LEN)
+    let li = loc_find(p, n)
+    if li >= 0 {
+        emit_load_local(load64(loc(li) + LO_OFF))
+        return load64(loc(li) + LO_TYPE)
+    }
+    let si = sym_find(p, n)
+    if si < 0 {
+        fatal_at(t, "unknown name")
+    }
+    let s = sym(si)
+    let sk = load64(s + SY_KIND)
+    if sk == S_CONST {
+        emit_mov_rax_imm(load64(s + SY_VAL))
+        return ty_int
+    }
+    if sk == S_VAR {
+        emit_load_global(load64(s + SY_VAL))
+        return load64(s + SY_TYPE)
+    }
+    fatal_at(t, "not a value")
+    return 0
+}
+
+fn parse_atom() -> i64 {
+    let t = tk()
+    let k = load64(t + TK_KIND)
+    if k == T_INT {
+        advance()
+        emit_mov_rax_imm(load64(t + TK_VAL))
+        return ty_int
+    }
+    if k == T_STR {
+        advance()
+        emit_mov_rax_imm(load64(t + TK_VAL))
+        return ty_str
+    }
+    if k == T_TRUE || k == T_FALSE {
+        advance()
+        emit_mov_rax_imm(k == T_TRUE)
+        return ty_bool
+    }
+    if k == T_NONE {
+        advance()
+        emit_mov_rax_imm(0)
+        return ty_none
+    }
+    if k == '(' {
+        advance()
+        let saved = no_struct
+        no_struct = 0
+        let r = parse_expr()
+        no_struct = saved
+        expect(')')
+        return r
+    }
+    if k == '[' {
+        return parse_list_lit()
+    }
+    if k != T_IDENT {
+        fatal("expected expression")
+    }
+    advance()
+    if kind() == '(' {
+        return parse_call(t)
+    }
+    if kind() == '{' && !no_struct {
+        let si = sym_find(load64(t + TK_PTR), load64(t + TK_LEN))
+        if si >= 0 && load64(sym(si) + SY_KIND) == S_TYPE {
+            return parse_struct_lit(load64(sym(si) + SY_VAL))
+        }
+    }
+    return load_name(t)
+}
+
+// [] или [a, b, ...]
+fn parse_list_lit() -> i64 {
+    advance()
+    let saved = no_struct
+    no_struct = 0
+    emit_mov_rax_imm(4)
+    emit_push_rax()
+    emit_mov_rax_imm(8)
+    emit_push_rax()
+    emit_call_name("__list_new", 2)
+    var et = ty_any
+    if kind() != ']' {
+        while 1 {
+            emit_push_rax()
+            emit_push_rax()
+            et = parse_expr()
+            emit_push_rax()
+            emit_call_name("__list_push", 2)
+            emit_pop_rax()
+            if kind() != ',' {
+                break
+            }
+            advance()
+        }
+    }
+    expect(']')
+    no_struct = saved
+    return ty_get(K_LIST, et)
+}
+
+// Имя { поле: значение, ... }
+fn parse_struct_lit(s: i64) -> i64 {
+    advance()
+    let saved = no_struct
+    no_struct = 0
+    emit_mov_rax_imm(load64(st(s) + ST_NFIELDS) * 8 + 8)
+    emit_push_rax()
+    emit_call_name("__alloc", 1)
+    emit_push_rax()
+    while kind() != '}' {
+        let f = expect_ident()
+        expect(':')
+        let fi = field_index(s, f)
+        parse_expr()
+        emit4(0x48, 0x8B, 0x0C, 0x24)
+        emit3(0x48, 0x89, 0x81)
+        emit32(fi * 8)
+        if kind() == ',' {
+            advance()
+        }
+    }
+    advance()
+    emit_pop_rax()
+    no_struct = saved
+    return ty_get(K_STRUCT, s)
+}
+
+fn parse_postfix(ty: i64) -> i64 {
+    var t = ty
+    while 1 {
+        let k = kind()
+        if k == '.' {
+            advance()
+            let name = expect_ident()
+            if kind() == '(' {
+                t = parse_method(t, name)
+            } else {
+                t = emit_field_load(t, name)
+            }
+        } else if k == '[' {
+            t = parse_index(t)
+        } else {
+            return t
+        }
+    }
+    return t
+}
+
+fn emit_field_load(t: i64, name: i64) -> i64 {
+    let s = struct_of(t)
+    if s < 0 {
+        fatal_at(name, "field access on a non-struct value")
+    }
+    let fi = field_index(s, name)
+    emit3(0x48, 0x8B, 0x80)
+    emit32(fi * 8)
+    return field_type(s, fi)
+}
+
+// Склеивает префикс и имя в name_buf.
+fn method_name(prefix: i64, name: i64) -> i64 {
+    let pn = strlen(prefix)
+    let n = load64(name + TK_LEN)
+    var i = 0
+    while i < pn {
+        store8(name_buf + i, load8(prefix + i))
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        store8(name_buf + pn + i, load8(load64(name + TK_PTR) + i))
+        i = i + 1
+    }
+    store8(name_buf + pn + n, 0)
+    return pn + n
+}
+
+// получатель.метод(аргументы): получатель уже в rax.
+fn parse_method(t: i64, name: i64) -> i64 {
+    let k = ty_kind(strip_opt(t))
+    if (k == K_STR || k == K_LIST) && mem_eq(load64(name + TK_PTR), load64(name + TK_LEN), "len", 3) {
+        advance()
+        expect(')')
+        emit4(0x48, 0x8B, 0x40, 0x08)
+        return ty_int
+    }
+    var n = 0
+    if k == K_STR {
+        n = method_name("__str_", name)
+    } else if k == K_LIST {
+        n = method_name("__list_", name)
+    } else if k == K_INT {
+        n = method_name("__int_", name)
+    } else if k == K_BOOL {
+        n = method_name("__bool_", name)
+    } else {
+        n = method_name("", name)
+    }
+    let si = sym_find(name_buf, n)
+    if si < 0 || load64(sym(si) + SY_KIND) != S_FN {
+        fatal_at(name, "unknown method")
+    }
+    emit_push_rax()
+    advance()
+    let saved = no_struct
+    no_struct = 0
+    var nargs = 1
+    if kind() != ')' {
+        while 1 {
+            parse_expr()
+            emit_push_rax()
+            nargs = nargs + 1
+            if kind() != ',' {
+                break
+            }
+            advance()
+        }
+    }
+    expect(')')
+    no_struct = saved
+    emit_call_sym(si, nargs, load64(name + TK_LINE))
+    let ret = load64(sym(si) + SY_TYPE)
+    if ty_kind(ret) == K_GEN && ty_kind(t) == K_LIST {
+        return ty_a(t)
+    }
+    if ty_kind(ret) == K_LIST && ty_kind(ty_a(ret)) == K_GEN {
+        return t
+    }
+    return ret
+}
+
+// получатель[индекс] или строка[a..b]; получатель уже в rax.
+fn parse_index(t: i64) -> i64 {
+    advance()
+    emit_push_rax()
+    let saved = no_struct
+    no_struct = 0
+    parse_expr()
+    if kind() == T_DOTDOT {
+        advance()
+        emit_push_rax()
+        parse_expr()
+        emit_push_rax()
+        expect(']')
+        no_struct = saved
+        emit_call_name("__str_slice", 3)
+        return ty_str
+    }
+    expect(']')
+    no_struct = saved
+    emit3(0x48, 0x89, 0xC1)
+    emit_pop_rax()
+    emit3(0x48, 0x8B, 0x00)
+    if ty_kind(t) == K_STR {
+        emit4(0x0F, 0xB6, 0x04, 0x08)
+        return ty_int
+    }
+    emit4(0x48, 0x8B, 0x04, 0xC8)
+    return ty_a(strip_opt(t))
+}
+
+fn builtin_id(p: i64, n: i64) -> i64 {
+    if mem_eq(p, n, "load8", 5) {
+        return B_LOAD8
+    }
+    if mem_eq(p, n, "load64", 6) {
+        return B_LOAD64
+    }
+    if mem_eq(p, n, "store8", 6) {
+        return B_STORE8
+    }
+    if mem_eq(p, n, "store64", 7) {
+        return B_STORE64
+    }
+    if mem_eq(p, n, "syscall", 7) {
+        return B_SYSCALL
+    }
+    return 0
+}
+
+fn parse_call(t: i64) -> i64 {
+    advance()
+    let saved = no_struct
+    no_struct = 0
+    var nargs = 0
+    if kind() != ')' {
+        while 1 {
+            parse_expr()
+            emit_push_rax()
+            nargs = nargs + 1
+            if kind() != ',' {
+                break
+            }
+            advance()
+        }
+    }
+    expect(')')
+    no_struct = saved
+    let p = load64(t + TK_PTR)
+    let n = load64(t + TK_LEN)
+    let b = builtin_id(p, n)
+    if b == 0 {
+        let si = fn_sym(p, n)
+        emit_call_sym(si, nargs, load64(t + TK_LINE))
+        return load64(sym(si) + SY_TYPE)
+    }
+    if b == B_SYSCALL {
+        var i = nargs
+        while i > 0 {
+            i = i - 1
+            emit_pop_arg(i)
+        }
+        emit2(0x0F, 0x05)
+        return ty_int
+    }
+    if b == B_LOAD8 {
+        emit8(0x58)
+        emit3(0x0F, 0xB6, 0x00)
+        return ty_int
+    }
+    if b == B_LOAD64 {
+        emit8(0x58)
+        emit3(0x48, 0x8B, 0x00)
+        return ty_int
+    }
+    if b == B_STORE8 {
+        emit2(0x59, 0x58)
+        emit2(0x88, 0x08)
+        return ty_void
+    }
+    emit2(0x59, 0x58)
+    emit3(0x48, 0x89, 0x08)
+    return ty_void
+}
+
+// ============================================================================
+// Операторы
+// ============================================================================
+
+fn parse_block() {
+    expect('{')
+    let saved = nlocs
+    while kind() != '}' {
+        if kind() == T_EOF {
+            fatal("unexpected end of file inside a block")
+        }
+        parse_stmt()
+    }
+    advance()
+    nlocs = saved
+}
+
+fn parse_stmt() {
+    let k = kind()
+    if k == T_LET || k == T_VAR {
+        parse_let()
+    } else if k == T_IF {
+        parse_if()
+    } else if k == T_WHILE {
+        parse_while()
+    } else if k == T_FOR {
+        parse_for()
+    } else if k == T_RETURN {
+        parse_return()
+    } else if k == T_BREAK {
+        parse_break()
+    } else if k == T_CONTINUE {
+        parse_continue()
+    } else if k == T_IDENT && stmt_has_assign() {
+        parse_assign()
+    } else {
+        parse_expr()
+    }
+}
+
+fn parse_let() {
+    let mutable = kind() == T_VAR
+    advance()
+    let name = expect_ident()
+    var ty = -1
+    if kind() == ':' {
+        advance()
+        ty = parse_type()
+    }
+    expect('=')
+    let et = parse_expr()
+    if ty == -1 {
+        ty = et
+    }
+    let off = new_slot()
+    emit_store_local(off)
+    loc_add(load64(name + TK_PTR), load64(name + TK_LEN), off, mutable, ty)
+}
+
+// Левое значение в стеке, правое в rax → результат составного присваивания в rax.
+fn emit_compound(op: i64, t: i64) {
+    if op == T_PLUSEQ && ty_kind(t) == K_STR {
+        emit_push_rax()
+        emit_call_name("__str_concat", 2)
+        return
+    }
+    emit_pop_swap()
+    if op == T_PLUSEQ {
+        emit_binop('+')
+    } else if op == T_MINUSEQ {
+        emit_binop('-')
+    } else {
+        emit_binop('*')
+    }
+}
+
+fn parse_assign() {
+    let name = tk()
+    if is_assign_op(kind_next()) {
+        advance()
+        let op = kind()
+        advance()
+        assign_name(name, op)
+        return
+    }
+    advance()
+    var t = load_name(name)
+    while 1 {
+        if kind() == '.' {
+            if is_assign_op(kind_at(pos + 2)) {
+                advance()
+                let f = expect_ident()
+                let op = kind()
+                advance()
+                assign_field(t, f, op)
+                return
+            }
+            advance()
+            let f = expect_ident()
+            if kind() == '(' {
+                t = parse_method(t, f)
+            } else {
+                t = emit_field_load(t, f)
+            }
+        } else if kind() == '[' {
+            if is_assign_op(kind_at(matching_close(pos) + 1)) {
+                assign_index(t)
+                return
+            }
+            t = parse_index(t)
+        } else {
+            fatal("expected assignment")
+        }
+    }
+}
+
+fn assign_name(name: i64, op: i64) {
+    let p = load64(name + TK_PTR)
+    let n = load64(name + TK_LEN)
+    let li = loc_find(p, n)
+    var gi = -1
+    var t = 0
+    if li >= 0 {
+        t = load64(loc(li) + LO_TYPE)
+    } else {
+        gi = sym_find(p, n)
+        if gi < 0 || load64(sym(gi) + SY_KIND) != S_VAR {
+            fatal_at(name, "cannot assign to this name")
+        }
+        t = load64(sym(gi) + SY_TYPE)
+    }
+    if op != '=' {
+        load_name(name)
+        emit_push_rax()
+    }
+    parse_expr()
+    if op != '=' {
+        emit_compound(op, t)
+    }
+    if li >= 0 {
+        emit_store_local(load64(loc(li) + LO_OFF))
+    } else {
+        emit_store_global(load64(sym(gi) + SY_VAL))
+    }
+}
+
+// Указатель на структуру в rax; дальше «= выражение».
+fn assign_field(t: i64, f: i64, op: i64) {
+    let s = struct_of(t)
+    if s < 0 {
+        fatal_at(f, "field access on a non-struct value")
+    }
+    let fi = field_index(s, f)
+    emit_push_rax()
+    if op != '=' {
+        emit3(0x48, 0x8B, 0x80)
+        emit32(fi * 8)
+        emit_push_rax()
+        parse_expr()
+        emit_compound(op, field_type(s, fi))
+    } else {
+        parse_expr()
+    }
+    emit8(0x59)
+    emit3(0x48, 0x89, 0x81)
+    emit32(fi * 8)
+}
+
+// Список в rax, текущий токен — '['.
+fn assign_index(t: i64) {
+    advance()
+    emit_push_rax()
+    parse_expr()
+    expect(']')
+    emit_push_rax()
+    let op = kind()
+    advance()
+    if op != '=' {
+        emit4(0x48, 0x8B, 0x0C, 0x24)
+        emit4(0x48, 0x8B, 0x54, 0x24)
+        emit8(0x08)
+        emit3(0x48, 0x8B, 0x12)
+        emit4(0x48, 0x8B, 0x04, 0xCA)
+        emit_push_rax()
+        parse_expr()
+        emit_compound(op, ty_a(t))
+    } else {
+        parse_expr()
+    }
+    emit8(0x59)
+    emit8(0x5A)
+    emit3(0x48, 0x8B, 0x12)
+    emit4(0x48, 0x89, 0x04, 0xCA)
+}
+
+fn parse_return() {
+    let line = load64(tk() + TK_LINE)
+    advance()
+    if kind() != '}' && load64(tk() + TK_LINE) == line {
+        parse_expr()
+    } else {
+        emit_ret0()
+    }
+    emit_epilogue()
+}
+
+fn parse_break() {
+    if loop_depth == 0 {
+        fatal("break or continue outside of a loop")
+    }
+    advance()
+    if nbrk >= BRK_MAX {
+        limit_exceeded()
+    }
+    store64(brks + nbrk * 8, emit_jmp())
+    nbrk = nbrk + 1
+}
+
+fn parse_continue() {
+    if loop_depth == 0 {
+        fatal("break or continue outside of a loop")
+    }
+    advance()
+    if nconts >= BRK_MAX {
+        limit_exceeded()
+    }
+    store64(conts + nconts * 8, emit_jmp())
+    nconts = nconts + 1
+}
+
+fn patch_list(list: i64, count: i64, base: i64, target: i64) {
+    var i = base
+    while i < count {
+        patch_rel(load64(list + i * 8), target)
+        i = i + 1
+    }
+}
+
+fn parse_cond() {
+    let saved = no_struct
+    no_struct = 1
+    parse_expr()
+    no_struct = saved
+}
+
+fn parse_if() {
+    advance()
+    parse_cond()
+    emit_test()
+    let else_at = emit_jz()
+    parse_block()
+    if kind() != T_ELSE {
+        patch_rel(else_at, code_len)
+        return
+    }
+    advance()
+    let end_at = emit_jmp()
+    patch_rel(else_at, code_len)
+    if kind() == T_IF {
+        parse_if()
+    } else {
+        parse_block()
+    }
+    patch_rel(end_at, code_len)
+}
+
+fn parse_while() {
+    advance()
+    let brk_base = nbrk
+    let cont_base = nconts
+    loop_depth = loop_depth + 1
+    let start = code_len
+    parse_cond()
+    emit_test()
+    let end_at = emit_jz()
+    parse_block()
+    patch_rel(emit_jmp(), start)
+    patch_rel(end_at, code_len)
+    patch_list(conts, nconts, cont_base, start)
+    patch_list(brks, nbrk, brk_base, code_len)
+    nconts = cont_base
+    nbrk = brk_base
+    loop_depth = loop_depth - 1
+}
+
+// for x in список { ... } или for i in a..b { ... }
+fn parse_for() {
+    advance()
+    let name = expect_ident()
+    expect(T_IN)
+    let saved_nlocs = nlocs
+    let saved_ns = no_struct
+    no_struct = 1
+    let t = parse_expr()
+    let brk_base = nbrk
+    let cont_base = nconts
+    var top = 0
+    var end_at = 0
+    var idx = 0
+    if kind() == T_DOTDOT {
+        advance()
+        idx = new_slot()
+        emit_store_local(idx)
+        parse_expr()
+        let lim = new_slot()
+        emit_store_local(lim)
+        no_struct = saved_ns
+        loc_add(load64(name + TK_PTR), load64(name + TK_LEN), idx, 1, ty_int)
+        top = code_len
+        emit_load_local(idx)
+        emit3(0x48, 0x3B, 0x85)
+        emit32(lim)
+        end_at = emit_jge()
+    } else {
+        let lst = new_slot()
+        emit_store_local(lst)
+        idx = new_slot()
+        emit_mov_rax_imm(0)
+        emit_store_local(idx)
+        let x = new_slot()
+        no_struct = saved_ns
+        loc_add(load64(name + TK_PTR), load64(name + TK_LEN), x, 0, ty_a(strip_opt(t)))
+        top = code_len
+        emit_load_local(idx)
+        emit3(0x48, 0x8B, 0x8D)
+        emit32(lst)
+        emit4(0x48, 0x3B, 0x41, 0x08)
+        end_at = emit_jge()
+        emit3(0x48, 0x8B, 0x09)
+        emit4(0x48, 0x8B, 0x04, 0xC1)
+        emit_store_local(x)
+    }
+    loop_depth = loop_depth + 1
+    parse_block()
+    loop_depth = loop_depth - 1
+    patch_list(conts, nconts, cont_base, code_len)
+    emit_load_local(idx)
+    emit4(0x48, 0x83, 0xC0, 0x01)
+    emit_store_local(idx)
+    patch_rel(emit_jmp(), top)
+    patch_rel(end_at, code_len)
+    patch_list(brks, nbrk, brk_base, code_len)
+    nconts = cont_base
+    nbrk = brk_base
+    nlocs = saved_nlocs
+}
+
+// ============================================================================
+// Предварительный просмотр: типы, сигнатуры, глобальные, константы
+// ============================================================================
+
+fn parse_const_value() -> i64 {
+    var neg = 0
+    if kind() == '-' {
+        neg = 1
+        advance()
+    }
+    let t = tk()
+    if load64(t + TK_KIND) != T_INT {
+        fatal("expected integer constant")
+    }
+    advance()
+    if neg {
+        return -load64(t + TK_VAL)
+    }
+    return load64(t + TK_VAL)
+}
+
+fn prescan_const() {
+    advance()
+    let name = expect_ident()
+    check_dup(name)
+    expect('=')
+    let v = parse_const_value()
+    sym_add(load64(name + TK_PTR), load64(name + TK_LEN), S_CONST, v, 0)
+}
+
+fn prescan_type_name() {
+    advance()
+    let name = expect_ident()
+    check_dup(name)
+    if nstructs >= STRUCT_MAX {
+        limit_exceeded()
+    }
+    let s = st(nstructs)
+    store64(s + ST_PTR, load64(name + TK_PTR))
+    store64(s + ST_LEN, load64(name + TK_LEN))
+    store64(s + ST_FIELDS, alloc(FIELD_MAX * FIELD_SIZE))
+    sym_add(load64(name + TK_PTR), load64(name + TK_LEN), S_TYPE, nstructs, 0)
+    nstructs = nstructs + 1
+}
+
+fn prescan_type_fields() {
+    advance()
+    let name = expect_ident()
+    let s = st(load64(sym(sym_find(load64(name + TK_PTR), load64(name + TK_LEN))) + SY_VAL))
+    expect('{')
+    while kind() != '}' {
+        let f = expect_ident()
+        expect(':')
+        let ft = parse_type()
+        let n = load64(s + ST_NFIELDS)
+        if n >= FIELD_MAX {
+            limit_exceeded()
+        }
+        let fd = load64(s + ST_FIELDS) + n * FIELD_SIZE
+        store64(fd + FD_PTR, load64(f + TK_PTR))
+        store64(fd + FD_LEN, load64(f + TK_LEN))
+        store64(fd + FD_TYPE, ft)
+        store64(s + ST_NFIELDS, n + 1)
+        if kind() == ',' {
+            advance()
+        }
+    }
+}
+
+fn prescan_fn() {
+    advance()
+    let name = expect_ident()
+    check_dup(name)
+    expect('(')
+    var nparams = 0
+    if kind() != ')' {
+        while 1 {
+            expect_ident()
+            expect(':')
+            parse_type()
+            nparams = nparams + 1
+            if kind() != ',' {
+                break
+            }
+            advance()
+        }
+    }
+    expect(')')
+    var ret = ty_void
+    if kind() == T_ARROW {
+        advance()
+        ret = parse_type()
+    }
+    let si = sym_add(load64(name + TK_PTR), load64(name + TK_LEN), S_FN, -1, nparams)
+    store64(sym(si) + SY_TYPE, ret)
+}
+
+fn prescan_global() {
+    advance()
+    let name = expect_ident()
+    check_dup(name)
+    expect(':')
+    let t = parse_type()
+    data_align()
+    if data_len >= DATA_MAX - 32 {
+        limit_exceeded()
+    }
+    let addr = DATA_BASE + data_len
+    if ty_kind(t) == K_STR {
+        put64(data + data_len, empty_str)
+    } else {
+        put64(data + data_len, 0)
+    }
+    data_len = data_len + 8
+    let si = sym_add(load64(name + TK_PTR), load64(name + TK_LEN), S_VAR, addr, 0)
+    store64(sym(si) + SY_TYPE, t)
+}
+
+// Проходит объявления верхнего уровня; what: 1 — имена типов, 2 — остальное.
+fn prescan(what: i64) {
+    var i = 0
+    var depth = 0
+    while kind_at(i) != T_EOF {
+        let k = kind_at(i)
+        if depth == 0 {
+            pos = i
+            if what == 1 && k == T_TYPE {
+                prescan_type_name()
+            } else if what == 2 && k == T_TYPE {
+                prescan_type_fields()
+            } else if what == 2 && k == T_FN {
+                prescan_fn()
+            } else if what == 2 && k == T_VAR {
+                prescan_global()
+            } else if what == 2 && k == T_CONST {
+                prescan_const()
+            }
+        }
+        if k == '(' || k == '[' || k == '{' {
+            depth = depth + 1
+        }
+        if k == ')' || k == ']' || k == '}' {
+            depth = depth - 1
+        }
+        i = i + 1
+    }
+    pos = 0
+}
+
+// ============================================================================
+// Объявления верхнего уровня
+// ============================================================================
+
+fn skip_decl() {
+    advance()
+    while 1 {
+        let k = kind()
+        if k == T_EOF || k == T_FN || k == T_VAR || k == T_CONST || k == T_TYPE {
+            return
+        }
+        if k == '{' || k == '(' || k == '[' {
+            pos = matching_close(pos)
+        }
+        advance()
+    }
+}
+
+fn init_chunk_begin() -> i64 {
+    if ninits >= INIT_MAX {
+        limit_exceeded()
+    }
+    store64(inits + ninits * 8, code_len)
+    ninits = ninits + 1
+    nlocs = 0
+    frame = 0
+    return emit_prologue()
+}
+
+fn init_chunk_end(frame_at: i64) {
+    emit_epilogue()
+    put32(code + frame_at, frame)
+}
+
+// var имя: тип [= выражение] — значение вычисляется до main.
+fn compile_global() {
+    advance()
+    let name = expect_ident()
+    expect(':')
+    let t = parse_type()
+    let addr = load64(sym(sym_find(load64(name + TK_PTR), load64(name + TK_LEN))) + SY_VAL)
+    if kind() == '=' {
+        advance()
+        let fa = init_chunk_begin()
+        parse_expr()
+        emit_store_global(addr)
+        init_chunk_end(fa)
+        return
+    }
+    if ty_kind(t) == K_LIST {
+        let fa = init_chunk_begin()
+        emit_mov_rax_imm(4)
+        emit_push_rax()
+        emit_mov_rax_imm(8)
+        emit_push_rax()
+        emit_call_name("__list_new", 2)
+        emit_store_global(addr)
+        init_chunk_end(fa)
+    }
+}
+
+fn parse_fn() {
+    advance()
+    let name = expect_ident()
+    let si = sym_find(load64(name + TK_PTR), load64(name + TK_LEN))
+    if load64(sym(si) + SY_VAL) != -1 {
+        fatal_at(name, "duplicate definition")
+    }
+    store64(sym(si) + SY_VAL, code_len)
+    nlocs = 0
+    frame = 0
+    expect('(')
+    var nparams = 0
+    if kind() != ')' {
+        while 1 {
+            let pt = expect_ident()
+            expect(':')
+            let ty = parse_type()
+            loc_add(load64(pt + TK_PTR), load64(pt + TK_LEN), 0, 1, ty)
+            nparams = nparams + 1
+            if kind() != ',' {
+                break
+            }
+            advance()
+        }
+    }
+    expect(')')
+    var i = 0
+    while i < nparams {
+        store64(loc(i) + LO_OFF, 16 + 8 * (nparams - 1 - i))
+        i = i + 1
+    }
+    if kind() == T_ARROW {
+        advance()
+        parse_type()
+    }
+    let frame_at = emit_prologue()
+    loop_depth = 0
+    parse_block()
+    emit_ret0()
+    emit_epilogue()
+    put32(code + frame_at, frame)
+}
+
+fn compile() {
+    // Точка входа: __init_globals(), затем __start(argc, argv) → код выхода.
+    emit8(0xE8)
+    fix_add(code_len, fn_sym("__init_globals", 14), -1, 1)
+    emit32(0)
+    emit2(0x48, 0x8B)
+    emit2(0x04, 0x24)
+    emit3(0x48, 0x8D, 0x4C)
+    emit2(0x24, 0x08)
+    emit2(0x50, 0x51)
+    emit8(0xE8)
+    fix_add(code_len, fn_sym("__start", 7), -1, 1)
+    emit32(0)
+    emit3(0x48, 0x89, 0xC7)
+    emit8(0xB8)
+    emit32(SYS_EXIT)
+    emit2(0x0F, 0x05)
+    while kind() != T_EOF {
+        let k = kind()
+        if k == T_FN {
+            parse_fn()
+        } else if k == T_VAR {
+            compile_global()
+        } else if k == T_CONST || k == T_TYPE {
+            skip_decl()
+        } else {
+            fatal("expected fn, var, const or type")
+        }
+    }
+    // __init_globals вызывает куски инициализации по порядку объявления.
+    store64(sym(fn_sym("__init_globals", 14)) + SY_VAL, code_len)
+    store64(sym(fn_sym("__init_globals", 14)) + SY_EXTRA, 0)
+    emit8(0x55)
+    emit3(0x48, 0x89, 0xE5)
+    var i = 0
+    while i < ninits {
+        emit8(0xE8)
+        patch_rel(emit_hole(), load64(inits + i * 8))
+        i = i + 1
+    }
+    emit_epilogue()
+    resolve_fixups()
+}
+
+// ============================================================================
+// Запись ELF
+// ============================================================================
+
+fn write_all(fd: i64, p: i64, n: i64) {
+    while n > 0 {
+        let w = syscall(SYS_WRITE, fd, p, n)
+        if w <= 0 {
+            eprint("boot: cannot write output file\n")
+            exit(1)
+        }
+        p = p + w
+        n = n - w
+    }
+}
+
+fn write_elf(path: i64) {
+    let h = alloc(4096)
+    let zeros = alloc(4096)
+    store8(h, 0x7F)
+    store8(h + 1, 'E')
+    store8(h + 2, 'L')
+    store8(h + 3, 'F')
+    store8(h + 4, 2)
+    store8(h + 5, 1)
+    store8(h + 6, 1)
+    put16(h + 16, 2)
+    put16(h + 18, 0x3E)
+    put32(h + 20, 1)
+    put64(h + 24, CODE_BASE + HDR_SIZE)
+    put64(h + 32, 64)
+    put16(h + 52, 64)
+    put16(h + 54, 56)
+    put16(h + 56, 2)
+    put16(h + 58, 64)
+    let code_end = HDR_SIZE + code_len
+    put32(h + 64, 1)
+    put32(h + 68, 5)
+    put64(h + 72, 0)
+    put64(h + 80, CODE_BASE)
+    put64(h + 88, CODE_BASE)
+    put64(h + 96, code_end)
+    put64(h + 104, code_end)
+    put64(h + 112, 0x1000)
+    let data_off = (code_end + 0xFFF) & ~0xFFF
+    put32(h + 120, 1)
+    put32(h + 124, 6)
+    put64(h + 128, data_off)
+    put64(h + 136, DATA_BASE)
+    put64(h + 144, DATA_BASE)
+    put64(h + 152, data_len)
+    put64(h + 160, data_len)
+    put64(h + 168, 0x1000)
+    let fd = syscall(SYS_OPEN, path, 0x241, 493)
+    if fd < 0 {
+        eprint("boot: cannot write ")
+        eprint(path)
+        eprint("\n")
+        exit(1)
+    }
+    write_all(fd, h, HDR_SIZE)
+    write_all(fd, code, code_len)
+    write_all(fd, zeros, data_off - code_end)
+    write_all(fd, data, data_len)
+    syscall(SYS_CLOSE, fd)
+}
+
+// ============================================================================
+
+fn init() {
+    src = alloc(SRC_MAX)
+    files = alloc(FILE_MAX * FILE_SIZE)
+    toks = alloc(TOK_MAX * TOK_SIZE)
+    code = alloc(CODE_MAX)
+    data = alloc(DATA_MAX)
+    syms = alloc(SYM_MAX * SYM_SIZE)
+    locs = alloc(LOC_MAX * LOC_SIZE)
+    fixes = alloc(FIX_MAX * FIX_SIZE)
+    brks = alloc(BRK_MAX * 8)
+    conts = alloc(BRK_MAX * 8)
+    pend = alloc(PEND_MAX * 8)
+    structs = alloc(STRUCT_MAX * STRUCT_SIZE)
+    types = alloc(TYPE_MAX * TYPE_SIZE)
+    inits = alloc(INIT_MAX * 8)
+    name_buf = alloc(4096)
+    next_line = 1
+    ty_int = ty_get(K_INT, 0)
+    ty_bool = ty_get(K_BOOL, 0)
+    ty_str = ty_get(K_STR, 0)
+    ty_void = ty_get(K_VOID, 0)
+    ty_none = ty_get(K_NONE, 0)
+    ty_any = ty_get(K_ANY, 0)
+    data_byte(0)
+    empty_str = data_str_header(0, 0)
+}
+
+fn main(argc: i64, argv: i64) -> i64 {
+    if argc < 4 || !streq(load64(argv + 8), "-o") {
+        eprint("usage: boot -o <output> <input.kh>...\n")
+        return 2
+    }
+    init()
+    var i = 3
+    while i < argc {
+        read_file(load64(argv + i * 8))
+        i = i + 1
+    }
+    lex()
+    prescan(1)
+    prescan(2)
+    compile()
+    write_elf(load64(argv + 16))
+    return 0
+}

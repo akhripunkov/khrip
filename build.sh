@@ -1,23 +1,24 @@
 #!/usr/bin/env bash
 # Раскрутка компилятора Khrip из исходников, без Go, C и других компиляторов:
 #
-#   bootstrap/khc0.asm --nasm--> khc0       зерно на ассемблере
-#   src/khc.kh         --khc0--> khc1       компилятор на Khrip, собранный зерном
-#   src/khc.kh         --khc1--> khc2       компилятор собирает сам себя
-#   src/khc.kh         --khc2--> khc3       и ещё раз
+#   bootstrap/khc0.asm  --nasm-->  khc0   зерно на ассемблере (понимает Khrip-0)
+#   bootstrap/boot.kh   --khc0-->  boot   загрузчик на Khrip-0 (понимает подмножество Khrip-1)
+#   src/*.kh            --boot-->  khc1   компилятор на Khrip-1
+#   src/*.kh            --khc1-->  khc2   компилятор собирает сам себя
+#   src/*.kh            --khc2-->  khc3   и ещё раз
 #
-# khc2 и khc3 обязаны совпасть побайтно: это доказывает, что компилятор
-# воспроизводит сам себя. Итог — build/khc.
+# khc2 и khc3 обязаны совпасть побайтно: компилятор воспроизводит сам себя.
+# Итог — build/khc; стандартная библиотека — lib/ (ищется как ../lib от khc).
 set -euo pipefail
 cd "$(dirname "$0")"
 
 mkdir -p build
 nasm -f elf64 bootstrap/khc0.asm -o build/khc0.o
 ld build/khc0.o -o build/khc0
-
-build/khc0 -o build/khc1 src/khc.kh
-build/khc1 -o build/khc2 src/khc.kh
-build/khc2 -o build/khc3 src/khc.kh
+build/khc0 -o build/boot bootstrap/boot.kh
+build/boot -o build/khc1 bootstrap/shim.kh lib/core.kh src/*.kh
+build/khc1 -o build/khc2 src/*.kh
+build/khc2 -o build/khc3 src/*.kh
 
 if ! cmp -s build/khc2 build/khc3; then
 	echo "ошибка: khc2 и khc3 различаются — компилятор не воспроизводит сам себя" >&2

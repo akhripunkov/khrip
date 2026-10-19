@@ -1,0 +1,11 @@
+// expect: the value may be none; unwrap it before reading .name
+type User {
+    name: str
+}
+fn find() -> User? {
+    return none
+}
+fn main() {
+    let u = find()
+    print(u.name)
+}

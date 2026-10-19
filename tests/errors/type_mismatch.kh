@@ -1,0 +1,5 @@
+// expect: :4:18: error: expected int, found str
+// expect: hint: parse with s.to_int() ?? 0
+fn main() {
+    let x: int = "42"
+}

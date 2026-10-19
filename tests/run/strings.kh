@@ -1,17 +1,43 @@
-// Строки, экранирование, символьные литералы.
-fn main() -> i64 {
-    println("hello, khrip")
-    println("tab:\t|")
-    println("quotes: \"x\" 'y' \\")
-    println_int('\n')
-    println_int('\\')
-    println_int('\'')
-    println_int('\0')
-    println_int(strlen("abc\0def"))
-    let s = "mutable"
-    store8(s, 'M')
-    println(s)
-    println_int(mem_eq("abc", 3, "abc", 3))
-    println_int(mem_eq("abc", 3, "abd", 3))
-    return 0
+// Строки: экранирование, интерполяция, методы, срезы, сравнение.
+fn main() {
+    print("tab:\t|")
+    print("quotes: \"x\" 'y' \\")
+    print("braces: \{x} {} {\"k\": 1}")
+    let name = "Khrip"
+    let n = 3
+    print("hello, {name}! n={n}, next={n + 1}, ok={n > 2}")
+    print('\n')
+    print('A')
+    let s = "  Hello, World  "
+    print(s.trim())
+    print(s.trim().lower())
+    print(s.trim().upper())
+    print(s.contains("World"))
+    print(s.trim().starts_with("Hell"))
+    print(s.trim().ends_with("ld"))
+    let t = s.trim()
+    print(t[0..5])
+    print(t[7..])
+    print(t[..4])
+    print(t.len())
+    print(t[1])
+    print(t.find("o") ?? -1)
+    print(t.find("zz") ?? -1)
+    print("a-b-c".split("-").len())
+    print("a-b-c".replace("-", "+"))
+    print("ab".repeat(3))
+    print("42".to_int() ?? 0)
+    print("4x2".to_int() ?? -1)
+    print("-17".to_int() ?? 0)
+    print("abc" < "abd")
+    print("b" > "abc")
+    print("same" == "same")
+    var acc = ""
+    for c in "xyz" {
+        acc += c.to_str() + ","
+    }
+    print(acc)
+    var b = "a"
+    b += "b"
+    print(b)
 }

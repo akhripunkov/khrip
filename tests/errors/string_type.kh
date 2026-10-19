@@ -1,0 +1,5 @@
+// expect: unknown type 'String'
+// expect: hint: strings are str
+fn main() {
+    let s: String = "x"
+}

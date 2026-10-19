@@ -1,7 +1,7 @@
 // Вычислительные задачи: те же, что в go/main.go и csharp/Program.cs.
 // Запуск: compute fib | compute sieve
 
-fn fib(n: i64) -> i64 {
+fn fib(n: int) -> int {
     if n < 2 {
         return n
     }
@@ -9,32 +9,31 @@ fn fib(n: i64) -> i64 {
 }
 
 // Количество простых чисел не больше n.
-fn sieve(n: i64) -> i64 {
-    let composite = alloc(n + 1)
+fn sieve(n: int) -> int {
+    var composite = [false] * (n + 1)
     var count = 0
-    var i = 2
-    while i <= n {
-        if load8(composite + i) == 0 {
-            count = count + 1
-            var j = i * i
-            while j <= n {
-                store8(composite + j, 1)
-                j = j + i
-            }
+    for i in 2..n + 1 {
+        if composite[i] {
+            continue
         }
-        i = i + 1
+        count += 1
+        var j = i * i
+        while j <= n {
+            composite[j] = true
+            j += i
+        }
     }
     return count
 }
 
-fn main(argc: i64, argv: i64) -> i64 {
-    let task = load64(argv + 8)
-    if argc == 2 && mem_eq(task, strlen(task), "fib", 3) {
-        println_int(fib(38))
-    } else if argc == 2 && mem_eq(task, strlen(task), "sieve", 5) {
-        println_int(sieve(20000000))
+fn main() -> int {
+    let a = args()
+    if a.len() == 2 && a[1] == "fib" {
+        print(fib(38))
+    } else if a.len() == 2 && a[1] == "sieve" {
+        print(sieve(20000000))
     } else {
-        eprint("usage: compute fib|sieve\n")
+        eprint("usage: compute fib|sieve")
         return 2
     }
     return 0

@@ -1,0 +1,9 @@
+// expect: 'pick' must return a value of type int on every path
+fn pick(b: bool) -> int {
+    if b {
+        return 1
+    }
+}
+fn main() {
+    print(pick(true))
+}

@@ -1,0 +1,366 @@
+// ============================================================================
+// Машинный код x86-64: буфер, кодировщики инструкций, метки, вызовы, данные.
+// ============================================================================
+
+const RAX = 0
+const RCX = 1
+const RDX = 2
+const RBX = 3
+const RSP = 4
+const RBP = 5
+const RSI = 6
+const RDI = 7
+const R8 = 8
+const R9 = 9
+const R10 = 10
+const R11 = 11
+const R12 = 12
+const R13 = 13
+const R14 = 14
+const R15 = 15
+
+// Коды условий x86: инверсия условия — младший бит.
+const CC_O = 0
+const CC_NO = 1
+const CC_B = 2
+const CC_AE = 3
+const CC_E = 4
+const CC_NE = 5
+const CC_BE = 6
+const CC_A = 7
+const CC_L = 12
+const CC_GE = 13
+const CC_LE = 14
+const CC_G = 15
+
+const CODE_BASE = 0x400000
+const DATA_BASE = 0x20000000
+const HDR_SIZE = 176
+const CODE_MAX = 268435456
+const DATA_MAX = 134217728
+
+type Fixup {
+    at: int
+    func: int
+}
+
+var code: int
+var code_len: int
+var data: int
+var data_len: int
+var fixups: [Fixup]
+// Позиция последней метки: щелевая оптимизация не заглядывает за неё.
+var barrier: int
+// Позиция последнего push rax или -1.
+var last_push: int
+var strlit_addr: [int]
+var const_strs: StrMap = smap_new()
+
+fn emit_init() {
+    code = __mmap(CODE_MAX)
+    data = __mmap(DATA_MAX)
+    code_len = 0
+    data_len = 0
+    last_push = -1
+    barrier = 0
+    const_strs = smap_new()
+}
+
+fn emit8(b: int) {
+    store8(code + code_len, b)
+    code_len += 1
+}
+
+fn emit32(v: int) {
+    store8(code + code_len, v & 255)
+    store8(code + code_len + 1, (v >> 8) & 255)
+    store8(code + code_len + 2, (v >> 16) & 255)
+    store8(code + code_len + 3, (v >> 24) & 255)
+    code_len += 4
+}
+
+fn emit64(v: int) {
+    emit32(v & 0xFFFFFFFF)
+    emit32((v >> 32) & 0xFFFFFFFF)
+}
+
+fn put32_at(p: int, v: int) {
+    store8(p, v & 255)
+    store8(p + 1, (v >> 8) & 255)
+    store8(p + 2, (v >> 16) & 255)
+    store8(p + 3, (v >> 24) & 255)
+}
+
+// Выравнивание на 16 байт заполнителем, который никогда не исполняется
+// (между функциями или сразу после безусловного перехода).
+fn align16() {
+    while (code_len & 15) != 0 {
+        emit8(0xCC)
+    }
+}
+
+// Текущая позиция как цель перехода.
+fn here() -> int {
+    barrier = code_len
+    return code_len
+}
+
+fn patch_rel(at: int, target: int) {
+    put32_at(code + at, target - at - 4)
+}
+
+fn patch_here(at: int) {
+    patch_rel(at, here())
+}
+
+fn emit_hole() -> int {
+    let at = code_len
+    emit32(0)
+    return at
+}
+
+fn emit_jmp() -> int {
+    emit8(0xE9)
+    return emit_hole()
+}
+
+fn emit_jmp_to(target: int) {
+    emit8(0xE9)
+    emit32(target - code_len - 4)
+}
+
+fn emit_jcc(cc: int) -> int {
+    emit8(0x0F)
+    emit8(0x80 + cc)
+    return emit_hole()
+}
+
+fn emit_jcc_to(cc: int, target: int) {
+    emit8(0x0F)
+    emit8(0x80 + cc)
+    emit32(target - code_len - 4)
+}
+
+// ---- Регистры ----
+
+fn rex_w(reg: int, rm: int) -> int {
+    return 0x48 | ((reg >> 3) << 2) | (rm >> 3)
+}
+
+// op r/m64, r64 с регистровыми операндами (rm — назначение).
+fn emit_rr(op: int, reg: int, rm: int) {
+    emit8(rex_w(reg, rm))
+    emit8(op)
+    emit8(0xC0 | ((reg & 7) << 3) | (rm & 7))
+}
+
+fn emit_mov_rr(dst: int, src: int) {
+    if dst != src {
+        emit_rr(0x89, src, dst)
+    }
+}
+
+// op reg, [base + disp32] или [base + disp32], reg — по коду операции.
+fn emit_mem(op: int, reg: int, base: int, disp: int) {
+    emit8(rex_w(reg, base))
+    emit8(op)
+    emit8(0x80 | ((reg & 7) << 3) | (base & 7))
+    if (base & 7) == 4 {
+        emit8(0x24)
+    }
+    emit32(disp)
+}
+
+fn emit_load(dst: int, base: int, disp: int) {
+    emit_mem(0x8B, dst, base, disp)
+}
+
+fn emit_store(base: int, disp: int, src: int) {
+    emit_mem(0x89, src, base, disp)
+}
+
+fn emit_mov_imm(dst: int, v: int) {
+    if v >= 0 && v <= 0x7FFFFFFF {
+        if dst >= 8 {
+            emit8(0x41)
+        }
+        emit8(0xB8 + (dst & 7))
+        emit32(v)
+        return
+    }
+    if v < 0 && v >= -2147483648 {
+        emit8(0x48 | (dst >> 3))
+        emit8(0xC7)
+        emit8(0xC0 | (dst & 7))
+        emit32(v & 0xFFFFFFFF)
+        return
+    }
+    emit8(0x48 | (dst >> 3))
+    emit8(0xB8 + (dst & 7))
+    emit64(v)
+}
+
+fn fits_i32(v: int) -> bool {
+    return v >= -2147483648 && v <= 2147483647
+}
+
+// Арифметика с непосредственным операндом: ext — номер операции в группе 0x81.
+fn emit_alu_imm(ext: int, dst: int, v: int) {
+    emit8(0x48 | (dst >> 3))
+    if v >= -128 && v <= 127 {
+        emit8(0x83)
+        emit8(0xC0 | (ext << 3) | (dst & 7))
+        emit8(v & 255)
+        return
+    }
+    emit8(0x81)
+    emit8(0xC0 | (ext << 3) | (dst & 7))
+    emit32(v & 0xFFFFFFFF)
+}
+
+fn emit_push(r: int) {
+    if r >= 8 {
+        emit8(0x41)
+    }
+    emit8(0x50 + (r & 7))
+    if r == RAX {
+        last_push = code_len - 1
+    }
+}
+
+// pop сразу после push rax превращается в mov.
+fn emit_pop(r: int) {
+    if last_push >= 0 && last_push == code_len - 1 && last_push >= barrier {
+        code_len -= 1
+        last_push = -1
+        emit_mov_rr(r, RAX)
+        return
+    }
+    if r >= 8 {
+        emit8(0x41)
+    }
+    emit8(0x58 + (r & 7))
+}
+
+fn emit_test_rax() {
+    emit8(0x48)
+    emit8(0x85)
+    emit8(0xC0)
+}
+
+// rax = условие cc ? 1 : 0
+fn emit_setcc(cc: int) {
+    emit8(0x0F)
+    emit8(0x90 + cc)
+    emit8(0xC0)
+    emit8(0x0F)
+    emit8(0xB6)
+    emit8(0xC0)
+}
+
+// ---- Вызовы ----
+
+fn emit_call(fi: int) {
+    emit8(0xE8)
+    fixups.push(Fixup { at: code_len, func: fi })
+    emit32(0)
+}
+
+// Аргументы лежат в стеке (последний сверху); первые шесть уходят в регистры.
+fn emit_args_to_regs(n: int) {
+    if n <= 6 {
+        var i = n - 1
+        while i >= 0 {
+            emit_pop(arg_reg(i))
+            i -= 1
+        }
+        return
+    }
+    var i = 0
+    while i < 6 {
+        emit_load(arg_reg(i), RSP, (n - 1 - i) * 8)
+        i += 1
+    }
+}
+
+fn emit_args_cleanup(n: int) {
+    if n > 6 {
+        emit_alu_imm(0, RSP, n * 8)
+    }
+}
+
+fn arg_reg(i: int) -> int {
+    if i == 0 {
+        return RDI
+    }
+    if i == 1 {
+        return RSI
+    }
+    if i == 2 {
+        return RDX
+    }
+    if i == 3 {
+        return RCX
+    }
+    if i == 4 {
+        return R8
+    }
+    return R9
+}
+
+// ---- Данные ----
+
+fn data_byte(b: int) {
+    store8(data + data_len, b)
+    data_len += 1
+}
+
+fn data_align() {
+    while (data_len & 7) != 0 {
+        data_len += 1
+    }
+}
+
+fn data_u64(v: int) {
+    data_align()
+    store64(data + data_len, v)
+    data_len += 8
+}
+
+// Строка в сегменте данных: байты, ноль, заголовок {ptr, len} → адрес заголовка.
+fn data_str(s: str) -> int {
+    let off = data_len
+    var i = 0
+    let n = s.len()
+    while i < n {
+        data_byte(s[i])
+        i += 1
+    }
+    data_byte(0)
+    data_align()
+    let h = data_len
+    data_u64(DATA_BASE + off)
+    data_u64(n)
+    return DATA_BASE + h
+}
+
+fn strlit(i: int) -> int {
+    while strlit_addr.len() <= i {
+        strlit_addr.push(0)
+    }
+    if strlit_addr[i] == 0 {
+        strlit_addr[i] = data_str(strlits[i])
+    }
+    return strlit_addr[i]
+}
+
+// Строка, которую создаёт сам компилятор (места паник и т. п.), без повторов.
+fn const_str(s: str) -> int {
+    let a = smap_get(const_strs, s)
+    if a >= 0 {
+        return a
+    }
+    let addr = data_str(s)
+    smap_put(const_strs, s, addr)
+    return addr
+}

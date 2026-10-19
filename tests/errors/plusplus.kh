@@ -1,0 +1,6 @@
+// expect: Khrip has no ++ and --
+// expect: hint: use i += 1
+fn main() {
+    var i = 0
+    i++
+}

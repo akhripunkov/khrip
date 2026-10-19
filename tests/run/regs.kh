@@ -1,0 +1,49 @@
+// Много переменных в циклах: часть живёт в регистрах между итерациями.
+fn work(n: int) -> int {
+    var a = 1
+    var b = 2
+    var c = 3
+    var d = 4
+    var e = 5
+    var f = 6
+    var g = 7
+    var total = 0
+    for i in 0..n {
+        for j in 0..10 {
+            a += i
+            b += j
+            c = a + b
+            d = c - a
+            e = e + d % 3
+            f = f ^ i
+            g = g + (a & 7)
+            total += a + b + c + d + e + f + g
+        }
+    }
+    return total + a + b + c + d + e + f + g
+}
+
+fn count_primes(n: int) -> int {
+    var composite: [bool] = []
+    for i in 0..n + 1 {
+        composite.push(false)
+    }
+    var count = 0
+    for i in 2..n + 1 {
+        if composite[i] {
+            continue
+        }
+        count += 1
+        var j = i * i
+        while j <= n {
+            composite[j] = true
+            j += i
+        }
+    }
+    return count
+}
+
+fn main() {
+    print(work(50))
+    print(count_primes(100000))
+}

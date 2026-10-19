@@ -1,0 +1,242 @@
+// ============================================================================
+// Типы. Каждый тип — индекс в таблице types; одинаковые типы имеют один индекс.
+// ============================================================================
+
+const K_ERR = 0
+const K_INT = 1
+const K_BOOL = 2
+const K_STR = 3
+const K_VOID = 4
+const K_NONE = 5
+const K_LIST = 6
+const K_MAP = 7
+const K_OPT = 8
+const K_STRUCT = 9
+const K_GEN = 10
+
+type Ty {
+    kind: int
+    a: int
+    b: int
+}
+
+type Field {
+    name: str
+    ty: int
+}
+
+type StructT {
+    name: str
+    fields: [Field]
+    tok: int
+}
+
+var types: [Ty]
+var structs: [StructT]
+
+var ty_err: int
+var ty_int: int
+var ty_bool: int
+var ty_str: int
+var ty_void: int
+var ty_none: int
+
+fn ty_make(kind: int, a: int, b: int) -> int {
+    var i = 0
+    let n = types.len()
+    while i < n {
+        let t = types[i]
+        if t.kind == kind && t.a == a && t.b == b {
+            return i
+        }
+        i += 1
+    }
+    types.push(Ty { kind: kind, a: a, b: b })
+    return n
+}
+
+fn types_init() {
+    ty_err = ty_make(K_ERR, 0, 0)
+    ty_int = ty_make(K_INT, 0, 0)
+    ty_bool = ty_make(K_BOOL, 0, 0)
+    ty_str = ty_make(K_STR, 0, 0)
+    ty_void = ty_make(K_VOID, 0, 0)
+    ty_none = ty_make(K_NONE, 0, 0)
+}
+
+fn tkind(t: int) -> int {
+    return types[t].kind
+}
+
+fn ty_list(e: int) -> int {
+    return ty_make(K_LIST, e, 0)
+}
+
+fn ty_map(k: int, v: int) -> int {
+    return ty_make(K_MAP, k, v)
+}
+
+fn ty_opt(t: int) -> int {
+    if tkind(t) == K_OPT || t == ty_err {
+        return t
+    }
+    return ty_make(K_OPT, t, 0)
+}
+
+fn ty_struct(i: int) -> int {
+    return ty_make(K_STRUCT, i, 0)
+}
+
+fn ty_elem(t: int) -> int {
+    return types[t].a
+}
+
+fn ty_inner(t: int) -> int {
+    if tkind(t) == K_OPT {
+        return types[t].a
+    }
+    return t
+}
+
+// Ссылочные типы: none для них — нулевой адрес, без отдельной ячейки.
+fn is_ref(t: int) -> bool {
+    let k = tkind(t)
+    return k == K_STR || k == K_LIST || k == K_MAP || k == K_STRUCT
+}
+
+fn is_int_like(t: int) -> bool {
+    return t == ty_int || t == ty_err
+}
+
+fn ty_name(t: int) -> str {
+    let k = tkind(t)
+    if k == K_ERR {
+        return "<error>"
+    }
+    if k == K_INT {
+        return "int"
+    }
+    if k == K_BOOL {
+        return "bool"
+    }
+    if k == K_STR {
+        return "str"
+    }
+    if k == K_VOID {
+        return "nothing"
+    }
+    if k == K_NONE {
+        return "none"
+    }
+    if k == K_LIST {
+        return "[" + ty_name(types[t].a) + "]"
+    }
+    if k == K_MAP {
+        return "map[" + ty_name(types[t].a) + ", " + ty_name(types[t].b) + "]"
+    }
+    if k == K_OPT {
+        return ty_name(types[t].a) + "?"
+    }
+    if k == K_STRUCT {
+        return structs[types[t].a].name
+    }
+    if k == K_GEN {
+        if types[t].a == 'K' {
+            return "K"
+        }
+        if types[t].a == 'V' {
+            return "V"
+        }
+        return "T"
+    }
+    return "?"
+}
+
+// Можно ли значение типа from использовать там, где ожидается to.
+// Единственное неявное преобразование — T в T? (и none в T?).
+fn assignable(from: int, to: int) -> bool {
+    if from == to || from == ty_err || to == ty_err {
+        return true
+    }
+    if tkind(to) == K_OPT {
+        return from == ty_none || from == types[to].a
+    }
+    return false
+}
+
+// Подстановка T, K, V при вызове метода встроенного типа.
+fn subst(t: int, tt: int, kt: int, vt: int) -> int {
+    let k = tkind(t)
+    if k == K_GEN {
+        let g = types[t].a
+        if g == 'K' {
+            return kt
+        }
+        if g == 'V' {
+            return vt
+        }
+        return tt
+    }
+    if k == K_LIST {
+        return ty_list(subst(types[t].a, tt, kt, vt))
+    }
+    if k == K_OPT {
+        return ty_opt(subst(types[t].a, tt, kt, vt))
+    }
+    if k == K_MAP {
+        return ty_map(subst(types[t].a, tt, kt, vt), subst(types[t].b, tt, kt, vt))
+    }
+    return t
+}
+
+fn struct_find(name: str) -> int {
+    var i = 0
+    while i < structs.len() {
+        if structs[i].name == name {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+fn field_find(s: int, name: str) -> int {
+    let fs = structs[s].fields
+    var i = 0
+    while i < fs.len() {
+        if fs[i].name == name {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+// Привычные имена типов из других языков → подсказка.
+fn type_hint(name: str) -> str {
+    if name == "String" || name == "string" || name == "Str" || name == "char" || name == "text" {
+        return "strings are str"
+    }
+    if name == "i8" || name == "i16" || name == "i32" || name == "u8" || name == "u16" || name == "u32" || name == "u64" || name == "Int" || name == "long" || name == "number" || name == "usize" || name == "isize" || name == "int64" || name == "Integer" {
+        return "integers are int (64-bit)"
+    }
+    if name == "boolean" || name == "Bool" || name == "Boolean" {
+        return "booleans are bool"
+    }
+    if name == "float" || name == "double" || name == "f64" || name == "f32" || name == "float64" {
+        return "Khrip has no floating point yet; use int (e.g. cents instead of dollars)"
+    }
+    if name == "List" || name == "Vec" || name == "Array" || name == "slice" {
+        return "lists are written [T], e.g. [int]"
+    }
+    if name == "Map" || name == "HashMap" || name == "dict" || name == "Dictionary" || name == "Dict" {
+        return "maps are written map[K, V], e.g. map[str, int]"
+    }
+    if name == "Option" || name == "Optional" || name == "Maybe" {
+        return "optional values are written T?, e.g. User?"
+    }
+    if name == "void" || name == "unit" || name == "None" {
+        return "functions that return nothing omit the -> part"
+    }
+    return ""
+}

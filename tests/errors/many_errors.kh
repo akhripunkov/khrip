@@ -1,0 +1,10 @@
+// expect: many_errors.kh:6:
+// expect: many_errors.kh:7:
+// expect: many_errors.kh:9:
+// expect: 3 errors
+fn main() {
+    let a: int = true
+    let b = undefined_name
+    var c = 1
+    c = "text"
+}

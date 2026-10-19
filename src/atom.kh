@@ -1,0 +1,1181 @@
+// ============================================================================
+// Атомы, литералы, поля, индексы, вызовы функций и методов, встраивание.
+// ============================================================================
+
+var inline_depth: int
+var inline_stack: [int]
+var inline_rets: [int]
+
+fn parse_atom() -> int {
+    let w = want
+    want = ty_err
+    let t = tok()
+    let k = t.kind
+    if k == T_INT {
+        advance()
+        emit_mov_imm(RAX, t.val)
+        return ty_int
+    }
+    if k == T_STR {
+        advance()
+        emit_mov_imm(RAX, strlit(t.val))
+        return ty_str
+    }
+    if k == T_TRUE || k == T_FALSE {
+        advance()
+        if k == T_TRUE {
+            emit_mov_imm(RAX, 1)
+        } else {
+            emit_mov_imm(RAX, 0)
+        }
+        return ty_bool
+    }
+    if k == T_NONE {
+        advance()
+        emit_mov_imm(RAX, 0)
+        if tkind(w) == K_OPT {
+            return w
+        }
+        return ty_none
+    }
+    if k == '(' {
+        advance()
+        let saved = no_struct
+        no_struct = false
+        let r = parse_expr(w)
+        no_struct = saved
+        expect_tok(')')
+        return r
+    }
+    if k == '[' {
+        return parse_list_lit(w)
+    }
+    if k == '\{' {
+        return parse_map_lit(w)
+    }
+    if k == T_IDENT {
+        return parse_ident(w)
+    }
+    if k == T_CALL {
+        return parse_call_expr()
+    }
+    var hint = ""
+    if k == T_IF {
+        hint = "if is a statement in Khrip; use a var and assign it in both branches"
+    } else if k == T_FN {
+        hint = "Khrip has no anonymous functions; declare a named fn"
+    }
+    syntax_error(t, "expected a value, found " + tok_show(t), hint)
+    if k != T_EOF && k != '}' && k != ')' {
+        advance()
+    }
+    return ty_err
+}
+
+// Похожее имя для подсказки «может быть, вы имели в виду».
+fn similar_name(name: str) -> str {
+    var best = ""
+    var best_d = 3
+    var i = nlocals - 1
+    while i >= local_floor {
+        let d = edit_distance(name, locals[i].name)
+        if d < best_d {
+            best = locals[i].name
+            best_d = d
+        }
+        i -= 1
+    }
+    for g in sym_map.keys {
+        if !g.starts_with("__") {
+            let d = edit_distance(name, g)
+            if d < best_d {
+                best = g
+                best_d = d
+            }
+        }
+    }
+    return best
+}
+
+fn unknown_name_hint(name: str) -> str {
+    let h = name_hint(name)
+    if h.len() > 0 {
+        return h
+    }
+    let s = similar_name(name)
+    if s.len() > 0 {
+        return "did you mean '" + s + "'?"
+    }
+    return ""
+}
+
+fn parse_ident(w: int) -> int {
+    let t = tok()
+    advance()
+    let name = t.text
+    if kind() == '(' {
+        return parse_call(t, w)
+    }
+    if kind() == '\{' && !no_struct {
+        let si = struct_find(name)
+        if si >= 0 {
+            return parse_struct_lit(si, t)
+        }
+    }
+    let li = find_local(name)
+    if li >= 0 {
+        emit_load_local(li)
+        return locals[li].ty
+    }
+    let s = sym_find(name)
+    if s >= 0 {
+        let sk = sym_kind(s)
+        if sk == SK_GLOBAL {
+            let g = globals[sym_idx(s)]
+            if g.is_store {
+                store_touch()
+            }
+            emit_load_abs(RAX, g.addr)
+            return g.ty
+        }
+        if sk == SK_CONST {
+            let c = consts[sym_idx(s)]
+            emit_mov_imm(RAX, c.val)
+            return c.ty
+        }
+        if sk == SK_FN {
+            error_tok(t, "'" + name + "' is a function; call it with " + name + "(...)", "")
+            return ty_err
+        }
+        error_tok(t, "'" + name + "' is a type, not a value", "create a value with " + name + " \{ field: value }")
+        return ty_err
+    }
+    error_tok(t, "unknown name '" + name + "'", unknown_name_hint(name))
+    return ty_err
+}
+
+// ---- Литералы списков, словарей и структур ----
+
+// Размер элемента списка в памяти: bool — байт, остальное — слово.
+fn esize_of(et: int) -> int {
+    if et == ty_bool {
+        return 1
+    }
+    return 8
+}
+
+fn emit_list_new(et: int) {
+    emit_mov_imm(RDI, 4)
+    emit_mov_imm(RSI, esize_of(et))
+    emit_call(rt_func("__list_new"))
+}
+
+// [a, b, ...]: список создаётся, когда известен тип элемента — из ожидаемого
+// типа или по первому элементу.
+fn parse_list_lit(w: int) -> int {
+    let at = tok()
+    advance()
+    let saved = no_struct
+    no_struct = false
+    var et = ty_err
+    var known = false
+    if tkind(w) == K_LIST {
+        et = ty_elem(w)
+        known = true
+        emit_list_new(et)
+        emit_push(RAX)
+    }
+    var first = true
+    while kind() != ']' && kind() != T_EOF && !panic_mode {
+        let vt = tok()
+        if known {
+            want = et
+        } else {
+            want = ty_err
+        }
+        let t = parse_coalesce()
+        if !known {
+            et = t
+            known = true
+            // первый элемент в стек, затем новый список
+            emit_push(RAX)
+            emit_list_new(et)
+            emit_push(RAX)
+            emit_load(RSI, RSP, 8)
+            emit_mov_rr(RDI, RAX)
+            emit_call(rt_func("__list_push"))
+            // убрать первый элемент из-под списка
+            emit_pop(RAX)
+            emit_store(RSP, 0, RAX)
+        } else {
+            coerce(t, et, vt)
+            emit_mov_rr(RSI, RAX)
+            emit_load(RDI, RSP, 0)
+            emit_call(rt_func("__list_push"))
+        }
+        first = false
+        if kind() == ',' {
+            advance()
+        } else if kind() != ']' {
+            syntax_error(tok(), "expected ',' or ']' in the list, found " + tok_show(tok()), "")
+        }
+    }
+    expect_tok(']')
+    no_struct = saved
+    if !known {
+        error_tok(at, "cannot infer the element type of []", "annotate the variable, e.g. var xs: [int] = []")
+        emit_mov_imm(RAX, 0)
+        return ty_err
+    }
+    emit_pop(RAX)
+    return ty_list(et)
+}
+
+fn parse_map_lit(w: int) -> int {
+    let at = tok()
+    advance()
+    let saved = no_struct
+    no_struct = false
+    var kt = ty_err
+    var vt = ty_err
+    var known = false
+    if tkind(w) == K_MAP {
+        kt = types[w].a
+        vt = types[w].b
+        known = true
+    }
+    // ключ-строка определяется по ожидаемому типу или первому ключу
+    let first_str = kind() == T_STR
+    var is_str = first_str
+    if known {
+        is_str = kt == ty_str
+    }
+    if is_str {
+        emit_mov_imm(RDI, 1)
+    } else {
+        emit_mov_imm(RDI, 0)
+    }
+    emit_call(rt_func("__map_new"))
+    emit_push(RAX)
+    while kind() != '}' && kind() != T_EOF && !panic_mode {
+        let kt_tok = tok()
+        if known {
+            want = kt
+        } else {
+            want = ty_err
+        }
+        let k1 = parse_coalesce()
+        if !known {
+            kt = k1
+            if kt != ty_int && kt != ty_str {
+                error_tok(kt_tok, "map keys must be int or str", "")
+            }
+        } else {
+            coerce(k1, kt, kt_tok)
+        }
+        emit_push(RAX)
+        expect_tok(':')
+        let vtok = tok()
+        if known {
+            want = vt
+        } else {
+            want = ty_err
+        }
+        let v1 = parse_coalesce()
+        if !known {
+            vt = v1
+            known = true
+        } else {
+            coerce(v1, vt, vtok)
+        }
+        emit_mov_rr(RDX, RAX)
+        emit_pop(RSI)
+        emit_load(RDI, RSP, 0)
+        emit_call(rt_func("__map_set"))
+        if kind() == ',' {
+            advance()
+        }
+    }
+    expect_tok('}')
+    no_struct = saved
+    emit_pop(RAX)
+    if !known {
+        error_tok(at, "cannot infer the type of \{}", "annotate the variable, e.g. var m: map[str, int] = \{}")
+        return ty_err
+    }
+    return ty_map(kt, vt)
+}
+
+// Имена, заданные в литерале явно (поле: значение или сокращение поле).
+fn explicit_fields(open: int) -> [str] {
+    var names: [str] = []
+    let close = matching_close(open)
+    var i = open + 1
+    var depth = 0
+    while i < close {
+        let k = toks[i].kind
+        if k == '(' || k == '[' || k == '\{' {
+            depth += 1
+        } else if k == ')' || k == ']' || k == '}' {
+            depth -= 1
+        } else if depth == 0 && k == T_IDENT {
+            let prev = toks[i - 1].kind
+            let next = toks[i + 1].kind
+            if (prev == '\{' || prev == ',') && (next == ':' || next == ',' || next == '}') {
+                names.push(toks[i].text)
+            }
+        }
+        i += 1
+    }
+    return names
+}
+
+fn list_has(xs: [str], s: str) -> bool {
+    for x in xs {
+        if x == s {
+            return true
+        }
+    }
+    return false
+}
+
+// Имя { поле: значение, ...другое, поле }
+fn parse_struct_lit(si: int, at: Token) -> int {
+    let open = pos
+    let explicit = explicit_fields(open)
+    advance()
+    let saved = no_struct
+    no_struct = false
+    let fields = structs[si].fields
+    let nf = fields.len()
+    var set: [bool] = []
+    var i = 0
+    while i < nf {
+        set.push(false)
+        i += 1
+    }
+    emit_mov_imm(RDI, nf * 8 + 8)
+    emit_call(rt_func("__alloc"))
+    emit_push(RAX)
+    while kind() != '}' && kind() != T_EOF && !panic_mode {
+        if kind() == T_ELLIPSIS {
+            let st = tok()
+            advance()
+            let src = parse_expr(ty_err)
+            if tkind(src) != K_STRUCT {
+                if src != ty_err {
+                    error_tok(st, "... needs a value of a type with fields, found " + ty_name(src), "")
+                }
+            } else {
+                let sf = structs[types[src].a].fields
+                var j = 0
+                while j < nf {
+                    let f = fields[j]
+                    if !list_has(explicit, f.name) {
+                        var m = 0
+                        while m < sf.len() {
+                            if sf[m].name == f.name && assignable(sf[m].ty, f.ty) {
+                                emit_load(RCX, RAX, m * 8)
+                                emit_load(RDX, RSP, 0)
+                                emit_store(RDX, j * 8, RCX)
+                                set[j] = true
+                            }
+                            m += 1
+                        }
+                    }
+                    j += 1
+                }
+            }
+        } else {
+            let fname = expect_ident()
+            if panic_mode {
+                break
+            }
+            let fi = field_find(si, fname.text)
+            var ft = ty_err
+            if fi < 0 {
+                var hint = ""
+                var best_d = 3
+                for f in fields {
+                    let d = edit_distance(fname.text, f.name)
+                    if d < best_d {
+                        best_d = d
+                        hint = "did you mean '" + f.name + "'?"
+                    }
+                }
+                error_tok(fname, "type '" + structs[si].name + "' has no field '" + fname.text + "'", hint)
+            } else {
+                ft = fields[fi].ty
+            }
+            if kind() == ':' {
+                advance()
+                let vt = tok()
+                let t = parse_expr(ft)
+                coerce(t, ft, vt)
+            } else {
+                // сокращение: поле с тем же именем, что у переменной
+                pos -= 1
+                let t = parse_ident(ft)
+                coerce(t, ft, fname)
+            }
+            if fi >= 0 {
+                if set[fi] && list_has(explicit, fname.text) {
+                    let cnt = count_name(explicit, fname.text)
+                    if cnt > 1 {
+                        error_tok(fname, "field '" + fname.text + "' is set twice", "")
+                    }
+                }
+                emit_load(RCX, RSP, 0)
+                emit_store(RCX, fi * 8, RAX)
+                set[fi] = true
+            }
+        }
+        if kind() == ',' {
+            advance()
+        }
+    }
+    expect_tok('}')
+    no_struct = saved
+    var missing = ""
+    var j = 0
+    while j < nf {
+        if !set[j] && !panic_mode {
+            if missing.len() > 0 {
+                missing += ", "
+            }
+            missing += fields[j].name + ": " + ty_name(fields[j].ty)
+        }
+        j += 1
+    }
+    if missing.len() > 0 {
+        error_tok(at, "missing fields in " + structs[si].name + ": " + missing, "set every field, or copy them with ...other")
+    }
+    emit_pop(RAX)
+    return ty_struct(si)
+}
+
+fn count_name(xs: [str], s: str) -> int {
+    var n = 0
+    for x in xs {
+        if x == s {
+            n += 1
+        }
+    }
+    return n
+}
+
+// ---- Постфиксные операции: поле, метод, индекс, срез ----
+
+fn parse_postfix(t0: int, at: Token) -> int {
+    var t = t0
+    while true {
+        let k = kind()
+        if k == '.' {
+            advance()
+            let nt = expect_ident()
+            if panic_mode {
+                return ty_err
+            }
+            if kind() == '(' {
+                t = parse_method(t, nt)
+            } else {
+                t = field_load(t, nt)
+            }
+        } else if k == '[' {
+            t = parse_index(t)
+        } else if k == '?' && kind_at(pos + 1) == '.' {
+            syntax_error(tok(), "Khrip has no ?. operator", "unwrap first: let v = x else { ... } or if let v = x { ... }")
+            return ty_err
+        } else {
+            return t
+        }
+    }
+    return t
+}
+
+fn field_load(t: int, nt: Token) -> int {
+    if t == ty_err {
+        return ty_err
+    }
+    if tkind(t) == K_OPT && tkind(ty_inner(t)) == K_STRUCT {
+        error_tok(nt, "the value may be none; unwrap it before reading ." + nt.text, "if let v = x { v." + nt.text + " } or let v = x else { return ... }")
+        return ty_err
+    }
+    if tkind(t) != K_STRUCT {
+        var hint = ""
+        if nt.text == "length" || nt.text == "size" || nt.text == "len" || nt.text == "count" {
+            hint = "use .len()"
+        }
+        error_tok(nt, ty_name(t) + " has no field '" + nt.text + "'", hint)
+        return ty_err
+    }
+    let si = types[t].a
+    let fi = field_find(si, nt.text)
+    if fi < 0 {
+        var hint = ""
+        var best_d = 3
+        for f in structs[si].fields {
+            let d = edit_distance(nt.text, f.name)
+            if d < best_d {
+                best_d = d
+                hint = "did you mean '" + f.name + "'?"
+            }
+        }
+        if hint.len() == 0 {
+            if func_find(nt.text) >= 0 {
+                hint = "to call the function, write ." + nt.text + "()"
+            }
+        }
+        error_tok(nt, "type '" + structs[si].name + "' has no field '" + nt.text + "'", hint)
+        return ty_err
+    }
+    emit_load(RAX, RAX, fi * 8)
+    return structs[si].fields[fi].ty
+}
+
+fn parse_index(t: int) -> int {
+    let at = tok()
+    advance()
+    let saved = no_struct
+    no_struct = false
+    let k = tkind(t)
+    if k == K_MAP {
+        emit_push(RAX)
+        let kt = tok()
+        let it = parse_expr(types[t].a)
+        coerce(it, types[t].a, kt)
+        expect_tok(']')
+        no_struct = saved
+        emit_mov_rr(RSI, RAX)
+        emit_pop(RDI)
+        let vt = types[t].b
+        if is_ref(vt) {
+            emit_call(rt_func("__map_get_ref"))
+        } else {
+            emit_call(rt_func("__map_get_box"))
+        }
+        return ty_opt(vt)
+    }
+    if k == K_OPT {
+        error_tok(at, "the value may be none; unwrap it before indexing", "let v = x else { return ... }")
+    } else if k != K_LIST && k != K_STR && t != ty_err {
+        error_tok(at, ty_name(t) + " cannot be indexed", "")
+    }
+    // срез: [a..b], [..b], [a..]
+    if kind() == T_DOTDOT {
+        advance()
+        emit_push(RAX)
+        emit_mov_imm(RAX, 0)
+        return finish_slice(t, at, saved)
+    }
+    if peek_simple(1) && is_int_like(op_ty) && kind_at(pos + 1) == ']' {
+        advance()
+        load_operand(RCX)
+    } else {
+        emit_push(RAX)
+        let it = parse_expr(ty_int)
+        if it != ty_int && it != ty_err {
+            error_tok(at, "index must be int, found " + ty_name(it), mismatch_hint(it, ty_int))
+        }
+        if kind() == T_DOTDOT {
+            advance()
+            return finish_slice(t, at, saved)
+        }
+        emit_mov_rr(RCX, RAX)
+        emit_pop(RAX)
+    }
+    expect_tok(']')
+    no_struct = saved
+    emit_bounds_check(at)
+    emit_load(RAX, RAX, 0)
+    if k == K_STR {
+        // movzx eax, byte [rax + rcx]
+        emit8(0x0F)
+        emit8(0xB6)
+        emit8(0x04)
+        emit8(0x08)
+        return ty_int
+    }
+    if k == K_LIST && ty_elem(t) == ty_bool {
+        emit8(0x0F)
+        emit8(0xB6)
+        emit8(0x04)
+        emit8(0x08)
+        return ty_bool
+    }
+    // mov rax, [rax + rcx*8]
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x04)
+    emit8(0xC8)
+    if k == K_LIST {
+        return ty_elem(t)
+    }
+    return ty_err
+}
+
+// Получатель в стеке, начало среза в rax; текущий токен — после «..».
+fn finish_slice(t: int, at: Token, saved: bool) -> int {
+    emit_push(RAX)
+    if kind() == ']' {
+        // до конца: длина получателя
+        emit_load(RAX, RSP, 8)
+        emit_load(RAX, RAX, 8)
+    } else {
+        let et = parse_expr(ty_int)
+        if et != ty_int && et != ty_err {
+            error_tok(at, "slice bounds must be int", "")
+        }
+    }
+    expect_tok(']')
+    no_struct = saved
+    emit_mov_rr(RDX, RAX)
+    emit_pop(RSI)
+    emit_pop(RDI)
+    if tkind(t) == K_STR {
+        emit_call(rt_func("__str_slice"))
+        return ty_str
+    }
+    emit_call(rt_func("__list_slice"))
+    return t
+}
+
+// ---- Вызовы ----
+
+// Аргументы по параметрам ps начиная с first; каждый кладётся в стек.
+// → число положенных аргументов.
+fn compile_args(ps: [Param], first: int, tt: int, kt: int, vt: int, name: str, at: Token) -> int {
+    let saved = no_struct
+    no_struct = false
+    var n = 0
+    var i = first
+    while kind() != ')' && kind() != T_EOF && !panic_mode {
+        let a = tok()
+        var pt = ty_err
+        if i < ps.len() {
+            pt = subst(ps[i].ty, tt, kt, vt)
+        }
+        let t = parse_expr(pt)
+        if i < ps.len() {
+            coerce(t, pt, a)
+        }
+        emit_push(RAX)
+        n += 1
+        i += 1
+        if kind() == ',' {
+            advance()
+        } else if kind() != ')' {
+            syntax_error(tok(), "expected ',' or ')' in the call, found " + tok_show(tok()), "")
+        }
+    }
+    expect_tok(')')
+    no_struct = saved
+    if i != ps.len() && !panic_mode {
+        let want_n = ps.len() - first
+        let got = i - first
+        var sig = ""
+        var j = first
+        while j < ps.len() {
+            if sig.len() > 0 {
+                sig += ", "
+            }
+            sig += ps[j].name + ": " + ty_name(ps[j].ty)
+            j += 1
+        }
+        error_tok(at, "'" + name + "' takes " + want_n.to_str() + " argument(s), got " + got.to_str(), name + "(" + sig + ")")
+    }
+    return n
+}
+
+fn in_inline_stack(fi: int) -> bool {
+    for x in inline_stack {
+        if x == fi {
+            return true
+        }
+    }
+    return false
+}
+
+// Вызов функции fi, аргументы (n штук) в стеке.
+fn emit_call_args(fi: int, n: int) {
+    funcs[fi].used = true
+    if n == funcs[fi].params.len() && funcs[fi].inline_ok && inline_depth < 3 && fi != cur_fn && !in_inline_stack(fi) && diags.len() == 0 {
+        inline_call(fi, n)
+        return
+    }
+    emit_args_to_regs(n)
+    emit_call(fi)
+    emit_args_cleanup(n)
+}
+
+// Встраивание: тело функции разбирается заново на месте вызова.
+fn inline_call(fi: int, n: int) {
+    let f = funcs[fi]
+    var slots: [int] = []
+    var i = 0
+    while i < n {
+        slots.push(new_slot())
+        i += 1
+    }
+    i = n - 1
+    while i >= 0 {
+        emit_pop(RAX)
+        emit_store(RBP, slots[i], RAX)
+        i -= 1
+    }
+    let saved_pos = pos
+    let saved_n = nlocals
+    let saved_floor = local_floor
+    let saved_ret = fn_ret_ty
+    let saved_ns = no_struct
+    let saved_want = want
+    let saved_loop = loop_depth
+    local_floor = nlocals
+    i = 0
+    while i < n {
+        add_local(f.params[i].name, f.params[i].ty, false, -1, slots[i])
+        i += 1
+    }
+    fn_ret_ty = f.ret
+    no_struct = false
+    loop_depth = 0
+    inline_depth += 1
+    quiet += 1
+    inline_stack.push(fi)
+    let base = inline_rets.len()
+    pos = f.body
+    parse_block()
+    // return в самом конце тела — переход на следующую инструкцию
+    if inline_rets.len() > base && inline_rets[inline_rets.len() - 1] == code_len - 4 && code_len - 5 >= barrier {
+        inline_rets.pop()
+        code_len -= 5
+    }
+    let end = here()
+    while inline_rets.len() > base {
+        patch_rel(inline_rets.pop(), end)
+    }
+    inline_stack.pop()
+    quiet -= 1
+    inline_depth -= 1
+    pos = saved_pos
+    nlocals = saved_n
+    local_floor = saved_floor
+    fn_ret_ty = saved_ret
+    no_struct = saved_ns
+    want = saved_want
+    loop_depth = saved_loop
+}
+
+// Значение int/bool/str в rax → str.
+fn emit_to_str(t: int, at: Token) -> bool {
+    if t == ty_str || t == ty_err {
+        return true
+    }
+    emit_mov_rr(RDI, RAX)
+    if t == ty_int {
+        emit_call(rt_func("__int_to_str"))
+        return true
+    }
+    if t == ty_bool {
+        emit_call(rt_func("__bool_to_str"))
+        return true
+    }
+    error_tok(at, "cannot turn " + ty_name(t) + " into text", "interpolate its fields instead")
+    return false
+}
+
+fn builtin_args(n: int, at: Token, name: str) -> int {
+    let saved = no_struct
+    no_struct = false
+    var got = 0
+    while kind() != ')' && kind() != T_EOF && !panic_mode {
+        let a = tok()
+        let t = parse_expr(ty_int)
+        if t != ty_int && t != ty_err {
+            error_tok(a, name + " takes int arguments, found " + ty_name(t), "")
+        }
+        emit_push(RAX)
+        got += 1
+        if kind() == ',' {
+            advance()
+        } else if kind() != ')' {
+            syntax_error(tok(), "expected ',' or ')' in the call", "")
+        }
+    }
+    expect_tok(')')
+    no_struct = saved
+    if n >= 0 && got != n {
+        error_tok(at, name + " takes " + n.to_str() + " argument(s), got " + got.to_str(), "")
+    }
+    return got
+}
+
+// Встроенные функции. → тип или -1, если это не встроенная.
+fn parse_builtin(t: Token, w: int) -> int {
+    let name = t.text
+    if name == "load8" || name == "load64" {
+        advance()
+        builtin_args(1, t, name)
+        emit_pop(RAX)
+        if name == "load8" {
+            emit8(0x0F)
+            emit8(0xB6)
+            emit8(0x00)
+        } else {
+            emit_load(RAX, RAX, 0)
+        }
+        return ty_int
+    }
+    if name == "store8" || name == "store64" {
+        advance()
+        builtin_args(2, t, name)
+        emit_pop(RCX)
+        emit_pop(RAX)
+        if name == "store8" {
+            emit8(0x88)
+            emit8(0x08)
+        } else {
+            emit_store(RAX, 0, RCX)
+        }
+        return ty_void
+    }
+    if name == "syscall" {
+        advance()
+        let n = builtin_args(-1, t, name)
+        var i = n - 1
+        while i >= 0 {
+            if i == 0 {
+                emit_pop(RAX)
+            } else if i == 4 {
+                emit_pop(R10)
+            } else if i == 5 {
+                emit_pop(R8)
+            } else if i == 6 {
+                emit_pop(R9)
+            } else {
+                emit_pop(arg_reg(i - 1))
+            }
+            i -= 1
+        }
+        emit8(0x0F)
+        emit8(0x05)
+        return ty_int
+    }
+    if name == "__ctx" {
+        advance()
+        expect_tok(')')
+        // mov rax, fs:[0]
+        emit8(0x64)
+        emit8(0x48)
+        emit8(0x8B)
+        emit8(0x04)
+        emit8(0x25)
+        emit32(0)
+        return ty_int
+    }
+    if name == "__cast" {
+        advance()
+        let t1 = parse_expr(ty_err)
+        expect_tok(')')
+        if w == ty_err {
+            error_tok(t, "__cast needs a known target type", "")
+            return ty_err
+        }
+        return w
+    }
+    if name == "__to_str" {
+        advance()
+        let a = tok()
+        let t1 = parse_expr(ty_err)
+        expect_tok(')')
+        emit_to_str(t1, a)
+        return ty_str
+    }
+    if (name == "__memcpy" || name == "__memset") && !files[t.file].is_lib {
+        return -1
+    }
+    if name == "__memset" {
+        // rep stosb: rdi = куда, al = байт, rcx = сколько
+        advance()
+        builtin_args(3, t, name)
+        emit_pop(RCX)
+        emit_pop(RAX)
+        emit_pop(RDI)
+        emit8(0xF3)
+        emit8(0xAA)
+        return ty_void
+    }
+    if name == "__memcpy" {
+        // rep movsb: rdi = куда, rsi = откуда, rcx = сколько
+        advance()
+        builtin_args(3, t, name)
+        emit_pop(RCX)
+        emit_pop(RSI)
+        emit_pop(RDI)
+        emit8(0xF3)
+        emit8(0xA4)
+        return ty_void
+    }
+    if name == "len" {
+        advance()
+        let a = tok()
+        let t1 = parse_expr(ty_err)
+        expect_tok(')')
+        let k = tkind(t1)
+        if k == K_STR || k == K_LIST || k == K_MAP {
+            emit_load(RAX, RAX, 8)
+            return ty_int
+        }
+        if t1 != ty_err {
+            error_tok(a, ty_name(t1) + " has no length", "")
+        }
+        return ty_err
+    }
+    if name == "print" || name == "eprint" || name == "write" {
+        advance()
+        let a = tok()
+        let saved = no_struct
+        no_struct = false
+        let t1 = parse_expr(ty_str)
+        no_struct = saved
+        if kind() == ',' {
+            error_tok(tok(), name + " takes one value", "combine values with interpolation: " + name + "(\"\{a} \{b}\")")
+            while kind() != ')' && kind() != T_EOF {
+                advance()
+            }
+        }
+        expect_tok(')')
+        if emit_to_str(t1, a) {
+            emit_mov_rr(RDI, RAX)
+            emit_call(rt_func(name))
+        }
+        last_was_call = true
+        return ty_void
+    }
+    return -1
+}
+
+fn parse_call(t: Token, w: int) -> int {
+    let bt = parse_builtin(t, w)
+    if bt >= 0 {
+        last_was_call = true
+        return bt
+    }
+    let name = t.text
+    let fi = func_find(name)
+    advance()
+    if fi < 0 {
+        var hint = name_hint(name)
+        if hint.len() == 0 {
+            let s = similar_name(name)
+            if s.len() > 0 {
+                hint = "did you mean '" + s + "'?"
+            }
+        }
+        if struct_find(name) >= 0 {
+            hint = "create a value with " + name + " \{ field: value }"
+        }
+        error_tok(t, "unknown function '" + name + "'", hint)
+        // разобрать аргументы, чтобы продолжить
+        var ps: [Param] = []
+        let n = compile_args(ps, 0, ty_err, ty_err, ty_err, name, t)
+        emit_alu_imm(0, RSP, n * 8)
+        return ty_err
+    }
+    let f = funcs[fi]
+    let n = compile_args(f.params, 0, ty_err, ty_err, ty_err, name, t)
+    if n != f.params.len() {
+        emit_alu_imm(0, RSP, n * 8)
+        return f.ret
+    }
+    emit_call_args(fi, n)
+    last_was_call = true
+    return f.ret
+}
+
+// Методы встроенных типов → функции библиотеки __str_*, __list_*, __int_*, ...
+fn method_prefix(k: int) -> str {
+    if k == K_STR {
+        return "__str_"
+    }
+    if k == K_LIST {
+        return "__list_"
+    }
+    if k == K_INT {
+        return "__int_"
+    }
+    if k == K_BOOL {
+        return "__bool_"
+    }
+    if k == K_MAP {
+        return "__map_"
+    }
+    return ""
+}
+
+fn skip_call_args() {
+    let close = matching_close(pos)
+    pos = close
+    advance()
+}
+
+// получатель.имя(аргументы); получатель в rax, текущий токен — '('.
+fn parse_method(rt: int, nt: Token) -> int {
+    let name = nt.text
+    let k = tkind(rt)
+    if rt == ty_err {
+        skip_call_args()
+        return ty_err
+    }
+    if k == K_OPT {
+        error_tok(nt, "the value may be none; unwrap it before calling ." + name + "()", "if let v = x { v." + name + "() } or (x ?? default)." + name + "()")
+        skip_call_args()
+        return ty_err
+    }
+    if name == "len" && (k == K_STR || k == K_LIST || k == K_MAP) && kind_at(pos + 1) == ')' {
+        advance()
+        advance()
+        emit_load(RAX, RAX, 8)
+        last_was_call = false
+        return ty_int
+    }
+    if k == K_MAP {
+        return parse_map_method(rt, nt)
+    }
+    var tt = ty_err
+    if k == K_LIST {
+        tt = ty_elem(rt)
+        if name == "contains" || name == "sort" || name == "index_of" {
+            return parse_list_typed_method(rt, nt)
+        }
+    }
+    var fi = -1
+    let prefix = method_prefix(k)
+    if prefix.len() > 0 {
+        fi = func_find(prefix + name)
+    }
+    if fi < 0 {
+        let uf = func_find(name)
+        if uf >= 0 && funcs[uf].params.len() > 0 && assignable(rt, funcs[uf].params[0].ty) {
+            fi = uf
+        }
+    }
+    if fi < 0 {
+        var hint = method_hint(name)
+        if hint.len() == 0 {
+            let uf = func_find(name)
+            if uf >= 0 && funcs[uf].params.len() > 0 {
+                hint = "'" + name + "' takes " + ty_name(funcs[uf].params[0].ty) + " as its first parameter"
+            }
+        }
+        error_tok(nt, ty_name(rt) + " has no method '" + name + "'", hint)
+        skip_call_args()
+        return ty_err
+    }
+    let f = funcs[fi]
+    emit_push(RAX)
+    advance()
+    let n = compile_args(f.params, 1, tt, ty_err, ty_err, name, nt) + 1
+    if n != f.params.len() {
+        emit_alu_imm(0, RSP, n * 8)
+        return subst(f.ret, tt, ty_err, ty_err)
+    }
+    emit_call_args(fi, n)
+    last_was_call = true
+    return subst(f.ret, tt, ty_err, ty_err)
+}
+
+// contains/sort/index_of для [int] и [str] — разные функции библиотеки.
+fn parse_list_typed_method(rt: int, nt: Token) -> int {
+    let et = ty_elem(rt)
+    var suffix = ""
+    if et == ty_int {
+        suffix = "_int"
+    } else if et == ty_bool && nt.text != "sort" {
+        suffix = "_bool"
+    } else if et == ty_str {
+        suffix = "_str"
+    } else {
+        error_tok(nt, "." + nt.text + "() works on lists of int or str, not " + ty_name(rt), "")
+        skip_call_args()
+        return ty_err
+    }
+    let fi = rt_func("__list_" + nt.text + suffix)
+    let f = funcs[fi]
+    emit_push(RAX)
+    advance()
+    let n = compile_args(f.params, 1, et, ty_err, ty_err, nt.text, nt) + 1
+    if n != f.params.len() {
+        emit_alu_imm(0, RSP, n * 8)
+        return f.ret
+    }
+    emit_call_args(fi, n)
+    last_was_call = true
+    return f.ret
+}
+
+// Методы словаря: has, get, remove, keys, values, clear.
+fn parse_map_method(rt: int, nt: Token) -> int {
+    let name = nt.text
+    let kt = types[rt].a
+    let vt = types[rt].b
+    emit_push(RAX)
+    advance()
+    var argc = 0
+    if name == "has" || name == "get" || name == "remove" || name == "contains" {
+        argc = 1
+    }
+    var n = 0
+    if argc == 1 {
+        let a = tok()
+        let t = parse_expr(kt)
+        coerce(t, kt, a)
+        emit_push(RAX)
+        n = 1
+    }
+    if !expect_tok(')') {
+        emit_alu_imm(0, RSP, (n + 1) * 8)
+        return ty_err
+    }
+    last_was_call = true
+    if argc == 1 {
+        emit_pop(RSI)
+    }
+    emit_pop(RDI)
+    if name == "has" || name == "contains" {
+        emit_call(rt_func("__map_has"))
+        return ty_bool
+    }
+    if name == "get" {
+        if is_ref(vt) {
+            emit_call(rt_func("__map_get_ref"))
+        } else {
+            emit_call(rt_func("__map_get_box"))
+        }
+        return ty_opt(vt)
+    }
+    if name == "remove" {
+        if is_ref(vt) {
+            emit_call(rt_func("__map_remove_ref"))
+        } else {
+            emit_call(rt_func("__map_remove_box"))
+        }
+        return ty_opt(vt)
+    }
+    if name == "keys" {
+        emit_call(rt_func("__map_keys"))
+        return ty_list(kt)
+    }
+    if name == "values" {
+        emit_mov_imm(RSI, esize_of(vt))
+        emit_call(rt_func("__map_values"))
+        return ty_list(vt)
+    }
+    if name == "clear" {
+        emit_call(rt_func("__map_clear"))
+        return ty_void
+    }
+    var hint = method_hint(name)
+    error_tok(nt, ty_name(rt) + " has no method '" + name + "'", hint)
+    return ty_err
+}

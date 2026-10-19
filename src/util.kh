@@ -1,0 +1,128 @@
+// Вспомогательные структуры компилятора: словарь строк в числа.
+
+// Хеш-таблица с открытой адресацией: строка → неотрицательное число.
+type StrMap {
+    keys: [str]
+    vals: [int]
+    slots: [int]
+    mask: int
+}
+
+fn smap_new() -> StrMap {
+    var slots: [int] = []
+    var i = 0
+    while i < 1024 {
+        slots.push(0)
+        i += 1
+    }
+    var keys: [str] = []
+    var vals: [int] = []
+    return StrMap { keys: keys, vals: vals, slots: slots, mask: 1023 }
+}
+
+// Хеш без переполнения: арифметика в Khrip проверяемая.
+fn str_hash(s: str) -> int {
+    var h = 5381
+    var i = 0
+    let n = s.len()
+    while i < n {
+        h = (h * 33 + s[i]) & 0xFFFFFFF
+        i += 1
+    }
+    return h
+}
+
+// Индекс слота для ключа: либо слот с этим ключом, либо пустой.
+fn smap_slot(m: StrMap, k: str) -> int {
+    var i = str_hash(k) & m.mask
+    while true {
+        let e = m.slots[i]
+        if e == 0 {
+            return i
+        }
+        if m.keys[e - 1] == k {
+            return i
+        }
+        i = (i + 1) & m.mask
+    }
+    return 0
+}
+
+fn smap_get(m: StrMap, k: str) -> int {
+    let e = m.slots[smap_slot(m, k)]
+    if e == 0 {
+        return -1
+    }
+    return m.vals[e - 1]
+}
+
+fn smap_grow(m: StrMap) {
+    let size = (m.mask + 1) * 2
+    var slots: [int] = []
+    var i = 0
+    while i < size {
+        slots.push(0)
+        i += 1
+    }
+    m.slots = slots
+    m.mask = size - 1
+    var j = 0
+    while j < m.keys.len() {
+        m.slots[smap_slot(m, m.keys[j])] = j + 1
+        j += 1
+    }
+}
+
+fn smap_put(m: StrMap, k: str, v: int) {
+    let s = smap_slot(m, k)
+    let e = m.slots[s]
+    if e != 0 {
+        m.vals[e - 1] = v
+        return
+    }
+    m.keys.push(k)
+    m.vals.push(v)
+    m.slots[s] = m.keys.len()
+    if m.keys.len() * 2 > m.mask {
+        smap_grow(m)
+    }
+}
+
+fn min_int(a: int, b: int) -> int {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+// Расстояние редактирования — для подсказок «может быть, вы имели в виду».
+fn edit_distance(a: str, b: str) -> int {
+    let n = a.len()
+    let m = b.len()
+    if n > 40 || m > 40 {
+        return 99
+    }
+    var prev: [int] = []
+    var j = 0
+    while j <= m {
+        prev.push(j)
+        j += 1
+    }
+    var i = 1
+    while i <= n {
+        var cur: [int] = []
+        cur.push(i)
+        j = 1
+        while j <= m {
+            var cost = 1
+            if a[i - 1] == b[j - 1] {
+                cost = 0
+            }
+            cur.push(min_int(min_int(prev[j] + 1, cur[j - 1] + 1), prev[j - 1] + cost))
+            j += 1
+        }
+        prev = cur
+        i += 1
+    }
+    return prev[m]
+}

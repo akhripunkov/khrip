@@ -1,0 +1,8 @@
+// expect: hint: parameters are read-only
+fn f(x: int) -> int {
+    x = x + 1
+    return x
+}
+fn main() {
+    print(f(1))
+}

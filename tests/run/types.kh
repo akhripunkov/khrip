@@ -1,0 +1,73 @@
+// Структуры, распространение полей, сокращения, T?, ??, let ... else, if let.
+type Point {
+    x: int
+    y: int
+}
+
+type NewUser {
+    name: str
+    age: int
+}
+
+type User {
+    id: int
+    ...NewUser
+}
+
+fn find(users: [User], id: int) -> User? {
+    for u in users {
+        if u.id == id {
+            return u
+        }
+    }
+    return none
+}
+
+fn half(x: int) -> int? {
+    if x % 2 != 0 {
+        return none
+    }
+    return x / 2
+}
+
+fn describe(users: [User], id: int) -> str {
+    let u = find(users, id) else {
+        return "no user " + id.to_str()
+    }
+    return u.name + " is " + u.age.to_str()
+}
+
+fn main() {
+    let p = Point { x: 3, y: 4 }
+    print(p.x * p.x + p.y * p.y)
+    var q = Point { y: 1, x: 2 }
+    q.x += 10
+    print(q.x + q.y)
+    let body = NewUser { name: "Ann", age: 30 }
+    let id = 7
+    let u = User { id, ...body }
+    print(u.id)
+    print(u.name)
+    let v = User { ...body, id: 8, age: 31 }
+    print(v.age)
+    var users: [User] = []
+    users.push(u)
+    users.push(v)
+    print(describe(users, 8))
+    print(describe(users, 9))
+    print(half(10) ?? -1)
+    print(half(7) ?? -1)
+    if let h = half(42) {
+        print(h)
+    }
+    if let h = half(43) {
+        print(h)
+    } else {
+        print("odd")
+    }
+    let missing = find(users, 100)
+    print(missing == none)
+    print(find(users, 7) != none)
+    let name = (find(users, 7) ?? v).name
+    print(name)
+}

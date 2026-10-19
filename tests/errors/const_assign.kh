@@ -1,6 +1,0 @@
-// expect: const_assign.kh:4: error: cannot assign to a constant (near 'LIMIT')
-const LIMIT = 10
-fn main() -> i64 {
-    LIMIT = 5
-    return 0
-}

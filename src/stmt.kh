@@ -1,0 +1,1646 @@
+// ============================================================================
+// Операторы, блоки, функции. Каждый оператор возвращает true, если после него
+// управление не идёт дальше (return, break, continue, бесконечный цикл).
+// ============================================================================
+
+var fn_ret_ty: int
+var loop_depth: int
+var brks: [int]
+var conts: [int]
+var ret_holes: [int]
+
+// Пропуск до начала следующего оператора после синтаксической ошибки.
+fn sync_stmt() {
+    let line = tok().line
+    var depth = 0
+    while kind() != T_EOF {
+        let k = kind()
+        if depth == 0 && (k == '}' || tok().line != line) {
+            break
+        }
+        if k == '(' || k == '[' || k == '\{' {
+            depth += 1
+        } else if k == ')' || k == ']' || k == '}' {
+            depth -= 1
+        }
+        advance()
+    }
+    panic_mode = false
+}
+
+fn parse_block() -> bool {
+    if !expect_tok('\{') {
+        sync_stmt()
+        return false
+    }
+    let saved = nlocals
+    var div = false
+    while kind() != '}' && kind() != T_EOF {
+        let before = pos
+        panic_mode = false
+        if parse_stmt() {
+            div = true
+        }
+        if panic_mode {
+            sync_stmt()
+        }
+        if pos == before {
+            advance()
+        }
+    }
+    expect_tok('}')
+    panic_mode = false
+    nlocals = saved
+    return div
+}
+
+fn is_assign_op(k: int) -> bool {
+    return k == '=' || k == T_PLUSEQ || k == T_MINUSEQ || k == T_STAREQ || k == T_SLASHEQ || k == T_PERCENTEQ
+}
+
+// Есть ли в операторе (до конца строки, вне скобок) присваивание.
+fn stmt_has_assign() -> bool {
+    let line = tok().line
+    var depth = 0
+    var j = pos
+    while j < toks.len() {
+        let t = toks[j]
+        if t.kind == T_EOF {
+            return false
+        }
+        if depth == 0 && j > pos && t.line != line {
+            return false
+        }
+        if t.kind == '(' || t.kind == '[' || t.kind == '\{' {
+            depth += 1
+        } else if t.kind == ')' || t.kind == ']' || t.kind == '}' {
+            if depth == 0 {
+                return false
+            }
+            depth -= 1
+        } else if depth == 0 && is_assign_op(t.kind) {
+            return true
+        }
+        j += 1
+    }
+    return false
+}
+
+fn parse_stmt() -> bool {
+    let t = tok()
+    let k = t.kind
+    last_was_call = false
+    if k == T_LET || k == T_VAR {
+        parse_let()
+        return false
+    }
+    if k == T_IF {
+        return parse_if()
+    }
+    if k == T_WHILE {
+        return parse_while()
+    }
+    if k == T_FOR {
+        parse_for()
+        return false
+    }
+    if k == T_RETURN {
+        parse_return()
+        return true
+    }
+    if k == T_BREAK || k == T_CONTINUE {
+        advance()
+        if loop_depth == 0 {
+            error_tok(t, t.text + " outside of a loop", "")
+            return true
+        }
+        if k == T_BREAK {
+            brks.push(emit_jmp())
+        } else {
+            conts.push(emit_jmp())
+        }
+        return true
+    }
+    if k == T_EXPECT {
+        parse_expect()
+        return false
+    }
+    if k == '\{' {
+        return parse_block()
+    }
+    if k == T_FN || k == T_TYPE {
+        syntax_error(t, "declarations are only allowed at the top level", "move it outside the function")
+        return false
+    }
+    if k == T_IDENT && (kind_at(pos + 1) == T_PLUSPLUS || kind_at(pos + 1) == T_MINUSMINUS) {
+        syntax_error(toks[pos + 1], "Khrip has no ++ and --", "use " + t.text + " += 1")
+        return false
+    }
+    if k == T_IDENT && stmt_has_assign() {
+        parse_assign()
+        return false
+    }
+    let ty = parse_expr(ty_err)
+    if !last_was_call && ty != ty_err && !panic_mode {
+        var hint = ""
+        if ty == ty_bool {
+            hint = "to assign, use = instead of =="
+        }
+        error_tok(t, "this expression is not used", hint)
+    }
+    return false
+}
+
+// ---- let и var ----
+
+fn zero_value(t: int, at: Token) -> bool {
+    let k = tkind(t)
+    if k == K_INT || k == K_BOOL || k == K_OPT {
+        emit_mov_imm(RAX, 0)
+        return true
+    }
+    if k == K_STR {
+        emit_mov_imm(RAX, const_str(""))
+        return true
+    }
+    if k == K_LIST {
+        emit_list_new(ty_elem(t))
+        return true
+    }
+    if k == K_MAP {
+        if types[t].a == ty_str {
+            emit_mov_imm(RDI, 1)
+        } else {
+            emit_mov_imm(RDI, 0)
+        }
+        emit_call(rt_func("__map_new"))
+        return true
+    }
+    if t != ty_err {
+        error_tok(at, "a value of type " + ty_name(t) + " needs an initial value", "write = " + ty_name(t) + " \{ ... }")
+    }
+    return false
+}
+
+fn parse_let() {
+    let kw = tok()
+    let mutable = kw.kind == T_VAR
+    advance()
+    if kw.kind == T_LET && tok().text == "mut" && kind_at(pos + 1) == T_IDENT {
+        error_tok(tok(), "Khrip has no let mut", "use var for a mutable variable")
+        advance()
+    }
+    let name = expect_ident()
+    if panic_mode {
+        return
+    }
+    var t = -1
+    if kind() == ':' {
+        advance()
+        t = parse_type()
+    }
+    if kind() != '=' {
+        if t >= 0 {
+            if !mutable {
+                error_tok(name, "let '" + name.text + "' needs a value", "write let " + name.text + " = ... or use var")
+            }
+            zero_value(t, name)
+            let li = declare_local(name.text, t, mutable)
+            emit_store_local(li)
+            return
+        }
+        syntax_error(tok(), "expected '=' after " + kw.text + " " + name.text, "")
+        return
+    }
+    advance()
+    let eq = tok()
+    var w = ty_err
+    if t >= 0 {
+        w = t
+    }
+    var et = parse_expr(w)
+    if kind() == T_ELSE {
+        // let x = optional else { выход }
+        let et_tok = tok()
+        advance()
+        if tkind(et) != K_OPT {
+            if et != ty_err {
+                error_tok(et_tok, "let ... else needs an optional value, found " + ty_name(et), "")
+            }
+        } else {
+            emit_test_rax()
+            let has = emit_jcc(CC_NE)
+            let div = parse_block()
+            if !div {
+                error_tok(et_tok, "the else block must leave the scope", "end it with return, break or continue")
+            }
+            patch_here(has)
+            et = ty_inner(et)
+            if !is_ref(et) {
+                emit_load(RAX, RAX, 0)
+            }
+        }
+    }
+    var final_t = et
+    if t >= 0 {
+        final_t = coerce(et, t, eq)
+    } else if et == ty_none {
+        error_tok(eq, "cannot infer the type of none", "annotate: let " + name.text + ": User? = none")
+        final_t = ty_err
+    } else if et == ty_void {
+        error_tok(eq, "this expression has no value", "")
+        final_t = ty_err
+    }
+    let li = declare_local(name.text, final_t, mutable)
+    emit_store_local(li)
+}
+
+// ---- Присваивание ----
+
+fn compound_op(k: int) -> int {
+    if k == T_PLUSEQ {
+        return '+'
+    }
+    if k == T_MINUSEQ {
+        return '-'
+    }
+    if k == T_STAREQ {
+        return '*'
+    }
+    if k == T_SLASHEQ {
+        return '/'
+    }
+    return '%'
+}
+
+// Левое значение в стеке, правое разбирается здесь → результат в rax.
+fn compound_value(op_k: int, lt: int, at: Token) {
+    let op = compound_op(op_k)
+    if lt == ty_str && op == '+' {
+        let rt = parse_expr(ty_str)
+        coerce(rt, ty_str, at)
+        emit_mov_rr(RSI, RAX)
+        emit_pop(RDI)
+        emit_call(rt_func("__str_concat"))
+        return
+    }
+    check_int(lt, at, op)
+    let rt = parse_expr(ty_int)
+    check_int(rt, at, op)
+    emit_mov_rr(RCX, RAX)
+    emit_pop(RAX)
+    emit_arith_rcx(op, at)
+}
+
+fn parse_assign() {
+    let t = tok()
+    if is_assign_op(kind_at(pos + 1)) {
+        advance()
+        let op = kind()
+        let at = tok()
+        advance()
+        assign_name(t, op, at)
+        return
+    }
+    advance()
+    var ty = load_name_value(t)
+    while !panic_mode {
+        let k = kind()
+        if k == '.' {
+            if kind_at(pos + 1) == T_IDENT && is_assign_op(kind_at(pos + 2)) {
+                advance()
+                let f = tok()
+                advance()
+                let op = kind()
+                let at = tok()
+                advance()
+                assign_field(ty, f, op, at)
+                return
+            }
+            advance()
+            let nt = expect_ident()
+            if kind() == '(' {
+                ty = parse_method(ty, nt)
+            } else {
+                ty = field_load(ty, nt)
+            }
+        } else if k == '[' {
+            let close = matching_close(pos)
+            if is_assign_op(kind_at(close + 1)) {
+                assign_index(ty)
+                return
+            }
+            ty = parse_index(ty)
+        } else {
+            syntax_error(tok(), "expected an assignment, found " + tok_show(tok()), "")
+            return
+        }
+    }
+}
+
+fn load_name_value(t: Token) -> int {
+    let li = find_local(t.text)
+    if li >= 0 {
+        emit_load_local(li)
+        return locals[li].ty
+    }
+    let s = sym_find(t.text)
+    if s >= 0 && sym_kind(s) == SK_GLOBAL {
+        let g = globals[sym_idx(s)]
+        if g.is_store {
+            store_touch()
+        }
+        emit_load_abs(RAX, g.addr)
+        return g.ty
+    }
+    error_tok(t, "unknown name '" + t.text + "'", unknown_name_hint(t.text))
+    return ty_err
+}
+
+// Простое x op= операнд для int-переменной без rax.
+fn fast_compound(li: int, op_k: int, at: Token) -> bool {
+    let l = locals[li]
+    if l.ty != ty_int || (op_k != T_PLUSEQ && op_k != T_MINUSEQ) {
+        return false
+    }
+    if !peek_simple(3) || kind_at(pos + 1) == T_QQ || !ends_stmt(pos + 1) {
+        return false
+    }
+    if op_kind == OPK_LOCAL {
+        if !is_int_like(op_ty) {
+            return false
+        }
+        advance()
+        var opc = 0x01
+        if op_k == T_MINUSEQ {
+            opc = 0x29
+        }
+        let src = locals[op_val]
+        var sreg = src.reg
+        if sreg < 0 {
+            emit_load(RAX, RBP, src.off)
+            sreg = RAX
+        }
+        if l.reg >= 0 {
+            emit_rr(opc, sreg, l.reg)
+        } else {
+            emit_mem(opc, sreg, RBP, l.off)
+        }
+        emit_overflow_check(at)
+        return true
+    }
+    if op_kind != OPK_IMM {
+        return false
+    }
+    let v = op_val
+    advance()
+    var ext = 0
+    if op_k == T_MINUSEQ {
+        ext = 5
+    }
+    if l.reg >= 0 {
+        emit_alu_imm(ext, l.reg, v)
+    } else {
+        emit8(0x48)
+        if v >= -128 && v <= 127 {
+            emit8(0x83)
+            emit8(0x85 | (ext << 3))
+            emit32(l.off)
+            emit8(v & 255)
+        } else {
+            emit8(0x81)
+            emit8(0x85 | (ext << 3))
+            emit32(l.off)
+            emit32(v & 0xFFFFFFFF)
+        }
+    }
+    emit_overflow_check(at)
+    return true
+}
+
+// x op= выражение для int-переменной: выражение в rax, затем op прямо в
+// регистр или ячейку переменной, без промежуточного стека.
+fn direct_compound(li: int, op_k: int, at: Token) {
+    let vtok = tok()
+    let rt = parse_expr(ty_int)
+    check_int(rt, vtok, compound_op(op_k))
+    let l = locals[li]
+    if op_k == T_STAREQ {
+        if l.reg >= 0 {
+            // imul reg, rax
+            emit8(0x48 | ((l.reg >> 3) << 2))
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0xC0 | ((l.reg & 7) << 3))
+            emit_overflow_check(at)
+        } else {
+            // imul rax, [rbp+off]
+            emit8(0x48)
+            emit8(0x0F)
+            emit8(0xAF)
+            emit8(0x85)
+            emit32(l.off)
+            emit_overflow_check(at)
+            emit_store(RBP, l.off, RAX)
+        }
+        return
+    }
+    var opc = 0x01
+    if op_k == T_MINUSEQ {
+        opc = 0x29
+    }
+    if l.reg >= 0 {
+        emit_rr(opc, RAX, l.reg)
+    } else {
+        emit_mem(opc, RAX, RBP, l.off)
+    }
+    emit_overflow_check(at)
+}
+
+// Токен i завершает оператор: новая строка, } или конец файла.
+fn ends_stmt(i: int) -> bool {
+    let k = kind_at(i)
+    return k == '}' || k == T_EOF || toks[i].line != toks[i - 1].line
+}
+
+fn kind_line(i: int) -> int {
+    if i >= toks.len() {
+        return 0
+    }
+    return toks[i].line
+}
+
+fn assign_name(t: Token, op: int, at: Token) {
+    let name = t.text
+    let li = find_local(name)
+    if li >= 0 {
+        let l = locals[li]
+        if !l.mutable {
+            var hint = "declare it with var to make it mutable"
+            if l.off > 0 || is_param(name) {
+                hint = "parameters are read-only; copy it first: var " + name + "2 = " + name
+            }
+            error_tok(t, "cannot assign to '" + name + "': it is declared with let", hint)
+        }
+        if op != '=' && fast_compound(li, op, at) {
+            return
+        }
+        if (op == T_PLUSEQ || op == T_MINUSEQ || op == T_STAREQ) && l.ty == ty_int {
+            direct_compound(li, op, at)
+            return
+        }
+        if op == '=' {
+            let vtok = tok()
+            let vt = parse_expr(l.ty)
+            coerce(vt, l.ty, vtok)
+        } else {
+            emit_load_local(li)
+            emit_push(RAX)
+            compound_value(op, l.ty, at)
+        }
+        emit_store_local(li)
+        return
+    }
+    let s = sym_find(name)
+    if s < 0 {
+        error_tok(t, "unknown name '" + name + "'", unknown_name_hint(name))
+        parse_expr(ty_err)
+        return
+    }
+    let sk = sym_kind(s)
+    if sk != SK_GLOBAL {
+        if sk == SK_CONST {
+            error_tok(t, "cannot assign to constant '" + name + "'", "use var for a value that changes")
+        } else {
+            error_tok(t, "cannot assign to '" + name + "'", "")
+        }
+        parse_expr(ty_err)
+        return
+    }
+    let g = globals[sym_idx(s)]
+    if g.is_store {
+        store_touch()
+    }
+    if op == '=' {
+        let vtok = tok()
+        let vt = parse_expr(g.ty)
+        coerce(vt, g.ty, vtok)
+    } else {
+        emit_load_abs(RAX, g.addr)
+        emit_push(RAX)
+        compound_value(op, g.ty, at)
+    }
+    if g.is_store {
+        store_write(g.ty)
+    }
+    emit_store_abs(g.addr, RAX)
+}
+
+fn is_param(name: str) -> bool {
+    if inline_depth > 0 {
+        return false
+    }
+    for p in funcs[cur_fn].params {
+        if p.name == name {
+            return true
+        }
+    }
+    return false
+}
+
+// Указатель на структуру в rax.
+fn assign_field(t: int, f: Token, op: int, at: Token) {
+    if t == ty_err {
+        parse_expr(ty_err)
+        return
+    }
+    if tkind(t) != K_STRUCT {
+        if tkind(t) == K_OPT {
+            error_tok(f, "the value may be none; unwrap it before assigning ." + f.text, "")
+        } else {
+            error_tok(f, ty_name(t) + " has no field '" + f.text + "'", "")
+        }
+        parse_expr(ty_err)
+        return
+    }
+    let si = types[t].a
+    let fi = field_find(si, f.text)
+    if fi < 0 {
+        error_tok(f, "type '" + structs[si].name + "' has no field '" + f.text + "'", "")
+        parse_expr(ty_err)
+        return
+    }
+    let ft = structs[si].fields[fi].ty
+    emit_push(RAX)
+    if op == '=' {
+        let vt = parse_expr(ft)
+        coerce(vt, ft, at)
+    } else {
+        emit_load(RAX, RAX, fi * 8)
+        emit_push(RAX)
+        compound_value(op, ft, at)
+    }
+    emit_pop(RCX)
+    emit_store(RCX, fi * 8, RAX)
+}
+
+// Получатель в rax, текущий токен — '['.
+fn assign_index(t: int) {
+    let at = tok()
+    advance()
+    let k = tkind(t)
+    if k == K_MAP {
+        let kt = types[t].a
+        let vt = types[t].b
+        emit_push(RAX)
+        let kt_tok = tok()
+        let it = parse_expr(kt)
+        coerce(it, kt, kt_tok)
+        expect_tok(']')
+        emit_push(RAX)
+        let op = kind()
+        let opt = tok()
+        advance()
+        if op == '=' {
+            let v = parse_expr(vt)
+            coerce(v, vt, opt)
+        } else {
+            if vt != ty_int && !(vt == ty_str && op == T_PLUSEQ) {
+                error_tok(opt, "compound assignment on a map needs int values", "")
+            }
+            emit_load(RSI, RSP, 0)
+            emit_load(RDI, RSP, 8)
+            if vt == ty_str {
+                emit_call(rt_func("__map_get_or_empty"))
+            } else {
+                emit_call(rt_func("__map_get_or0"))
+            }
+            emit_push(RAX)
+            compound_value(op, vt, opt)
+        }
+        if is_store_value(t) {
+            store_write(vt)
+        }
+        emit_mov_rr(RDX, RAX)
+        emit_pop(RSI)
+        emit_pop(RDI)
+        emit_call(rt_func("__map_set"))
+        return
+    }
+    if k == K_STR {
+        error_tok(at, "strings are immutable", "build a new string, e.g. s[..i] + \"x\" + s[i + 1..]")
+    } else if k != K_LIST && t != ty_err {
+        error_tok(at, ty_name(t) + " cannot be indexed", "")
+    }
+    if k == K_LIST && fast_index_store(t, at) {
+        return
+    }
+    emit_push(RAX)
+    let it = parse_expr(ty_int)
+    if it != ty_int && it != ty_err {
+        error_tok(at, "index must be int", "")
+    }
+    expect_tok(']')
+    emit_push(RAX)
+    var et = ty_err
+    if k == K_LIST {
+        et = ty_elem(t)
+    }
+    let op = kind()
+    let opt = tok()
+    advance()
+    if op == '=' {
+        let v = parse_expr(et)
+        coerce(v, et, opt)
+    } else {
+        emit_load(RCX, RSP, 0)
+        emit_load(RAX, RSP, 8)
+        emit_bounds_check(at)
+        emit_load(RAX, RAX, 0)
+        emit8(0x48)
+        emit8(0x8B)
+        emit8(0x04)
+        emit8(0xC8)
+        emit_push(RAX)
+        compound_value(op, et, opt)
+    }
+    emit_mov_rr(RDX, RAX)
+    emit_pop(RCX)
+    emit_pop(RAX)
+    emit_bounds_check(at)
+    emit_load(RAX, RAX, 0)
+    if et == ty_bool {
+        // mov [rax + rcx], dl
+        emit8(0x88)
+        emit8(0x14)
+        emit8(0x08)
+        return
+    }
+    // mov [rax + rcx*8], rdx
+    emit8(0x48)
+    emit8(0x89)
+    emit8(0x14)
+    emit8(0xC8)
+}
+
+// xs[i] = v, где i и v — константы или локальные: без стека.
+// Получатель в rax, текущий токен — сразу после '['.
+fn fast_index_store(t: int, at: Token) -> bool {
+    if !peek_simple(1) || !is_int_like(op_ty) || kind_at(pos + 1) != ']' || kind_at(pos + 2) != '=' {
+        return false
+    }
+    let et = ty_elem(t)
+    let ik = op_kind
+    let iv = op_val
+    let save = pos
+    pos += 3
+    if !peek_simple(1) || !ends_stmt(pos + 1) || !assignable(op_ty, et) || op_ty == ty_none {
+        pos = save
+        return false
+    }
+    // индекс → rcx, значение → rdx
+    op_kind = ik
+    op_val = iv
+    load_operand(RCX)
+    pos += 0
+    peek_simple(1)
+    load_operand(RDX)
+    advance()
+    emit_bounds_check(at)
+    emit_load(RAX, RAX, 0)
+    if et == ty_bool {
+        emit8(0x88)
+        emit8(0x14)
+        emit8(0x08)
+    } else {
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0x14)
+        emit8(0xC8)
+    }
+    return true
+}
+
+// ---- Условия: переходы вместо вычисления 0/1 ----
+
+fn parse_cond(fl: [int]) {
+    let saved = no_struct
+    no_struct = true
+    cond_or(fl)
+    no_struct = saved
+}
+
+fn cond_or(fl: [int]) {
+    var local_fl: [int] = []
+    cond_and(local_fl)
+    if kind() != T_OROR {
+        for x in local_fl {
+            fl.push(x)
+        }
+        return
+    }
+    var tl: [int] = []
+    while kind() == T_OROR {
+        advance()
+        tl.push(emit_jmp())
+        let h = here()
+        for x in local_fl {
+            patch_rel(x, h)
+        }
+        local_fl = []
+        cond_and(local_fl)
+    }
+    for x in local_fl {
+        fl.push(x)
+    }
+    let body = here()
+    for x in tl {
+        patch_rel(x, body)
+    }
+}
+
+fn cond_and(fl: [int]) {
+    cond_cmp(fl)
+    while kind() == T_ANDAND {
+        advance()
+        cond_cmp(fl)
+    }
+}
+
+// x < y, где x — локальная в регистре, а y — константа или локальная:
+// cmp без пересылки в rax. → условие или -1.
+fn try_reg_compare() -> int {
+    let t = tok()
+    if t.kind != T_IDENT || !is_cmp_op(kind_at(pos + 1)) {
+        return -1
+    }
+    let li = find_local(t.text)
+    if li < 0 || locals[li].reg < 0 || !is_int_like(locals[li].ty) {
+        return -1
+    }
+    let save = pos
+    pos += 2
+    let nk = kind_at(pos + 1)
+    if !peek_simple(3) || !is_int_like(op_ty) || (nk != '\{' && nk != T_ANDAND && nk != T_OROR) {
+        pos = save
+        return -1
+    }
+    let op = kind_at(save + 1)
+    let r = locals[li].reg
+    if op_kind == OPK_IMM {
+        emit_alu_imm(7, r, op_val)
+    } else {
+        let l2 = locals[op_val]
+        if l2.reg >= 0 {
+            emit_rr(0x39, l2.reg, r)
+        } else {
+            emit_mem(0x3B, r, RBP, l2.off)
+        }
+    }
+    advance()
+    return cmp_cc(op)
+}
+
+fn cond_cmp(fl: [int]) {
+    let rc = try_reg_compare()
+    if rc >= 0 {
+        fl.push(emit_jcc(rc ^ 1))
+        return
+    }
+    let at = tok()
+    want = ty_err
+    var lt = parse_add()
+    if is_cmp_op(kind()) {
+        let op = kind()
+        advance()
+        let cc = emit_compare(op, lt, at)
+        fl.push(emit_jcc(cc ^ 1))
+        if is_cmp_op(kind()) {
+            error_tok(tok(), "comparisons cannot be chained", "write a < b && b < c")
+        }
+        return
+    }
+    if kind() == T_QQ {
+        lt = coalesce_rest(lt)
+    }
+    if lt != ty_bool && lt != ty_err {
+        var hint = mismatch_hint(lt, ty_bool)
+        if tkind(lt) == K_OPT {
+            hint = "check for none explicitly: x != none, or unwrap with if let v = x"
+        }
+        error_tok(at, "condition must be bool, found " + ty_name(lt), hint)
+    }
+    emit_test_rax()
+    fl.push(emit_jcc(CC_E))
+}
+
+// Продолжение «??» в условии, когда левая часть уже вычислена.
+fn coalesce_rest(lt: int) -> int {
+    let at = tok()
+    advance()
+    if tkind(lt) != K_OPT {
+        error_tok(at, "?? needs an optional value on the left", "")
+        parse_add()
+        return ty_err
+    }
+    let inner = ty_inner(lt)
+    emit_test_rax()
+    let has = emit_jcc(CC_NE)
+    want = inner
+    let rt = parse_add()
+    coerce(rt, inner, at)
+    let done = emit_jmp()
+    patch_here(has)
+    if !is_ref(inner) {
+        emit_load(RAX, RAX, 0)
+    }
+    patch_here(done)
+    return inner
+}
+
+fn patch_all(holes: [int], target: int) {
+    for h in holes {
+        patch_rel(h, target)
+    }
+}
+
+// if условие { break } / { continue } без else: один условный переход.
+fn try_branch_if() -> bool {
+    if loop_depth == 0 {
+        return false
+    }
+    // условие без && и || до {
+    var j = pos
+    var depth = 0
+    while j < toks.len() {
+        let k = toks[j].kind
+        if depth == 0 && k == '\{' {
+            break
+        }
+        if k == '(' || k == '[' {
+            depth += 1
+        } else if k == ')' || k == ']' {
+            depth -= 1
+        } else if k == T_ANDAND || k == T_OROR || k == T_EOF {
+            return false
+        }
+        j += 1
+    }
+    let k1 = kind_at(j + 1)
+    if (k1 != T_BREAK && k1 != T_CONTINUE) || kind_at(j + 2) != '}' || kind_at(j + 3) == T_ELSE {
+        return false
+    }
+    let saved = no_struct
+    no_struct = true
+    var tl: [int] = []
+    cond_cmp_true(tl)
+    no_struct = saved
+    pos = j + 3
+    for h in tl {
+        if k1 == T_BREAK {
+            brks.push(h)
+        } else {
+            conts.push(h)
+        }
+    }
+    return true
+}
+
+// Как cond_cmp, но переход — когда условие истинно.
+fn cond_cmp_true(tl: [int]) {
+    let rc = try_reg_compare()
+    if rc >= 0 {
+        tl.push(emit_jcc(rc))
+        return
+    }
+    let at = tok()
+    want = ty_err
+    let lt = parse_add()
+    if is_cmp_op(kind()) {
+        let op = kind()
+        advance()
+        let cc = emit_compare(op, lt, at)
+        tl.push(emit_jcc(cc))
+        return
+    }
+    if lt != ty_bool && lt != ty_err {
+        error_tok(at, "condition must be bool, found " + ty_name(lt), mismatch_hint(lt, ty_bool))
+    }
+    emit_test_rax()
+    tl.push(emit_jcc(CC_NE))
+}
+
+fn parse_if() -> bool {
+    advance()
+    if kind() == T_LET {
+        return parse_if_let()
+    }
+    if try_branch_if() {
+        return false
+    }
+    var fl: [int] = []
+    parse_cond(fl)
+    let d1 = parse_block()
+    if kind() != T_ELSE {
+        patch_all(fl, here())
+        return false
+    }
+    advance()
+    var end = -1
+    if !d1 {
+        end = emit_jmp()
+    }
+    patch_all(fl, here())
+    var d2 = false
+    if kind() == T_IF {
+        d2 = parse_if()
+    } else {
+        d2 = parse_block()
+    }
+    if end >= 0 {
+        patch_here(end)
+    }
+    return d1 && d2
+}
+
+// if let x = optional { ... } else { ... }
+fn parse_if_let() -> bool {
+    advance()
+    let name = expect_ident()
+    if !expect_tok('=') {
+        return false
+    }
+    let at = tok()
+    let saved = no_struct
+    no_struct = true
+    let t = parse_expr(ty_err)
+    no_struct = saved
+    var inner = t
+    if tkind(t) != K_OPT {
+        if t != ty_err {
+            error_tok(at, "if let needs an optional value, found " + ty_name(t), "use a plain if")
+        }
+    } else {
+        inner = ty_inner(t)
+    }
+    emit_test_rax()
+    let none_at = emit_jcc(CC_E)
+    if !is_ref(inner) && inner != ty_err {
+        emit_load(RAX, RAX, 0)
+    }
+    let saved_n = nlocals
+    let li = declare_local(name.text, inner, false)
+    emit_store_local(li)
+    let d1 = parse_block()
+    nlocals = saved_n
+    if kind() != T_ELSE {
+        patch_here(none_at)
+        return false
+    }
+    advance()
+    var end = -1
+    if !d1 {
+        end = emit_jmp()
+    }
+    patch_here(none_at)
+    var d2 = false
+    if kind() == T_IF {
+        d2 = parse_if()
+    } else {
+        d2 = parse_block()
+    }
+    if end >= 0 {
+        patch_here(end)
+    }
+    return d1 && d2
+}
+
+// ---- Циклы ----
+
+fn loop_begin() -> int {
+    loop_depth += 1
+    return brks.len() * 65536 + conts.len()
+}
+
+// Направить break на exit, continue на cont и вернуть счётчики.
+fn loop_end(mark: int, cont: int, exit: int) -> bool {
+    let bb = mark / 65536
+    let cb = mark % 65536
+    let had_break = brks.len() > bb
+    while conts.len() > cb {
+        patch_rel(conts.pop(), cont)
+    }
+    while brks.len() > bb {
+        patch_rel(brks.pop(), exit)
+    }
+    loop_depth -= 1
+    return had_break
+}
+
+fn parse_while() -> bool {
+    advance()
+    let top = here()
+    var fl: [int] = []
+    let infinite = kind() == T_TRUE && kind_at(pos + 1) == '\{'
+    if infinite {
+        advance()
+    } else {
+        parse_cond(fl)
+    }
+    let mark = loop_begin()
+    parse_block()
+    emit_jmp_to(top)
+    let exit = here()
+    patch_all(fl, exit)
+    let had_break = loop_end(mark, top, exit)
+    return infinite && !had_break
+}
+
+fn parse_for() {
+    let ft = tok()
+    advance()
+    let n1 = expect_ident()
+    var two = false
+    var n2 = n1
+    if kind() == ',' {
+        advance()
+        n2 = expect_ident()
+        two = true
+    }
+    if panic_mode {
+        return
+    }
+    if !expect_tok(T_IN) {
+        return
+    }
+    let saved_n = nlocals
+    let saved_ns = no_struct
+    no_struct = true
+    let at = tok()
+    let t = parse_expr(ty_err)
+    if kind() == T_DOTDOT || kind() == T_DOTDOTEQ {
+        let inclusive = kind() == T_DOTDOTEQ
+        advance()
+        if t != ty_int && t != ty_err {
+            error_tok(at, "range bounds must be int, found " + ty_name(t), "")
+        }
+        if two {
+            error_tok(n2, "a range loop has one variable", "for i in a..b")
+        }
+        for_range(n1, inclusive, saved_ns)
+    } else {
+        no_struct = saved_ns
+        let k = tkind(t)
+        if k == K_LIST || k == K_STR {
+            for_list(n1, n2, two, t)
+        } else if k == K_MAP {
+            for_map(n1, n2, two, t)
+        } else {
+            if t != ty_err {
+                var hint = ""
+                if t == ty_int {
+                    hint = "to count, use a range: for i in 0..n"
+                } else if tkind(t) == K_OPT {
+                    hint = "unwrap the optional first"
+                }
+                error_tok(at, "cannot loop over " + ty_name(t), hint)
+            }
+            parse_block()
+        }
+    }
+    nlocals = saved_n
+}
+
+// Сравнить локальную a с локальной b (или числом) и перейти, если меньше.
+fn emit_loop_test(i_li: int, lim_li: int, lim_imm: int, use_imm: bool, inclusive: bool, top: int) {
+    let il = locals[i_li]
+    var lhs = RAX
+    if il.reg >= 0 {
+        lhs = il.reg
+    } else {
+        emit_load(RAX, RBP, il.off)
+    }
+    if use_imm {
+        emit_alu_imm(7, lhs, lim_imm)
+    } else {
+        let ll = locals[lim_li]
+        if ll.reg >= 0 {
+            emit_rr(0x39, ll.reg, lhs)
+        } else {
+            emit_mem(0x3B, lhs, RBP, ll.off)
+        }
+    }
+    if inclusive {
+        emit_jcc_to(CC_LE, top)
+    } else {
+        emit_jcc_to(CC_L, top)
+    }
+}
+
+fn emit_inc_local(li: int) {
+    let l = locals[li]
+    if l.reg >= 0 {
+        emit_alu_imm(0, l.reg, 1)
+    } else {
+        // add qword [rbp+off], 1
+        emit8(0x48)
+        emit8(0x83)
+        emit8(0x85)
+        emit32(l.off)
+        emit8(1)
+    }
+}
+
+// for i in a..b: начало в rax.
+fn for_range(n1: Token, inclusive: bool, saved_ns: bool) {
+    emit_push(RAX)
+    var use_imm = false
+    var lim_imm = 0
+    var lim = -1
+    let lt = tok()
+    if peek_simple(3) && op_kind == OPK_IMM && op_ty == ty_int && kind_at(pos + 1) == '\{' {
+        use_imm = true
+        lim_imm = op_val
+        advance()
+    } else {
+        let t2 = parse_expr(ty_int)
+        if t2 != ty_int && t2 != ty_err {
+            error_tok(lt, "range bounds must be int", "")
+        }
+        lim = hidden_local(ty_int)
+        emit_store_local(lim)
+    }
+    no_struct = saved_ns
+    emit_pop(RAX)
+    let i_li = declare_local(n1.text, ty_int, false)
+    emit_store_local(i_li)
+    let test_at = emit_jmp()
+    align16()
+    let top = here()
+    let mark = loop_begin()
+    parse_block()
+    let cont = here()
+    emit_inc_local(i_li)
+    patch_here(test_at)
+    emit_loop_test(i_li, lim, lim_imm, use_imm, inclusive, top)
+    let exit = here()
+    loop_end(mark, cont, exit)
+    if lim >= 0 {
+        release_hidden(lim)
+    }
+}
+
+// for x in список / строка (байты); for i, x in ...
+fn for_list(n1: Token, n2: Token, two: bool, t: int) {
+    let is_str = tkind(t) == K_STR
+    let lst = hidden_local(t)
+    emit_store_local(lst)
+    var idx = -1
+    if two {
+        idx = declare_local(n1.text, ty_int, false)
+    } else {
+        idx = hidden_local(ty_int)
+    }
+    emit_mov_imm(RAX, 0)
+    emit_store_local(idx)
+    var et = ty_int
+    if !is_str {
+        et = ty_elem(t)
+    }
+    var xname = n1.text
+    if two {
+        xname = n2.text
+    }
+    let x = declare_local(xname, et, false)
+    let test_at = emit_jmp()
+    align16()
+    let top = here()
+    // x = данные[idx]
+    emit_load_local(lst)
+    emit_load(RAX, RAX, 0)
+    let il = locals[idx]
+    if il.reg >= 0 {
+        emit_mov_rr(RCX, il.reg)
+    } else {
+        emit_load(RCX, RBP, il.off)
+    }
+    if is_str || et == ty_bool {
+        emit8(0x0F)
+        emit8(0xB6)
+        emit8(0x04)
+        emit8(0x08)
+    } else {
+        emit8(0x48)
+        emit8(0x8B)
+        emit8(0x04)
+        emit8(0xC8)
+    }
+    emit_store_local(x)
+    let mark = loop_begin()
+    parse_block()
+    let cont = here()
+    emit_inc_local(idx)
+    patch_here(test_at)
+    // idx < len
+    emit_load_local(lst)
+    emit_mov_rr(RCX, RAX)
+    if il.reg >= 0 {
+        emit_mov_rr(RAX, il.reg)
+    } else {
+        emit_load(RAX, RBP, il.off)
+    }
+    emit_mem(0x3B, RAX, RCX, 8)
+    emit_jcc_to(CC_L, top)
+    let exit = here()
+    loop_end(mark, cont, exit)
+    release_hidden(lst)
+    if !two {
+        release_hidden(idx)
+    }
+}
+
+// for k, v in словарь; for k in словарь. Записи хранятся по порядку вставки,
+// удалённые помечены нулём в списке alive.
+fn for_map(n1: Token, n2: Token, two: bool, t: int) {
+    let m = hidden_local(t)
+    emit_store_local(m)
+    let idx = hidden_local(ty_int)
+    emit_mov_imm(RAX, 0)
+    emit_store_local(idx)
+    let k_li = declare_local(n1.text, types[t].a, false)
+    var v_li = -1
+    if two {
+        v_li = declare_local(n2.text, types[t].b, false)
+    }
+    let test_at = emit_jmp()
+    let top = here()
+    let il = locals[idx]
+    if il.reg >= 0 {
+        emit_mov_rr(RCX, il.reg)
+    } else {
+        emit_load(RCX, RBP, il.off)
+    }
+    // alive[idx]
+    emit_load_local(m)
+    emit_load(RAX, RAX, 24)
+    emit_load(RAX, RAX, 0)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x04)
+    emit8(0xC8)
+    emit_test_rax()
+    let dead = emit_jcc(CC_E)
+    // k = keys[idx]
+    emit_load_local(m)
+    emit_load(RAX, RAX, 0)
+    emit_load(RAX, RAX, 0)
+    emit8(0x48)
+    emit8(0x8B)
+    emit8(0x04)
+    emit8(0xC8)
+    emit_store_local(k_li)
+    if two {
+        emit_load_local(m)
+        emit_load(RAX, RAX, 16)
+        emit_load(RAX, RAX, 0)
+        emit8(0x48)
+        emit8(0x8B)
+        emit8(0x04)
+        emit8(0xC8)
+        emit_store_local(v_li)
+    }
+    let mark = loop_begin()
+    parse_block()
+    let cont = here()
+    patch_rel(dead, cont)
+    emit_inc_local(idx)
+    patch_here(test_at)
+    emit_load_local(m)
+    emit_load(RCX, RAX, 0)
+    if il.reg >= 0 {
+        emit_mov_rr(RAX, il.reg)
+    } else {
+        emit_load(RAX, RBP, il.off)
+    }
+    emit_mem(0x3B, RAX, RCX, 8)
+    emit_jcc_to(CC_L, top)
+    let exit = here()
+    loop_end(mark, cont, exit)
+    release_hidden(m)
+    release_hidden(idx)
+}
+
+// ---- return ----
+
+fn parse_return() {
+    let at = tok()
+    advance()
+    let has_value = kind() != '}' && kind() != T_EOF && tok().line == at.line
+    if route_ctx >= 0 && inline_depth == 0 {
+        route_return(at, has_value)
+        return
+    }
+    if has_value {
+        if fn_ret_ty == ty_void {
+            error_tok(at, "this function returns nothing, but return has a value", "declare the result type: fn name(...) -> int")
+            parse_expr(ty_err)
+        } else {
+            let vt = tok()
+            let t = parse_expr(fn_ret_ty)
+            coerce(t, fn_ret_ty, vt)
+        }
+    } else if fn_ret_ty != ty_void {
+        error_tok(at, "return needs a value of type " + ty_name(fn_ret_ty), "")
+    }
+    if inline_depth > 0 {
+        inline_rets.push(emit_jmp())
+    } else {
+        ret_holes.push(emit_jmp())
+    }
+}
+
+// ---- Функции ----
+
+// Какие локальные получат регистры: вес использования в цикле глубины d — 8^d.
+fn plan_regs(fi: int) {
+    plan = smap_new()
+    plan_mask = 0
+    let f = funcs[fi]
+    let index = smap_new()
+    var names: [str] = []
+    var weight: [int] = []
+    var decls: [int] = []
+    for p in f.params {
+        smap_put(index, p.name, names.len())
+        names.push(p.name)
+        weight.push(0)
+        decls.push(1)
+    }
+    var depth = 0
+    var loops: [int] = []
+    var pending = false
+    var has_for = false
+    var i = f.body
+    while i <= f.body_end {
+        let k = toks[i].kind
+        if k == T_WHILE || k == T_FOR {
+            pending = true
+            if k == T_FOR {
+                has_for = true
+            }
+        } else if k == '\{' {
+            depth += 1
+            if pending {
+                loops.push(depth)
+                pending = false
+            }
+        } else if k == '}' {
+            if loops.len() > 0 && loops[loops.len() - 1] == depth {
+                loops.pop()
+            }
+            depth -= 1
+        } else if k == T_IDENT {
+            let name = toks[i].text
+            var ix = smap_get(index, name)
+            if ix < 0 {
+                ix = names.len()
+                smap_put(index, name, ix)
+                names.push(name)
+                weight.push(0)
+                decls.push(0)
+            }
+            let prev = toks[i - 1].kind
+            if prev == T_LET || prev == T_VAR || prev == T_FOR || (prev == ',' && i >= 3 && toks[i - 3].kind == T_FOR) {
+                decls[ix] += 1
+            }
+            var d = loops.len()
+            if d > 4 {
+                d = 4
+            }
+            weight[ix] += 1 << (3 * d)
+        }
+        i += 1
+    }
+    var cap = 5
+    if has_for {
+        cap = 3
+    }
+    var k = 0
+    while k < cap {
+        var best = -1
+        var best_w = 2
+        var j = 0
+        while j < names.len() {
+            if decls[j] == 1 && weight[j] > best_w && smap_get(plan, names[j]) < 0 {
+                best = j
+                best_w = weight[j]
+            }
+            j += 1
+        }
+        if best < 0 {
+            break
+        }
+        smap_put(plan, names[best], k)
+        plan_mask = plan_mask | (1 << k)
+        k += 1
+    }
+}
+
+fn begin_fn(fi: int) -> int {
+    cur_fn = fi
+    align16()
+    funcs[fi].code = here()
+    nlocals = 0
+    local_floor = 0
+    frame = 0
+    used_regs = 0
+    temp_regs = 0
+    loop_depth = 0
+    brks.clear()
+    conts.clear()
+    ret_holes.clear()
+    panic_sites.clear()
+    fn_ret_ty = funcs[fi].ret
+    panic_mode = false
+    inline_depth = 0
+    route_ctx = -1
+    emit_push(RBP)
+    emit_mov_rr(RBP, RSP)
+    // sub rsp, размер кадра (дописывается в конце)
+    emit8(0x48)
+    emit8(0x81)
+    emit8(0xEC)
+    let frame_at = emit_hole()
+    // место под сохранение rbx, r12–r15: 5 четырёхбайтовых nop
+    var k = 0
+    while k < 5 {
+        emit8(0x0F)
+        emit8(0x1F)
+        emit8(0x40)
+        emit8(0x00)
+        k += 1
+    }
+    return frame_at
+}
+
+fn save_reg_bytes(at: int, op: int, k: int) {
+    let r = reg_of(k)
+    store8(code + at, 0x48 | ((r >> 3) << 2))
+    store8(code + at + 1, op)
+    store8(code + at + 2, 0x45 | ((r & 7) << 3))
+    store8(code + at + 3, (-8 * (k + 1)) & 255)
+}
+
+fn end_fn(frame_at: int, diverged: bool) {
+    let sled = frame_at + 4
+    if diverged && ret_holes.len() > 0 && ret_holes[ret_holes.len() - 1] == code_len - 4 && code_len - 5 >= barrier {
+        ret_holes.pop()
+        code_len -= 5
+    } else if !diverged {
+        emit_mov_imm(RAX, 0)
+    }
+    let ep = here()
+    for h in ret_holes {
+        patch_rel(h, ep)
+    }
+    var k = 0
+    var nsaved = 0
+    while k < 5 {
+        if (used_regs & (1 << k)) != 0 {
+            save_reg_bytes(sled + 4 * nsaved, 0x89, k)
+            nsaved += 1
+            let at = code_len
+            emit32(0)
+            save_reg_bytes(at, 0x8B, k)
+        }
+        k += 1
+    }
+    emit_mov_rr(RSP, RBP)
+    emit8(0x5D)
+    emit8(0xC3)
+    emit_panic_stubs()
+    put32_at(code + frame_at, (40 + frame + 15) & ~15)
+    // убрать неиспользованные места сохранения: тело сдвигается назад,
+    // ссылки на другие функции (fixups) из этого тела — тоже
+    let gap = (5 - nsaved) * 4
+    if gap > 0 {
+        let from = sled + 20
+        __memcpy(code + from - gap, code + from, code_len - from)
+        code_len -= gap
+        var i = fixups.len() - 1
+        while i >= 0 && fixups[i].at >= from {
+            fixups[i].at -= gap
+            i -= 1
+        }
+        barrier = code_len
+        last_push = -1
+    }
+}
+
+fn compile_fn(fi: int) {
+    let f = funcs[fi]
+    let frame_at = begin_fn(fi)
+    plan_regs(fi)
+    let n = f.params.len()
+    var i = 0
+    while i < n {
+        let p = f.params[i]
+        let li = declare_local(p.name, p.ty, false)
+        let l = locals[li]
+        if i < 6 {
+            if l.reg >= 0 {
+                emit_mov_rr(l.reg, arg_reg(i))
+            } else {
+                emit_store(RBP, l.off, arg_reg(i))
+            }
+        } else {
+            let off = 16 + 8 * (n - 1 - i)
+            if l.reg >= 0 {
+                emit_load(l.reg, RBP, off)
+            } else {
+                locals[li].off = off
+            }
+        }
+        i += 1
+    }
+    if f.kind == FK_ROUTE {
+        route_ctx = fi
+    }
+    pos = f.body
+    let close = toks[f.body_end]
+    let div = parse_block()
+    if !div && f.ret != ty_void {
+        error_tok(close, "'" + f.name + "' must return a value of type " + ty_name(f.ret) + " on every path", "add a return at the end")
+    }
+    end_fn(frame_at, div)
+}
+
+// ---- Сгенерированные функции: инициализация глобальных и __main ----
+
+fn gen_func(name: str, ret: int) -> int {
+    var ps: [Param] = []
+    funcs.push(Func {
+        name: name,
+        params: ps,
+        ret: ret,
+        tok: 0,
+        body: -1,
+        body_end: -1,
+        code: -1,
+        kind: FK_GEN,
+        inline_ok: false,
+        is_lib: true,
+        used: true,
+        size: 0
+    })
+    let t = toks[0]
+    sym_add(name, SK_FN, funcs.len() - 1, t)
+    return funcs.len() - 1
+}
+
+fn compile_init_globals(fi: int) {
+    let frame_at = begin_fn(fi)
+    for g in globals {
+        if g.init >= 0 {
+            pos = g.init
+            panic_mode = false
+            let at = tok()
+            let t = parse_expr(g.ty)
+            coerce(t, g.ty, at)
+            emit_store_abs(g.addr, RAX)
+        } else if tkind(g.ty) != K_INT && tkind(g.ty) != K_BOOL && tkind(g.ty) != K_OPT {
+            if zero_value(g.ty, toks[g.tok]) {
+                emit_store_abs(g.addr, RAX)
+            }
+        }
+    }
+    end_fn(frame_at, false)
+}
+
+fn compile_main_wrapper(fi: int, test_mode: bool) {
+    let frame_at = begin_fn(fi)
+    let m = func_find("main")
+    if test_mode {
+        emit_call(rt_func("__run_tests"))
+    } else if m >= 0 && !funcs[m].is_lib {
+        let f = funcs[m]
+        if f.params.len() > 0 {
+            error_tok(toks[f.tok], "main takes no parameters", "read arguments with args()")
+        }
+        if f.ret != ty_void && f.ret != ty_int {
+            error_tok(toks[f.tok], "main may return nothing or int (the exit code)", "")
+        }
+        funcs[m].used = true
+        emit_call(m)
+        if f.ret == ty_void {
+            emit_mov_imm(RAX, 0)
+        }
+    } else if routes.len() > 0 {
+        emit_call(rt_func("__serve"))
+        emit_mov_imm(RAX, 0)
+    } else {
+        report_at(files.len() - 1, 1, 1, "the program has no fn main", "add fn main() { ... } or declare routes")
+    }
+    // результат уже в rax
+    end_fn(frame_at, true)
+}

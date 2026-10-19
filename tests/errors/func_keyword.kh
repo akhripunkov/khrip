@@ -1,0 +1,4 @@
+// expect: found 'func'
+// expect: hint: declare functions with fn
+func main() {
+}

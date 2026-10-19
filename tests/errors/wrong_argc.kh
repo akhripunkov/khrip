@@ -1,7 +1,8 @@
-// expect: wrong_argc.kh:6: error: wrong number of arguments for 'add'
-fn add(a: i64, b: i64) -> i64 {
+// expect: 'add' takes 2 argument(s), got 1
+// expect: hint: add(a: int, b: int)
+fn add(a: int, b: int) -> int {
     return a + b
 }
-fn main() -> i64 {
-    return add(1)
+fn main() {
+    print(add(1))
 }

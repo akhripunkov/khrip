@@ -1,0 +1,223 @@
+// ============================================================================
+// Ошибки компиляции. Компилятор не останавливается на первой ошибке: собирает
+// все (по одной на оператор), печатает с исходной строкой, кареткой и
+// подсказкой, как исправить. С ключом --json — тот же список в JSON.
+// ============================================================================
+
+type Diag {
+    file: int
+    line: int
+    col: int
+    msg: str
+    hint: str
+}
+
+const MAX_ERRORS = 100
+
+var diags: [Diag]
+var json_errors: bool
+// Пока идёт восстановление после синтаксической ошибки, новые ошибки не пишутся.
+var panic_mode: bool
+// Ошибки внутри повторного разбора (встраивание) не пишутся: тело уже проверено.
+var quiet: int
+
+fn report_at(file: int, line: int, col: int, msg: str, hint: str) {
+    if diags.len() >= MAX_ERRORS {
+        return
+    }
+    // одна ошибка на строку — остальные обычно следствие первой
+    var i = 0
+    while i < diags.len() {
+        if diags[i].file == file && diags[i].line == line {
+            return
+        }
+        i += 1
+    }
+    diags.push(Diag { file: file, line: line, col: col, msg: msg, hint: hint })
+}
+
+fn error_tok(t: Token, msg: str, hint: str) {
+    if quiet > 0 || panic_mode {
+        return
+    }
+    report_at(t.file, t.line, t.col, msg, hint)
+}
+
+// Синтаксическая ошибка: дальше до конца оператора ошибки не пишутся.
+fn syntax_error(t: Token, msg: str, hint: str) {
+    error_tok(t, msg, hint)
+    panic_mode = true
+}
+
+// Строка исходника с номером line (без перевода строки).
+fn source_line(file: int, line: int) -> str {
+    let text = files[file].text
+    var i = 0
+    var cur = 1
+    let n = text.len()
+    while i < n && cur < line {
+        if text[i] == '\n' {
+            cur += 1
+        }
+        i += 1
+    }
+    var j = i
+    while j < n && text[j] != '\n' {
+        j += 1
+    }
+    return text[i..j]
+}
+
+fn json_escape(s: str) -> str {
+    let b = buf_new(s.len() + 8)
+    var i = 0
+    while i < s.len() {
+        let c = s[i]
+        if c == '"' || c == '\\' {
+            buf_byte(b, '\\')
+            buf_byte(b, c)
+        } else if c == '\n' {
+            buf_add(b, "\\n")
+        } else if c == '\t' {
+            buf_add(b, "\\t")
+        } else if c >= 32 {
+            buf_byte(b, c)
+        }
+        i += 1
+    }
+    return buf_str(b)
+}
+
+fn print_diags() {
+    if json_errors {
+        let b = buf_new(1024)
+        buf_add(b, "[")
+        var i = 0
+        while i < diags.len() {
+            let d = diags[i]
+            if i > 0 {
+                buf_add(b, ",\n ")
+            }
+            buf_add(b, "\{\"file\":\"" + json_escape(files[d.file].path) + "\",\"line\":" + d.line.to_str() + ",\"col\":" + d.col.to_str())
+            buf_add(b, ",\"message\":\"" + json_escape(d.msg) + "\",\"hint\":\"" + json_escape(d.hint) + "\"}")
+            i += 1
+        }
+        buf_add(b, "]\n")
+        write(buf_str(b))
+        return
+    }
+    var i = 0
+    while i < diags.len() {
+        let d = diags[i]
+        eprint(files[d.file].path + ":" + d.line.to_str() + ":" + d.col.to_str() + ": error: " + d.msg)
+        let line = source_line(d.file, d.line)
+        eprint("    " + line)
+        let mark = buf_new(d.col + 8)
+        buf_add(mark, "    ")
+        var c = 1
+        while c < d.col && c <= line.len() {
+            if line[c - 1] == '\t' {
+                buf_byte(mark, '\t')
+            } else {
+                buf_byte(mark, ' ')
+            }
+            c += 1
+        }
+        buf_byte(mark, '^')
+        eprint(buf_str(mark))
+        if d.hint.len() > 0 {
+            eprint("    hint: " + d.hint)
+        }
+        i += 1
+    }
+    var word = " errors"
+    if diags.len() == 1 {
+        word = " error"
+    }
+    eprint(diags.len().to_str() + word)
+}
+
+// Подсказка для неизвестного имени: привычки из других языков.
+fn name_hint(name: str) -> str {
+    if name == "null" || name == "nil" || name == "None" || name == "NULL" || name == "undefined" {
+        return "Khrip has no null; use none with an optional type, e.g. let u: User? = none"
+    }
+    if name == "and" {
+        return "use && for logical and"
+    }
+    if name == "or" {
+        return "use || for logical or"
+    }
+    if name == "not" {
+        return "use ! for logical not"
+    }
+    if name == "elif" || name == "elsif" || name == "elseif" {
+        return "write else if"
+    }
+    if name == "True" || name == "TRUE" {
+        return "booleans are true and false"
+    }
+    if name == "False" || name == "FALSE" {
+        return "booleans are true and false"
+    }
+    if name == "func" || name == "def" || name == "function" || name == "fun" {
+        return "declare functions with fn name(arg: type) -> type { ... }"
+    }
+    if name == "println" || name == "printf" || name == "console" || name == "fmt" || name == "puts" || name == "echo" {
+        return "use print(x); it adds a newline"
+    }
+    if name == "len" || name == "length" {
+        return "use x.len()"
+    }
+    if name == "self" || name == "this" {
+        return "methods take the receiver as the first parameter named self: fn name(self: Type)"
+    }
+    return ""
+}
+
+// Подсказка для неизвестного метода по имени.
+fn method_hint(name: str) -> str {
+    if name == "length" || name == "size" || name == "count" || name == "Count" || name == "Length" || name == "len_" {
+        return "use .len()"
+    }
+    if name == "append" || name == "add" || name == "push_back" || name == "Add" {
+        return "use .push(x) to add to a list"
+    }
+    if name == "toString" || name == "ToString" || name == "to_string" || name == "str" || name == "String" {
+        return "use .to_str() or interpolation \"\{x}\""
+    }
+    if name == "includes" || name == "Contains" || name == "has" {
+        return "use .contains(x) for strings, .has(key) for maps"
+    }
+    if name == "startsWith" || name == "StartsWith" || name == "startswith" {
+        return "use .starts_with(prefix)"
+    }
+    if name == "endsWith" || name == "EndsWith" || name == "endswith" {
+        return "use .ends_with(suffix)"
+    }
+    if name == "indexOf" || name == "IndexOf" || name == "index" {
+        return "use .find(sub), it returns int?"
+    }
+    if name == "toUpperCase" || name == "ToUpper" || name == "toUpper" {
+        return "use .upper()"
+    }
+    if name == "toLowerCase" || name == "ToLower" || name == "toLower" {
+        return "use .lower()"
+    }
+    if name == "strip" || name == "Trim" {
+        return "use .trim()"
+    }
+    if name == "parse" || name == "parseInt" || name == "atoi" || name == "Atoi" || name == "toInt" {
+        return "use s.to_int() ?? 0"
+    }
+    if name == "get" {
+        return "use m[key], it returns V?"
+    }
+    if name == "delete" || name == "erase" || name == "Remove" {
+        return "use .remove(key) for maps, .remove_at(i) for lists"
+    }
+    if name == "substring" || name == "substr" || name == "Substring" {
+        return "use s[from..to]"
+    }
+    return ""
+}
