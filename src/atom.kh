@@ -13,8 +13,18 @@ fn parse_atom() -> int {
     let k = t.kind
     if k == T_INT {
         advance()
+        if is_float_want(w) {
+            emit_mov_imm(RAX, __int_to_f64_bits(t.val))
+            return ty_float
+        }
         emit_mov_imm(RAX, t.val)
+        int_lit_end = pos
         return ty_int
+    }
+    if k == T_FLOAT {
+        advance()
+        emit_mov_imm(RAX, t.val)
+        return ty_float
     }
     if k == T_STR {
         advance()
@@ -818,6 +828,10 @@ fn emit_to_str(t: int, at: Token) -> bool {
         emit_call(rt_func("__bool_to_str"))
         return true
     }
+    if t == ty_float {
+        emit_call(rt_func("__float_to_str"))
+        return true
+    }
     error_tok(at, "cannot turn " + ty_name(t) + " into text", "interpolate its fields instead")
     return false
 }
@@ -966,7 +980,7 @@ fn parse_builtin(t: Token, w: int) -> int {
         emit_call(rt_func("__json_decode"))
         return ty_opt(inner)
     }
-    let lib_only = name.starts_with("__simd_") || name == "__cpu_avx2" || name == "__spawn" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset"
+    let lib_only = name == "__fsqrt" || name.starts_with("__simd_") || name == "__cpu_avx2" || name == "__spawn" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset"
     if lib_only && !files[t.file].is_lib {
         return -1
     }
@@ -1074,6 +1088,16 @@ fn parse_builtin(t: Token, w: int) -> int {
         emit8(0x05)
         patch_here(parent)
         return ty_int
+    }
+    if name == "__fsqrt" {
+        advance()
+        let a = tok()
+        let t1 = parse_expr(ty_float)
+        coerce(t1, ty_float, a)
+        expect_tok(')')
+        // movq xmm0, rax; sqrtsd xmm0, xmm0; movq rax, xmm0
+        emit_hex("66 48 0F 6E C0 F2 0F 51 C0 66 48 0F 7E C0")
+        return ty_float
     }
     if name == "__file_name" {
         advance()
@@ -1235,6 +1259,9 @@ fn method_prefix(k: int) -> str {
     if k == K_BOOL {
         return "__bool_"
     }
+    if k == K_FLOAT {
+        return "__float_"
+    }
     if k == K_MAP {
         return "__map_"
     }
@@ -1260,6 +1287,20 @@ fn parse_method(rt: int, nt: Token) -> int {
         skip_call_args()
         return ty_err
     }
+    if k == K_FLOAT && name == "to_int" && kind_at(pos + 1) == ')' {
+        advance()
+        advance()
+        emit_float_to_int(nt)
+        last_was_call = false
+        return ty_int
+    }
+    if k == K_INT && name == "to_float" && kind_at(pos + 1) == ')' {
+        advance()
+        advance()
+        emit_int_to_float()
+        last_was_call = false
+        return ty_float
+    }
     if name == "len" && (k == K_STR || k == K_LIST || k == K_MAP) && kind_at(pos + 1) == ')' {
         advance()
         advance()
@@ -1284,6 +1325,9 @@ fn parse_method(rt: int, nt: Token) -> int {
     let prefix = method_prefix(k)
     if prefix.len() > 0 {
         fi = func_find(prefix + name)
+        if k == K_LIST && name == "sum" && tt == ty_float {
+            fi = func_find("__list_sum_float")
+        }
     }
     if fi < 0 {
         let uf = func_find(name)

@@ -1,0 +1,13 @@
+// expect: float_mix.kh:6:19: error: cannot mix float and int in *
+// expect: hint: convert explicitly: x.to_float()
+// expect: float_mix.kh:7:18: error: expected int, found float
+// expect: hint: convert with x.to_int() (truncates) or x.round()
+fn main() {
+    let a = 2.5 * n()
+    let b: int = 2.5
+    print("{a} {b}")
+}
+
+fn n() -> int {
+    return 3
+}

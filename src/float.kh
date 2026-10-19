@@ -1,0 +1,152 @@
+// ============================================================================
+// float: значение — биты double в слове (rax), арифметика — скалярный SSE2.
+// Целый литерал рядом с float сам становится float (t * 2, t < 0, let x: float = 5);
+// целую переменную нужно перевести явно: n.to_float().
+// ============================================================================
+
+// Позиция сразу за последним целым литералом-атомом: левый операнд был литералом,
+// если оператор стоит ровно здесь.
+var int_lit_end: int
+
+fn is_float_want(w: int) -> bool {
+    return w == ty_float || (tkind(w) == K_OPT && ty_inner(w) == ty_float)
+}
+
+// Следующий операнд — float: литерал, -литерал или float-переменная.
+fn float_follows() -> bool {
+    let k = kind()
+    if k == T_FLOAT || (k == '-' && kind_at(pos + 1) == T_FLOAT) {
+        return true
+    }
+    if k == T_IDENT {
+        let li = find_local(tok().text)
+        return li >= 0 && locals[li].ty == ty_float
+    }
+    return false
+}
+
+// xmm0 = левое (из rcx), xmm1 = правое (из rax).
+fn float_operands(left_int: bool) {
+    // movq xmm1, rax
+    emit_hex("66 48 0F 6E C8")
+    emit_pop(RCX)
+    if left_int {
+        // cvtsi2sd xmm0, rcx
+        emit_hex("F2 48 0F 2A C1")
+    } else {
+        // movq xmm0, rcx
+        emit_hex("66 48 0F 6E C1")
+    }
+}
+
+fn float_right(t: int, at: Token, op: int) {
+    if t == ty_int {
+        error_tok(at, "cannot mix float and int in " + op_text(op), "convert explicitly: x.to_float()")
+    } else if t != ty_float && t != ty_err {
+        error_tok(at, "operator " + op_text(op) + " needs float operands, found " + ty_name(t), mismatch_hint(t, ty_float))
+    }
+}
+
+// Арифметика: левое значение в rax (float или целый литерал), оператор прочитан.
+// level 1 — уровень умножения, 2 — сложения.
+fn float_arith(op: int, at: Token, left_int: bool, level: int) -> int {
+    emit_push(RAX)
+    want = ty_float
+    let rt_tok = tok()
+    var rt = ty_err
+    if level == 1 {
+        rt = parse_unary()
+    } else {
+        rt = parse_mul()
+    }
+    float_right(rt, rt_tok, op)
+    float_operands(left_int)
+    if op == '+' {
+        emit_hex("F2 0F 58 C1")
+    } else if op == '-' {
+        emit_hex("F2 0F 5C C1")
+    } else if op == '*' {
+        emit_hex("F2 0F 59 C1")
+    } else if op == '/' {
+        emit_hex("F2 0F 5E C1")
+    } else {
+        error_tok(at, "operator " + op_text(op) + " is not defined for float", "")
+    }
+    // movq rax, xmm0
+    emit_hex("66 48 0F 7E C0")
+    return ty_float
+}
+
+// Условие для ucomisd: сравнение без знака по флагам CF и ZF.
+fn float_cc(op: int) -> int {
+    if op == T_EQ {
+        return CC_E
+    }
+    if op == T_NE {
+        return CC_NE
+    }
+    if op == '<' {
+        return CC_B
+    }
+    if op == T_LE {
+        return CC_BE
+    }
+    if op == '>' {
+        return CC_A
+    }
+    return CC_AE
+}
+
+// Сравнение: левое в rax, оператор прочитан. → условие истинности.
+fn float_compare(op: int, at: Token, left_int: bool) -> int {
+    emit_push(RAX)
+    want = ty_float
+    let rt_tok = tok()
+    let rt = parse_add()
+    float_right(rt, rt_tok, op)
+    float_operands(left_int)
+    // ucomisd xmm0, xmm1
+    emit_hex("66 0F 2E C1")
+    return float_cc(op)
+}
+
+// -x: смена знакового бита (btc rax, 63).
+fn emit_float_neg() {
+    emit_hex("48 0F BA F8 3F")
+}
+
+// x op= y для float: левое в стеке, правое разбирается здесь.
+fn float_compound(op: int, at: Token) {
+    want = ty_float
+    let rt_tok = tok()
+    let rt = parse_expr(ty_float)
+    float_right(rt, rt_tok, op)
+    float_operands(false)
+    if op == '+' {
+        emit_hex("F2 0F 58 C1")
+    } else if op == '-' {
+        emit_hex("F2 0F 5C C1")
+    } else if op == '*' {
+        emit_hex("F2 0F 59 C1")
+    } else if op == '/' {
+        emit_hex("F2 0F 5E C1")
+    } else {
+        error_tok(at, "operator " + op_text(op) + " is not defined for float", "")
+    }
+    emit_hex("66 48 0F 7E C0")
+}
+
+// x.to_int(): отбрасывание дробной части; вне диапазона int — паника.
+fn emit_float_to_int(at: Token) {
+    // movq xmm0, rax; cvttsd2si rax, xmm0
+    emit_hex("66 48 0F 6E C0 F2 48 0F 2C C0")
+    emit_mov_imm(RCX, 1 << 63)
+    emit_rr(0x39, RCX, RAX)
+    emit_panic_jump(CC_E, PANIC_OVERFLOW, at)
+}
+
+// n.to_float()
+fn emit_int_to_float() {
+    // cvtsi2sd xmm0, rax; movq rax, xmm0
+    emit_hex("F2 48 0F 2A C0 66 48 0F 7E C0")
+}

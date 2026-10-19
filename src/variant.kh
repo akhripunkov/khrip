@@ -538,8 +538,13 @@ fn parse_lambda_method(rt: int, nt: Token) -> int {
         emit_call(rt_func("__list_push"))
         rtype = ty_list(bt)
     } else if name == "sort_by" {
-        if bt != ty_int && bt != ty_str && bt != ty_err {
-            error_tok(bt_tok, "sort_by needs an int or str key, found " + ty_name(bt), "")
+        if bt != ty_int && bt != ty_str && bt != ty_float && bt != ty_err {
+            error_tok(bt_tok, "sort_by needs an int, float or str key, found " + ty_name(bt), "")
+        }
+        if bt == ty_float {
+            // биты double → целое того же порядка: у отрицательных инвертируются 63 бита
+            // mov rcx, rax; sar rcx, 63; shr rcx, 1; xor rax, rcx
+            emit_hex("48 89 C1 48 C1 F9 3F 48 D1 E9 48 31 C8")
         }
         put32_at(code + esize_at, 8)
         emit_mov_rr(RSI, RAX)

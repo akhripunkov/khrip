@@ -262,6 +262,15 @@ fn mismatch_hint(from: int, to: int) -> str {
     if to == ty_int && from == ty_str {
         return "parse with s.to_int() ?? 0"
     }
+    if to == ty_float && from == ty_int {
+        return "convert with x.to_float()"
+    }
+    if to == ty_int && from == ty_float {
+        return "convert with x.to_int() (truncates) or x.round()"
+    }
+    if to == ty_float && from == ty_str {
+        return "parse with s.to_float() ?? 0.0"
+    }
     if from == ty_none {
         return "only optional types accept none; declare the type as " + ty_name(to) + "?"
     }
@@ -683,7 +692,7 @@ fn equatable(t: int) -> bool {
     if tkind(t) == K_SUM {
         return sum_unit_only(types[t].a)
     }
-    return t == ty_int || t == ty_bool || t == ty_str || t == ty_err
+    return t == ty_int || t == ty_bool || t == ty_str || t == ty_float || t == ty_err
 }
 
 // Сравнение: левый операнд в rax, оператор уже прочитан. Выставляет флаги
@@ -701,6 +710,10 @@ fn mixed_opt(a: int, b: int) -> bool {
 
 fn emit_compare(op: int, lt: int, at: Token) -> int {
     want = ty_err
+    let left_lit = int_lit_end == pos - 1
+    if lt == ty_float || (lt == ty_int && left_lit && float_follows()) {
+        return float_compare(op, at, lt == ty_int)
+    }
     let ordered = op != T_EQ && op != T_NE
     if lt != ty_str && peek_simple(3) && !mixed_opt(lt, op_ty) {
         let rt = op_ty
@@ -767,7 +780,7 @@ fn compare_ok(lt: int, rt: int, ordered: bool, at: Token) -> bool {
         return true
     }
     if ordered {
-        if (lt == ty_int && rt == ty_int) || (lt == ty_str && rt == ty_str) {
+        if (lt == ty_int && rt == ty_int) || (lt == ty_str && rt == ty_str) || (lt == ty_float && rt == ty_float) {
             return true
         }
         error_tok(at, "cannot order " + ty_name(lt) + " and " + ty_name(rt), "< > <= >= work on int and str")
@@ -828,7 +841,12 @@ fn parse_add() -> int {
     while is_add_op(kind()) {
         let at = tok()
         let op = kind()
+        let left_lit = int_lit_end == pos
         advance()
+        if lt == ty_float || (lt == ty_int && left_lit && float_follows()) {
+            lt = float_arith(op, at, lt == ty_int, 2)
+            continue
+        }
         if op == '+' && lt == ty_str {
             emit_push(RAX)
             want = ty_err
@@ -855,7 +873,12 @@ fn parse_mul() -> int {
     while is_mul_op(kind()) {
         let at = tok()
         let op = kind()
+        let left_lit = int_lit_end == pos
         advance()
+        if lt == ty_float || (lt == ty_int && left_lit && float_follows()) {
+            lt = float_arith(op, at, lt == ty_int, 1)
+            continue
+        }
         if op == '*' && tkind(lt) == K_LIST {
             // [x] * n — повторение списка
             emit_push(RAX)
@@ -880,15 +903,31 @@ fn parse_unary() -> int {
     let k = kind()
     let at = tok()
     if k == '-' {
+        let w = want
         advance()
         want = ty_err
         if kind() == T_INT {
             let v = tok().val
             advance()
+            if is_float_want(w) {
+                emit_mov_imm(RAX, __int_to_f64_bits(0 - v))
+                return parse_postfix(ty_float, at)
+            }
             emit_mov_imm(RAX, -v)
+            int_lit_end = pos
             return parse_postfix(ty_int, at)
         }
+        if kind() == T_FLOAT {
+            let bits = tok().val
+            advance()
+            emit_mov_imm(RAX, bits | (1 << 63))
+            return parse_postfix(ty_float, at)
+        }
         let t = parse_unary()
+        if t == ty_float {
+            emit_float_neg()
+            return ty_float
+        }
         check_int(t, at, '-')
         emit8(0x48)
         emit8(0xF7)

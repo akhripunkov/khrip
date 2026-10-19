@@ -54,6 +54,7 @@ const D_MAP = 5
 const D_OPT = 6
 const D_STRUCT = 7
 const D_SUM = 8
+const D_FLOAT = 9
 
 // Смещение CTX_STORE_HELD в контексте потока (lib/core.kh).
 const CTX_STORE_HELD_OFF = 72
@@ -62,6 +63,7 @@ fn lib_files() -> [str] {
     var names: [str] = []
     names.push("core.kh")
     names.push("rt.kh")
+    names.push("float.kh")
     return names
 }
 
@@ -90,7 +92,7 @@ fn is_http_method(s: str) -> bool {
 }
 
 fn is_scalar_ty(t: int) -> bool {
-    return t == ty_int || t == ty_bool || t == ty_err || t == ty_void || t == ty_none
+    return t == ty_int || t == ty_bool || t == ty_float || t == ty_err || t == ty_void || t == ty_none
 }
 
 // ---- Предварительный проход: route и test ----
@@ -235,8 +237,8 @@ fn prescan_route() {
         }
         let k = tkind(p.ty)
         if si >= 0 {
-            if p.ty != ty_int && p.ty != ty_str && p.ty != ty_bool && p.ty != ty_err && !is_enum(p.ty) {
-                error_tok(kw, "path parameter '" + p.name + "' must be int, str, bool or an enum, not " + ty_name(p.ty), "")
+            if p.ty != ty_int && p.ty != ty_str && p.ty != ty_bool && p.ty != ty_float && p.ty != ty_err && !is_enum(p.ty) {
+                error_tok(kw, "path parameter '" + p.name + "' must be int, float, str, bool or an enum, not " + ty_name(p.ty), "")
             }
             pkind.push(PK_PATH)
         } else if k == K_STRUCT || k == K_LIST || k == K_MAP {
@@ -247,8 +249,8 @@ fn prescan_route() {
             pkind.push(PK_BODY)
         } else {
             let inner = ty_inner(p.ty)
-            if inner != ty_int && inner != ty_str && inner != ty_bool && inner != ty_err && !is_enum(inner) {
-                error_tok(kw, "query parameter '" + p.name + "' must be int, str, bool or an enum (or optional), not " + ty_name(p.ty), "")
+            if inner != ty_int && inner != ty_str && inner != ty_bool && inner != ty_float && inner != ty_err && !is_enum(inner) {
+                error_tok(kw, "query parameter '" + p.name + "' must be int, float, str, bool or an enum (or optional), not " + ty_name(p.ty), "")
             }
             pkind.push(PK_QUERY)
         }
@@ -418,13 +420,15 @@ fn type_desc(t: int) -> int {
     }
     let k = tkind(t)
     var off = 0
-    if k == K_STR || k == K_INT || k == K_BOOL {
+    if k == K_STR || k == K_INT || k == K_BOOL || k == K_FLOAT {
         off = desc_reserve(1)
         var d = D_STR
         if k == K_INT {
             d = D_INT
         } else if k == K_BOOL {
             d = D_BOOL
+        } else if k == K_FLOAT {
+            d = D_FLOAT
         }
         desc_put(off, 0, d)
         type_descs[t] = DATA_BASE + off
@@ -936,6 +940,8 @@ fn gen_param(b: Buf, r: Route, i: int) {
         let seg = "__url_decode(__s[" + r.pseg[i].to_str() + "])"
         if is_enum(p.ty) {
             gen_enum_param(b, v, p.ty, seg, lit)
+        } else if p.ty == ty_float {
+            buf_add(b, "            let " + v + " = __param_float(" + seg + ", " + lit + ") else \{\n                return\n            }\n")
         } else if p.ty == ty_int {
             buf_add(b, "            let " + v + " = __param_int(" + seg + ", " + lit + ") else \{\n                return\n            }\n")
         } else if p.ty == ty_bool {
@@ -968,6 +974,8 @@ fn gen_param(b: Buf, r: Route, i: int) {
     var conv = ""
     if inner == ty_int {
         conv = "__param_int"
+    } else if inner == ty_float {
+        conv = "__param_float"
     } else if inner == ty_bool {
         conv = "__param_bool"
     }

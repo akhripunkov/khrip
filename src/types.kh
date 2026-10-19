@@ -16,6 +16,8 @@ const K_GEN = 10
 // вариант: значение — одна из структур-вариантов; метка варианта лежит
 // перед полями структуры (по адресу значения − 8)
 const K_SUM = 11
+// 64-битное число с плавающей точкой; значение — биты double в слове
+const K_FLOAT = 12
 
 type Ty {
     kind: int
@@ -52,6 +54,7 @@ var ty_err: int
 var ty_int: int
 var ty_bool: int
 var ty_str: int
+var ty_float: int
 var ty_void: int
 var ty_none: int
 // тип ветки, которая не возвращает управление (return, break)
@@ -79,6 +82,7 @@ fn types_init() {
     ty_void = ty_make(K_VOID, 0, 0)
     ty_none = ty_make(K_NONE, 0, 0)
     ty_never = ty_make(K_VOID, 1, 0)
+    ty_float = ty_make(K_FLOAT, 0, 0)
 }
 
 fn tkind(t: int) -> int {
@@ -173,6 +177,9 @@ fn ty_name(t: int) -> str {
     }
     if k == K_STR {
         return "str"
+    }
+    if k == K_FLOAT {
+        return "float"
     }
     if k == K_VOID {
         if types[t].a == 1 {
@@ -278,14 +285,14 @@ fn type_hint(name: str) -> str {
     if name == "String" || name == "string" || name == "Str" || name == "char" || name == "text" {
         return "strings are str"
     }
-    if name == "i8" || name == "i16" || name == "i32" || name == "u8" || name == "u16" || name == "u32" || name == "u64" || name == "Int" || name == "long" || name == "number" || name == "usize" || name == "isize" || name == "int64" || name == "Integer" {
+    if name == "i8" || name == "i16" || name == "i32" || name == "u8" || name == "u16" || name == "u32" || name == "u64" || name == "Int" || name == "long" || name == "usize" || name == "isize" || name == "int64" || name == "Integer" {
         return "integers are int (64-bit)"
     }
     if name == "boolean" || name == "Bool" || name == "Boolean" {
         return "booleans are bool"
     }
-    if name == "float" || name == "double" || name == "f64" || name == "f32" || name == "float64" {
-        return "Khrip has no floating point yet; use int (e.g. cents instead of dollars)"
+    if name == "double" || name == "f64" || name == "f32" || name == "float64" || name == "float32" || name == "Double" || name == "Float" || name == "decimal" || name == "Decimal" || name == "number" {
+        return "fractional numbers are float (64-bit); money is better kept in int cents"
     }
     if name == "List" || name == "Vec" || name == "Array" || name == "slice" {
         return "lists are written [T], e.g. [int]"

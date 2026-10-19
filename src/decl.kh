@@ -232,6 +232,8 @@ fn parse_type() -> int {
             t = ty_bool
         } else if name == "str" {
             t = ty_str
+        } else if name == "float" {
+            t = ty_float
         } else if name == "map" {
             if expect_tok('[') {
                 let k = parse_type()

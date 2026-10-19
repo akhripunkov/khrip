@@ -289,6 +289,10 @@ fn compound_op(k: int) -> int {
 // Левое значение в стеке, правое разбирается здесь → результат в rax.
 fn compound_value(op_k: int, lt: int, at: Token) {
     let op = compound_op(op_k)
+    if lt == ty_float {
+        float_compound(op, at)
+        return
+    }
     if lt == ty_str && op == '+' {
         let rt = parse_expr(ty_str)
         coerce(rt, ty_str, at)

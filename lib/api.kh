@@ -23,6 +23,7 @@ const D_MAP = 5
 const D_OPT = 6
 const D_STRUCT = 7
 const D_SUM = 8
+const D_FLOAT = 9
 
 const CT_TEXT = 1
 const CT_JSON = 2
@@ -62,7 +63,7 @@ fn __worker_init() -> __Worker {
 
 fn __is_scalar(d: int) -> bool {
     let k = load64(d)
-    return k == D_INT || k == D_BOOL
+    return k == D_INT || k == D_BOOL || k == D_FLOAT
 }
 
 fn __field(d: int, i: int) -> int {
@@ -123,7 +124,7 @@ fn __persist(v: int, d: int) -> int {
 
 fn __deep_copy(v: int, d: int) -> int {
     let k = load64(d)
-    if k == D_INT || k == D_BOOL || v == 0 || !__in_arena(v) {
+    if k == D_INT || k == D_BOOL || k == D_FLOAT || v == 0 || !__in_arena(v) {
         return v
     }
     if k == D_STR {
@@ -238,6 +239,16 @@ fn __json_enc(b: Buf, v: int, d: int) {
     }
     if k == D_STR {
         __json_str(b, __cast(v))
+        return
+    }
+    if k == D_FLOAT {
+        // бесконечность и NaN в JSON не записать
+        if (v >> 52) & 0x7FF == 0x7FF {
+            buf_add(b, "null")
+            return
+        }
+        let f: float = __cast(v)
+        buf_add(b, f.to_str())
         return
     }
     if k == D_BOOL {
@@ -574,6 +585,26 @@ fn __jd_int(j: __Json, at: str) -> int {
     return v
 }
 
+fn __jd_float(j: __Json, at: str) -> int {
+    __jd_ws(j)
+    let start = j.p
+    while j.p < j.end {
+        let c = load8(j.p)
+        if (c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E' {
+            j.p += 1
+        } else {
+            break
+        }
+    }
+    let f = __float_parse(start, j.p - start) else {
+        j.p = start
+        __jd_expect(j, at, "a number")
+        return 0
+    }
+    let bits: int = __cast(f)
+    return bits
+}
+
 // Пропуск любого значения (поля, которых нет в типе).
 fn __jd_skip(j: __Json, at: str) {
     let c = __jd_peek(j)
@@ -644,6 +675,9 @@ fn __jd(j: __Json, d: int, at: str) -> int {
     let c = __jd_peek(j)
     if k == D_INT {
         return __jd_int(j, at)
+    }
+    if k == D_FLOAT {
+        return __jd_float(j, at)
     }
     if k == D_STR {
         return __cast(__jd_str(j, at))
@@ -1112,6 +1146,14 @@ fn __query(q: str, name: str) -> str? {
 fn __param_int(s: str, name: str) -> int? {
     let v = s.to_int() else {
         __reply_text(400, "parameter '" + name + "' must be an integer, found '" + s + "'")
+        return none
+    }
+    return v
+}
+
+fn __param_float(s: str, name: str) -> float? {
+    let v = s.to_float() else {
+        __reply_text(400, "parameter '" + name + "' must be a number, found '" + s + "'")
         return none
     }
     return v

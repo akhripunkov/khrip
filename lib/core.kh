@@ -1202,6 +1202,291 @@ fn __sort_by(self: [T], keys: [int], by_str: bool) -> [T] {
     return self
 }
 
+// ---- Длинные целые: [int] по 32 бита, младшие первыми ----
+// Нужны для точного перевода десятичной записи в double и обратно.
+
+fn __big_trim(a: [int]) {
+    while a.len() > 0 && a[a.len() - 1] == 0 {
+        a.pop()
+    }
+}
+
+// a = a × m + add; m и add меньше 2^31.
+fn __big_mul_add(a: [int], m: int, add: int) {
+    var carry = add
+    var i = 0
+    while i < a.len() {
+        let v = a[i] * m + carry
+        a[i] = v & 0xFFFFFFFF
+        carry = v >> 32
+        i += 1
+    }
+    while carry > 0 {
+        a.push(carry & 0xFFFFFFFF)
+        carry = carry >> 32
+    }
+}
+
+fn __big_word(a: [int], i: int) -> int {
+    if i < a.len() {
+        return a[i]
+    }
+    return 0
+}
+
+fn __big_bitlen(a: [int]) -> int {
+    var n = a.len()
+    while n > 0 && a[n - 1] == 0 {
+        n -= 1
+    }
+    if n == 0 {
+        return 0
+    }
+    var top = a[n - 1]
+    var b = 0
+    while top > 0 {
+        b += 1
+        top = top >> 1
+    }
+    return (n - 1) * 32 + b
+}
+
+fn __big_bit(a: [int], i: int) -> int {
+    return (__big_word(a, i / 32) >> (i % 32)) & 1
+}
+
+// a << n — новое число.
+fn __big_shl(a: [int], n: int) -> [int] {
+    var r: [int] = []
+    let bits = n % 32
+    var w = 0
+    while w < n / 32 {
+        r.push(0)
+        w += 1
+    }
+    var carry = 0
+    for x in a {
+        let v = (x << bits) | carry
+        r.push(v & 0xFFFFFFFF)
+        carry = v >> 32
+    }
+    if carry > 0 {
+        r.push(carry)
+    }
+    return r
+}
+
+fn __big_cmp(a: [int], b: [int]) -> int {
+    let la = __big_bitlen(a)
+    let lb = __big_bitlen(b)
+    if la != lb {
+        if la < lb {
+            return -1
+        }
+        return 1
+    }
+    var i = (la + 31) / 32 - 1
+    while i >= 0 {
+        let x = __big_word(a, i)
+        let y = __big_word(b, i)
+        if x != y {
+            if x < y {
+                return -1
+            }
+            return 1
+        }
+        i -= 1
+    }
+    return 0
+}
+
+// a -= b, где a >= b.
+fn __big_sub(a: [int], b: [int]) {
+    var borrow = 0
+    var i = 0
+    while i < a.len() {
+        var v = a[i] - __big_word(b, i) - borrow
+        borrow = 0
+        if v < 0 {
+            v += 0x100000000
+            borrow = 1
+        }
+        a[i] = v
+        i += 1
+    }
+}
+
+// Частное n / d; n становится остатком.
+fn __big_divmod(n: [int], d: [int]) -> [int] {
+    var q: [int] = []
+    let ln = __big_bitlen(n)
+    var w = 0
+    while w <= ln / 32 {
+        q.push(0)
+        w += 1
+    }
+    var r: [int] = []
+    var i = ln - 1
+    while i >= 0 {
+        __big_mul_add(r, 2, __big_bit(n, i))
+        if __big_cmp(r, d) >= 0 {
+            __big_sub(r, d)
+            q[i / 32] = q[i / 32] | (1 << (i % 32))
+        }
+        i -= 1
+    }
+    n.clear()
+    for x in r {
+        n.push(x)
+    }
+    __big_trim(n)
+    __big_trim(q)
+    return q
+}
+
+fn __big_pow10(e: int) -> [int] {
+    var d: [int] = []
+    d.push(1)
+    var j = 0
+    while j < e {
+        __big_mul_add(d, 10, 0)
+        j += 1
+    }
+    return d
+}
+
+// Десятичная мантисса (цифры в [p, p + n), точка пропускается) × 10^exp → биты
+// double с округлением к ближайшему (при равенстве — к чётному). Знак — у вызывающего.
+fn __dec_to_f64(p: int, n: int, exp: int) -> int {
+    var x: [int] = []
+    var e10 = exp
+    var frac = false
+    var nd = 0
+    var i = 0
+    while i < n {
+        let c = load8(p + i)
+        if c == '.' {
+            frac = true
+        } else if c >= '0' && c <= '9' {
+            if x.len() > 0 || c != '0' {
+                nd += 1
+            }
+            if nd <= 40 {
+                __big_mul_add(x, 10, c - '0')
+                if frac {
+                    e10 -= 1
+                }
+            } else if !frac {
+                e10 += 1
+            }
+        }
+        i += 1
+    }
+    __big_trim(x)
+    let bl = __big_bitlen(x)
+    if bl == 0 {
+        return 0
+    }
+    if e10 + nd > 310 {
+        return 0x7FF0000000000000
+    }
+    if e10 + nd < -326 {
+        return 0
+    }
+    var sticky = 0
+    var exp2 = 0
+    var q = x
+    if e10 >= 0 {
+        var j = 0
+        while j < e10 {
+            __big_mul_add(q, 10, 0)
+            j += 1
+        }
+    } else {
+        let d = __big_pow10(0 - e10)
+        var k = __big_bitlen(d) - bl + 55
+        if k < 0 {
+            k = 0
+        }
+        let num = __big_shl(x, k)
+        q = __big_divmod(num, d)
+        if num.len() > 0 {
+            sticky = 1
+        }
+        exp2 = 0 - k
+    }
+    // value = q × 2^exp2 (+ остаток); q → 53 бита
+    let L = __big_bitlen(q)
+    var mant = 0
+    var shift = L - 53
+    if shift <= 0 {
+        var b = 0
+        while b < L {
+            if __big_bit(q, b) == 1 {
+                mant = mant | (1 << b)
+            }
+            b += 1
+        }
+        mant = mant << (0 - shift)
+    } else {
+        var b = 0
+        while b < 53 {
+            if __big_bit(q, shift + b) == 1 {
+                mant = mant | (1 << b)
+            }
+            b += 1
+        }
+        let half = __big_bit(q, shift - 1)
+        var below = sticky
+        b = 0
+        while b < shift - 1 && below == 0 {
+            if __big_bit(q, b) == 1 {
+                below = 1
+            }
+            b += 1
+        }
+        if half == 1 && (below == 1 || (mant & 1) == 1) {
+            mant += 1
+            if mant == 0x20000000000000 {
+                mant = mant >> 1
+                shift += 1
+            }
+        }
+    }
+    let e = exp2 + shift + 52
+    if e > 1023 {
+        return 0x7FF0000000000000
+    }
+    if e < -1022 {
+        // денормализованное число
+        let sh = -1022 - e
+        if sh > 53 {
+            return 0
+        }
+        let half = (mant >> (sh - 1)) & 1
+        let rest = mant & ((1 << (sh - 1)) - 1)
+        var m = mant >> sh
+        if half == 1 && (rest != 0 || sticky == 1 || (m & 1) == 1) {
+            m += 1
+        }
+        return m
+    }
+    return ((e + 1023) << 52) | (mant & 0xFFFFFFFFFFFFF)
+}
+
+// Целое → биты double (точно до 2^53, дальше — с округлением).
+fn __int_to_f64_bits(v: int) -> int {
+    if v == 0 {
+        return 0
+    }
+    var sign = 0
+    if v < 0 {
+        sign = 1 << 63
+    }
+    let s = __int_to_str(v)
+    return sign | __dec_to_f64(__str_ptr(s), s.len(), 0)
+}
+
 // x == v, где x — int? или bool? (ячейка или 0).
 fn __opt_eq_word(box: int, v: int) -> bool {
     return box != 0 && load64(box) == v

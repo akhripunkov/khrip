@@ -1,0 +1,50 @@
+// float: литералы, арифметика, смешение с целыми литералами, печать как в
+// JavaScript (самая короткая обратимая запись), разбор, методы, JSON.
+type Weather {
+    temp: float
+    wind: float
+    hist: [float] = []
+}
+
+fn avg(xs: [float]) -> float {
+    if xs.len() == 0 {
+        return 0
+    }
+    return xs.sum() / xs.len().to_float()
+}
+
+fn main() {
+    let a = 0.1
+    let b = 0.2
+    print("{a + b} {a * 3} {1.5 * 2} {2 * 1.5} {10 / 4.0} {-a} {1e21} {1e-7} {0.000001} {123456789.125}")
+    let t = 12.3
+    print("{t} {t * 2} {t > 10} {t < 0} {0 < t} {t == 12.3} {t != 12.3} {t.to_int()} {t.round()} {(-2.5).round()} {t.floor()} {t.ceil()} {(-t).floor()}")
+    let x: float = 5
+    var acc = 0.0
+    for i in 0..10 {
+        acc += 0.1
+    }
+    print("{x} {acc} {acc.round_to(2)} {(2.0).sqrt()} {t.abs()} {(-t).abs()} {t.min(3.5)} {t.max(30)}")
+    let n = 7
+    print("{n.to_float() / 2} {n / 2}")
+    let s = "3.75"
+    let p1 = "abc".to_float() ?? -1
+    let p2 = "1e3".to_float() ?? 0
+    let p3 = "-0.5".to_float() ?? 0
+    let p4 = "12".to_float() ?? 0
+    print("{(s.to_float() ?? 0) * 2} {p1} {p2} {p3} {p4}")
+    let w = Weather { temp: -3.5, wind: 12, hist: [1.5, 2.5, 3] }
+    let js = to_json(w)
+    print(js)
+    let back: Weather? = from_json("\{\"temp\": 21.75, \"wind\": 3, \"hist\": [0.1, 1e2, -2.5e-1]}")
+    if let wb = back {
+        print("{wb.temp} {wb.wind} {wb.hist.len()} {avg(wb.hist)} {wb.hist[2]}")
+    }
+    let bad: Weather? = from_json("\{\"temp\": \"warm\", \"wind\": 1}")
+    print(json_error())
+    let temps = [3.5, -1.25, 10.0, 0.5]
+    print(temps.sort_by(v => v).map(v => v.to_str()).join(","))
+    print("{temps.filter(v => v > 1).len()} {temps.any(v => v < -1)}")
+    let big = 123456789012345678.0
+    print("{big} {1.0 / 3} {2.0 / 3} {100.0} {1e100} {5e-324} {1.7976931348623157e308}")
+}
