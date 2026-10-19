@@ -12,8 +12,42 @@ fn __entry(sp: int) {
     __thread_init()
     __argc = load64(sp)
     __argv = sp + 8
+    __simd_init()
     __init_globals()
     exit(__main())
+}
+
+// ---- SIMD: 2 — AVX2, 1 — SSE2, 0 — побайтно (KHRIP_SIMD может понизить) ----
+
+var __simd_level: int
+
+fn __simd_init() {
+    var lvl = 1
+    if __cpu_avx2() {
+        lvl = 2
+    }
+    if let s = env("KHRIP_SIMD") {
+        let v = s.to_int() ?? lvl
+        if v >= 0 && v < lvl {
+            lvl = v
+        }
+    }
+    __simd_level = lvl
+}
+
+// Индекс первого байта b в [p, p + n) или n.
+fn __find_byte(p: int, n: int, b: int) -> int {
+    return __simd_find_byte(p, n, b)
+}
+
+// Индекс первого '"', '\\' или управляющего байта или n.
+fn __find_json_special(p: int, n: int) -> int {
+    return __simd_find_json(p, n)
+}
+
+// Индекс начала «\r\n\r\n» или n.
+fn __find_crlf2(p: int, n: int) -> int {
+    return __simd_find_crlf2(p, n)
 }
 
 // Контекст потока: регион памяти и указатель на себя в fs:[0].

@@ -1,0 +1,310 @@
+// ============================================================================
+// SIMD-примитивы рантайма: поиск байта, конца заголовков HTTP («\r\n\r\n»)
+// и символов, которые нужно экранировать в JSON. Каждый примитив — три пути:
+// AVX2 (32 байта за шаг), SSE2 (16 байт, есть на любом x86-64) и побайтный;
+// путь выбирается по __simd_level (2, 1, 0), который рантайм выставляет
+// при старте по cpuid (lib/rt.kh, __simd_init).
+// Аргументы: rdi — адрес, rsi — длина, rdx — байт; результат в rax — индекс
+// первого совпадения или длина, если совпадений нет.
+// ============================================================================
+
+fn hex_val(c: int) -> int {
+    if c >= '0' && c <= '9' {
+        return c - '0'
+    }
+    if c >= 'A' && c <= 'F' {
+        return c - 'A' + 10
+    }
+    return c - 'a' + 10
+}
+
+// Байты машинного кода из строки «C5 FD 74 C1».
+fn emit_hex(s: str) {
+    var i = 0
+    while i + 1 < s.len() {
+        if s[i] == ' ' {
+            i += 1
+            continue
+        }
+        emit8(hex_val(s[i]) * 16 + hex_val(s[i + 1]))
+        i += 2
+    }
+}
+
+fn simd_level_addr() -> int {
+    let s = sym_find("__simd_level")
+    if s < 0 || sym_kind(s) != SK_GLOBAL {
+        error_tok(tok(), "internal: missing __simd_level", "")
+        return 0
+    }
+    return globals[sym_idx(s)].addr
+}
+
+// cmp byte [__simd_level], v
+fn emit_level_cmp(v: int) {
+    emit_hex("80 3C 25")
+    emit32(simd_level_addr())
+    emit8(v)
+}
+
+// Общая часть: выбор пути. → [переход на SSE2, переход на побайтный путь].
+fn simd_dispatch() -> [int] {
+    var holes: [int] = []
+    // xor eax, eax
+    emit_hex("31 C0")
+    emit_level_cmp(1)
+    let to_scalar = emit_jcc(CC_B)
+    emit_level_cmp(2)
+    let to_sse = emit_jcc(CC_B)
+    holes.push(to_sse)
+    holes.push(to_scalar)
+    return holes
+}
+
+// Цикл по блокам: «lea rcx, [rax + need]; cmp rcx, rsi; ja выход».
+fn simd_block_check(need: int) -> int {
+    emit_hex("48 8D 48")
+    emit8(need)
+    emit_hex("48 39 F1")
+    return emit_jcc(CC_A)
+}
+
+// Найден блок с маской в ecx: rax += bsf(ecx).
+fn simd_found() -> int {
+    // bsf ecx, ecx; add rax, rcx
+    emit_hex("0F BC C9 48 01 C8")
+    return emit_jmp()
+}
+
+// Байт рядом в xmmN для SSE2: mov ecx, b; movd; punpcklbw; punpcklwd; pshufd.
+fn sse_broadcast(reg: int, b: int) {
+    emit8(0xB9)
+    emit32(b)
+    let r = reg & 7
+    emit_hex("66 0F 6E")
+    emit8(0xC1 | (r << 3))
+    emit_hex("66 0F 60")
+    emit8(0xC0 | (r << 3) | r)
+    emit_hex("66 0F 61")
+    emit8(0xC0 | (r << 3) | r)
+    emit_hex("66 0F 70")
+    emit8(0xC0 | (r << 3) | r)
+    emit8(0)
+}
+
+// То же для AVX2: mov ecx, b; vmovd xmmN, ecx; vpbroadcastb ymmN, xmmN.
+fn avx_broadcast(reg: int, b: int) {
+    emit8(0xB9)
+    emit32(b)
+    let r = reg & 7
+    emit_hex("C5 F9 6E")
+    emit8(0xC1 | (r << 3))
+    emit_hex("C4 E2 7D 78")
+    emit8(0xC0 | (r << 3) | r)
+}
+
+// __simd_find_byte(адрес, длина, байт)
+fn emit_simd_find_byte() {
+    let d = simd_dispatch()
+    var found: [int] = []
+    var done: [int] = []
+    // AVX2: байт из edx: vmovd xmm1, edx; vpbroadcastb ymm1, xmm1
+    emit_hex("C5 F9 6E CA C4 E2 7D 78 C9")
+    let avx_top = here()
+    let avx_end = simd_block_check(32)
+    // vmovdqu ymm0, [rdi+rax]; vpcmpeqb ymm0, ymm0, ymm1; vpmovmskb ecx, ymm0
+    emit_hex("C5 FE 6F 04 07 C5 FD 74 C1 C5 FD D7 C8")
+    emit_hex("85 C9")
+    let avx_hit = emit_jcc(CC_NE)
+    emit_hex("48 83 C0 20")
+    emit_jmp_to(avx_top)
+    patch_here(avx_hit)
+    emit_hex("C5 F8 77")
+    found.push(emit_jmp())
+    patch_here(avx_end)
+    emit_hex("C5 F8 77")
+    // SSE2
+    patch_here(d[0])
+    emit_hex("66 0F 6E CA 66 0F 60 C9 66 0F 61 C9 66 0F 70 C9 00")
+    let sse_top = here()
+    let sse_end = simd_block_check(16)
+    // movdqu xmm0, [rdi+rax]; pcmpeqb xmm0, xmm1; pmovmskb ecx, xmm0
+    emit_hex("F3 0F 6F 04 07 66 0F 74 C1 66 0F D7 C8")
+    emit_hex("85 C9")
+    found.push(emit_jcc(CC_NE))
+    emit_hex("48 83 C0 10")
+    emit_jmp_to(sse_top)
+    let found_at = here()
+    for h in found {
+        patch_rel(h, found_at)
+    }
+    done.push(simd_found())
+    // побайтно
+    patch_here(sse_end)
+    patch_here(d[1])
+    let sc_top = here()
+    emit_hex("48 39 F0")
+    done.push(emit_jcc(CC_AE))
+    // cmp byte [rdi+rax], dl
+    emit_hex("38 14 07")
+    done.push(emit_jcc(CC_E))
+    emit_hex("48 FF C0")
+    emit_jmp_to(sc_top)
+    let end = here()
+    for h in done {
+        patch_rel(h, end)
+    }
+}
+
+// __simd_find_json(адрес, длина): первый '"', '\\' или байт < 0x20.
+fn emit_simd_find_json() {
+    let d = simd_dispatch()
+    var found: [int] = []
+    var done: [int] = []
+    // AVX2: ymm1 = '"', ymm2 = '\\', ymm3 = 0x1F
+    avx_broadcast(1, 0x22)
+    avx_broadcast(2, 0x5C)
+    avx_broadcast(3, 0x1F)
+    let avx_top = here()
+    let avx_end = simd_block_check(32)
+    // ymm0 = блок; ymm6 = (min(v, 0x1F) == v); ymm5 = (v == '"') | ymm6 | (v == '\\')
+    emit_hex("C5 FE 6F 04 07")
+    emit_hex("C5 FD DA F3 C5 CD 74 F0")
+    emit_hex("C5 FD 74 E9 C5 D5 EB EE")
+    emit_hex("C5 FD 74 F2 C5 D5 EB EE")
+    emit_hex("C5 FD D7 CD 85 C9")
+    let avx_hit = emit_jcc(CC_NE)
+    emit_hex("48 83 C0 20")
+    emit_jmp_to(avx_top)
+    patch_here(avx_hit)
+    emit_hex("C5 F8 77")
+    found.push(emit_jmp())
+    patch_here(avx_end)
+    emit_hex("C5 F8 77")
+    // SSE2
+    patch_here(d[0])
+    sse_broadcast(1, 0x22)
+    sse_broadcast(2, 0x5C)
+    sse_broadcast(3, 0x1F)
+    let sse_top = here()
+    let sse_end = simd_block_check(16)
+    emit_hex("F3 0F 6F 04 07")
+    emit_hex("66 0F 6F F0 66 0F DA F3 66 0F 74 F0")
+    emit_hex("66 0F 6F E8 66 0F 74 E9 66 0F EB EE")
+    emit_hex("66 0F 6F F0 66 0F 74 F2 66 0F EB EE")
+    emit_hex("66 0F D7 CD 85 C9")
+    found.push(emit_jcc(CC_NE))
+    emit_hex("48 83 C0 10")
+    emit_jmp_to(sse_top)
+    let found_at = here()
+    for h in found {
+        patch_rel(h, found_at)
+    }
+    done.push(simd_found())
+    // побайтно
+    patch_here(sse_end)
+    patch_here(d[1])
+    let sc_top = here()
+    emit_hex("48 39 F0")
+    done.push(emit_jcc(CC_AE))
+    // movzx ecx, byte [rdi+rax]
+    emit_hex("0F B6 0C 07")
+    emit_hex("83 F9 22")
+    done.push(emit_jcc(CC_E))
+    emit_hex("83 F9 5C")
+    done.push(emit_jcc(CC_E))
+    emit_hex("83 F9 20")
+    done.push(emit_jcc(CC_B))
+    emit_hex("48 FF C0")
+    emit_jmp_to(sc_top)
+    let end = here()
+    for h in done {
+        patch_rel(h, end)
+    }
+}
+
+// __simd_find_crlf2(адрес, длина): начало «\r\n\r\n» или длина.
+fn emit_simd_find_crlf2() {
+    let d = simd_dispatch()
+    var found: [int] = []
+    var done: [int] = []
+    // AVX2: ymm1 = '\r', ymm2 = '\n'; совпадение в i — '\r' в i, '\n' в i+1, ...
+    avx_broadcast(1, 13)
+    avx_broadcast(2, 10)
+    let avx_top = here()
+    let avx_end = simd_block_check(35)
+    emit_hex("C5 F5 74 04 07")
+    emit_hex("C5 ED 74 6C 07 01 C5 FD DB C5")
+    emit_hex("C5 F5 74 6C 07 02 C5 FD DB C5")
+    emit_hex("C5 ED 74 6C 07 03 C5 FD DB C5")
+    emit_hex("C5 FD D7 C8 85 C9")
+    let avx_hit = emit_jcc(CC_NE)
+    emit_hex("48 83 C0 20")
+    emit_jmp_to(avx_top)
+    patch_here(avx_hit)
+    emit_hex("C5 F8 77")
+    found.push(emit_jmp())
+    patch_here(avx_end)
+    emit_hex("C5 F8 77")
+    // SSE2
+    patch_here(d[0])
+    sse_broadcast(1, 13)
+    sse_broadcast(2, 10)
+    let sse_top = here()
+    let sse_end = simd_block_check(19)
+    emit_hex("F3 0F 6F 04 07 66 0F 74 C1")
+    emit_hex("F3 0F 6F 6C 07 01 66 0F 74 EA 66 0F DB C5")
+    emit_hex("F3 0F 6F 6C 07 02 66 0F 74 E9 66 0F DB C5")
+    emit_hex("F3 0F 6F 6C 07 03 66 0F 74 EA 66 0F DB C5")
+    emit_hex("66 0F D7 C8 85 C9")
+    found.push(emit_jcc(CC_NE))
+    emit_hex("48 83 C0 10")
+    emit_jmp_to(sse_top)
+    let found_at = here()
+    for h in found {
+        patch_rel(h, found_at)
+    }
+    done.push(simd_found())
+    // побайтно: cmp dword [rdi+rax], 0x0A0D0A0D
+    patch_here(sse_end)
+    patch_here(d[1])
+    let sc_top = here()
+    emit_hex("48 8D 48 04 48 39 F1")
+    let miss = emit_jcc(CC_A)
+    emit_hex("81 3C 07 0D 0A 0D 0A")
+    done.push(emit_jcc(CC_E))
+    emit_hex("48 FF C0")
+    emit_jmp_to(sc_top)
+    patch_here(miss)
+    // mov rax, rsi
+    emit_hex("48 89 F0")
+    let end = here()
+    for h in done {
+        patch_rel(h, end)
+    }
+}
+
+// __cpu_avx2(): есть ли AVX2 и включено ли сохранение ymm операционной системой.
+fn emit_cpu_avx2() {
+    var no: [int] = []
+    // push rbx; mov eax, 1; xor ecx, ecx; cpuid
+    emit_hex("53 B8 01 00 00 00 31 C9 0F A2")
+    // OSXSAVE и AVX: ecx биты 27, 28
+    emit_hex("81 E1 00 00 00 18 81 F9 00 00 00 18")
+    no.push(emit_jcc(CC_NE))
+    // xgetbv: XMM и YMM сохраняются
+    emit_hex("31 C9 0F 01 D0 83 E0 06 83 F8 06")
+    no.push(emit_jcc(CC_NE))
+    // mov eax, 7; xor ecx, ecx; cpuid; test ebx, 1 << 5
+    emit_hex("B8 07 00 00 00 31 C9 0F A2 F7 C3 20 00 00 00")
+    emit_setcc(CC_NE)
+    let done = emit_jmp()
+    let no_at = here()
+    for h in no {
+        patch_rel(h, no_at)
+    }
+    emit_hex("31 C0")
+    patch_here(done)
+    // pop rbx
+    emit8(0x5B)
+}

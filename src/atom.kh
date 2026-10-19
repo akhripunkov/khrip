@@ -927,7 +927,7 @@ fn parse_builtin(t: Token, w: int) -> int {
         emit_call(rt_func("__json_decode"))
         return ty_opt(inner)
     }
-    let lib_only = name == "__spawn" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset"
+    let lib_only = name.starts_with("__simd_") || name == "__cpu_avx2" || name == "__spawn" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset"
     if lib_only && !files[t.file].is_lib {
         return -1
     }
@@ -973,6 +973,31 @@ fn parse_builtin(t: Token, w: int) -> int {
         emit8(0xFF)
         emit8(0x20)
         return ty_void
+    }
+    if name == "__simd_find_byte" || name == "__simd_find_json" || name == "__simd_find_crlf2" {
+        advance()
+        if name == "__simd_find_byte" {
+            builtin_args(3, t, name)
+            emit_pop(RDX)
+        } else {
+            builtin_args(2, t, name)
+        }
+        emit_pop(RSI)
+        emit_pop(RDI)
+        if name == "__simd_find_byte" {
+            emit_simd_find_byte()
+        } else if name == "__simd_find_json" {
+            emit_simd_find_json()
+        } else {
+            emit_simd_find_crlf2()
+        }
+        return ty_int
+    }
+    if name == "__cpu_avx2" {
+        advance()
+        expect_tok(')')
+        emit_cpu_avx2()
+        return ty_bool
     }
     if name == "__spawn" {
         // __spawn(вершина стека, аргумент): новый поток (clone) выполняет

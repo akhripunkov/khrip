@@ -418,7 +418,7 @@ fn can_inline(fi: int) -> bool {
         if k == T_WHILE || k == T_FOR {
             return false
         }
-        if k == T_IDENT && toks[i].text == f.name {
+        if k == T_IDENT && (toks[i].text == f.name || toks[i].text.starts_with("__simd_")) {
             return false
         }
         i += 1

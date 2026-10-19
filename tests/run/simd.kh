@@ -1,0 +1,93 @@
+// SIMD-примитивы рантайма дают тот же ответ, что и простой цикл, на всех путях:
+// AVX2 (2), SSE2 (1) и побайтном (0), при любой длине и любом месте совпадения.
+
+fn ref_byte(p: int, n: int, b: int) -> int {
+    for i in 0..n {
+        if load8(p + i) == b {
+            return i
+        }
+    }
+    return n
+}
+
+fn ref_json(p: int, n: int) -> int {
+    for i in 0..n {
+        let c = load8(p + i)
+        if c == '"' || c == '\\' || c < 0x20 {
+            return i
+        }
+    }
+    return n
+}
+
+fn ref_crlf2(p: int, n: int) -> int {
+    var i = 0
+    while i + 4 <= n {
+        if load8(p + i) == '\r' && load8(p + i + 1) == '\n' && load8(p + i + 2) == '\r' && load8(p + i + 3) == '\n' {
+            return i
+        }
+        i += 1
+    }
+    return n
+}
+
+fn fill(p: int, n: int, c: int) {
+    for i in 0..n {
+        store8(p + i, c)
+    }
+}
+
+fn main() -> int {
+    let buf = __alloc(256)
+    let p = buf + 7
+    var bad = 0
+    var checks = 0
+    let fillers = [0x61, 0x20, 0x7F, 0x80, 0xFF, 0x0D]
+    for level in 0..3 {
+        __simd_level = level
+        for n in 0..90 {
+            for f in fillers {
+                fill(p, n, f)
+                if __find_byte(p, n, 'x') != ref_byte(p, n, 'x') || __find_json_special(p, n) != ref_json(p, n) || __find_crlf2(p, n) != ref_crlf2(p, n) {
+                    bad += 1
+                }
+                checks += 1
+                for at in 0..n {
+                    fill(p, n, f)
+                    store8(p + at, 'x')
+                    if __find_byte(p, n, 'x') != ref_byte(p, n, 'x') {
+                        bad += 1
+                    }
+                    for sp in [0x22, 0x5C, 0x00, 0x1F] {
+                        fill(p, n, f)
+                        store8(p + at, sp)
+                        if __find_json_special(p, n) != ref_json(p, n) {
+                            bad += 1
+                        }
+                    }
+                    if at + 4 <= n {
+                        fill(p, n, f)
+                        store8(p + at, '\r')
+                        store8(p + at + 1, '\n')
+                        store8(p + at + 2, '\r')
+                        store8(p + at + 3, '\n')
+                        if at >= 3 {
+                            store8(p + at - 3, '\r')
+                            store8(p + at - 2, '\n')
+                            store8(p + at - 1, '\n')
+                        }
+                        if __find_crlf2(p, n) != ref_crlf2(p, n) {
+                            bad += 1
+                        }
+                    }
+                    checks += 6
+                }
+            }
+        }
+    }
+    print("checks: {checks}, mismatches: {bad}")
+    if bad > 0 {
+        return 1
+    }
+    return 0
+}

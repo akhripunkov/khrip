@@ -1,0 +1,86 @@
+// Замер SIMD-примитивов рантайма на типичных данных. Уровень задаётся
+// KHRIP_SIMD: 2 — AVX2, 1 — SSE2, 0 — побайтно. Печатает нс на операцию.
+
+type Article {
+    id: int
+    title: str
+    author: str
+    body: str
+    tags: [str]
+}
+
+fn now_ns() -> int {
+    let ts = __alloc(16)
+    syscall(228, 1, ts)
+    return load64(ts) * 1000000000 + load64(ts + 8)
+}
+
+// Типичный запрос браузера: ~750 байт заголовков.
+fn browser_request() -> str {
+    var r = "GET /api/articles/42?lang=en HTTP/1.1\r\n"
+    r += "Host: api.example.com\r\n"
+    r += "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\r\n"
+    r += "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8\r\n"
+    r += "Accept-Language: en-US,en;q=0.9,ru;q=0.8\r\n"
+    r += "Accept-Encoding: gzip, deflate, br, zstd\r\n"
+    r += "Referer: https://www.example.com/articles/41?utm_source=newsletter&utm_medium=email\r\n"
+    r += "Cookie: session=6f1c2a9e8b7d4c3f2e1a0b9c8d7e6f5a4b3c2d1e; theme=dark; consent=analytics,ads; _ga=GA1.1.123456789.1700000000\r\n"
+    r += "Sec-Fetch-Dest: document\r\nSec-Fetch-Mode: navigate\r\nSec-Fetch-Site: same-origin\r\n"
+    r += "Cache-Control: max-age=0\r\nConnection: keep-alive\r\n\r\n"
+    return r
+}
+
+// Разбор как в lib/http.kh: конец заголовков, строки, двоеточия.
+fn parse_headers(p: int, n: int) -> int {
+    let hend = __header_end(p, n)
+    var i = __find_byte(p, hend, '\r') + 2
+    var colons = 0
+    while i < hend - 2 {
+        let line_len = __find_byte(p + i, hend - i, '\r')
+        colons += __find_byte(p + i, line_len, ':')
+        i += line_len + 2
+    }
+    return colons + hend
+}
+
+fn main() {
+    let req = browser_request()
+    let rp = __str_ptr(req)
+    let rn = req.len()
+    var text = ""
+    for i in 0..40 {
+        text += "Khrip is a language for APIs; this paragraph is filler text number {i} for the benchmark. "
+    }
+    let a = Article { id: 42, title: "SIMD in the Khrip runtime", author: "Khrip team", body: text, tags: ["simd", "json", "http"] }
+    __arena_init(0)
+
+    let n1 = 1000000
+    var sum = 0
+    var t = now_ns()
+    for k in 0..n1 {
+        sum += parse_headers(rp, rn)
+    }
+    let http_ns = (now_ns() - t) / n1
+
+    let n2 = 200000
+    let js = to_json(a)
+    t = now_ns()
+    for k in 0..n2 {
+        __arena_begin()
+        sum += to_json(a).len()
+        __arena_end()
+    }
+    let enc_ns = (now_ns() - t) / n2
+
+    t = now_ns()
+    for k in 0..n2 {
+        __arena_begin()
+        let b: Article? = from_json(js)
+        if let x = b {
+            sum += x.body.len()
+        }
+        __arena_end()
+    }
+    let dec_ns = (now_ns() - t) / n2
+    print("{__simd_level} {http_ns} {enc_ns} {dec_ns} {rn} {js.len()} {sum % 7}")
+}

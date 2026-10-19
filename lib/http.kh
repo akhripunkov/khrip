@@ -250,24 +250,13 @@ fn __http_error(s: __Server, c: __Conn, status: int) {
 
 // ---- Разбор запросов ----
 
-// Позиция сразу за «\r\n\r\n» или 0. Байт не \r и не \n не может входить
-// в конец заголовков, поэтому можно перескочить сразу на 4 байта.
+// Позиция сразу за «\r\n\r\n» или 0, если заголовки ещё не пришли целиком.
 fn __header_end(p: int, n: int) -> int {
-    var i = 3
-    while i < n {
-        let c = load8(p + i)
-        if c == '\n' {
-            if load8(p + i - 1) == '\r' && load8(p + i - 2) == '\n' && load8(p + i - 3) == '\r' {
-                return i + 1
-            }
-            i += 1
-        } else if c == '\r' {
-            i += 1
-        } else {
-            i += 4
-        }
+    let i = __find_crlf2(p, n)
+    if i >= n {
+        return 0
     }
-    return 0
+    return i + 4
 }
 
 fn __lower(c: int) -> int {
@@ -314,18 +303,16 @@ fn __http_request(s: __Server, c: __Conn, p: int, n: int) -> int {
         return 0
     }
     // строка запроса: МЕТОД ПУТЬ ВЕРСИЯ
-    var i = 0
-    while i < hend && load8(p + i) != ' ' {
-        i += 1
-    }
-    let method_len = i
-    i += 1
+    let line_end = __find_byte(p, hend, '\r')
+    let method_len = __find_byte(p, line_end, ' ')
+    var i = method_len + 1
     let target = p + i
-    while i < hend && load8(p + i) != ' ' && load8(p + i) != '\r' {
-        i += 1
+    var target_len = 0
+    if i < line_end {
+        target_len = __find_byte(target, line_end - i, ' ')
     }
-    let target_len = p + i - target
-    if method_len == 0 || target_len == 0 || load8(p + i) != ' ' || load8(target) != '/' || i + 9 > hend {
+    i += target_len
+    if method_len == 0 || target_len == 0 || i >= line_end || load8(target) != '/' || i + 9 > hend {
         __http_error(s, c, 400)
         return n
     }
@@ -337,23 +324,14 @@ fn __http_request(s: __Server, c: __Conn, p: int, n: int) -> int {
         __http_error(s, c, 400)
         return n
     }
-    while load8(p + i) != '\n' {
-        i += 1
-    }
-    i += 1
+    i = line_end + 2
     // заголовки: нужны Content-Length, Connection и Transfer-Encoding
     var body_len = 0
     while i < hend - 2 {
         let line = p + i
-        var j = i
-        while load8(p + j) != '\r' {
-            j += 1
-        }
-        let line_len = p + j - line
-        var k = 0
-        while k < line_len && load8(line + k) != ':' {
-            k += 1
-        }
+        let line_len = __find_byte(line, hend - i, '\r')
+        let j = i + line_len
+        let k = __find_byte(line, line_len, ':')
         if k == line_len {
             __http_error(s, c, 400)
             return n
@@ -391,10 +369,7 @@ fn __http_request(s: __Server, c: __Conn, p: int, n: int) -> int {
         return 0
     }
     // путь и строка запроса после «?»
-    var path_len = 0
-    while path_len < target_len && load8(target + path_len) != '?' {
-        path_len += 1
-    }
+    let path_len = __find_byte(target, target_len, '?')
     var query_len = target_len - path_len - 1
     if query_len < 0 {
         query_len = 0

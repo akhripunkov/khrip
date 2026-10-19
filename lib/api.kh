@@ -159,12 +159,12 @@ fn __json_str(b: Buf, s: str) {
     buf_byte(b, '"')
     var start = 0
     var i = 0
-    while i < n {
-        let c = load8(p + i)
-        if c >= 0x20 && c != '"' && c != '\\' {
-            i += 1
-            continue
+    while true {
+        i += __find_json_special(p + i, n - i)
+        if i >= n {
+            break
         }
+        let c = load8(p + i)
         buf_add_raw(b, p + start, i - start)
         if c == '"' {
             buf_add(b, "\\\"")
@@ -396,25 +396,21 @@ fn __jd_str(j: __Json, at: str) -> str {
     }
     j.p += 1
     let start = j.p
-    while j.p < j.end {
-        let c = load8(j.p)
-        if c == '"' {
-            let s = __str_new(start, j.p - start)
-            j.p += 1
-            return s
-        }
-        if c == '\\' {
-            break
-        }
-        if c < 0x20 {
-            __jd_fail(j, at, "control character in a string")
-            return ""
-        }
+    j.p += __find_json_special(j.p, j.end - j.p)
+    if j.p < j.end && load8(j.p) == '"' {
+        let s = __str_new(start, j.p - start)
         j.p += 1
+        return s
     }
     let b = buf_new(j.p - start + 16)
     buf_add_raw(b, start, j.p - start)
     while j.p < j.end {
+        let k = __find_json_special(j.p, j.end - j.p)
+        buf_add_raw(b, j.p, k)
+        j.p += k
+        if j.p >= j.end {
+            break
+        }
         let c = load8(j.p)
         if c == '"' {
             j.p += 1
@@ -423,11 +419,6 @@ fn __jd_str(j: __Json, at: str) -> str {
         if c < 0x20 {
             __jd_fail(j, at, "control character in a string")
             return ""
-        }
-        if c != '\\' {
-            buf_byte(b, c)
-            j.p += 1
-            continue
         }
         if j.p + 1 >= j.end {
             break
