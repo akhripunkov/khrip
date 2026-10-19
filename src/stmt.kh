@@ -1661,6 +1661,9 @@ fn compile_main_wrapper(fi: int, test_mode: bool) {
     } else if routes.len() > 0 {
         emit_call(rt_func("__serve"))
         emit_mov_imm(RAX, 0)
+    } else if everies.len() > 0 {
+        emit_call(rt_func("__run_timers"))
+        emit_mov_imm(RAX, 0)
     } else if m >= 0 && !funcs[m].is_lib {
         let f = funcs[m]
         if f.params.len() > 0 {

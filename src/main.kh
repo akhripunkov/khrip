@@ -12,7 +12,7 @@
 // ============================================================================
 
 fn version() -> str {
-    return "0.7.0"
+    return "0.8.0"
 }
 
 fn put16_at(p: int, v: int) {
@@ -128,6 +128,7 @@ fn add_generated(text: str) {
     let start = toks.len()
     lex_file(files.len() - 1)
     add_tok_text(T_EOF, 0, "", lx_p)
+    prescan_from(1, start)
     prescan_from(2, start)
 }
 
@@ -252,7 +253,7 @@ fn main() -> int {
     let main_fn = gen_func("__main", ty_int)
     prescan(1)
     prescan(2)
-    api_mode = routes.len() > 0 || tests.len() > 0 || test_mode
+    api_mode = routes.len() > 0 || tests.len() > 0 || everies.len() > 0 || test_mode
     check_api()
     if api_libs {
         add_generated(gen_api_source())

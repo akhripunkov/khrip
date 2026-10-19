@@ -1,0 +1,19 @@
+// Приёмник вебхуков для тестов: запоминает уведомления.
+
+type Notice {
+    chat_id: str?
+    text: str
+    city: str
+    temperature: float
+}
+
+store received: [Notice]
+
+route POST "/hook" (body: Notice) -> str {
+    received.push(body)
+    return "ok"
+}
+
+route GET "/received" -> [Notice] {
+    return received
+}

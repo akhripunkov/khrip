@@ -1,0 +1,45 @@
+// Поддельный Open-Meteo для тестов: геокодер и текущая погода.
+// Температуру задаёт POST /set?t=...
+
+type Place {
+    name: str
+    country: str
+    latitude: float
+    longitude: float
+}
+
+type Places {
+    results: [Place]
+}
+
+type Current {
+    time: str
+    temperature_2m: float
+    wind_speed_10m: float
+    weather_code: int
+}
+
+type Forecast {
+    latitude: float
+    longitude: float
+    current: Current
+}
+
+store temp: float = 21.5
+
+route GET "/v1/search" (name: str, count: int?) -> Places {
+    if name == "Nowhere" {
+        return Places { results: [] }
+    }
+    return Places { results: [Place { name, country: "XX", latitude: 55.75, longitude: 37.62 }] }
+}
+
+route GET "/v1/forecast" (latitude: float, longitude: float, current: str) -> Forecast {
+    let c = Current { time: "2026-10-19T15:00", temperature_2m: temp, wind_speed_10m: 3.6, weather_code: 3 }
+    return Forecast { latitude, longitude, current: c }
+}
+
+route POST "/set" (t: float) -> 204 {
+    temp = t
+    return 204
+}

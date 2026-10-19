@@ -34,8 +34,15 @@ type TestDecl {
     fi: int
 }
 
+// every N единиц { ... }: фоновая задача с периодом ms.
+type EveryDecl {
+    ms: int
+    fi: int
+}
+
 var routes: [Route]
 var tests: [TestDecl]
+var everies: [EveryDecl]
 // Индекс маршрута, тело которого компилируется, или -1.
 var route_ctx: int
 // В текущем return маршрута разрешено «x ?? статус».
@@ -71,6 +78,7 @@ fn api_lib_files() -> [str] {
     var names: [str] = []
     names.push("api.kh")
     names.push("http.kh")
+    names.push("fetch.kh")
     return names
 }
 
@@ -80,7 +88,7 @@ fn uses_api() -> bool {
         if t.kind == T_ROUTE || t.kind == T_TEST || t.kind == T_STORE {
             return true
         }
-        if t.kind == T_IDENT && (t.text == "to_json" || t.text == "from_json") {
+        if t.kind == T_IDENT && (t.text == "to_json" || t.text == "from_json" || t.text == "fetch" || t.text == "every") {
             return true
         }
     }
@@ -375,14 +383,78 @@ fn route_of(fi: int) -> int {
     return -1
 }
 
+// Длительность единицы времени в мс или -1.
+fn unit_ms(u: str) -> int {
+    if u == "ms" {
+        return 1
+    }
+    if u == "s" || u == "sec" || u == "second" || u == "seconds" {
+        return 1000
+    }
+    if u == "min" || u == "minute" || u == "minutes" {
+        return 60000
+    }
+    if u == "h" || u == "hour" || u == "hours" {
+        return 3600000
+    }
+    if u == "d" || u == "day" || u == "days" {
+        return 86400000
+    }
+    return -1
+}
+
+// every 10 min { ... }
+fn prescan_every() {
+    let kw_at = pos
+    let kw = tok()
+    advance()
+    let nt = tok()
+    advance()
+    let ut = tok()
+    var ms = unit_ms(ut.text)
+    if ut.kind != T_IDENT || ms < 0 {
+        error_tok(ut, "expected a time unit after every " + nt.val.to_str() + ", found " + tok_show(ut), "every 10 min \{ ... } — units: ms, s, min, h, d")
+        ms = 1000
+    } else {
+        advance()
+    }
+    if nt.val <= 0 {
+        error_tok(nt, "the period must be positive", "")
+    }
+    if kind() != '\{' {
+        syntax_error(tok(), "expected '\{' to start the every block, found " + tok_show(tok()), "")
+        return
+    }
+    let body = pos
+    let end = matching_close(body)
+    var ps: [Param] = []
+    let fname = "__every_" + everies.len().to_str()
+    funcs.push(Func {
+        name: fname,
+        params: ps,
+        ret: ty_void,
+        tok: kw_at,
+        body: body,
+        body_end: end,
+        code: -1,
+        kind: FK_EVERY,
+        inline_ok: false,
+        is_lib: false,
+        used: false,
+        size: end - body
+    })
+    sym_add(fname, SK_FN, funcs.len() - 1, kw)
+    everies.push(EveryDecl { ms: nt.val * ms, fi: funcs.len() - 1 })
+}
+
 // Проверки программы-сервера после предварительного прохода.
 fn check_api() {
-    if routes.len() == 0 {
+    if routes.len() == 0 && everies.len() == 0 {
         return
     }
     let m = func_find("main")
     if m >= 0 && !funcs[m].is_lib {
-        error_tok(toks[funcs[m].tok], "a program with routes is an HTTP server and has no fn main", "remove fn main; the server starts by itself (set the port with PORT)")
+        error_tok(toks[funcs[m].tok], "a program with routes or every blocks runs by itself and has no fn main", "remove fn main; the server starts by itself (set the port with PORT)")
     }
     for g in globals {
         if !g.is_store && !files[toks[g.tok].file].is_lib {
@@ -914,6 +986,54 @@ fn parse_call_expr() -> int {
     return ty_struct(s)
 }
 
+// fetch МЕТОД url [тело] [headers карта] → Response
+fn parse_fetch(at: Token) -> int {
+    let mt = tok()
+    advance()
+    let saved = no_struct
+    no_struct = false
+    let ut = tok()
+    let utype = parse_add()
+    coerce(utype, ty_str, ut)
+    emit_push(RAX)
+    var has_body = starts_value(pos) && tok().line == ut.line
+    if kind() == T_IDENT && tok().text == "headers" {
+        has_body = false
+    }
+    if has_body {
+        let bt = parse_expr(ty_err)
+        emit_push(RAX)
+        emit_mov_imm(RAX, type_desc(bt))
+        emit_push(RAX)
+    } else {
+        emit_mov_imm(RAX, 0)
+        emit_push(RAX)
+        emit_push(RAX)
+    }
+    if kind() == T_IDENT && tok().text == "headers" && tok().line == ut.line {
+        advance()
+        let ht = tok()
+        let hm = ty_map(ty_str, ty_str)
+        let t = parse_expr(hm)
+        coerce(t, hm, ht)
+    } else {
+        emit_mov_imm(RAX, 0)
+    }
+    no_struct = saved
+    emit_mov_rr(R8, RAX)
+    emit_pop(RCX)
+    emit_pop(RDX)
+    emit_pop(RSI)
+    emit_mov_imm(RDI, const_str(mt.text))
+    emit_call(rt_func("__fetch"))
+    last_was_call = true
+    let s = struct_find("Response")
+    if s < 0 {
+        return ty_err
+    }
+    return ty_struct(s)
+}
+
 // ---- Сгенерированный исходный текст ----
 
 // Строковый литерал Khrip с экранированием.
@@ -1081,9 +1201,58 @@ fn gen_tests(b: Buf) {
     buf_add(b, "    return __tests_done()\n}\n")
 }
 
+// Таблица фоновых задач.
+fn gen_everies(b: Buf) {
+    buf_add(b, "fn __every_count() -> int \{\n    return " + everies.len().to_str() + "\n}\n\n")
+    buf_add(b, "fn __every_ms(i: int) -> int \{\n")
+    var i = 0
+    while i < everies.len() {
+        buf_add(b, "    if i == " + i.to_str() + " \{\n        return " + everies[i].ms.to_str() + "\n    }\n")
+        i += 1
+    }
+    buf_add(b, "    return 0\n}\n\nfn __every_run(i: int) \{\n")
+    i = 0
+    while i < everies.len() {
+        buf_add(b, "    if i == " + i.to_str() + " \{\n        __every_" + i.to_str() + "()\n    }\n")
+        i += 1
+    }
+    buf_add(b, "}\n\n")
+}
+
+// Снимок всех store в JSON (KHRIP_DATA): поля необязательные, чтобы снимок
+// читался и после того, как в программе появились новые store.
+fn gen_snapshot(b: Buf) {
+    buf_add(b, "type __Snapshot \{\n")
+    for g in globals {
+        if g.is_store && !files[toks[g.tok].file].is_lib {
+            buf_add(b, "    " + g.name + ": " + ty_name(ty_opt(g.ty)) + "\n")
+        }
+    }
+    buf_add(b, "}\n\nfn __store_snapshot() -> str \{\n    return to_json(__Snapshot \{")
+    var first = true
+    for g in globals {
+        if g.is_store && !files[toks[g.tok].file].is_lib {
+            if !first {
+                buf_add(b, ",")
+            }
+            first = false
+            buf_add(b, " " + g.name + ": " + g.name)
+        }
+    }
+    buf_add(b, " })\n}\n\nfn __store_restore(text: str) -> bool \{\n    let __s: __Snapshot? = from_json(text)\n    let __v = __s else \{\n        return false\n    }\n")
+    for g in globals {
+        if g.is_store && !files[toks[g.tok].file].is_lib {
+            buf_add(b, "    if let __x = __v." + g.name + " \{\n        " + g.name + " = __x\n    }\n")
+        }
+    }
+    buf_add(b, "    return true\n}\n\n")
+}
+
 fn gen_api_source() -> str {
     let b = buf_new(4096)
     gen_dispatch(b)
     gen_tests(b)
+    gen_everies(b)
+    gen_snapshot(b)
     return buf_str(b)
 }

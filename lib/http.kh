@@ -588,11 +588,155 @@ fn __pin(cpu: int) {
     syscall(SYS_SCHED_SETAFFINITY, 0, 128, mask)
 }
 
-// Начало рабочего потока (__spawn).
+// Начало рабочего потока (__spawn); id < 0 — поток фоновых задач.
 fn __thread_main(id: int) {
     __thread_init()
+    if id < 0 {
+        __timer_loop()
+        return
+    }
     __pin(__cpus[id % __cpus.len()])
     __http_worker(id)
+}
+
+// ---- Фоновые задачи (every) и сохранение store (KHRIP_DATA) ----
+
+const SYS_RT_SIGPROCMASK = 14
+const SYS_RT_SIGTIMEDWAIT = 128
+const SYS_RENAME_STORE = 82
+const SIGINT = 2
+const SIGTERM = 15
+
+var __timer_arena: int
+var __store_saved: int
+
+fn __data_path() -> str {
+    return env("KHRIP_DATA") ?? ""
+}
+
+fn __timers_wanted() -> bool {
+    return __every_count() > 0 || __data_path().len() > 0
+}
+
+fn __signal_set() -> int {
+    let set = __alloc(8)
+    store64(set, (1 << (SIGINT - 1)) | (1 << (SIGTERM - 1)))
+    return set
+}
+
+// SIGINT и SIGTERM блокируются во всех потоках: их принимает поток задач,
+// сохраняет store и завершает программу.
+fn __block_signals() {
+    syscall(SYS_RT_SIGPROCMASK, 0, __signal_set(), 0, 8)
+}
+
+fn __load_store() {
+    let path = __data_path()
+    if path.len() == 0 {
+        return
+    }
+    let text = read_file(path) else {
+        return
+    }
+    if !__store_restore(text) {
+        eprint("khrip: cannot read store from {path}: {json_error()}")
+        exit(1)
+    }
+}
+
+// Снимок store под блокировкой, запись — в файл рядом и переименование.
+fn __save_store() {
+    let path = __data_path()
+    __arena_begin()
+    __store_lock()
+    let text = __store_snapshot()
+    __store_saved = __store_touches
+    __store_unlock()
+    let tmp = path + ".tmp"
+    if write_file(tmp, text, false) {
+        syscall(SYS_RENAME_STORE, __cstr(tmp), __cstr(path))
+    } else {
+        eprint("khrip: cannot write store to {path}")
+    }
+    __arena_end()
+}
+
+fn __run_task(w: __Worker, i: int) {
+    let c = __ctx()
+    __arena_begin()
+    if __setjmp(w.jb) == 0 {
+        store64(c + CTX_CATCH, w.jb)
+        __every_run(i)
+    } else {
+        __pmode_reset()
+        let msg: str = __cast(load64(c + CTX_PANIC))
+        eprint(msg)
+    }
+    store64(c + CTX_CATCH, 0)
+    __store_unlock()
+    __arena_end()
+}
+
+fn __timer_loop() {
+    let w = __worker_init()
+    __arena_init(__timer_arena)
+    let n = __every_count()
+    var t = now_ms()
+    var next: [int] = []
+    for i in 0..n {
+        next.push(t + __every_ms(i))
+    }
+    let set = __signal_set()
+    let ts = __alloc(16)
+    let saving = __data_path().len() > 0
+    while true {
+        var wait = 3600000
+        if saving {
+            wait = 1000
+        }
+        for x in next {
+            if x - t < wait {
+                wait = x - t
+            }
+        }
+        if wait < 0 {
+            wait = 0
+        }
+        store64(ts, wait / 1000)
+        store64(ts + 8, (wait % 1000) * 1000000)
+        let sig = syscall(SYS_RT_SIGTIMEDWAIT, set, 0, ts, 8)
+        if sig == SIGINT || sig == SIGTERM {
+            if saving {
+                __save_store()
+            }
+            exit(0)
+        }
+        t = now_ms()
+        for i in 0..n {
+            if t >= next[i] {
+                __run_task(w, i)
+                t = now_ms()
+                next[i] = t + __every_ms(i)
+            }
+        }
+        if saving && __store_touches != __store_saved {
+            __save_store()
+        }
+    }
+}
+
+// Программа без route, но с every: только фоновые задачи.
+fn __run_timers() {
+    __ignore_sigpipe()
+    __store_init()
+    __store_lock()
+    __store_unlock()
+    __load_store()
+    __store_saved = __store_touches
+    __block_signals()
+    __timer_arena = 0
+    eprint("khrip: running {__every_count()} background task(s)")
+    __timer_loop()
 }
 
 // Точка входа сервера: программа с route. Рабочих потоков — по числу
@@ -603,15 +747,26 @@ fn __serve() {
     __store_init()
     __store_lock()
     __store_unlock()
+    __load_store()
+    __store_saved = __store_touches
     __read_cpus()
     var n = __env_int("THREADS", __cpus.len())
     if n < 1 {
         n = 1
     }
+    let timers = __timers_wanted()
+    if timers {
+        __block_signals()
+    }
     eprint("khrip: listening on http://0.0.0.0:{__http_port} ({n} threads)")
     for id in 1..n {
         let stack = syscall(SYS_MMAP, 0, THREAD_STACK, 3, 0x22 | 0x4000, -1, 0)
         __spawn(stack + THREAD_STACK, id)
+    }
+    if timers {
+        __timer_arena = n
+        let stack = syscall(SYS_MMAP, 0, THREAD_STACK, 3, 0x22 | 0x4000, -1, 0)
+        __spawn(stack + THREAD_STACK, -1)
     }
     if n > 1 {
         __pin(__cpus[0])

@@ -73,6 +73,20 @@ fn __panic_at(kind: int, loc: int) {
     __panic(kind, __file_name(loc >> 24) + ":" + (loc & 0xFFFFFF).to_str())
 }
 
+// ---- Время ----
+
+// Секунды с 1970-01-01 (UTC).
+fn now() -> int {
+    return syscall(201, 0)
+}
+
+// Миллисекунды с 1970-01-01 (UTC).
+fn now_ms() -> int {
+    let ts = __ctx() + 192
+    syscall(228, 0, ts)
+    return load64(ts) * 1000 + load64(ts + 8) / 1000000
+}
+
 // ---- Мьютекс на futex: 0 — свободен, 1 — занят, 2 — занят и есть ждущие ----
 
 fn __mutex_lock(m: int) {
@@ -94,6 +108,8 @@ fn __mutex_unlock(m: int) {
 }
 
 var __store_mutex: int
+// Сколько раз брали блокировку store: по нему видно, что store могли изменить.
+var __store_touches: int
 
 fn __store_lock() {
     let c = __ctx()
@@ -105,6 +121,7 @@ fn __store_lock() {
     }
     __mutex_lock(__store_mutex)
     store64(c + CTX_STORE_HELD, 1)
+    __store_touches += 1
 }
 
 fn __store_unlock() {

@@ -1,0 +1,539 @@
+// Исходящие HTTP-запросы: fetch МЕТОД url [тело] [headers карта] → Response.
+// http:// — свой клиент: DNS (/etc/resolv.conf), /etc/hosts, HTTP_PROXY, ответы
+// с Content-Length и по частям (chunked). https:// — пока через curl: своего TLS
+// у Khrip ещё нет. Ошибка соединения — Response со status 0 и текстом в body.
+// Пока запрос ждёт сеть, блокировка store отпущена: другие запросы идут дальше,
+// поэтому данные store между вызовами fetch могут измениться.
+
+const SYS_CONNECT = 42
+const SYS_SENDTO = 44
+const SYS_RECVFROM = 45
+const SYS_ACCESS = 21
+const SYS_PIPE2 = 293
+const SYS_FORK = 57
+const SYS_DUP2 = 33
+const SYS_EXECVE = 59
+const SYS_WAIT4 = 61
+const SYS_RENAME = 82
+const SO_RCVTIMEO = 20
+const SO_SNDTIMEO = 21
+const SOCK_DGRAM = 2
+const FETCH_TIMEOUT = 30
+
+type __Url {
+    https: bool
+    host: str
+    port: int
+    target: str
+}
+
+fn __parse_url(url: str) -> __Url? {
+    var rest = ""
+    var https = false
+    if url.starts_with("http://") {
+        rest = url[7..]
+    } else if url.starts_with("https://") {
+        rest = url[8..]
+        https = true
+    } else {
+        return none
+    }
+    var cut = rest.len()
+    for i in 0..rest.len() {
+        if rest[i] == '/' || rest[i] == '?' {
+            cut = i
+            break
+        }
+    }
+    let hostport = rest[..cut]
+    var target = rest[cut..]
+    if target.len() == 0 {
+        target = "/"
+    } else if target[0] == '?' {
+        target = "/" + target
+    }
+    var host = hostport
+    var port = 80
+    if https {
+        port = 443
+    }
+    if let c = hostport.find(":") {
+        host = hostport[..c]
+        port = hostport[c + 1..].to_int() ?? -1
+    }
+    if host.len() == 0 || port <= 0 || port > 65535 {
+        return none
+    }
+    return __Url { https, host, port, target }
+}
+
+// ---- Адреса ----
+
+// "a.b.c.d" → a << 24 | b << 16 | c << 8 | d
+fn __ip_parse(s: str) -> int? {
+    let parts = s.split(".")
+    if parts.len() != 4 {
+        return none
+    }
+    var ip = 0
+    for p in parts {
+        let v = p.to_int() else {
+            return none
+        }
+        if v < 0 || v > 255 || p.len() == 0 {
+            return none
+        }
+        ip = ip * 256 + v
+    }
+    return ip
+}
+
+fn __hosts_lookup(host: str) -> int? {
+    let text = read_file("/etc/hosts") else {
+        return none
+    }
+    for line in text.split("\n") {
+        let l = (line.split("#"))[0].replace("\t", " ").trim()
+        let words = l.split(" ").filter(w => w.len() > 0)
+        if words.len() < 2 {
+            continue
+        }
+        if words[1..words.len()].contains(host) {
+            if let ip = __ip_parse(words[0]) {
+                return ip
+            }
+        }
+    }
+    return none
+}
+
+fn __nameservers() -> [int] {
+    var r: [int] = []
+    if let text = read_file("/etc/resolv.conf") {
+        for line in text.split("\n") {
+            let l = line.trim()
+            if l.starts_with("nameserver ") {
+                if let ip = __ip_parse(l[11..].trim()) {
+                    r.push(ip)
+                }
+            }
+        }
+    }
+    if r.len() == 0 {
+        r.push(0x08080808)
+    }
+    return r
+}
+
+fn __sockaddr(ip: int, port: int) -> int {
+    let a = __alloc(16)
+    store8(a, AF_INET)
+    store8(a + 2, (port >> 8) & 255)
+    store8(a + 3, port & 255)
+    store8(a + 4, (ip >> 24) & 255)
+    store8(a + 5, (ip >> 16) & 255)
+    store8(a + 6, (ip >> 8) & 255)
+    store8(a + 7, ip & 255)
+    return a
+}
+
+fn __set_timeouts(fd: int, sec: int) {
+    let tv = __alloc(16)
+    store64(tv, sec)
+    syscall(SYS_SETSOCKOPT, fd, SOL_SOCKET, SO_RCVTIMEO, tv, 16)
+    syscall(SYS_SETSOCKOPT, fd, SOL_SOCKET, SO_SNDTIMEO, tv, 16)
+}
+
+// Запрос A-записи у DNS-сервера по UDP.
+fn __dns_query(host: str) -> int? {
+    let q = buf_new(64)
+    let id = syscall(SYS_TIME, 0) & 0xFFFF
+    buf_byte(q, id >> 8)
+    buf_byte(q, id & 255)
+    // флаги: рекурсия; один вопрос
+    for b in [1, 0, 0, 1, 0, 0, 0, 0, 0, 0] {
+        buf_byte(q, b)
+    }
+    for label in host.split(".") {
+        if label.len() == 0 || label.len() > 63 {
+            return none
+        }
+        buf_byte(q, label.len())
+        buf_add(q, label)
+    }
+    for b in [0, 0, 1, 0, 1] {
+        buf_byte(q, b)
+    }
+    let resp = __alloc(1500)
+    for ns in __nameservers() {
+        for attempt in 0..2 {
+            let fd = syscall(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0)
+            if fd < 0 {
+                return none
+            }
+            __set_timeouts(fd, 2)
+            syscall(SYS_SENDTO, fd, q.data, q.len, 0, __sockaddr(ns, 53), 16)
+            let n = syscall(SYS_RECVFROM, fd, resp, 1500, 0, 0, 0)
+            syscall(SYS_CLOSE, fd)
+            if n >= 12 && load8(resp) == (id >> 8) && load8(resp + 1) == (id & 255) {
+                return __dns_answer(resp, n)
+            }
+        }
+    }
+    return none
+}
+
+fn __dns_skip_name(p: int, n: int, at: int) -> int {
+    var i = at
+    while i < n {
+        let len = load8(p + i)
+        if len == 0 {
+            return i + 1
+        }
+        if (len & 0xC0) == 0xC0 {
+            return i + 2
+        }
+        i += len + 1
+    }
+    return n
+}
+
+fn __dns_answer(p: int, n: int) -> int? {
+    let ancount = load8(p + 6) * 256 + load8(p + 7)
+    var i = __dns_skip_name(p, n, 12) + 4
+    for a in 0..ancount {
+        i = __dns_skip_name(p, n, i)
+        if i + 10 > n {
+            return none
+        }
+        let typ = load8(p + i) * 256 + load8(p + i + 1)
+        let rdlen = load8(p + i + 8) * 256 + load8(p + i + 9)
+        i += 10
+        if typ == 1 && rdlen == 4 && i + 4 <= n {
+            return ((load8(p + i) * 256 + load8(p + i + 1)) * 256 + load8(p + i + 2)) * 256 + load8(p + i + 3)
+        }
+        i += rdlen
+    }
+    return none
+}
+
+fn __resolve(host: str) -> int? {
+    if let ip = __ip_parse(host) {
+        return ip
+    }
+    if host == "localhost" {
+        return 0x7F000001
+    }
+    if let ip = __hosts_lookup(host) {
+        return ip
+    }
+    return __dns_query(host)
+}
+
+// Хост не идёт через прокси: localhost, 127.*, домены из NO_PROXY.
+fn __no_proxy(host: str) -> bool {
+    if host == "localhost" || host.starts_with("127.") {
+        return true
+    }
+    let list = env("NO_PROXY") ?? env("no_proxy") ?? ""
+    for item in list.split(",") {
+        let d = item.trim()
+        if d.len() > 0 && (host == d || host.ends_with("." + d.trim_start_dot())) {
+            return true
+        }
+    }
+    return false
+}
+
+fn __str_trim_start_dot(self: str) -> str {
+    if self.starts_with(".") {
+        return self[1..]
+    }
+    return self
+}
+
+// ---- HTTP по TCP ----
+
+fn __fetch_fail(msg: str) -> Response {
+    return Response { status: 0, body: msg }
+}
+
+// Тело ответа по частям: «размер\r\nданные\r\n» ... «0\r\n\r\n».
+fn __unchunk(s: str) -> str {
+    let b = buf_new(s.len())
+    var i = 0
+    while i < s.len() {
+        var size = 0
+        while i < s.len() && __hex_val(s[i]) >= 0 {
+            size = size * 16 + __hex_val(s[i])
+            i += 1
+        }
+        let eol = s.find_from("\r\n", i)
+        if eol < 0 || size == 0 {
+            break
+        }
+        i = eol + 2
+        if i + size > s.len() {
+            buf_add(b, s[i..])
+            break
+        }
+        buf_add(b, s[i..i + size])
+        i += size + 2
+    }
+    return __str_new(b.data, b.len)
+}
+
+fn __parse_response(raw: str) -> Response {
+    let hend = raw.find("\r\n\r\n") else {
+        return __fetch_fail("incomplete HTTP response")
+    }
+    let head = raw[..hend]
+    var body = raw[hend + 4..]
+    let lines = head.split("\r\n")
+    let first = lines[0].split(" ")
+    if first.len() < 2 || !first[0].starts_with("HTTP/") {
+        return __fetch_fail("not an HTTP response")
+    }
+    let status = first[1].to_int() ?? 0
+    var chunked = false
+    var length = -1
+    for line in lines[1..lines.len()] {
+        let c = line.find(":") ?? line.len()
+        let name = line[..c].lower()
+        let value = line[c + 1..].trim()
+        if name == "transfer-encoding" && value.lower().contains("chunked") {
+            chunked = true
+        } else if name == "content-length" {
+            length = value.to_int() ?? -1
+        }
+    }
+    if chunked {
+        body = __unchunk(body)
+    } else if length >= 0 && length < body.len() {
+        body = body[..length]
+    }
+    return Response { status, body }
+}
+
+fn __http_exchange(url: __Url, request: str) -> Response {
+    var host = url.host
+    var port = url.port
+    let proxy = env("HTTP_PROXY") ?? env("http_proxy") ?? ""
+    if proxy.len() > 0 && !__no_proxy(url.host) {
+        if let pu = __parse_url(proxy) {
+            host = pu.host
+            port = pu.port
+        }
+    }
+    let ip = __resolve(host) else {
+        return __fetch_fail("cannot resolve host " + host)
+    }
+    let fd = syscall(SYS_SOCKET, AF_INET, SOCK_STREAM, 0)
+    if fd < 0 {
+        return __fetch_fail("cannot create a socket")
+    }
+    __set_timeouts(fd, FETCH_TIMEOUT)
+    if syscall(SYS_CONNECT, fd, __sockaddr(ip, port), 16) < 0 {
+        syscall(SYS_CLOSE, fd)
+        return __fetch_fail("cannot connect to " + host + ":" + port.to_str())
+    }
+    var off = 0
+    while off < request.len() {
+        let w = syscall(SYS_WRITE, fd, __str_ptr(request) + off, request.len() - off)
+        if w <= 0 {
+            syscall(SYS_CLOSE, fd)
+            return __fetch_fail("connection closed while sending")
+        }
+        off += w
+    }
+    let b = buf_new(16384)
+    while true {
+        buf_reserve(b, 16384)
+        let n = syscall(SYS_READ, fd, b.data + b.len, b.cap - b.len)
+        if n == 0 {
+            break
+        }
+        if n < 0 {
+            syscall(SYS_CLOSE, fd)
+            if b.len == 0 {
+                return __fetch_fail("timeout or connection error")
+            }
+            break
+        }
+        b.len += n
+    }
+    syscall(SYS_CLOSE, fd)
+    return __parse_response(__str_new(b.data, b.len))
+}
+
+// ---- Внешние программы (curl для https) ----
+
+type __Proc {
+    code: int
+    out: str
+}
+
+fn __find_exe(name: str) -> str? {
+    let path = env("PATH") ?? "/usr/local/bin:/usr/bin:/bin"
+    for dir in path.split(":") {
+        let full = dir + "/" + name
+        if dir.len() > 0 && syscall(SYS_ACCESS, __cstr(full), 1) == 0 {
+            return full
+        }
+    }
+    return none
+}
+
+// Запуск программы: input — на её stdin, stdout и stderr — в out.
+fn __run_capture(exe: str, args: [str], input: str) -> __Proc {
+    let fds = __alloc(16)
+    syscall(SYS_PIPE2, fds, 0x80000)
+    let in_r = load64(fds) & 0xFFFFFFFF
+    let in_w = (load64(fds) >> 32) & 0xFFFFFFFF
+    syscall(SYS_PIPE2, fds, 0x80000)
+    let out_r = load64(fds) & 0xFFFFFFFF
+    let out_w = (load64(fds) >> 32) & 0xFFFFFFFF
+    let argv = __alloc((args.len() + 1) * 8)
+    for i, a in args {
+        store64(argv + i * 8, __cstr(a))
+    }
+    let path = __cstr(exe)
+    let envp = __argv + (__argc + 1) * 8
+    let pid = syscall(SYS_FORK)
+    if pid == 0 {
+        syscall(SYS_DUP2, in_r, 0)
+        syscall(SYS_DUP2, out_w, 1)
+        syscall(SYS_DUP2, out_w, 2)
+        syscall(SYS_EXECVE, path, argv, envp)
+        syscall(SYS_EXIT, 127)
+    }
+    syscall(SYS_CLOSE, in_r)
+    syscall(SYS_CLOSE, out_w)
+    var off = 0
+    while off < input.len() {
+        let w = syscall(SYS_WRITE, in_w, __str_ptr(input) + off, input.len() - off)
+        if w <= 0 {
+            break
+        }
+        off += w
+    }
+    syscall(SYS_CLOSE, in_w)
+    let b = buf_new(16384)
+    while true {
+        buf_reserve(b, 16384)
+        let n = syscall(SYS_READ, out_r, b.data + b.len, b.cap - b.len)
+        if n <= 0 {
+            break
+        }
+        b.len += n
+    }
+    syscall(SYS_CLOSE, out_r)
+    let st = __alloc(8)
+    syscall(SYS_WAIT4, pid, st, 0, 0)
+    return __Proc { code: (load64(st) >> 8) & 255, out: __str_new(b.data, b.len) }
+}
+
+fn __fetch_curl(method: str, url: str, body: str, has_body: bool, ctype: str, headers: map[str, str]) -> Response {
+    let curl = __find_exe("curl") else {
+        return __fetch_fail("https needs curl in PATH: Khrip has no TLS of its own yet")
+    }
+    var args = ["curl", "-sS", "--max-time", FETCH_TIMEOUT.to_str(), "-X", method, "-o", "-", "-w", "\n%\{http_code}"]
+    for k, v in headers {
+        args.push("-H")
+        args.push(k + ": " + v)
+    }
+    if has_body {
+        if !headers.has("Content-Type") {
+            args.push("-H")
+            args.push("Content-Type: " + ctype)
+        }
+        args.push("--data-binary")
+        args.push("@-")
+    }
+    args.push(url)
+    let p = __run_capture(curl, args, body)
+    if p.code != 0 {
+        // сообщение curl без кода ответа, который он дописал в конец
+        let cut = __last_nl(p.out)
+        if cut < p.out.len() {
+            return __fetch_fail(p.out[..cut].trim())
+        }
+        return __fetch_fail(p.out.trim())
+    }
+    // curl дописывает в конец «\nКОД»
+    let nl = __last_nl(p.out)
+    if nl >= p.out.len() {
+        return __fetch_fail("unexpected curl output")
+    }
+    let status = p.out[nl + 1..].trim().to_int() ?? 0
+    return Response { status, body: p.out[..nl] }
+}
+
+fn __last_nl(s: str) -> int {
+    var i = s.len() - 1
+    while i >= 0 && s[i] != '\n' {
+        i -= 1
+    }
+    if i < 0 {
+        return s.len()
+    }
+    return i
+}
+
+// fetch МЕТОД url [тело] [headers карта]: тело — str как есть или значение в JSON.
+fn __fetch(method: str, url: str, body: int, d: int, headers: int) -> Response {
+    var text = ""
+    var ctype = "application/json"
+    let has_body = d != 0
+    if has_body {
+        if load64(d) == D_STR {
+            text = __cast(body)
+            ctype = "text/plain; charset=utf-8"
+        } else {
+            text = __json_encode(body, d)
+        }
+    }
+    var hs: map[str, str] = {}
+    if headers != 0 {
+        hs = __cast(headers)
+    }
+    let c = __ctx()
+    let held = load64(c + CTX_STORE_HELD) != 0
+    if held {
+        __store_unlock()
+    }
+    var r = __fetch_fail("bad URL: " + url)
+    if let u = __parse_url(url) {
+        if u.https {
+            r = __fetch_curl(method, url, text, has_body, ctype, hs)
+        } else {
+            let req = buf_new(256 + text.len())
+            var target = u.target
+            let proxy = env("HTTP_PROXY") ?? env("http_proxy") ?? ""
+            if proxy.len() > 0 && !__no_proxy(u.host) {
+                target = url
+            }
+            buf_add(req, method + " " + target + " HTTP/1.1\r\nHost: " + u.host)
+            if u.port != 80 {
+                buf_add(req, ":" + u.port.to_str())
+            }
+            buf_add(req, "\r\nUser-Agent: khrip\r\nAccept: */*\r\nConnection: close\r\n")
+            for k, v in hs {
+                buf_add(req, k + ": " + v + "\r\n")
+            }
+            if has_body {
+                if !hs.has("Content-Type") {
+                    buf_add(req, "Content-Type: " + ctype + "\r\n")
+                }
+                buf_add(req, "Content-Length: " + text.len().to_str() + "\r\n")
+            }
+            buf_add(req, "\r\n")
+            buf_add(req, text)
+            r = __http_exchange(u, __str_new(req.data, req.len))
+        }
+    }
+    if held {
+        __store_lock()
+    }
+    return r
+}

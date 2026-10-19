@@ -6,7 +6,8 @@
 #                       содержать каждую строку «// expect: ...»; ключи
 #                       компилятора — из «// flags: ...»;
 #   tests/api/*.kh    — блоки test (khc test); вывод сравнивается с .out;
-#   tests/http.sh     — HTTP-сервер на Khrip отвечает правильно.
+#   tests/http.sh     — HTTP-сервер на Khrip отвечает правильно;
+#   tests/weather.sh  — погодный бэкенд: fetch, every, сохранение store.
 # Компилятор берётся из $KHC (по умолчанию build/khc).
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -76,6 +77,11 @@ done
 if [[ -f tests/http.sh ]]; then
 	# shellcheck source=tests/http.sh
 	source tests/http.sh
+fi
+
+if [[ -f tests/weather.sh ]] && command -v curl >/dev/null; then
+	# shellcheck source=tests/weather.sh
+	source tests/weather.sh
 fi
 
 echo "тестов пройдено: $pass, провалено: $fail"

@@ -1,4 +1,4 @@
-// expect: error: a program with routes is an HTTP server and has no fn main
+// expect: error: a program with routes or every blocks runs by itself and has no fn main
 route GET "/" -> str {
     return "hi"
 }

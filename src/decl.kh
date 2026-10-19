@@ -14,6 +14,7 @@ const FK_USER = 0
 const FK_ROUTE = 1
 const FK_TEST = 2
 const FK_GEN = 3
+const FK_EVERY = 4
 
 type Param {
     name: str
@@ -693,8 +694,10 @@ fn prescan_from(pass: int, from: int) {
                     prescan_const()
                 } else if k == T_ROUTE || k == T_TEST {
                     prescan_api(k)
+                } else if k == T_IDENT && toks[i].text == "every" && kind_at(i + 1) == T_INT {
+                    prescan_every()
                 } else if k != T_TYPE && starts_decl_error(i) {
-                    error_tok(toks[i], "expected a declaration (fn, type, var, const, store, route or test), found " + tok_show(toks[i]), decl_hint(toks[i]))
+                    error_tok(toks[i], "expected a declaration (fn, type, var, const, store, route, every or test), found " + tok_show(toks[i]), decl_hint(toks[i]))
                 }
             }
         }

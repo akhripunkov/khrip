@@ -1,0 +1,179 @@
+// Погода по городу и уведомления о ней.
+//
+//   GET    /weather?city=Moscow       текущая погода
+//   POST   /alerts                    подписка: город, вебхук, порог below/above
+//   GET    /alerts, DELETE /alerts/1  подписки
+//   POST   /alerts/check              проверить подписки сейчас
+//
+// Каждые 10 минут подписки проверяются; когда температура выходит за порог,
+// на вебхук уходит POST с JSON. Для Telegram вебхук —
+// https://api.telegram.org/bot<токен>/sendMessage, а chat_id — номер чата.
+// Данные — Open-Meteo (без ключа); METEO_URL и GEO_URL меняют адреса.
+// Подписки переживают перезапуск: KHRIP_DATA=alerts.json.
+
+type Place {
+    name: str
+    latitude: float
+    longitude: float
+}
+
+type Places {
+    results: [Place] = []
+}
+
+type Current {
+    temperature_2m: float
+    wind_speed_10m: float
+    weather_code: int
+}
+
+type Forecast {
+    current: Current
+}
+
+type Weather {
+    city: str
+    temperature: float
+    wind: float
+    sky: str
+}
+
+type NewAlert {
+    city: str
+    webhook: str
+    chat_id: str? = none
+    below: float? = none
+    above: float? = none
+}
+
+type Alert {
+    id: int
+    ...NewAlert
+    last: float? = none
+    fired: bool = false
+}
+
+type Notice {
+    chat_id: str?
+    text: str
+    city: str
+    temperature: float
+}
+
+store alerts: map[int, Alert]
+store last_id: int
+
+fn meteo() -> str {
+    return env("METEO_URL") ?? "https://api.open-meteo.com"
+}
+
+fn geo() -> str {
+    return env("GEO_URL") ?? "https://geocoding-api.open-meteo.com"
+}
+
+fn find_place(city: str) -> Place? {
+    let r = fetch GET "{geo()}/v1/search?count=1&name={url_encode(city)}"
+    let found: Places? = from_json(r.body)
+    let places = found else {
+        return none
+    }
+    if r.status != 200 || places.results.len() == 0 {
+        return none
+    }
+    return places.results[0]
+}
+
+fn sky(code: int) -> str {
+    return match code {
+        0 => "clear"
+        1 | 2 => "partly cloudy"
+        3 => "overcast"
+        45 | 48 => "fog"
+        51 | 53 | 55 | 56 | 57 => "drizzle"
+        61 | 63 | 65 | 66 | 67 | 80 | 81 | 82 => "rain"
+        71 | 73 | 75 | 77 | 85 | 86 => "snow"
+        95 | 96 | 99 => "thunderstorm"
+        _ => "unknown"
+    }
+}
+
+fn weather(city: str) -> Weather? {
+    let place = find_place(city) else {
+        return none
+    }
+    let r = fetch GET "{meteo()}/v1/forecast?latitude={place.latitude}&longitude={place.longitude}&current=temperature_2m,wind_speed_10m,weather_code"
+    let f: Forecast? = from_json(r.body)
+    let now = f else {
+        return none
+    }
+    let c = now.current
+    return Weather { city: place.name, temperature: c.temperature_2m, wind: c.wind_speed_10m, sky: sky(c.weather_code) }
+}
+
+route GET "/weather" (city: str) -> Weather | 502 str {
+    let w = weather(city) else {
+        return 502 "weather for '{city}' is not available"
+    }
+    return w
+}
+
+route POST "/alerts" (body: NewAlert) -> 201 Alert | 400 str {
+    if body.city.trim() == "" {
+        return 400 "city is required"
+    }
+    if !body.webhook.starts_with("http://") && !body.webhook.starts_with("https://") {
+        return 400 "webhook must be an http(s) URL"
+    }
+    if body.below == none && body.above == none {
+        return 400 "set below or above"
+    }
+    last_id += 1
+    let alert = Alert { id: last_id, ...body }
+    alerts[alert.id] = alert
+    return 201 alert
+}
+
+route GET "/alerts" -> [Alert] {
+    return alerts.values()
+}
+
+route DELETE "/alerts/{id}" (id: int) -> 204 | 404 {
+    alerts.remove(id) else {
+        return 404
+    }
+    return 204
+}
+
+route POST "/alerts/check" -> int {
+    return check_alerts()
+}
+
+every 10 min {
+    check_alerts()
+}
+
+// Проверка подписок; уведомление уходит один раз, пока температура за порогом.
+// → сколько уведомлений отправлено
+fn check_alerts() -> int {
+    var sent = 0
+    for a in alerts.values() {
+        let w = weather(a.city) else {
+            continue
+        }
+        let t = w.temperature
+        let cold = t < (a.below ?? -1000)
+        let hot = t > (a.above ?? 1000)
+        if (cold || hot) && !a.fired {
+            let text = if cold { "{w.city}: {t}°C, below {a.below ?? 0}°C" } else { "{w.city}: {t}°C, above {a.above ?? 0}°C" }
+            let r = fetch POST a.webhook Notice { chat_id: a.chat_id, text, city: w.city, temperature: t }
+            if r.status >= 200 && r.status < 300 {
+                a.fired = true
+                sent += 1
+            }
+        } else if !cold && !hot {
+            a.fired = false
+        }
+        a.last = t
+    }
+    return sent
+}

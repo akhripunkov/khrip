@@ -1091,6 +1091,21 @@ fn __path_segs(p: str) -> [str] {
     return segs
 }
 
+// Текст для строки запроса: всё, кроме букв, цифр и - _ . ~, — как %XX.
+fn url_encode(s: str) -> str {
+    let b = buf_new(s.len() + 8)
+    for c in s {
+        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~' {
+            buf_byte(b, c)
+        } else {
+            buf_byte(b, '%')
+            buf_byte(b, __hex_digit(c >> 4) - 32 * ((c >> 4) / 10))
+            buf_byte(b, __hex_digit(c & 15) - 32 * ((c & 15) / 10))
+        }
+    }
+    return __str_new(b.data, b.len)
+}
+
 fn __url_decode(s: str) -> str {
     let n = s.len()
     var plain = true

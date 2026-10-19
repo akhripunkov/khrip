@@ -1,4 +1,4 @@
-# Khrip language reference (v0.7)
+# Khrip language reference (v0.8)
 
 Khrip is a compiled, strictly typed language for HTTP APIs on Linux x86-64.
 One project = one namespace: no imports, declaration order does not matter.
@@ -12,8 +12,8 @@ khc -o app app.kh         # build a static binary
 
 ## Types
 
-`int` (64-bit, overflow panics), `bool`, `str` (immutable bytes), `[T]` list,
-`map[K, V]` (K is int or str), `T?` optional, and named types:
+`int` (64-bit, overflow panics), `float` (64-bit), `bool`, `str` (immutable
+bytes), `[T]` list, `map[K, V]` (K is int or str), `T?` optional, and named types:
 
 ```khrip
 type Point {
@@ -31,9 +31,11 @@ type Shape = Circle { r: int } | Rect { w: int, h: int } | Empty
 
 A variant type holds one of its variants: `let s: Shape = Circle { r: 2 }`,
 `let r = Admin`. Enum values compare with `==`; read variant fields with `match`.
-No floats (use int cents), no null (use `T?` and `none`), no classes, generics,
-exceptions or operator overloading. Implicit conversions: `T` → `T?` and
-variant → its type. Conditions must be `bool`.
+No null (use `T?` and `none`), no classes, generics, exceptions or operator
+overloading. Implicit conversions: `T` → `T?`, variant → its type, and an int
+*literal* where a float is expected (`t * 2`, `t < 0`, `let x: float = 5`); an
+int variable needs `n.to_float()`, a float `x.to_int()` or `x.round()`. Keep
+money in int cents. Conditions must be `bool`.
 
 ## Declarations
 
@@ -130,7 +132,9 @@ is `describe(p)`.
 
 - `str`: `len contains starts_with ends_with find trim lower upper split
   replace repeat to_int`
-- `int`: `to_str abs min max`; `bool`: `to_str`
+- `int`: `to_str to_float abs min max`; `bool`: `to_str`
+- `float`: `to_str to_int round floor ceil` (→ int) `round_to(digits) abs sqrt
+  min max`; `s.to_float()` → `float?`; floats print like JavaScript (`0.1`, `1e+21`)
 - `[T]`: `len push pop last insert remove_at clear truncate reverse copy
   contains index_of sort` (sort: int or str), `join` ([str]), `sum` ([int]),
   `xs[i]`, `xs[a..b]`
@@ -141,17 +145,18 @@ is `describe(p)`.
 
 Functions: `print(s)`, `eprint(s)`, `write(s)` (no newline), `len(x)`,
 `args() -> [str]`, `env(name) -> str?`, `read_file(path) -> str?`,
-`write_file(path, text, executable) -> bool`, `exit(code)`,
-`to_json(value) -> str`, `from_json(text) -> T?` (the type comes from the
-annotation: `let u: User? = from_json(text)`), `json_error() -> str`.
+`write_file(path, text, executable) -> bool`, `exit(code)`, `now()` (unix
+seconds), `now_ms()`, `url_encode(s)`, `to_json(value) -> str`,
+`from_json(text) -> T?` (the type comes from the annotation:
+`let u: User? = from_json(text)`), `json_error() -> str`.
 
 Index out of range, overflow, division by zero and `pop` on an empty list
 panic: the program exits with code 101; in a server the request gets 500.
 
 ## HTTP API
 
-A program with `route` declarations is a server (no `fn main`); `PORT` sets
-the port (8080), `THREADS` the worker threads (all cores).
+A program with `route` or `every` declarations runs by itself (no `fn main`);
+`PORT` sets the port (8080), `THREADS` the worker threads (all cores).
 
 ```khrip
 type NewUser {
@@ -196,7 +201,7 @@ route DELETE "/users/{id}" (id: int) -> 204 | 404 {
 ```
 
 - Method: `GET POST PUT PATCH DELETE`. Path parameters `{id}` must be declared
-  (`int`, `str`, `bool` or an enum). A struct, list or map parameter is the JSON
+  (`int`, `float`, `str`, `bool` or an enum). A struct, list or map parameter is the JSON
   body; other parameters come from the query string (`T?` makes one optional).
   Missing body fields take their defaults; enums are JSON strings ("Admin"),
   other variants objects with a "type" field.
@@ -208,6 +213,26 @@ route DELETE "/users/{id}" (id: int) -> 204 | 404 {
 - `store name: T` is data that outlives requests. Each request runs in its own
   memory arena; writes into store are copied out automatically. Handlers see
   store as if requests ran one at a time.
+
+## Calling other services, background tasks
+
+```khrip
+let r = fetch GET "https://api.example.com/v1/items?q={url_encode(q)}"
+let items: [Item]? = from_json(r.body)
+fetch POST hook Notice { text: "done" } headers {"Authorization": "Bearer {key}"}
+
+every 10 min {
+    refresh()
+}
+```
+
+`fetch METHOD url [body] [headers map]` returns `Response { status, body }`;
+`status` is 0 when the service cannot be reached (`body` says why). A body
+value is sent as JSON, a str as text. https uses `curl` (must be installed).
+While `fetch` waits, other requests may change store. `every N ms|s|min|h|d`
+runs a block in a background thread (first run after one period); call the
+same function from a test or a route to check it. With `KHRIP_DATA=file.json`
+store is loaded at start and saved each second after changes and on SIGTERM.
 
 ## Tests
 

@@ -130,6 +130,9 @@ fn parse_ident(w: int) -> int {
     if kind() == '(' {
         return parse_call(t, w)
     }
+    if name == "fetch" && kind() == T_IDENT && is_http_method(tok().text) && find_local(name) < 0 {
+        return parse_fetch(t)
+    }
     if kind() == '\{' && !no_struct {
         let si = struct_find(name)
         if si >= 0 {

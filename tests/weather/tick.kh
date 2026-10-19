@@ -1,0 +1,11 @@
+// every: задача идёт сама, store доступен ей и маршрутам.
+
+store ticks: int
+
+every 100 ms {
+    ticks += 1
+}
+
+route GET "/ticks" -> int {
+    return ticks
+}
