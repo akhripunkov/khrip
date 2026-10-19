@@ -1,0 +1,28 @@
+// && и || вычисляются по короткой схеме и дают 0 или 1.
+var calls: i64
+
+fn yes() -> i64 {
+    calls = calls + 1
+    return 1
+}
+
+fn no() -> i64 {
+    calls = calls + 1
+    return 0
+}
+
+fn main() -> i64 {
+    println_int(no() && yes())
+    println_int(calls)
+    println_int(yes() || no())
+    println_int(calls)
+    println_int(no() || no() || yes())
+    println_int(calls)
+    println_int(yes() && yes() && no())
+    println_int(calls)
+    println_int(5 && 7)
+    println_int(!5)
+    println_int(!0)
+    println_int(1 < 2 && 2 < 3 || 0)
+    return 0
+}

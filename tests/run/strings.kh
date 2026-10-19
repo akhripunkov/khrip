@@ -1,0 +1,17 @@
+// Строки, экранирование, символьные литералы.
+fn main() -> i64 {
+    println("hello, khrip")
+    println("tab:\t|")
+    println("quotes: \"x\" 'y' \\")
+    println_int('\n')
+    println_int('\\')
+    println_int('\'')
+    println_int('\0')
+    println_int(strlen("abc\0def"))
+    let s = "mutable"
+    store8(s, 'M')
+    println(s)
+    println_int(mem_eq("abc", 3, "abc", 3))
+    println_int(mem_eq("abc", 3, "abd", 3))
+    return 0
+}

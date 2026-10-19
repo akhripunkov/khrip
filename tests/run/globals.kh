@@ -1,0 +1,26 @@
+// Константы и глобальные переменные.
+const ANSWER = 42
+const NEG = -7
+const CH = 'A'
+var counter: i64
+var start: i64 = 1000
+var minus: i64 = -1
+
+fn bump() -> i64 {
+    counter = counter + 1
+    return counter
+}
+
+fn main() -> i64 {
+    println_int(ANSWER)
+    println_int(NEG)
+    println_int(CH)
+    println_int(start)
+    println_int(minus)
+    bump()
+    bump()
+    println_int(bump())
+    start = start + counter
+    println_int(start)
+    return 0
+}

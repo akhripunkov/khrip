@@ -1,0 +1,4 @@
+// expect: unknown_name.kh:3: error: unknown name (near 'foo')
+fn main() -> i64 {
+    return foo
+}

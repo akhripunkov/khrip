@@ -1,0 +1,92 @@
+// Минимальная стандартная библиотека Khrip-0.
+// Подключается как ещё один входной файл: khc -o prog lib/std.kh prog.kh
+
+const SYS_READ = 0
+const SYS_WRITE = 1
+const SYS_OPEN = 2
+const SYS_CLOSE = 3
+const SYS_MMAP = 9
+const SYS_EXIT = 60
+
+const STDOUT = 1
+const STDERR = 2
+
+fn exit(status: i64) {
+    syscall(SYS_EXIT, status)
+}
+
+// Выделяет обнулённую память у ядра (mmap); освобождается при выходе.
+fn alloc(size: i64) -> i64 {
+    let p = syscall(SYS_MMAP, 0, size, 3, 0x22, -1, 0)
+    if p < 0 {
+        eprint("out of memory\n")
+        exit(1)
+    }
+    return p
+}
+
+fn strlen(s: i64) -> i64 {
+    var n = 0
+    while load8(s + n) != 0 {
+        n = n + 1
+    }
+    return n
+}
+
+fn mem_eq(a: i64, an: i64, b: i64, bn: i64) -> i64 {
+    if an != bn {
+        return 0
+    }
+    var i = 0
+    while i < an {
+        if load8(a + i) != load8(b + i) {
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+fn write_n(fd: i64, p: i64, n: i64) {
+    syscall(SYS_WRITE, fd, p, n)
+}
+
+fn print(s: i64) {
+    write_n(STDOUT, s, strlen(s))
+}
+
+fn println(s: i64) {
+    print(s)
+    print("\n")
+}
+
+fn eprint(s: i64) {
+    write_n(STDERR, s, strlen(s))
+}
+
+fn print_int(x: i64) {
+    if x == 0 {
+        print("0")
+        return
+    }
+    if x < 0 {
+        print("-")
+    }
+    let buf = "................................"
+    var i = 32
+    while x != 0 {
+        var d = x % 10
+        if d < 0 {
+            d = -d
+        }
+        i = i - 1
+        store8(buf + i, '0' + d)
+        x = x / 10
+    }
+    write_n(STDOUT, buf + i, 32 - i)
+}
+
+fn println_int(x: i64) {
+    print_int(x)
+    print("\n")
+}

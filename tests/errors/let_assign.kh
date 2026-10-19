@@ -1,0 +1,6 @@
+// expect: let_assign.kh:4: error: cannot assign to a let binding; declare it with var to make it mutable (near 'x')
+fn main() -> i64 {
+    let x = 1
+    x = 2
+    return x
+}

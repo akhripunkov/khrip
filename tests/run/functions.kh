@@ -1,0 +1,38 @@
+// Рекурсия, много параметров, затенение имён, функция без значения.
+fn fib(n: i64) -> i64 {
+    if n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fn ack(m: i64, n: i64) -> i64 {
+    if m == 0 { return n + 1 }
+    if n == 0 { return ack(m - 1, 1) }
+    return ack(m - 1, ack(m, n - 1))
+}
+
+fn many(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64) -> i64 {
+    return a - b + c * d - e + f * g - h
+}
+
+fn shadow(x: i64) -> i64 {
+    let y = x * 2
+    if 1 {
+        let y = 100
+        x = x + y
+    }
+    return x + y
+}
+
+fn nothing() {
+}
+
+fn main() -> i64 {
+    println_int(fib(25))
+    println_int(ack(2, 3))
+    println_int(many(1, 2, 3, 4, 5, 6, 7, 8))
+    println_int(shadow(5))
+    println_int(nothing())
+    return 0
+}

@@ -1,0 +1,1575 @@
+// ============================================================================
+// khc — компилятор Khrip, написанный на Khrip.
+//
+// Сейчас понимает подмножество Khrip-0 (docs/KHRIP0.md) — то самое, на котором
+// написан. Первый раз его собирает зерно bootstrap/khc0.asm, дальше он собирает
+// себя сам (см. build.sh).
+//
+// Устройство: лексер разбивает весь текст на токены, затем рекурсивный спуск
+// сразу генерирует машинный код x86-64. Модель исполнения — стековая машина:
+// значение выражения в rax, промежуточные значения в стеке. Результат —
+// статический ELF без libc: код с адреса 0x400000, данные (строки и глобальные
+// переменные) с адреса 0x10000000.
+//
+// Запуск: khc -o <выход> <вход.kh>...
+// ============================================================================
+
+// ---- Системные вызовы Linux ----
+
+const SYS_READ = 0
+const SYS_WRITE = 1
+const SYS_OPEN = 2
+const SYS_CLOSE = 3
+const SYS_MMAP = 9
+const SYS_EXIT = 60
+
+// ---- Пределы ----
+
+const SRC_MAX = 8388608
+const FILE_MAX = 256
+const TOK_MAX = 1048576
+const CODE_MAX = 16777216
+const DATA_MAX = 8388608
+const SYM_MAX = 65536
+const LOC_MAX = 4096
+const FIX_MAX = 1048576
+const BRK_MAX = 4096
+const PEND_MAX = 4096
+
+// ---- Раскладка исполняемого файла ----
+
+const CODE_BASE = 0x400000
+const HDR_SIZE = 176
+const DATA_BASE = 0x10000000
+
+// ---- Виды токенов (одиночные знаки препинания — своим ASCII-кодом) ----
+
+const T_EOF = 0
+const T_IDENT = 1
+const T_INT = 2
+const T_STR = 3
+const T_FN = 10
+const T_LET = 11
+const T_VAR = 12
+const T_CONST = 13
+const T_IF = 14
+const T_ELSE = 15
+const T_WHILE = 16
+const T_RETURN = 17
+const T_BREAK = 18
+const T_CONTINUE = 19
+const T_EQ = 256
+const T_NE = 257
+const T_LE = 258
+const T_GE = 259
+const T_ANDAND = 260
+const T_OROR = 261
+const T_SHL = 262
+const T_SHR = 263
+const T_ARROW = 264
+
+// ---- Встроенные функции ----
+
+const B_LOAD8 = 1
+const B_LOAD64 = 2
+const B_STORE8 = 3
+const B_STORE64 = 4
+const B_SYSCALL = 5
+
+// ---- Записи таблиц (поля по 8 байт) ----
+
+const FILE_SIZE = 16
+const FL_PATH = 0
+const FL_LINE = 8
+
+const TOK_SIZE = 40
+const TK_KIND = 0
+const TK_VAL = 8
+const TK_PTR = 16
+const TK_LEN = 24
+const TK_LINE = 32
+
+const SYM_SIZE = 40
+const SY_PTR = 0
+const SY_LEN = 8
+const SY_KIND = 16
+const SY_VAL = 24
+const SY_EXTRA = 32
+
+const S_CONST = 1
+const S_VAR = 2
+const S_FN = 3
+
+const LOC_SIZE = 32
+const LO_PTR = 0
+const LO_LEN = 8
+const LO_OFF = 16
+const LO_MUT = 24
+
+const FIX_SIZE = 32
+const FX_POS = 0
+const FX_SYM = 8
+const FX_ARGC = 16
+const FX_LINE = 24
+
+// ---- Состояние компилятора ----
+
+var src: i64
+var src_len: i64
+var files: i64
+var nfiles: i64
+var next_line: i64
+var lex_p: i64
+var lex_end: i64
+var lex_line: i64
+var toks: i64
+var ntok: i64
+var pos: i64
+var code: i64
+var code_len: i64
+var data: i64
+var data_len: i64
+var syms: i64
+var nsyms: i64
+var locs: i64
+var nlocs: i64
+var frame: i64
+var fixes: i64
+var nfix: i64
+var brks: i64
+var nbrk: i64
+var pend: i64
+var npend: i64
+var cont_target: i64
+
+// ============================================================================
+// Основа: память, строки, вывод
+// ============================================================================
+
+fn exit(status: i64) {
+    syscall(SYS_EXIT, status)
+}
+
+fn strlen(s: i64) -> i64 {
+    var n = 0
+    while load8(s + n) != 0 {
+        n = n + 1
+    }
+    return n
+}
+
+fn mem_eq(a: i64, an: i64, b: i64, bn: i64) -> i64 {
+    if an != bn {
+        return 0
+    }
+    var i = 0
+    while i < an {
+        if load8(a + i) != load8(b + i) {
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+fn streq(a: i64, b: i64) -> i64 {
+    return mem_eq(a, strlen(a), b, strlen(b))
+}
+
+fn eprint_n(p: i64, n: i64) {
+    syscall(SYS_WRITE, 2, p, n)
+}
+
+fn eprint(s: i64) {
+    eprint_n(s, strlen(s))
+}
+
+fn eprint_int(x: i64) {
+    if x == 0 {
+        eprint("0")
+        return
+    }
+    let buf = "...................."
+    var i = 20
+    while x > 0 {
+        i = i - 1
+        store8(buf + i, '0' + x % 10)
+        x = x / 10
+    }
+    eprint_n(buf + i, 20 - i)
+}
+
+fn alloc(size: i64) -> i64 {
+    let p = syscall(SYS_MMAP, 0, size, 3, 0x22, -1, 0)
+    if p < 0 {
+        eprint("khc: out of memory\n")
+        exit(1)
+    }
+    return p
+}
+
+fn put16(p: i64, v: i64) {
+    store8(p, v & 255)
+    store8(p + 1, (v >> 8) & 255)
+}
+
+fn put32(p: i64, v: i64) {
+    put16(p, v & 65535)
+    put16(p + 2, (v >> 16) & 65535)
+}
+
+fn put64(p: i64, v: i64) {
+    put32(p, v & 0xFFFFFFFF)
+    put32(p + 4, (v >> 32) & 0xFFFFFFFF)
+}
+
+// ============================================================================
+// Ошибки. Формат как у gcc: «файл:строка: error: сообщение».
+// ============================================================================
+
+// Печатает «файл:строка» по сквозному номеру строки во всех входных файлах.
+fn eprint_location(line: i64) {
+    var i = nfiles - 1
+    while i > 0 && load64(files + i * FILE_SIZE + FL_LINE) > line {
+        i = i - 1
+    }
+    let f = files + i * FILE_SIZE
+    eprint(load64(f + FL_PATH))
+    eprint(":")
+    eprint_int(line - load64(f + FL_LINE) + 1)
+}
+
+fn fatal_at(t: i64, msg: i64) {
+    eprint_location(load64(t + TK_LINE))
+    eprint(": error: ")
+    eprint(msg)
+    eprint(" (near '")
+    eprint_n(load64(t + TK_PTR), load64(t + TK_LEN))
+    eprint("')\n")
+    exit(1)
+}
+
+fn fatal(msg: i64) {
+    fatal_at(tk(), msg)
+}
+
+fn fatal_sym(s: i64, line: i64, msg: i64) {
+    eprint_location(line)
+    eprint(": error: ")
+    eprint(msg)
+    eprint(" '")
+    eprint_n(load64(s + SY_PTR), load64(s + SY_LEN))
+    eprint("'\n")
+    exit(1)
+}
+
+fn lex_fatal(msg: i64) {
+    eprint_location(lex_line)
+    eprint(": error: ")
+    eprint(msg)
+    eprint("\n")
+    exit(1)
+}
+
+fn limit_exceeded() {
+    fatal("compiler limit exceeded")
+}
+
+// ============================================================================
+// Чтение исходников
+// ============================================================================
+
+fn read_file(path: i64) {
+    if nfiles >= FILE_MAX {
+        eprint("khc: too many input files\n")
+        exit(1)
+    }
+    let fd = syscall(SYS_OPEN, path, 0, 0)
+    if fd < 0 {
+        eprint("khc: cannot open ")
+        eprint(path)
+        eprint("\n")
+        exit(1)
+    }
+    let f = files + nfiles * FILE_SIZE
+    store64(f + FL_PATH, path)
+    store64(f + FL_LINE, next_line)
+    nfiles = nfiles + 1
+    let start = src_len
+    while 1 {
+        let room = SRC_MAX - 1 - src_len
+        if room <= 0 {
+            eprint("khc: source too large\n")
+            exit(1)
+        }
+        let n = syscall(SYS_READ, fd, src + src_len, room)
+        if n < 0 {
+            eprint("khc: cannot read ")
+            eprint(path)
+            eprint("\n")
+            exit(1)
+        }
+        if n == 0 {
+            break
+        }
+        src_len = src_len + n
+    }
+    syscall(SYS_CLOSE, fd)
+    store8(src + src_len, '\n')
+    src_len = src_len + 1
+    var i = start
+    while i < src_len {
+        if load8(src + i) == '\n' {
+            next_line = next_line + 1
+        }
+        i = i + 1
+    }
+}
+
+// ============================================================================
+// Лексер: весь текст → массив токенов
+// ============================================================================
+
+fn add_tok(kind: i64, val: i64, start: i64, len: i64) {
+    if ntok >= TOK_MAX {
+        lex_fatal("compiler limit exceeded")
+    }
+    let t = toks + ntok * TOK_SIZE
+    store64(t + TK_KIND, kind)
+    store64(t + TK_VAL, val)
+    store64(t + TK_PTR, start)
+    store64(t + TK_LEN, len)
+    store64(t + TK_LINE, lex_line)
+    ntok = ntok + 1
+}
+
+fn is_alpha(c: i64) -> i64 {
+    let l = c | 32
+    return l >= 'a' && l <= 'z' || c == '_'
+}
+
+fn is_digit(c: i64) -> i64 {
+    return c >= '0' && c <= '9'
+}
+
+fn keyword_kind(p: i64, n: i64) -> i64 {
+    if mem_eq(p, n, "fn", 2) {
+        return T_FN
+    }
+    if mem_eq(p, n, "let", 3) {
+        return T_LET
+    }
+    if mem_eq(p, n, "var", 3) {
+        return T_VAR
+    }
+    if mem_eq(p, n, "const", 5) {
+        return T_CONST
+    }
+    if mem_eq(p, n, "if", 2) {
+        return T_IF
+    }
+    if mem_eq(p, n, "else", 4) {
+        return T_ELSE
+    }
+    if mem_eq(p, n, "while", 5) {
+        return T_WHILE
+    }
+    if mem_eq(p, n, "return", 6) {
+        return T_RETURN
+    }
+    if mem_eq(p, n, "break", 5) {
+        return T_BREAK
+    }
+    if mem_eq(p, n, "continue", 8) {
+        return T_CONTINUE
+    }
+    return T_IDENT
+}
+
+fn two_char_kind(a: i64, b: i64) -> i64 {
+    if a == '=' && b == '=' {
+        return T_EQ
+    }
+    if a == '!' && b == '=' {
+        return T_NE
+    }
+    if a == '<' && b == '=' {
+        return T_LE
+    }
+    if a == '>' && b == '=' {
+        return T_GE
+    }
+    if a == '&' && b == '&' {
+        return T_ANDAND
+    }
+    if a == '|' && b == '|' {
+        return T_OROR
+    }
+    if a == '<' && b == '<' {
+        return T_SHL
+    }
+    if a == '>' && b == '>' {
+        return T_SHR
+    }
+    if a == '-' && b == '>' {
+        return T_ARROW
+    }
+    return 0
+}
+
+fn is_single(c: i64) -> i64 {
+    let s = "(){},:+-*/%&|^~!<>="
+    var i = 0
+    while load8(s + i) != 0 {
+        if load8(s + i) == c {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn data_byte(b: i64) {
+    if data_len >= DATA_MAX - 16 {
+        lex_fatal("compiler limit exceeded")
+    }
+    store8(data + data_len, b)
+    data_len = data_len + 1
+}
+
+// Один символ литерала (с экранированием) по lex_p.
+fn lex_char() -> i64 {
+    if lex_p >= lex_end {
+        lex_fatal("bad escape sequence")
+    }
+    var c = load8(lex_p)
+    lex_p = lex_p + 1
+    if c != '\\' {
+        return c
+    }
+    if lex_p >= lex_end {
+        lex_fatal("bad escape sequence")
+    }
+    c = load8(lex_p)
+    lex_p = lex_p + 1
+    if c == 'n' {
+        return 10
+    }
+    if c == 't' {
+        return 9
+    }
+    if c == 'r' {
+        return 13
+    }
+    if c == '0' {
+        return 0
+    }
+    if c == '\\' || c == '\'' || c == '"' {
+        return c
+    }
+    lex_fatal("bad escape sequence")
+    return 0
+}
+
+fn lex_number() -> i64 {
+    var v = 0
+    if load8(lex_p) == '0' && lex_p + 1 < lex_end && (load8(lex_p + 1) | 32) == 'x' {
+        lex_p = lex_p + 2
+        while lex_p < lex_end {
+            let c = load8(lex_p)
+            let l = c | 32
+            var d = -1
+            if is_digit(c) {
+                d = c - '0'
+            } else if l >= 'a' && l <= 'f' {
+                d = l - 'a' + 10
+            }
+            if d < 0 {
+                break
+            }
+            v = v * 16 + d
+            lex_p = lex_p + 1
+        }
+        return v
+    }
+    while lex_p < lex_end && is_digit(load8(lex_p)) {
+        v = v * 10 + load8(lex_p) - '0'
+        lex_p = lex_p + 1
+    }
+    return v
+}
+
+fn lex() {
+    lex_p = src
+    lex_end = src + src_len
+    lex_line = 1
+    while lex_p < lex_end {
+        let c = load8(lex_p)
+        if c == '\n' {
+            lex_line = lex_line + 1
+            lex_p = lex_p + 1
+            continue
+        }
+        if c == ' ' || c == '\t' || c == '\r' {
+            lex_p = lex_p + 1
+            continue
+        }
+        if c == '/' && lex_p + 1 < lex_end && load8(lex_p + 1) == '/' {
+            while lex_p < lex_end && load8(lex_p) != '\n' {
+                lex_p = lex_p + 1
+            }
+            continue
+        }
+        let start = lex_p
+        if is_alpha(c) {
+            while lex_p < lex_end && (is_alpha(load8(lex_p)) || is_digit(load8(lex_p))) {
+                lex_p = lex_p + 1
+            }
+            add_tok(keyword_kind(start, lex_p - start), 0, start, lex_p - start)
+            continue
+        }
+        if is_digit(c) {
+            let v = lex_number()
+            add_tok(T_INT, v, start, lex_p - start)
+            continue
+        }
+        if c == '\'' {
+            lex_p = lex_p + 1
+            let v = lex_char()
+            if lex_p >= lex_end || load8(lex_p) != '\'' {
+                lex_fatal("bad character literal")
+            }
+            lex_p = lex_p + 1
+            add_tok(T_INT, v, start, lex_p - start)
+            continue
+        }
+        if c == '"' {
+            lex_p = lex_p + 1
+            let off = data_len
+            while 1 {
+                if lex_p >= lex_end || load8(lex_p) == '\n' {
+                    lex_fatal("unterminated string")
+                }
+                if load8(lex_p) == '"' {
+                    break
+                }
+                data_byte(lex_char())
+            }
+            lex_p = lex_p + 1
+            data_byte(0)
+            add_tok(T_STR, DATA_BASE + off, start, lex_p - start)
+            continue
+        }
+        if lex_p + 1 < lex_end {
+            let k = two_char_kind(c, load8(lex_p + 1))
+            if k != 0 {
+                lex_p = lex_p + 2
+                add_tok(k, 0, start, 2)
+                continue
+            }
+        }
+        if is_single(c) {
+            lex_p = lex_p + 1
+            add_tok(c, 0, start, 1)
+            continue
+        }
+        lex_fatal("unexpected character")
+    }
+    add_tok(T_EOF, 0, lex_p, 0)
+}
+
+// ============================================================================
+// Токены для разбора
+// ============================================================================
+
+fn tk() -> i64 {
+    return toks + pos * TOK_SIZE
+}
+
+fn kind() -> i64 {
+    return load64(tk() + TK_KIND)
+}
+
+fn kind_next() -> i64 {
+    return load64(tk() + TOK_SIZE + TK_KIND)
+}
+
+fn advance() {
+    pos = pos + 1
+}
+
+fn expect(k: i64) {
+    if kind() != k {
+        let msg = "expected 'X'"
+        store8(msg + 10, k)
+        fatal(msg)
+    }
+    advance()
+}
+
+fn expect_ident() -> i64 {
+    let t = tk()
+    if load64(t + TK_KIND) != T_IDENT {
+        fatal("expected identifier")
+    }
+    advance()
+    return t
+}
+
+// ============================================================================
+// Таблицы имён
+// ============================================================================
+
+fn sym(i: i64) -> i64 {
+    return syms + i * SYM_SIZE
+}
+
+fn sym_find(p: i64, n: i64) -> i64 {
+    var i = 0
+    while i < nsyms {
+        let s = sym(i)
+        if mem_eq(p, n, load64(s + SY_PTR), load64(s + SY_LEN)) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn sym_add(p: i64, n: i64, kind: i64, val: i64, extra: i64) -> i64 {
+    if nsyms >= SYM_MAX {
+        limit_exceeded()
+    }
+    let s = sym(nsyms)
+    store64(s + SY_PTR, p)
+    store64(s + SY_LEN, n)
+    store64(s + SY_KIND, kind)
+    store64(s + SY_VAL, val)
+    store64(s + SY_EXTRA, extra)
+    nsyms = nsyms + 1
+    return nsyms - 1
+}
+
+fn check_dup(t: i64) {
+    if sym_find(load64(t + TK_PTR), load64(t + TK_LEN)) != -1 {
+        fatal_at(t, "duplicate definition")
+    }
+}
+
+// Функцию можно вызвать до её определения: тогда она заводится заранее
+// со смещением -1, а вызов дописывается в resolve_fixups.
+fn fn_sym(p: i64, n: i64) -> i64 {
+    let i = sym_find(p, n)
+    if i == -1 {
+        return sym_add(p, n, S_FN, -1, -1)
+    }
+    if load64(sym(i) + SY_KIND) != S_FN {
+        fatal("not a function")
+    }
+    return i
+}
+
+fn loc(i: i64) -> i64 {
+    return locs + i * LOC_SIZE
+}
+
+// Поиск с конца, чтобы внутренние объявления закрывали внешние.
+fn loc_find(p: i64, n: i64) -> i64 {
+    var i = nlocs
+    while i > 0 {
+        i = i - 1
+        let l = loc(i)
+        if mem_eq(p, n, load64(l + LO_PTR), load64(l + LO_LEN)) {
+            return i
+        }
+    }
+    return -1
+}
+
+fn loc_add(p: i64, n: i64, off: i64, mutable: i64) {
+    if nlocs >= LOC_MAX {
+        limit_exceeded()
+    }
+    let l = loc(nlocs)
+    store64(l + LO_PTR, p)
+    store64(l + LO_LEN, n)
+    store64(l + LO_OFF, off)
+    store64(l + LO_MUT, mutable)
+    nlocs = nlocs + 1
+}
+
+fn fix_add(at: i64, si: i64, argc: i64, line: i64) {
+    if nfix >= FIX_MAX {
+        limit_exceeded()
+    }
+    let f = fixes + nfix * FIX_SIZE
+    store64(f + FX_POS, at)
+    store64(f + FX_SYM, si)
+    store64(f + FX_ARGC, argc)
+    store64(f + FX_LINE, line)
+    nfix = nfix + 1
+}
+
+fn resolve_fixups() {
+    var i = 0
+    while i < nfix {
+        let f = fixes + i * FIX_SIZE
+        let s = sym(load64(f + FX_SYM))
+        let target = load64(s + SY_VAL)
+        if target == -1 {
+            fatal_sym(s, load64(f + FX_LINE), "undefined function")
+        }
+        let argc = load64(f + FX_ARGC)
+        if argc != -1 && argc != load64(s + SY_EXTRA) {
+            fatal_sym(s, load64(f + FX_LINE), "wrong number of arguments for")
+        }
+        patch_rel(load64(f + FX_POS), target)
+        i = i + 1
+    }
+}
+
+// ============================================================================
+// Генерация машинного кода x86-64
+// ============================================================================
+
+fn emit8(b: i64) {
+    if code_len >= CODE_MAX - 16 {
+        limit_exceeded()
+    }
+    store8(code + code_len, b)
+    code_len = code_len + 1
+}
+
+fn emit2(a: i64, b: i64) {
+    emit8(a)
+    emit8(b)
+}
+
+fn emit3(a: i64, b: i64, c: i64) {
+    emit8(a)
+    emit8(b)
+    emit8(c)
+}
+
+fn emit32(v: i64) {
+    emit8(v & 255)
+    emit8((v >> 8) & 255)
+    emit8((v >> 16) & 255)
+    emit8((v >> 24) & 255)
+}
+
+fn emit64(v: i64) {
+    emit32(v)
+    emit32(v >> 32)
+}
+
+// Дописывает в поле rel32 по смещению at переход на target.
+fn patch_rel(at: i64, target: i64) {
+    put32(code + at, target - at - 4)
+}
+
+// Место под rel32, которое заполнится позже → его смещение.
+fn emit_hole() -> i64 {
+    let at = code_len
+    emit32(0)
+    return at
+}
+
+fn emit_jz() -> i64 {
+    emit2(0x0F, 0x84)
+    return emit_hole()
+}
+
+fn emit_jnz() -> i64 {
+    emit2(0x0F, 0x85)
+    return emit_hole()
+}
+
+fn emit_jmp() -> i64 {
+    emit8(0xE9)
+    return emit_hole()
+}
+
+fn emit_test() {
+    emit3(0x48, 0x85, 0xC0)
+}
+
+// rax → 0 или 1
+fn emit_bool() {
+    emit_test()
+    emit3(0x0F, 0x95, 0xC0)
+    emit3(0x0F, 0xB6, 0xC0)
+}
+
+fn emit_push_rax() {
+    emit8(0x50)
+}
+
+// Правый операнд в rcx, левый из стека в rax.
+fn emit_pop_swap() {
+    emit3(0x48, 0x89, 0xC1)
+    emit8(0x58)
+}
+
+fn emit_mov_rax_imm(v: i64) {
+    emit2(0x48, 0xB8)
+    emit64(v)
+}
+
+fn emit_load_local(off: i64) {
+    emit3(0x48, 0x8B, 0x85)
+    emit32(off)
+}
+
+fn emit_store_local(off: i64) {
+    emit3(0x48, 0x89, 0x85)
+    emit32(off)
+}
+
+fn emit_load_global(addr: i64) {
+    emit_mov_rax_imm(addr)
+    emit3(0x48, 0x8B, 0x00)
+}
+
+fn emit_store_global(addr: i64) {
+    emit2(0x48, 0xB9)
+    emit64(addr)
+    emit3(0x48, 0x89, 0x01)
+}
+
+fn emit_ret0() {
+    emit2(0x31, 0xC0)
+}
+
+fn emit_epilogue() {
+    emit3(0x48, 0x89, 0xEC)
+    emit8(0x5D)
+    emit8(0xC3)
+}
+
+// rax = rax <op> rcx
+fn emit_binop(op: i64) {
+    if op == '+' {
+        emit3(0x48, 0x01, 0xC8)
+    } else if op == '-' {
+        emit3(0x48, 0x29, 0xC8)
+    } else if op == '|' {
+        emit3(0x48, 0x09, 0xC8)
+    } else if op == '^' {
+        emit3(0x48, 0x31, 0xC8)
+    } else if op == '&' {
+        emit3(0x48, 0x21, 0xC8)
+    } else if op == '*' {
+        emit2(0x48, 0x0F)
+        emit2(0xAF, 0xC1)
+    } else if op == '/' {
+        emit2(0x48, 0x99)
+        emit3(0x48, 0xF7, 0xF9)
+    } else if op == '%' {
+        emit2(0x48, 0x99)
+        emit3(0x48, 0xF7, 0xF9)
+        emit3(0x48, 0x89, 0xD0)
+    } else if op == T_SHL {
+        emit3(0x48, 0xD3, 0xE0)
+    } else {
+        emit3(0x48, 0xD3, 0xF8)
+    }
+}
+
+// Код setcc для сравнения или 0, если это не сравнение.
+fn setcc_code(op: i64) -> i64 {
+    if op == T_EQ {
+        return 0x94
+    }
+    if op == T_NE {
+        return 0x95
+    }
+    if op == '<' {
+        return 0x9C
+    }
+    if op == T_LE {
+        return 0x9E
+    }
+    if op == '>' {
+        return 0x9F
+    }
+    if op == T_GE {
+        return 0x9D
+    }
+    return 0
+}
+
+// pop в регистр i-го аргумента syscall: rax, rdi, rsi, rdx, r10, r8, r9
+fn emit_pop_arg(i: i64) {
+    if i == 0 {
+        emit8(0x58)
+    } else if i == 1 {
+        emit8(0x5F)
+    } else if i == 2 {
+        emit8(0x5E)
+    } else if i == 3 {
+        emit8(0x5A)
+    } else if i == 4 {
+        emit2(0x41, 0x5A)
+    } else if i == 5 {
+        emit2(0x41, 0x58)
+    } else {
+        emit2(0x41, 0x59)
+    }
+}
+
+// Переходы, которые нужно направить на конец выражения && или ||.
+fn pend_push(at: i64) {
+    if npend >= PEND_MAX {
+        limit_exceeded()
+    }
+    store64(pend + npend * 8, at)
+    npend = npend + 1
+}
+
+fn pend_patch(mark: i64) {
+    while npend > mark {
+        npend = npend - 1
+        patch_rel(load64(pend + npend * 8), code_len)
+    }
+}
+
+// ============================================================================
+// Выражения. Каждая функция генерирует код, оставляющий значение в rax.
+// Приоритеты как в Go: || < && < сравнения < + - | ^ < * / % << >> &
+// ============================================================================
+
+fn parse_expr() {
+    parse_or()
+}
+
+fn parse_or() {
+    parse_and()
+    if kind() != T_OROR {
+        return
+    }
+    emit_bool()
+    let mark = npend
+    while kind() == T_OROR {
+        advance()
+        emit_test()
+        pend_push(emit_jnz())
+        parse_and()
+        emit_bool()
+    }
+    pend_patch(mark)
+}
+
+fn parse_and() {
+    parse_cmp()
+    if kind() != T_ANDAND {
+        return
+    }
+    emit_bool()
+    let mark = npend
+    while kind() == T_ANDAND {
+        advance()
+        emit_test()
+        pend_push(emit_jz())
+        parse_cmp()
+        emit_bool()
+    }
+    pend_patch(mark)
+}
+
+fn parse_cmp() {
+    parse_add()
+    let cc = setcc_code(kind())
+    if cc == 0 {
+        return
+    }
+    advance()
+    emit_push_rax()
+    parse_add()
+    emit_pop_swap()
+    emit3(0x48, 0x39, 0xC8)
+    emit3(0x0F, cc, 0xC0)
+    emit3(0x0F, 0xB6, 0xC0)
+}
+
+fn is_add_op(k: i64) -> i64 {
+    return k == '+' || k == '-' || k == '|' || k == '^'
+}
+
+fn is_mul_op(k: i64) -> i64 {
+    return k == '*' || k == '/' || k == '%' || k == T_SHL || k == T_SHR || k == '&'
+}
+
+fn parse_add() {
+    parse_mul()
+    while is_add_op(kind()) {
+        let op = kind()
+        advance()
+        emit_push_rax()
+        parse_mul()
+        emit_pop_swap()
+        emit_binop(op)
+    }
+}
+
+fn parse_mul() {
+    parse_unary()
+    while is_mul_op(kind()) {
+        let op = kind()
+        advance()
+        emit_push_rax()
+        parse_unary()
+        emit_pop_swap()
+        emit_binop(op)
+    }
+}
+
+fn parse_unary() {
+    let k = kind()
+    if k == '-' {
+        advance()
+        parse_unary()
+        emit3(0x48, 0xF7, 0xD8)
+    } else if k == '!' {
+        advance()
+        parse_unary()
+        emit_test()
+        emit3(0x0F, 0x94, 0xC0)
+        emit3(0x0F, 0xB6, 0xC0)
+    } else if k == '~' {
+        advance()
+        parse_unary()
+        emit3(0x48, 0xF7, 0xD0)
+    } else {
+        parse_primary()
+    }
+}
+
+fn parse_primary() {
+    let t = tk()
+    let k = load64(t + TK_KIND)
+    if k == T_INT || k == T_STR {
+        advance()
+        emit_mov_rax_imm(load64(t + TK_VAL))
+        return
+    }
+    if k == '(' {
+        advance()
+        parse_expr()
+        expect(')')
+        return
+    }
+    if k != T_IDENT {
+        fatal("expected expression")
+    }
+    advance()
+    if kind() == '(' {
+        parse_call(t)
+        return
+    }
+    let p = load64(t + TK_PTR)
+    let n = load64(t + TK_LEN)
+    let li = loc_find(p, n)
+    if li >= 0 {
+        emit_load_local(load64(loc(li) + LO_OFF))
+        return
+    }
+    let si = sym_find(p, n)
+    if si < 0 {
+        fatal_at(t, "unknown name")
+    }
+    let s = sym(si)
+    let sk = load64(s + SY_KIND)
+    if sk == S_CONST {
+        emit_mov_rax_imm(load64(s + SY_VAL))
+        return
+    }
+    if sk == S_VAR {
+        emit_load_global(load64(s + SY_VAL))
+        return
+    }
+    fatal_at(t, "function used as a value")
+}
+
+fn builtin_id(p: i64, n: i64) -> i64 {
+    if mem_eq(p, n, "load8", 5) {
+        return B_LOAD8
+    }
+    if mem_eq(p, n, "load64", 6) {
+        return B_LOAD64
+    }
+    if mem_eq(p, n, "store8", 6) {
+        return B_STORE8
+    }
+    if mem_eq(p, n, "store64", 7) {
+        return B_STORE64
+    }
+    if mem_eq(p, n, "syscall", 7) {
+        return B_SYSCALL
+    }
+    return 0
+}
+
+// Аргументы вычисляются слева направо и кладутся в стек.
+fn parse_call(t: i64) {
+    advance()
+    var nargs = 0
+    if kind() != ')' {
+        while 1 {
+            parse_expr()
+            emit_push_rax()
+            nargs = nargs + 1
+            if kind() != ',' {
+                break
+            }
+            advance()
+        }
+    }
+    expect(')')
+    let p = load64(t + TK_PTR)
+    let n = load64(t + TK_LEN)
+    let b = builtin_id(p, n)
+    if b == 0 {
+        let si = fn_sym(p, n)
+        emit8(0xE8)
+        fix_add(code_len, si, nargs, load64(t + TK_LINE))
+        emit32(0)
+        if nargs > 0 {
+            emit3(0x48, 0x81, 0xC4)
+            emit32(nargs * 8)
+        }
+        return
+    }
+    if b == B_SYSCALL {
+        if nargs < 1 || nargs > 7 {
+            fatal_at(t, "wrong number of arguments for builtin")
+        }
+        var i = nargs
+        while i > 0 {
+            i = i - 1
+            emit_pop_arg(i)
+        }
+        emit2(0x0F, 0x05)
+        return
+    }
+    let is_load = b == B_LOAD8 || b == B_LOAD64
+    if is_load && nargs != 1 || !is_load && nargs != 2 {
+        fatal_at(t, "wrong number of arguments for builtin")
+    }
+    if b == B_LOAD8 {
+        emit8(0x58)
+        emit3(0x0F, 0xB6, 0x00)
+    } else if b == B_LOAD64 {
+        emit8(0x58)
+        emit3(0x48, 0x8B, 0x00)
+    } else if b == B_STORE8 {
+        emit2(0x59, 0x58)
+        emit2(0x88, 0x08)
+    } else {
+        emit2(0x59, 0x58)
+        emit3(0x48, 0x89, 0x08)
+    }
+}
+
+// ============================================================================
+// Операторы
+// ============================================================================
+
+fn parse_block() {
+    expect('{')
+    let saved = nlocs
+    while kind() != '}' {
+        if kind() == T_EOF {
+            fatal("unexpected end of file inside a block")
+        }
+        parse_stmt()
+    }
+    advance()
+    nlocs = saved
+}
+
+fn parse_stmt() {
+    let k = kind()
+    if k == T_LET || k == T_VAR {
+        parse_let()
+    } else if k == T_IF {
+        parse_if()
+    } else if k == T_WHILE {
+        parse_while()
+    } else if k == T_RETURN {
+        parse_return()
+    } else if k == T_BREAK {
+        parse_break()
+    } else if k == T_CONTINUE {
+        parse_continue()
+    } else if k == T_IDENT && kind_next() == '=' {
+        parse_assign()
+    } else {
+        parse_expr()
+    }
+}
+
+// let имя [: тип] = выражение — неизменяемая привязка
+// var имя [: тип] = выражение — изменяемая переменная
+fn parse_let() {
+    let mutable = kind() == T_VAR
+    advance()
+    let name = expect_ident()
+    if kind() == ':' {
+        advance()
+        expect_ident()
+    }
+    expect('=')
+    parse_expr()
+    frame = frame + 8
+    emit_store_local(-frame)
+    loc_add(load64(name + TK_PTR), load64(name + TK_LEN), -frame, mutable)
+}
+
+// имя = выражение
+fn parse_assign() {
+    let name = tk()
+    advance()
+    advance()
+    parse_expr()
+    let p = load64(name + TK_PTR)
+    let n = load64(name + TK_LEN)
+    let li = loc_find(p, n)
+    if li >= 0 {
+        if !load64(loc(li) + LO_MUT) {
+            fatal_at(name, "cannot assign to a let binding; declare it with var to make it mutable")
+        }
+        emit_store_local(load64(loc(li) + LO_OFF))
+        return
+    }
+    let si = sym_find(p, n)
+    if si < 0 {
+        fatal_at(name, "unknown name")
+    }
+    if load64(sym(si) + SY_KIND) == S_CONST {
+        fatal_at(name, "cannot assign to a constant")
+    }
+    if load64(sym(si) + SY_KIND) != S_VAR {
+        fatal_at(name, "cannot assign to a function")
+    }
+    emit_store_global(load64(sym(si) + SY_VAL))
+}
+
+// Значение возврата должно начинаться на той же строке, что и return.
+fn parse_return() {
+    let line = load64(tk() + TK_LINE)
+    advance()
+    if kind() != '}' && load64(tk() + TK_LINE) == line {
+        parse_expr()
+    } else {
+        emit_ret0()
+    }
+    emit_epilogue()
+}
+
+fn parse_break() {
+    if cont_target == -1 {
+        fatal("break or continue outside of a loop")
+    }
+    advance()
+    if nbrk >= BRK_MAX {
+        limit_exceeded()
+    }
+    store64(brks + nbrk * 8, emit_jmp())
+    nbrk = nbrk + 1
+}
+
+fn parse_continue() {
+    if cont_target == -1 {
+        fatal("break or continue outside of a loop")
+    }
+    advance()
+    patch_rel(emit_jmp(), cont_target)
+}
+
+// if условие { ... } [else if ... | else { ... }]
+fn parse_if() {
+    advance()
+    parse_expr()
+    emit_test()
+    let else_at = emit_jz()
+    parse_block()
+    if kind() != T_ELSE {
+        patch_rel(else_at, code_len)
+        return
+    }
+    advance()
+    let end_at = emit_jmp()
+    patch_rel(else_at, code_len)
+    if kind() == T_IF {
+        parse_if()
+    } else {
+        parse_block()
+    }
+    patch_rel(end_at, code_len)
+}
+
+// while условие { ... }
+fn parse_while() {
+    advance()
+    let saved_cont = cont_target
+    let saved_brk = nbrk
+    let start = code_len
+    cont_target = start
+    parse_expr()
+    emit_test()
+    let end_at = emit_jz()
+    parse_block()
+    patch_rel(emit_jmp(), start)
+    patch_rel(end_at, code_len)
+    while nbrk > saved_brk {
+        nbrk = nbrk - 1
+        patch_rel(load64(brks + nbrk * 8), code_len)
+    }
+    cont_target = saved_cont
+}
+
+// ============================================================================
+// Объявления верхнего уровня
+// ============================================================================
+
+// [-] целое
+fn parse_const_value() -> i64 {
+    var neg = 0
+    if kind() == '-' {
+        neg = 1
+        advance()
+    }
+    let t = tk()
+    if load64(t + TK_KIND) != T_INT {
+        fatal("expected integer constant")
+    }
+    advance()
+    if neg {
+        return -load64(t + TK_VAL)
+    }
+    return load64(t + TK_VAL)
+}
+
+// const ИМЯ = [-]целое
+fn parse_const() {
+    advance()
+    let name = expect_ident()
+    check_dup(name)
+    expect('=')
+    let v = parse_const_value()
+    sym_add(load64(name + TK_PTR), load64(name + TK_LEN), S_CONST, v, 0)
+}
+
+// var имя: тип [= [-]целое]
+fn parse_global() {
+    advance()
+    let name = expect_ident()
+    check_dup(name)
+    expect(':')
+    expect_ident()
+    var v = 0
+    if kind() == '=' {
+        advance()
+        v = parse_const_value()
+    }
+    data_len = (data_len + 7) & ~7
+    if data_len >= DATA_MAX - 16 {
+        limit_exceeded()
+    }
+    let addr = DATA_BASE + data_len
+    put64(data + data_len, v)
+    data_len = data_len + 8
+    sym_add(load64(name + TK_PTR), load64(name + TK_LEN), S_VAR, addr, 0)
+}
+
+// fn имя(параметры) [-> тип] { ... }
+// Параметр i из n лежит по адресу rbp + 16 + 8*(n-1-i): вызывающий кладёт
+// аргументы в стек слева направо и сам их снимает.
+fn parse_fn() {
+    advance()
+    let name = expect_ident()
+    let p = load64(name + TK_PTR)
+    let n = load64(name + TK_LEN)
+    var si = sym_find(p, n)
+    if si >= 0 {
+        let s = sym(si)
+        if load64(s + SY_KIND) != S_FN || load64(s + SY_VAL) != -1 {
+            fatal_at(name, "duplicate definition")
+        }
+    } else {
+        si = sym_add(p, n, S_FN, -1, -1)
+    }
+    store64(sym(si) + SY_VAL, code_len)
+    nlocs = 0
+    frame = 0
+    expect('(')
+    var nparams = 0
+    if kind() != ')' {
+        while 1 {
+            let pt = expect_ident()
+            loc_add(load64(pt + TK_PTR), load64(pt + TK_LEN), 0, 1)
+            nparams = nparams + 1
+            expect(':')
+            expect_ident()
+            if kind() != ',' {
+                break
+            }
+            advance()
+        }
+    }
+    expect(')')
+    var i = 0
+    while i < nparams {
+        store64(loc(i) + LO_OFF, 16 + 8 * (nparams - 1 - i))
+        i = i + 1
+    }
+    store64(sym(si) + SY_EXTRA, nparams)
+    if kind() == T_ARROW {
+        advance()
+        expect_ident()
+    }
+    emit8(0x55)
+    emit3(0x48, 0x89, 0xE5)
+    emit3(0x48, 0x81, 0xEC)
+    let frame_at = emit_hole()
+    cont_target = -1
+    parse_block()
+    emit_ret0()
+    emit_epilogue()
+    put32(code + frame_at, frame)
+}
+
+fn compile() {
+    // Точка входа: main(argc, argv), код возврата main — код выхода процесса.
+    emit2(0x48, 0x8B)
+    emit2(0x04, 0x24)
+    emit3(0x48, 0x8D, 0x4C)
+    emit2(0x24, 0x08)
+    emit2(0x50, 0x51)
+    emit8(0xE8)
+    fix_add(code_len, fn_sym("main", 4), -1, 1)
+    emit32(0)
+    emit3(0x48, 0x89, 0xC7)
+    emit8(0xB8)
+    emit32(SYS_EXIT)
+    emit2(0x0F, 0x05)
+    while kind() != T_EOF {
+        let k = kind()
+        if k == T_FN {
+            parse_fn()
+        } else if k == T_VAR {
+            parse_global()
+        } else if k == T_CONST {
+            parse_const()
+        } else {
+            fatal("expected fn, var or const")
+        }
+    }
+    resolve_fixups()
+}
+
+// ============================================================================
+// Запись ELF
+// ============================================================================
+
+fn write_all(fd: i64, p: i64, n: i64) {
+    while n > 0 {
+        let w = syscall(SYS_WRITE, fd, p, n)
+        if w <= 0 {
+            eprint("khc: cannot write output file\n")
+            exit(1)
+        }
+        p = p + w
+        n = n - w
+    }
+}
+
+fn write_elf(path: i64) {
+    let h = alloc(4096)
+    let zeros = alloc(4096)
+    store8(h, 0x7F)
+    store8(h + 1, 'E')
+    store8(h + 2, 'L')
+    store8(h + 3, 'F')
+    store8(h + 4, 2)
+    store8(h + 5, 1)
+    store8(h + 6, 1)
+    put16(h + 16, 2)
+    put16(h + 18, 0x3E)
+    put32(h + 20, 1)
+    put64(h + 24, CODE_BASE + HDR_SIZE)
+    put64(h + 32, 64)
+    put16(h + 52, 64)
+    put16(h + 54, 56)
+    put16(h + 56, 2)
+    put16(h + 58, 64)
+
+    // Сегмент кода: заголовки + код, чтение и исполнение.
+    let code_end = HDR_SIZE + code_len
+    put32(h + 64, 1)
+    put32(h + 68, 5)
+    put64(h + 72, 0)
+    put64(h + 80, CODE_BASE)
+    put64(h + 88, CODE_BASE)
+    put64(h + 96, code_end)
+    put64(h + 104, code_end)
+    put64(h + 112, 0x1000)
+
+    // Сегмент данных: с границы страницы, чтение и запись.
+    let data_off = (code_end + 0xFFF) & ~0xFFF
+    put32(h + 120, 1)
+    put32(h + 124, 6)
+    put64(h + 128, data_off)
+    put64(h + 136, DATA_BASE)
+    put64(h + 144, DATA_BASE)
+    put64(h + 152, data_len)
+    put64(h + 160, data_len)
+    put64(h + 168, 0x1000)
+
+    let fd = syscall(SYS_OPEN, path, 0x241, 493)
+    if fd < 0 {
+        eprint("khc: cannot write ")
+        eprint(path)
+        eprint("\n")
+        exit(1)
+    }
+    write_all(fd, h, HDR_SIZE)
+    write_all(fd, code, code_len)
+    write_all(fd, zeros, data_off - code_end)
+    write_all(fd, data, data_len)
+    syscall(SYS_CLOSE, fd)
+}
+
+// ============================================================================
+
+fn init() {
+    src = alloc(SRC_MAX)
+    files = alloc(FILE_MAX * FILE_SIZE)
+    toks = alloc(TOK_MAX * TOK_SIZE)
+    code = alloc(CODE_MAX)
+    data = alloc(DATA_MAX)
+    syms = alloc(SYM_MAX * SYM_SIZE)
+    locs = alloc(LOC_MAX * LOC_SIZE)
+    fixes = alloc(FIX_MAX * FIX_SIZE)
+    brks = alloc(BRK_MAX * 8)
+    pend = alloc(PEND_MAX * 8)
+    next_line = 1
+}
+
+fn main(argc: i64, argv: i64) -> i64 {
+    if argc < 4 || !streq(load64(argv + 8), "-o") {
+        eprint("usage: khc -o <output> <input.kh>...\n")
+        return 2
+    }
+    init()
+    var i = 3
+    while i < argc {
+        read_file(load64(argv + i * 8))
+        i = i + 1
+    }
+    lex()
+    compile()
+    write_elf(load64(argv + 16))
+    return 0
+}

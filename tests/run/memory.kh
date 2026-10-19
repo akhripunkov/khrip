@@ -1,0 +1,24 @@
+// Память: mmap, load/store 8 и 64 бит.
+fn main() -> i64 {
+    let n = 1000
+    let a = alloc(n * 8)
+    var i = 0
+    while i < n {
+        store64(a + i * 8, i * i)
+        i = i + 1
+    }
+    var sum = 0
+    i = 0
+    while i < n {
+        sum = sum + load64(a + i * 8)
+        i = i + 1
+    }
+    println_int(sum)
+    let b = alloc(16)
+    store8(b, 300)
+    println_int(load8(b))
+    store64(b, -1)
+    println_int(load8(b + 7))
+    println_int(load64(b))
+    return 0
+}
