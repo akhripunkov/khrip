@@ -247,8 +247,7 @@ fn __json_enc(b: Buf, v: int, d: int) {
             buf_add(b, "null")
             return
         }
-        let f: float = __cast(v)
-        buf_add(b, f.to_str())
+        __json_float(b, v)
         return
     }
     if k == D_BOOL {

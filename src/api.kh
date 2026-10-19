@@ -1222,6 +1222,17 @@ fn gen_everies(b: Buf) {
 // Снимок всех store в JSON (KHRIP_DATA): поля необязательные, чтобы снимок
 // читался и после того, как в программе появились новые store.
 fn gen_snapshot(b: Buf) {
+    var has_store = false
+    for g in globals {
+        if g.is_store && !files[toks[g.tok].file].is_lib {
+            has_store = true
+        }
+    }
+    if !has_store {
+        // без store снимок пуст, и JSON в программу не попадает
+        buf_add(b, "fn __store_snapshot() -> str \{\n    return \"\\\{}\"\n}\n\nfn __store_restore(text: str) -> bool \{\n    return true\n}\n\n")
+        return
+    }
     buf_add(b, "type __Snapshot \{\n")
     for g in globals {
         if g.is_store && !files[toks[g.tok].file].is_lib {
@@ -1248,8 +1259,26 @@ fn gen_snapshot(b: Buf) {
     buf_add(b, "    return true\n}\n\n")
 }
 
+// Печать float в JSON — только если программа использует float: иначе точная
+// печать дробных чисел не попадает в бинарник.
+fn gen_json_float(b: Buf) {
+    var uses = false
+    for t in toks {
+        if !files[t.file].is_lib && (t.kind == T_FLOAT || (t.kind == T_IDENT && t.text == "float")) {
+            uses = true
+            break
+        }
+    }
+    if uses {
+        buf_add(b, "fn __json_float(b: Buf, v: int) \{\n    let f: float = __cast(v)\n    buf_add(b, f.to_str())\n}\n\n")
+    } else {
+        buf_add(b, "fn __json_float(b: Buf, v: int) \{\n    buf_add(b, \"0\")\n}\n\n")
+    }
+}
+
 fn gen_api_source() -> str {
     let b = buf_new(4096)
+    gen_json_float(b)
     gen_dispatch(b)
     gen_tests(b)
     gen_everies(b)
