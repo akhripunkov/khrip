@@ -582,11 +582,64 @@ fn __env_int(name: str, default: int) -> int {
     return v.to_int() ?? default
 }
 
-// Точка входа сервера: программа с route.
+const SYS_SCHED_SETAFFINITY = 203
+const SYS_SCHED_GETAFFINITY = 204
+const THREAD_STACK = 8388608
+
+// Ядра, на которых разрешено работать процессу (учитывает taskset).
+var __cpus: [int]
+
+fn __read_cpus() {
+    let mask = __alloc(128)
+    let n = syscall(SYS_SCHED_GETAFFINITY, 0, 128, mask)
+    if n <= 0 {
+        __cpus.push(-1)
+        return
+    }
+    for i in 0..n * 8 {
+        if (load8(mask + i / 8) >> (i % 8)) & 1 != 0 {
+            __cpus.push(i)
+        }
+    }
+}
+
+// Привязать текущий поток к одному ядру.
+fn __pin(cpu: int) {
+    if cpu < 0 {
+        return
+    }
+    let mask = __alloc(128)
+    store8(mask + cpu / 8, 1 << (cpu % 8))
+    syscall(SYS_SCHED_SETAFFINITY, 0, 128, mask)
+}
+
+// Начало рабочего потока (__spawn).
+fn __thread_main(id: int) {
+    __thread_init()
+    __pin(__cpus[id % __cpus.len()])
+    __http_worker(id)
+}
+
+// Точка входа сервера: программа с route. Рабочих потоков — по числу
+// доступных ядер (или THREADS); каждый со своим epoll и сокетом SO_REUSEPORT.
 fn __serve() {
     __http_port = __env_int("PORT", 8080)
     __ignore_sigpipe()
     __store_init()
-    eprint("khrip: listening on http://0.0.0.0:{__http_port}")
+    __store_lock()
+    __store_unlock()
+    __read_cpus()
+    var n = __env_int("THREADS", __cpus.len())
+    if n < 1 {
+        n = 1
+    }
+    eprint("khrip: listening on http://0.0.0.0:{__http_port} ({n} threads)")
+    for id in 1..n {
+        let stack = syscall(SYS_MMAP, 0, THREAD_STACK, 3, 0x22 | 0x4000, -1, 0)
+        __spawn(stack + THREAD_STACK, id)
+    }
+    if n > 1 {
+        __pin(__cpus[0])
+    }
     __http_worker(0)
 }

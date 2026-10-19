@@ -756,8 +756,9 @@ fn __json_decode(s: str, d: int) -> int {
         if load64(__ctx() + CTX_WORKER) != 0 {
             let w = __w()
             w.json_err = j.err
+        } else {
+            __json_last_err = j.err
         }
-        __json_last_err = j.err
         return 0
     }
     if __is_scalar(d) {
@@ -770,7 +771,11 @@ fn __json_decode(s: str, d: int) -> int {
 
 var __json_last_err: str
 
+// Текст ошибки последнего from_json.
 fn json_error() -> str {
+    if load64(__ctx() + CTX_WORKER) != 0 {
+        return __w().json_err
+    }
     return __json_last_err
 }
 

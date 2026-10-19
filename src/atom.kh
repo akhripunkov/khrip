@@ -927,7 +927,7 @@ fn parse_builtin(t: Token, w: int) -> int {
         emit_call(rt_func("__json_decode"))
         return ty_opt(inner)
     }
-    let lib_only = name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset"
+    let lib_only = name == "__spawn" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset"
     if lib_only && !files[t.file].is_lib {
         return -1
     }
@@ -973,6 +973,43 @@ fn parse_builtin(t: Token, w: int) -> int {
         emit8(0xFF)
         emit8(0x20)
         return ty_void
+    }
+    if name == "__spawn" {
+        // __spawn(вершина стека, аргумент): новый поток (clone) выполняет
+        // __thread_main(аргумент) и завершается
+        advance()
+        builtin_args(2, t, name)
+        emit_pop(RSI)
+        emit_pop(RDI)
+        // mov [rdi-8], rsi; lea rsi, [rdi-16]
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0x77)
+        emit8(0xF8)
+        emit8(0x48)
+        emit8(0x8D)
+        emit8(0x77)
+        emit8(0xF0)
+        // CLONE_VM | FS | FILES | SIGHAND | THREAD | SYSVSEM
+        emit_mov_imm(RDI, 0x50F00)
+        emit_mov_imm(RDX, 0)
+        emit_mov_imm(R10, 0)
+        emit_mov_imm(R8, 0)
+        emit_mov_imm(RAX, 56)
+        emit8(0x0F)
+        emit8(0x05)
+        emit_test_rax()
+        let parent = emit_jcc(CC_NE)
+        // поток: аргумент на его стеке
+        emit_load(RDI, RSP, 8)
+        emit_mov_imm(RBP, 0)
+        emit_call(rt_func("__thread_main"))
+        emit_mov_imm(RDI, 0)
+        emit_mov_imm(RAX, 60)
+        emit8(0x0F)
+        emit8(0x05)
+        patch_here(parent)
+        return ty_int
     }
     if name == "__file_name" {
         advance()

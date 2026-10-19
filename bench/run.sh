@@ -46,7 +46,7 @@ size_go()         { stat -c %s "$BUILD/go/server"; }
 size_csharp()     { du -sb --exclude='*.pdb' "$BUILD/csharp" | cut -f1; }
 size_csharp_aot() { stat -c %s "$BUILD/csharp-aot/Api"; }
 
-title_khrip()      { echo "Khrip v0.4 (1 поток)"; }
+title_khrip()      { echo "Khrip v0.5"; }
 title_go()         { echo "Go 1.24 net/http"; }
 title_csharp()     { echo "C# .NET 10 ASP.NET Core (JIT)*"; }
 title_csharp_aot() { echo "C# .NET 10 ASP.NET Core (Native AOT)"; }

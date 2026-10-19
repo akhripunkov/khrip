@@ -68,3 +68,16 @@ test "read after the arena is reset" {
     expect (call GET "/items/x").status == 400
     expect (call DELETE "/items/1").status == 405
 }
+
+route GET "/boom/{i}" (i: int) -> int {
+    let xs = [1, 2, 3]
+    return xs[i]
+}
+
+test "panic in a handler is a 500" {
+    expect (call GET "/boom/1").body == "2"
+    let r = call GET "/boom/7"
+    expect r.status == 500
+    expect r.body.starts_with("panic: index out of range at tests/api/store.kh:")
+    expect (call GET "/boom/2").body == "3"
+}
