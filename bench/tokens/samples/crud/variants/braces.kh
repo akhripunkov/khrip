@@ -1,0 +1,46 @@
+type User {
+    id: int
+    name: str
+    email: str
+    age: int
+}
+
+type NewUser {
+    name: str
+    email: str
+    age: int
+}
+
+store users: map[int, User]
+store last_id: int
+
+route POST "/users" (body: NewUser) -> 201 User | 400 str {
+    if body.name == "" {
+        return 400 "name is required"
+    }
+    if !body.email.contains("@") {
+        return 400 "email is invalid"
+    }
+    if body.age < 0 || body.age > 150 {
+        return 400 "age is out of range"
+    }
+    last_id += 1
+    let user = User { id: last_id, name: body.name, email: body.email, age: body.age }
+    users[user.id] = user
+    return 201 user
+}
+
+route GET "/users/{id}" (id: int) -> User | 404 {
+    return users[id] ?? 404
+}
+
+route GET "/users" -> [User] {
+    return users.values()
+}
+
+route DELETE "/users/{id}" (id: int) -> 204 | 404 {
+    users.remove(id) else {
+        return 404
+    }
+    return 204
+}

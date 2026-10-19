@@ -1,9 +1,6 @@
-bench/build/
-bench/csharp/bin/
-bench/csharp/obj/
 build/
-bench/compute/build/
-bench/compute/csharp/bin/
-bench/compute/csharp/obj/
-bench/tokens/node_modules/
-bench/tokens/package-lock.json
+bin/
+obj/
+__pycache__/
+node_modules/
+package-lock.json

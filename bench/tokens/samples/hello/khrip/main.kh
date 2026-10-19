@@ -1,0 +1,11 @@
+type Message {
+    message: str
+}
+
+route GET "/plaintext" -> str {
+    return "Hello, World!"
+}
+
+route GET "/json" -> Message {
+    return Message { message: "Hello, World!" }
+}
