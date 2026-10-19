@@ -1,0 +1,114 @@
+// Сеть: TCP-сокеты и epoll поверх системных вызовов Linux.
+// Нужен lib/std.kh.
+
+const SYS_RT_SIGACTION = 13
+const SYS_SOCKET = 41
+const SYS_BIND = 49
+const SYS_LISTEN = 50
+const SYS_SETSOCKOPT = 54
+const SYS_TIME = 201
+const SYS_EPOLL_WAIT = 232
+const SYS_EPOLL_CTL = 233
+const SYS_ACCEPT4 = 288
+const SYS_EPOLL_CREATE1 = 291
+
+const AF_INET = 2
+const SOCK_STREAM = 1
+const SOCK_NONBLOCK = 0x800
+const SOL_SOCKET = 1
+const SO_REUSEADDR = 2
+const SO_REUSEPORT = 15
+const IPPROTO_TCP = 6
+const TCP_NODELAY = 1
+const SIGPIPE = 13
+const SIG_IGN = 1
+
+const EAGAIN = 11
+
+const EPOLL_CTL_ADD = 1
+const EPOLL_CTL_MOD = 3
+const EPOLLIN = 1
+const EPOLLOUT = 4
+const EPOLLERR = 8
+const EPOLLHUP = 16
+const EPOLL_EVENT_SIZE = 12
+
+var net_tmp: i64
+
+fn net_scratch() -> i64 {
+    if net_tmp == 0 {
+        net_tmp = alloc(32)
+    }
+    return net_tmp
+}
+
+fn set_sockopt(fd: i64, level: i64, opt: i64, value: i64) -> i64 {
+    let v = net_scratch()
+    store64(v, value)
+    return syscall(SYS_SETSOCKOPT, fd, level, opt, v, 4)
+}
+
+// Запись в закрытый сокет не должна убивать процесс.
+fn ignore_sigpipe() {
+    let act = net_scratch()
+    store64(act, SIG_IGN)
+    store64(act + 8, 0)
+    store64(act + 16, 0)
+    store64(act + 24, 0)
+    syscall(SYS_RT_SIGACTION, SIGPIPE, act, 0, 8)
+}
+
+// Неблокирующий слушающий сокет на 0.0.0.0:port → дескриптор или код ошибки (< 0).
+fn tcp_listen(port: i64) -> i64 {
+    let fd = syscall(SYS_SOCKET, AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)
+    if fd < 0 {
+        return fd
+    }
+    set_sockopt(fd, SOL_SOCKET, SO_REUSEADDR, 1)
+    set_sockopt(fd, SOL_SOCKET, SO_REUSEPORT, 1)
+    let addr = alloc(16)
+    store8(addr, AF_INET)
+    store8(addr + 2, (port >> 8) & 255)
+    store8(addr + 3, port & 255)
+    let r = syscall(SYS_BIND, fd, addr, 16)
+    if r < 0 {
+        return r
+    }
+    let l = syscall(SYS_LISTEN, fd, 4096)
+    if l < 0 {
+        return l
+    }
+    return fd
+}
+
+fn tcp_accept(lfd: i64) -> i64 {
+    return syscall(SYS_ACCEPT4, lfd, 0, 0, SOCK_NONBLOCK)
+}
+
+fn tcp_nodelay(fd: i64) {
+    set_sockopt(fd, IPPROTO_TCP, TCP_NODELAY, 1)
+}
+
+fn epoll_new() -> i64 {
+    return syscall(SYS_EPOLL_CREATE1, 0)
+}
+
+// struct epoll_event на x86-64 упакована: u32 events, затем u64 data (здесь — fd).
+fn epoll_ctl(ep: i64, op: i64, fd: i64, events: i64) -> i64 {
+    let ev = net_scratch()
+    store64(ev, events)
+    store64(ev + 4, fd)
+    return syscall(SYS_EPOLL_CTL, ep, op, fd, ev)
+}
+
+fn epoll_wait(ep: i64, events: i64, max: i64, timeout_ms: i64) -> i64 {
+    return syscall(SYS_EPOLL_WAIT, ep, events, max, timeout_ms)
+}
+
+fn epoll_event_flags(e: i64) -> i64 {
+    return load64(e) & 0xFFFFFFFF
+}
+
+fn epoll_event_fd(e: i64) -> i64 {
+    return load64(e + 4)
+}

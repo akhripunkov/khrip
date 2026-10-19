@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Замеры HTTP-серверов: Go (net/http), C# (ASP.NET Core, JIT и Native AOT), позже Khrip.
+# Замеры HTTP-серверов: Khrip, Go (net/http), C# (ASP.NET Core, JIT и Native AOT).
 #
 # Сервер и нагрузочный клиент (wrk) живут на разных ядрах, чтобы не мешать друг другу.
 # Для каждого сценария делается прогрев, затем RUNS прогонов; в таблицу идёт прогон
 # с медианным RPS. Перед замером проверяется, что сервер отвечает правильным телом.
 #
-# Использование: ./run.sh [go|csharp|csharp-aot ...]   (по умолчанию — все)
+# Использование: ./run.sh [khrip|go|csharp|csharp-aot ...]   (по умолчанию — все)
 # Параметры через окружение: SERVER_CPUS, CLIENT_CPUS, CONNECTIONS, THREADS,
-#                            DURATION, WARMUP, RUNS, PORT.
+#                            DURATION, WARMUP, RUNS, PORT, LABEL (добавляется к имени
+#                            файла с результатами).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -26,19 +27,26 @@ JSON_BODY='{"message":"Hello, World!"}'
 
 # --- Описание серверов: сборка, команда запуска, что считать артефактом ---
 
+build_khrip() {
+	(cd .. && ./build.sh >/dev/null &&
+		build/khc -o "bench/$BUILD/khrip/server" lib/std.kh lib/net.kh lib/json.kh lib/http.kh bench/khrip/server.kh)
+}
 build_go()         { (cd go && go build -o "../$BUILD/go/server" .); }
 build_csharp()     { dotnet publish csharp -c Release -o "$BUILD/csharp" --nologo -v q >/dev/null; }
 build_csharp_aot() { dotnet publish csharp -c Release -p:PublishAot=true -o "$BUILD/csharp-aot" --nologo -v q >/dev/null; }
 
+cmd_khrip()      { echo "$BUILD/khrip/server"; }
 cmd_go()         { echo "$BUILD/go/server"; }
 cmd_csharp()     { echo "$BUILD/csharp/Api"; }
 cmd_csharp_aot() { echo "$BUILD/csharp-aot/Api"; }
 
 # Размер того, что нужно положить на сервер (без отладочных символов).
+size_khrip()      { stat -c %s "$BUILD/khrip/server"; }
 size_go()         { stat -c %s "$BUILD/go/server"; }
 size_csharp()     { du -sb --exclude='*.pdb' "$BUILD/csharp" | cut -f1; }
 size_csharp_aot() { stat -c %s "$BUILD/csharp-aot/Api"; }
 
+title_khrip()      { echo "Khrip v0.2 (1 поток)"; }
 title_go()         { echo "Go 1.24 net/http"; }
 title_csharp()     { echo "C# .NET 10 ASP.NET Core (JIT)*"; }
 title_csharp_aot() { echo "C# .NET 10 ASP.NET Core (Native AOT)"; }
@@ -130,17 +138,17 @@ bench_server() {
 	read -r j_rps j_p50 j_p99 j_err <<<"$json"
 	printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
 		"$(title_$fn)" "$p_rps" "$p_p50" "$p_p99" "$j_rps" "$j_p50" "$j_p99" \
-		"$(( rss_kb / 1024 ))" "$(awk -v b="$size" 'BEGIN {printf "%.1f", b / 1048576}')" "$startup_ms"
+		"$(awk -v k="$rss_kb" 'BEGIN {printf "%.1f", k / 1024}')" "$(awk -v b="$size" 'BEGIN {printf "%.2f", b / 1048576}')" "$startup_ms"
 	if [[ "$p_err" == "да" || "$j_err" == "да" ]]; then
 		echo "  внимание: у $(title_$fn) были ошибки сокетов или не-2xx ответы" >&2
 	fi
 }
 
 servers=("$@")
-[[ ${#servers[@]} -eq 0 ]] && servers=(go csharp csharp-aot)
+[[ ${#servers[@]} -eq 0 ]] && servers=(khrip go csharp csharp-aot)
 
-mkdir -p "$BUILD" results
-result="results/$(date +%Y-%m-%d).md"
+mkdir -p "$BUILD/khrip" results
+result="results/$(date +%Y-%m-%d)${LABEL:+-$LABEL}.md"
 {
 	echo "# Замеры $(date '+%Y-%m-%d %H:%M')"
 	echo

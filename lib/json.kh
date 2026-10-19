@@ -1,0 +1,49 @@
+// Запись JSON в буфер (buf из lib/std.kh).
+
+// Строка JSON в кавычках с экранированием. Безопасные участки копируются целиком.
+fn json_str_n(b: i64, p: i64, n: i64) {
+    buf_byte(b, '"')
+    var start = 0
+    var i = 0
+    while i < n {
+        let c = load8(p + i)
+        if c >= 0x20 && c != '"' && c != '\\' {
+            i = i + 1
+            continue
+        }
+        buf_add(b, p + start, i - start)
+        if c == '"' {
+            buf_add(b, "\\\"", 2)
+        } else if c == '\\' {
+            buf_add(b, "\\\\", 2)
+        } else if c == '\n' {
+            buf_add(b, "\\n", 2)
+        } else if c == '\r' {
+            buf_add(b, "\\r", 2)
+        } else if c == '\t' {
+            buf_add(b, "\\t", 2)
+        } else {
+            buf_add(b, "\\u00", 4)
+            buf_byte(b, load8("0123456789abcdef" + (c >> 4)))
+            buf_byte(b, load8("0123456789abcdef" + (c & 15)))
+        }
+        i = i + 1
+        start = i
+    }
+    buf_add(b, p + start, n - start)
+    buf_byte(b, '"')
+}
+
+fn json_str(b: i64, s: i64) {
+    json_str_n(b, s, strlen(s))
+}
+
+fn json_int(b: i64, x: i64) {
+    buf_int(b, x)
+}
+
+// Имя поля с двоеточием: "name":
+fn json_key(b: i64, name: i64) {
+    json_str(b, name)
+    buf_byte(b, ':')
+}

@@ -1,0 +1,25 @@
+// Эталонный сервер на Khrip: те же /plaintext и /json, что у Go и C#.
+// JSON собирается на каждый запрос, как и у них.
+// Сборка: build/khc -o server lib/std.kh lib/net.kh lib/json.kh lib/http.kh bench/khrip/server.kh
+
+fn handle(req: i64) {
+    if req_is(req, "GET", "/plaintext") {
+        respond_text(req, 200, "Hello, World!")
+        return
+    }
+    if req_is(req, "GET", "/json") {
+        let b = req_scratch(req)
+        buf_byte(b, '{')
+        json_key(b, "message")
+        json_str(b, "Hello, World!")
+        buf_byte(b, '}')
+        respond(req, 200, "application/json", buf_ptr(b), buf_len(b))
+        return
+    }
+    respond_text(req, 404, "Not Found")
+}
+
+fn main(argc: i64, argv: i64) -> i64 {
+    http_serve(env_int(argc, argv, "PORT", 8080))
+    return 0
+}

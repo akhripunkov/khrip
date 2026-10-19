@@ -1,0 +1,41 @@
+// Вычислительные задачи: те же, что в go/main.go и csharp/Program.cs.
+// Запуск: compute fib | compute sieve
+
+fn fib(n: i64) -> i64 {
+    if n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+// Количество простых чисел не больше n.
+fn sieve(n: i64) -> i64 {
+    let composite = alloc(n + 1)
+    var count = 0
+    var i = 2
+    while i <= n {
+        if load8(composite + i) == 0 {
+            count = count + 1
+            var j = i * i
+            while j <= n {
+                store8(composite + j, 1)
+                j = j + i
+            }
+        }
+        i = i + 1
+    }
+    return count
+}
+
+fn main(argc: i64, argv: i64) -> i64 {
+    let task = load64(argv + 8)
+    if argc == 2 && mem_eq(task, strlen(task), "fib", 3) {
+        println_int(fib(38))
+    } else if argc == 2 && mem_eq(task, strlen(task), "sieve", 5) {
+        println_int(sieve(20000000))
+    } else {
+        eprint("usage: compute fib|sieve\n")
+        return 2
+    }
+    return 0
+}

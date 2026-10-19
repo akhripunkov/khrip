@@ -1,0 +1,10 @@
+{
+  "name": "khrip-token-bench",
+  "private": true,
+  "type": "module",
+  "description": "Подсчёт токенов в одинаковых программах на Khrip, Go и C#",
+  "dependencies": {
+    "@anthropic-ai/tokenizer": "0.0.4",
+    "gpt-tokenizer": "2.9.0"
+  }
+}

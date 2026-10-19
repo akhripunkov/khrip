@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Тесты компилятора.
-#   tests/run/*.kh    — собираются вместе с lib/std.kh, вывод сравнивается с .out,
+#   tests/run/*.kh    — собираются вместе с lib/std.kh (и библиотеками из
+#                       комментария «// libs: ...»), вывод сравнивается с .out,
 #                       код выхода — с комментарием «// exit: N» (по умолчанию 0);
 #   tests/errors/*.kh — не должны компилироваться; сообщение об ошибке должно
-#                       содержать текст из комментария «// expect: ...».
+#                       содержать текст из комментария «// expect: ...»;
+#   tests/http.sh     — HTTP-сервер на Khrip отвечает правильно.
 # Компилятор берётся из $KHC (по умолчанию build/khc).
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -23,7 +25,9 @@ for src in tests/run/*.kh; do
 	name=$(basename "$src" .kh)
 	want_exit=$(sed -n 's|^// exit: *||p' "$src" | head -1)
 	want_exit=${want_exit:-0}
-	if ! "$KHC" -o "$tmp/$name" lib/std.kh "$src" 2>"$tmp/$name.err"; then
+	libs=$(sed -n 's|^// libs: *||p' "$src" | head -1)
+	# shellcheck disable=SC2086
+	if ! "$KHC" -o "$tmp/$name" lib/std.kh $libs "$src" 2>"$tmp/$name.err"; then
 		failed "$src" "не скомпилировалось: $(cat "$tmp/$name.err")"
 		continue
 	fi
@@ -51,6 +55,9 @@ for src in tests/errors/*.kh; do
 		pass=$((pass + 1))
 	fi
 done
+
+# shellcheck source=tests/http.sh
+source tests/http.sh
 
 echo "тестов пройдено: $pass, провалено: $fail"
 [[ $fail -eq 0 ]]
