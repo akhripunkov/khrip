@@ -12,17 +12,20 @@ import { encode as o200k } from 'gpt-tokenizer/encoding/o200k_base';
 import { encode as cl100k } from 'gpt-tokenizer/encoding/cl100k_base';
 import { countTokens as claude } from '@anthropic-ai/tokenizer';
 
-function stripComments(text) {
+function stripComments(text, file) {
+  // в Python комментарии начинаются с #, в остальных языках — с //
+  const mark = file.endsWith('.py') ? '#' : '//';
+  const tail = file.endsWith('.py') ? /\s+#.*$/ : /\s+\/\/.*$/;
   return text
     .split('\n')
-    .filter((line) => !line.trim().startsWith('//'))
-    .map((line) => line.replace(/\s+\/\/.*$/, '').trimEnd())
+    .filter((line) => !line.trim().startsWith(mark))
+    .map((line) => line.replace(tail, '').trimEnd())
     .filter((line) => line.length > 0)
     .join('\n');
 }
 
-const rows = process.argv.slice(2).map((file) => {
-  const code = stripComments(readFileSync(file, 'utf8'));
+export function measure(file) {
+  const code = stripComments(readFileSync(file, 'utf8'), file);
   return {
     file,
     lines: code.split('\n').length,
@@ -31,10 +34,14 @@ const rows = process.argv.slice(2).map((file) => {
     cl100k: cl100k(code).length,
     claude: claude(code),
   };
-});
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+const rows = process.argv.slice(2).map(measure);
 
 console.log('| Файл | Строк | Символов | o200k | cl100k | Claude (публичный) |');
 console.log('|---|---:|---:|---:|---:|---:|');
 for (const r of rows) {
   console.log(`| ${r.file} | ${r.lines} | ${r.chars} | ${r.o200k} | ${r.cl100k} | ${r.claude} |`);
+}
 }

@@ -19,6 +19,8 @@ const FK_EVERY = 4
 type Param {
     name: str
     ty: int
+    // лексема значения по умолчанию (литерал) или -1
+    def: int
 }
 
 type Func {
@@ -503,7 +505,30 @@ fn parse_params() -> [Param] {
         } else {
             error_tok(pn, "parameter '" + pn.text + "' needs a type", "write " + pn.text + ": int (or another type)")
         }
-        ps.push(Param { name: pn.text, ty: pt })
+        var def = -1
+        if kind() == '=' {
+            // значение по умолчанию: литерал
+            advance()
+            def = pos
+            if kind() == '-' && (kind_at(pos + 1) == T_INT || kind_at(pos + 1) == T_FLOAT) {
+                advance()
+            }
+            let dk = kind()
+            if dk == T_INT || dk == T_FLOAT || dk == T_STR || dk == T_TRUE || dk == T_FALSE || dk == T_NONE || dk == T_IDENT {
+                advance()
+                if kind() != ',' && kind() != ')' {
+                    error_tok(toks[def], "a default value must be a single literal: 10, \"text\", true, none or an enum value", "compute it inside the function")
+                    while kind() != ',' && kind() != ')' && kind() != T_EOF {
+                        advance()
+                    }
+                    def = -1
+                }
+            } else {
+                error_tok(tok(), "a default value must be a literal, found " + tok_show(tok()), pn.text + ": int = 10")
+                def = -1
+            }
+        }
+        ps.push(Param { name: pn.text, ty: pt, def: def })
         if kind() == ',' {
             advance()
         } else if kind() != ')' {

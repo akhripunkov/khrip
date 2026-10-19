@@ -34,6 +34,7 @@ fn parse_block() -> bool {
         return false
     }
     let saved = nlocals
+    let nn = narrowed.len()
     var div = false
     while kind() != '}' && kind() != T_EOF {
         let before = pos
@@ -51,6 +52,7 @@ fn parse_block() -> bool {
     expect_tok('}')
     panic_mode = false
     nlocals = saved
+    narrow_to(nn)
     return div
 }
 
@@ -153,6 +155,9 @@ fn parse_stmt() -> bool {
         parse_block()
         patch_here(has)
         return false
+    }
+    if ty == ty_never {
+        return true
     }
     if !last_was_call && ty != ty_err && !panic_mode {
         var hint = ""
@@ -759,6 +764,7 @@ fn parse_cond(fl: [int]) {
 
 fn cond_or(fl: [int]) {
     var local_fl: [int] = []
+    var start = pos
     cond_and(local_fl)
     if kind() != T_OROR {
         for x in local_fl {
@@ -766,8 +772,15 @@ fn cond_or(fl: [int]) {
         }
         return
     }
+    let nn = narrowed.len()
     var tl: [int] = []
     while kind() == T_OROR {
+        if pos - start == 3 {
+            let li = none_test_at(start, T_EQ)
+            if li >= 0 {
+                narrowed.push(li)
+            }
+        }
         advance()
         tl.push(emit_jmp())
         let h = here()
@@ -775,8 +788,10 @@ fn cond_or(fl: [int]) {
             patch_rel(x, h)
         }
         local_fl = []
+        start = pos
         cond_and(local_fl)
     }
+    narrow_to(nn)
     for x in local_fl {
         fl.push(x)
     }
@@ -787,11 +802,21 @@ fn cond_or(fl: [int]) {
 }
 
 fn cond_and(fl: [int]) {
+    var start = pos
     cond_cmp(fl)
+    let nn = narrowed.len()
     while kind() == T_ANDAND {
+        if pos - start == 3 {
+            let li = none_test_at(start, T_NE)
+            if li >= 0 {
+                narrowed.push(li)
+            }
+        }
         advance()
+        start = pos
         cond_cmp(fl)
     }
+    narrow_to(nn)
 }
 
 // x < y, где x — локальная в регистре, а y — константа или локальная:
@@ -966,10 +991,25 @@ fn parse_if() -> bool {
         return false
     }
     var fl: [int] = []
+    let cs = pos
     parse_cond(fl)
+    let ce = pos
+    let nn = narrowed.len()
+    for li in none_tests(cs, ce, T_ANDAND, T_NE) {
+        narrowed.push(li)
+    }
     let d1 = parse_block()
+    narrow_to(nn)
+    // ветка «иначе» знает, что все x == none из цепочки || ложны
+    let else_narrow = none_tests(cs, ce, T_OROR, T_EQ)
     if kind() != T_ELSE {
         patch_all(fl, here())
+        if d1 {
+            // if x == none { return }: дальше в блоке x — не none
+            for li in else_narrow {
+                narrowed.push(li)
+            }
+        }
         return false
     }
     advance()
@@ -978,12 +1018,16 @@ fn parse_if() -> bool {
         end = emit_jmp()
     }
     patch_all(fl, here())
+    for li in else_narrow {
+        narrowed.push(li)
+    }
     var d2 = false
     if kind() == T_IF {
         d2 = parse_if()
     } else {
         d2 = parse_block()
     }
+    narrow_to(nn)
     if end >= 0 {
         patch_here(end)
     }
@@ -1481,6 +1525,7 @@ fn begin_fn(fi: int) -> int {
     cur_fn = fi
     align16()
     funcs[fi].code = here()
+    narrow_to(0)
     nlocals = 0
     local_floor = 0
     frame = 0

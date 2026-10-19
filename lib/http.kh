@@ -9,6 +9,8 @@ const SYS_ACCEPT4 = 288
 const SYS_BIND = 49
 const SYS_LISTEN = 50
 const SYS_SETSOCKOPT = 54
+const SYS_SHUTDOWN = 48
+const SHUT_WR = 1
 const SYS_TIME = 201
 const SYS_EPOLL_WAIT = 232
 const SYS_EPOLL_CTL = 233
@@ -48,6 +50,10 @@ type __Conn {
     sent: int
     close: bool
     wait_out: bool
+    // ответ с закрытием отправлен: ждём, пока клиент закроет соединение, и
+    // выбрасываем его данные — иначе close() с непрочитанным вводом шлёт RST,
+    // и клиент может не успеть прочитать ответ (431, 400)
+    linger: bool
 }
 
 // Состояние сервера в потоке.
@@ -234,6 +240,11 @@ fn __write_response(s: __Server, c: __Conn) {
     }
     __out_str(c, "\r\nContent-Length: ")
     __out_int(c, n)
+    if w.extra.len > 0 {
+        __out_reserve(c, w.extra.len + 8)
+        __out_str(c, "\r\n")
+        __out_raw(c, w.extra.data, w.extra.len - 2)
+    }
     if c.close {
         __out_str(c, "\r\nConnection: close")
     }
@@ -382,7 +393,8 @@ fn __http_request(s: __Server, c: __Conn, p: int, n: int) -> int {
         method: __str_new(p, method_len),
         path: __str_new(target, path_len),
         query: __str_new(target + path_len + 1, query_len),
-        body: __str_new(p + hend, body_len)
+        body: __str_new(p + hend, body_len),
+        headers: __str_new(p + line_end + 2, hend - line_end - 4)
     }
     __serve_one(s.w, req)
     __write_response(s, c)
@@ -416,7 +428,12 @@ fn __flush(s: __Server, fd: int, c: __Conn) -> bool {
     c.out_len = 0
     c.sent = 0
     if c.close {
-        syscall(SYS_CLOSE, fd)
+        syscall(SYS_SHUTDOWN, fd, SHUT_WR)
+        c.linger = true
+        if c.wait_out {
+            c.wait_out = false
+            __epoll_ctl(s, EPOLL_CTL_MOD, fd, EPOLLIN)
+        }
         return false
     }
     if c.wait_out {
@@ -456,6 +473,19 @@ fn __process(s: __Server, fd: int, c: __Conn) {
 }
 
 fn __read(s: __Server, fd: int, c: __Conn) {
+    if c.linger {
+        // выбросить ввод; закрыть, когда клиент закроет своё направление
+        while true {
+            let d = syscall(SYS_READ, fd, c.inp, HTTP_IN_SIZE)
+            if d == -EAGAIN {
+                return
+            }
+            if d <= 0 {
+                syscall(SYS_CLOSE, fd)
+                return
+            }
+        }
+    }
     let n = syscall(SYS_READ, fd, c.inp + c.in_len, HTTP_IN_SIZE - c.in_len)
     if n == -EAGAIN {
         return
@@ -481,7 +511,7 @@ fn __accept(s: __Server) {
         __setsockopt(s.tmp, fd, IPPROTO_TCP, TCP_NODELAY, 1)
         var a = load64(s.conns + fd * 8)
         if a == 0 {
-            let c = __Conn { inp: __mmap(HTTP_IN_SIZE), in_len: 0, out: __mmap(HTTP_OUT_SIZE * 2), out_len: 0, out_cap: HTTP_OUT_SIZE * 2, sent: 0, close: false, wait_out: false }
+            let c = __Conn { inp: __mmap(HTTP_IN_SIZE), in_len: 0, out: __mmap(HTTP_OUT_SIZE * 2), out_len: 0, out_cap: HTTP_OUT_SIZE * 2, sent: 0, close: false, wait_out: false, linger: false }
             a = __cast(c)
             store64(s.conns + fd * 8, a)
         }
@@ -491,6 +521,7 @@ fn __accept(s: __Server) {
         c.sent = 0
         c.close = false
         c.wait_out = false
+        c.linger = false
         __epoll_ctl(s, EPOLL_CTL_ADD, fd, EPOLLIN)
     }
 }

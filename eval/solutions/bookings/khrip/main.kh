@@ -1,0 +1,64 @@
+type NewRoom { name: str, capacity: int }
+
+type Room { id: int, ...NewRoom }
+
+type NewBooking { room_id: int, title: str, start: str, end: str }
+
+type Booking { id: int, ...NewBooking }
+
+store rooms: map[int, Room]
+store bookings: map[int, Booking]
+store last_booking: int
+
+route POST "/rooms" (body: NewRoom) -> 201 Room | 400 str {
+    if body.name.trim() == "" || body.capacity < 1 {
+        return 400 "name is required and capacity must be at least 1"
+    }
+    let room = Room { id: rooms.len() + 1, ...body }
+    rooms[room.id] = room
+    return 201 room
+}
+
+route POST "/bookings" (body: NewBooking) -> 201 Booking | 400 str | 404 | 409 str {
+    let start = parse_time(body.start) ?? 0
+    let end = parse_time(body.end) ?? 0
+    if start == 0 || end <= start || end - start > 8 * 3600 || body.title.trim() == "" {
+        return 400 "need a title and valid start < end, at most 8 hours apart"
+    }
+    if !rooms.has(body.room_id) {
+        return 404
+    }
+    // время хранится в одном виде (…Z), поэтому строки сравниваются как время
+    let booking = Booking { id: last_booking + 1, ...body, start: time_iso(start), end: time_iso(end) }
+    if bookings.values().any(b => b.room_id == body.room_id && b.start < booking.end && booking.start < b.end) {
+        return 409 "the room is booked at that time"
+    }
+    last_booking += 1
+    bookings[booking.id] = booking
+    return 201 booking
+}
+
+route GET "/rooms/{id}/bookings" (id: int, date: str?) -> [Booking] | 400 str | 404 {
+    if !rooms.has(id) {
+        return 404
+    }
+    var from = ""
+    var to = "~"
+    if date != none {
+        let day = parse_date(date) else {
+            return 400 "date must look like 2026-10-19"
+        }
+        from = time_iso(day)
+        to = time_iso(day + 86400)
+    }
+    return bookings.values()
+        .filter(b => b.room_id == id && b.start < to && from < b.end)
+        .sort_by(b => b.start)
+}
+
+route DELETE "/bookings/{id}" (id: int) -> 204 | 404 {
+    bookings.remove(id) else {
+        return 404
+    }
+    return 204
+}

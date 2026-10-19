@@ -1,4 +1,4 @@
-# Khrip language reference (v0.8)
+# Khrip language reference (v0.9)
 
 Khrip is a compiled, strictly typed language for HTTP APIs on Linux x86-64.
 One project = one namespace: no imports, declaration order does not matter.
@@ -16,33 +16,29 @@ khc -o app app.kh         # build a static binary
 bytes), `[T]` list, `map[K, V]` (K is int or str), `T?` optional, and named types:
 
 ```khrip
-type Point {
-    x: int
-    y: int
-}
+type Point { x: int, y: int }
 type Named {
     name: str
     ...Point          // spread: copies fields x, y
     tags: [str] = []  // default: a literal, [], {} or an enum value
+    note: str?        // optional fields default to none
 }
 type Role = Admin | Member | Guest                     // enum
 type Shape = Circle { r: int } | Rect { w: int, h: int } | Empty
 ```
 
-A variant type holds one of its variants: `let s: Shape = Circle { r: 2 }`,
-`let r = Admin`. Enum values compare with `==`; read variant fields with `match`.
-No null (use `T?` and `none`), no classes, generics, exceptions or operator
-overloading. Implicit conversions: `T` → `T?`, variant → its type, and an int
-*literal* where a float is expected (`t * 2`, `t < 0`, `let x: float = 5`); an
-int variable needs `n.to_float()`, a float `x.to_int()` or `x.round()`. Keep
-money in int cents. Conditions must be `bool`.
+`let s: Shape = Circle { r: 2 }`, `let r = Admin`; enum values compare with `==`,
+variant fields are read with `match`. No null (use `T?` and `none`), classes,
+generics or exceptions. Implicit conversions: `T` → `T?`, variant → its type, int
+*literal* → float (`t * 2`); otherwise `n.to_float()`, `x.to_int()`, `x.round()`.
+Keep money in int cents. Conditions must be `bool`.
 
 ## Declarations
 
 ```khrip
 const LIMIT = 10            // int, str or bool literal
 var count: int = 0          // global (not allowed in servers: use store)
-fn add(a: int, b: int) -> int {
+fn add(a: int, b: int = 1) -> int {   // defaults are literals
     return a + b
 }
 fn log(msg: str) {          // no result: omit ->
@@ -66,32 +62,24 @@ let area = match s {                                // exhaustive
     Rect r => r.w * r.h
     Empty => 0
 }
-let text = match code {
-    200 | 201 => "ok"
-    404 => "missing"
-    _ => "error {code}"
-}
 while i < n {
     i += 1                  // += -= *= /= %= ; there is no ++
 }
-for x in xs { }             // list items, str bytes, map keys
-for i, x in xs { }          // index and item; for k, v in m { }
+for x in xs { }             // items, str bytes, map keys; for i, x in xs
 for i in 0..n { }           // 0..n excludes n, 0..=n includes it
-break
-continue
 ```
 
-Operators: `+ - * / %` (int; `/` truncates, division by zero panics),
-`== != < <= > >=`, `&& || !`, `& | ^ ~ << >>`, `+` also joins strings.
-Comparisons do not chain. `'a'` is an int (byte). A block used as a value ends
-with its value: `if c { let a = f(); a + 1 } else { 0 }`. `match` arms may also be
-blocks or `return ...`; `match` works on variants, int, str and bool and must
-cover every case (or have `_ =>`).
+Operators: `+ - * / %`, `== != < <= > >=`, `&& || !`, `& | ^ ~ << >>`; `+`
+also joins strings; comparisons do not chain. `'a'` is an int (byte). A block
+used as a value ends with its value: `if c { let a = f(); a + 1 } else { 0 }`.
+`match` works on variants, int, str and bool (`200 | 201 => ...`), arms may be
+blocks or `return ...`, and must cover every case (or have `_ =>`).
 
-Strings: `"Hello, {name}!"` interpolates any expression (`{user.name}`,
-`{m["a"] ?? 0}`, `{n * 2}`); it must not start with a quote. Write `\{` for a
-literal brace: `"\{\"id\": {id}}"`. Escapes: `\n \t \r \0 \\ \" \'`.
-`s[i]` is a byte (int), `s[a..b]` a substring.
+Strings: `"Hi, {user.name}!"` interpolates an expression that does not start
+with a quote (`{2,5}` stays text). Escapes: `\n \t \r \0 \\ \" \' \{`. Raw
+strings in backticks have neither and may span lines: `` `\d{4}` ``,
+`` `{"id": 1}` ``. `s[i]` is a byte (int); slices `s[a..b]`, `xs[a..]`, `xs[..b]`
+are clamped to the bounds.
 
 ## Optionals
 
@@ -100,15 +88,18 @@ let name = find(id) ?? "nobody"        // default
 let user = users[id] else {            // unwrap or leave the scope
     return 404
 }
-if let u = users[id] {
-    print(u.name)
-}
-if user == none { }
+if let u = users[id] { }               // u is the value
 if role == Admin { }                   // role: Role? compares directly
+if limit != none && n > limit { }      // after the check, limit is an int
+let ok = tag == none || item.tags.contains(tag)
+if q == none {
+    return 400
+}                                      // from here on q is a str
 ```
 
-`m[k]` on a map, `.get(k)`, `.remove(k)`, `.find(s)`, `.to_int()`,
-`.index_of(x)`, `read_file`, `env` and `from_json` return `T?`.
+Checks against `none` narrow a `let` or a parameter (not a `var`). `m[k]`,
+`.get(k)`, `.remove(k)`, `.find(s)`, `.to_int()`, `.index_of(x)`, `read_file`,
+`env`, `parse_time` and `from_json` return `T?`.
 
 ## Values
 
@@ -116,8 +107,7 @@ if role == Admin { }                   // role: Role? compares directly
 let p = Point { x: 1, y: 2 }
 let q = Point { x, y }                 // field shorthand: x: x, y: y
 let n = Named { name: "a", ...p }      // spread fields of p
-var xs: [int] = []
-let ys = [1, 2, 3]
+let u = Product { ...old, ...patch }   // patch's T? fields: only if not none
 let zeros = [0] * 100
 var m: map[str, int] = {}
 let ages = {"ann": 30, "bob": 41}
@@ -127,28 +117,30 @@ Structs, lists and maps are references: assigning shares, `.copy()` copies a lis
 
 ## Methods
 
-Any function can be called as a method of its first argument: `p.describe()`
-is `describe(p)`.
+Any function is also a method of its first argument: `p.describe()`.
 
 - `str`: `len contains starts_with ends_with find trim lower upper split
-  replace repeat to_int`
+  replace repeat to_int`, `matches(regex)` (whole string; `[a-z] \d \w \s . * + ?
+  {n,m} ( | )`, linear time)
 - `int`: `to_str to_float abs min max`; `bool`: `to_str`
 - `float`: `to_str to_int round floor ceil` (→ int) `round_to(digits) abs sqrt
-  min max`; `s.to_float()` → `float?`; floats print like JavaScript (`0.1`, `1e+21`)
-- `[T]`: `len push pop last insert remove_at clear truncate reverse copy
-  contains index_of sort` (sort: int or str), `join` ([str]), `sum` ([int]),
-  `xs[i]`, `xs[a..b]`
+  min max`; `s.to_float()` → `float?`
+- `[T]`: `len push pop last insert remove_at clear truncate copy contains
+  index_of`, `sort reverse` (in place, return the list; sort: int or str),
+  `join` ([str]), `sum` ([int], [float])
 - lambdas `x => expr` in list methods: `map filter find` (T?) `any all count
-  sort_by` (int or str key, sorts in place and returns the list); they see local
-  variables: `users.filter(u => u.age >= min).map(u => u.name)`
+  sort_by` (int, float or str key; stable, in place, returns the list); they see
+  local variables: `users.filter(u => u.age >= min).map(u => u.name)`
 - `map[K, V]`: `len has get remove keys values clear`, `m[k]` (V?), `m[k] = v`
 
-Functions: `print(s)`, `eprint(s)`, `write(s)` (no newline), `len(x)`,
-`args() -> [str]`, `env(name) -> str?`, `read_file(path) -> str?`,
-`write_file(path, text, executable) -> bool`, `exit(code)`, `now()` (unix
-seconds), `now_ms()`, `url_encode(s)`, `to_json(value) -> str`,
-`from_json(text) -> T?` (the type comes from the annotation:
-`let u: User? = from_json(text)`), `json_error() -> str`.
+Functions: `print(s)`, `eprint(s)`, `write(s)`, `args()`, `env(name) -> str?`,
+`read_file(path) -> str?`, `write_file(path, text, executable) -> bool`,
+`exit(code)`, `now()` (unix seconds), `now_ms()`, `time_iso(t)` →
+`"2026-10-19T15:04:05Z"`, `parse_time(s) -> int?` (ISO 8601, offsets allowed),
+`parse_date("2026-10-19") -> int?`, `random_str(n)` (A-Za-z0-9), `sha256(s)`
+(hex), `hash_password(p)`, `check_password(p, hash) -> bool`, `url_encode(s)`,
+`to_json(value)`, `from_json(text) -> T?` (the type comes from the annotation:
+`let u: User? = from_json(text)`), `json_error()`.
 
 Index out of range, overflow, division by zero and `pop` on an empty list
 panic: the program exits with code 101; in a server the request gets 500.
@@ -159,22 +151,15 @@ A program with `route` or `every` declarations runs by itself (no `fn main`);
 `PORT` sets the port (8080), `THREADS` the worker threads (all cores).
 
 ```khrip
-type NewUser {
-    name: str
-    email: str
-    age: int
-}
-type User {
-    id: int
-    ...NewUser
-}
+type NewUser { name: str, email: str, age: int }
+type User { id: int, ...NewUser }
 
 store users: map[int, User]
 store last_id: int
 
 route POST "/users" (body: NewUser) -> 201 User | 400 str {
-    if body.name == "" {
-        return 400 "name is required"
+    if !body.email.matches(`[^@\s]+@[^@\s]+`) {
+        return 400 "email is invalid"
     }
     last_id += 1
     let user = User { id: last_id, ...body }
@@ -186,10 +171,11 @@ route GET "/users/{id}" (id: int) -> User | 404 {
     return users[id] ?? 404
 }
 
-route GET "/users" (min_age: int?) -> [User] {
-    return users.values()
-        .filter(u => u.age >= (min_age ?? 0))
+route GET "/users" (min_age: int?, page: int = 1) -> [User] {
+    let all = users.values()
+        .filter(u => min_age == none || u.age >= min_age)
         .sort_by(u => u.name)
+    return all[(page - 1) * 20..page * 20]
 }
 
 route DELETE "/users/{id}" (id: int) -> 204 | 404 {
@@ -200,19 +186,20 @@ route DELETE "/users/{id}" (id: int) -> 204 | 404 {
 }
 ```
 
-- Method: `GET POST PUT PATCH DELETE`. Path parameters `{id}` must be declared
-  (`int`, `float`, `str`, `bool` or an enum). A struct, list or map parameter is the JSON
-  body; other parameters come from the query string (`T?` makes one optional).
-  Missing body fields take their defaults; enums are JSON strings ("Admin"),
-  other variants objects with a "type" field.
-  Bad input gets 400 with a message, a wrong method 405, an unknown path 404.
-- Results: `-> Type`, `-> 201 Type | 400 str | 404`; a type without a status
-  means 200. `return 201 user`, `return 404`, `return value` (status chosen by
-  type), `return x ?? 404`. `str` is sent as text, other types as JSON
-  (field names as declared). A route without `->` answers 204.
-- `store name: T` is data that outlives requests. Each request runs in its own
-  memory arena; writes into store are copied out automatically. Handlers see
-  store as if requests ran one at a time.
+- Method: `GET POST PUT PATCH DELETE`. Path parameters `{id}` are declared too.
+  A struct, list or map parameter is the JSON body; others come from the query
+  string: `T?` is optional, `page: int = 1` has a default. Missing body fields take their defaults; enums are
+  JSON strings ("Admin"), other variants objects with a "type" field. Bad input
+  gets 400 with a message, a wrong method 405, an unknown path 404.
+- Results: `-> Type` (200), `-> 201 Type | 400 str | 404`; `return 201 user`,
+  `return 404`, `return x ?? 404`. `str` is sent as text, other types as JSON. No
+  `->`: 204.
+- `header(name) -> str?` reads a request header (any case); `set_header(name,
+  value)` adds one to the response. `fail(status)` or `fail(status, message)`
+  ends the request from any function: `let key = header("X-API-Key") else {
+  fail(401) }`.
+- `store name: T` outlives requests; handlers see it as if requests ran one at a
+  time (no locks needed).
 
 ## Calling other services, background tasks
 
@@ -226,13 +213,11 @@ every 10 min {
 }
 ```
 
-`fetch METHOD url [body] [headers map]` returns `Response { status, body }`;
-`status` is 0 when the service cannot be reached (`body` says why). A body
-value is sent as JSON, a str as text. https uses `curl` (must be installed).
-While `fetch` waits, other requests may change store. `every N ms|s|min|h|d`
-runs a block in a background thread (first run after one period); call the
-same function from a test or a route to check it. With `KHRIP_DATA=file.json`
-store is loaded at start and saved each second after changes and on SIGTERM.
+`fetch METHOD url [body] [headers map]` returns `Response { status, body,
+headers }` (names lower case); `status` 0 means unreachable (`body` says why). A
+body value is sent as JSON, a str as text; https uses `curl`. During `fetch`
+other requests may change store. `every N ms|s|min|h|d` runs a block in a
+background thread. `KHRIP_DATA=file.json` keeps store across restarts.
 
 ## Tests
 
@@ -240,16 +225,13 @@ store is loaded at start and saved each second after changes and on SIGTERM.
 test "create user" {
     let r = call POST "/users" NewUser { name: "Ann", email: "a@x.io", age: 30 }
     expect r.status == 201
-    let u: User? = from_json(r.body)
-    expect (u ?? User { id: 0, name: "", email: "", age: 0 }).name == "Ann"
-    expect (call GET "/users/9").status == 404
+    expect (call GET "/users/1" headers {"X-Key": "k"}).body.contains(`"Ann"`)
 }
 ```
 
-`call METHOD "path?query" [body]` runs a request in-process and returns
-`Response { status: int, body: str }`; the body is a str or a value sent as
-JSON. `expect cond` records a failure and continues; `a == b` failures show
-both sides. Tests run in order and share store.
+`call METHOD "path?query" [body] [headers map]` runs a request in-process and
+returns a `Response`. `expect cond` records a failure and continues; `a == b`
+failures show both sides. Tests run in order and share store.
 
 ## Habits from other languages
 
@@ -257,4 +239,5 @@ both sides. Tests run in order and share store.
 `x++` → `x += 1`; `func def function` → `fn`; `String` → `str`;
 `x.length x.size() x.Count` → `x.len()`; `let mut` → `var`;
 `switch` → `match`; `enum` → `type Role = A | B`; `cond ? a : b` → `if`;
-`try/catch` → optionals and `else`; `import` → not needed.
+`try/catch`, `raise HTTPException` → optionals, `else`, `fail(status)`;
+`import` → not needed.

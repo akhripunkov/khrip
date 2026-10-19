@@ -18,3 +18,9 @@ node count.mjs $s/todo/variants/v06.kh $s/todo/khrip/main.kh
 echo
 echo "### Варианты синтаксиса CRUD"
 node count.mjs $s/crud/variants/braces.kh $s/crud/variants/indent.kh $s/crud/variants/rust_types.kh $s/crud/khrip/main.kh
+echo
+echo "### Задачи бэкенда (eval/): Khrip, Python, C#, Go"
+node eval.mjs
+echo
+echo "### Спецификация для промпта"
+node spec_tokens.mjs ../../docs/KHRIP.md

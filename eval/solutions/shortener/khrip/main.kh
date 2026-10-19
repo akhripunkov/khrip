@@ -1,0 +1,49 @@
+type NewLink { url: str, code: str = "" }
+
+type Link { code: str, url: str, clicks: int = 0 }
+
+store links: map[str, Link]
+
+route POST "/links" (body: NewLink) -> 201 Link | 400 str | 409 str {
+    if !body.url.starts_with("http://") && !body.url.starts_with("https://") {
+        return 400 "url must start with http:// or https://"
+    }
+    var code = body.code
+    if code == "" {
+        code = random_str(7)
+        while links.has(code) {
+            code = random_str(7)
+        }
+    } else if !code.matches("[A-Za-z0-9_-]{3,32}") {
+        return 400 "code must be 3-32 letters, digits, - or _"
+    } else if links.has(code) {
+        return 409 "code is taken"
+    }
+    let link = Link { code, url: body.url }
+    links[code] = link
+    return 201 link
+}
+
+route GET "/{code}" (code: str) -> 302 | 404 {
+    let link = links[code] else {
+        return 404
+    }
+    link.clicks += 1
+    set_header("Location", link.url)
+    return 302
+}
+
+route GET "/links" -> [Link] {
+    return links.values().sort_by(l => l.code).sort_by(l => -l.clicks)
+}
+
+route GET "/links/{code}" (code: str) -> Link | 404 {
+    return links[code] ?? 404
+}
+
+route DELETE "/links/{code}" (code: str) -> 204 | 404 {
+    links.remove(code) else {
+        return 404
+    }
+    return 204
+}

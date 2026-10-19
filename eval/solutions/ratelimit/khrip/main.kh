@@ -1,0 +1,68 @@
+const LIMIT = 5
+
+type Window { start: int, used: int }
+
+type Pong { pong: bool, remaining: int }
+
+type Time { time: str }
+
+type Limits {
+    key: str
+    used: int
+    remaining: int
+    reset_in: int
+}
+
+store windows: map[str, Window]
+
+fn window_ms() -> int {
+    return ((env("WINDOW_SECONDS") ?? "60").to_int() ?? 60) * 1000
+}
+
+// Активное окно ключа; истёкшее окно — как отсутствующее.
+fn active(key: str) -> Window? {
+    let w = windows[key] else {
+        return none
+    }
+    if now_ms() >= w.start + window_ms() {
+        return none
+    }
+    return w
+}
+
+fn seconds_left(w: Window) -> int {
+    return (w.start + window_ms() - now_ms() + 999) / 1000
+}
+
+// Засчитывает запрос ключа из X-API-Key: сколько осталось в окне.
+fn take() -> int {
+    let key = header("X-API-Key") else {
+        fail(401)
+    }
+    let w = active(key) ?? Window { start: now_ms(), used: 0 }
+    if w.used >= LIMIT {
+        set_header("Retry-After", seconds_left(w).to_str())
+        fail(429)
+    }
+    w.used += 1
+    windows[key] = w
+    return LIMIT - w.used
+}
+
+route GET "/api/ping" -> Pong {
+    return Pong { pong: true, remaining: take() }
+}
+
+route GET "/api/time" -> Time {
+    take()
+    return Time { time: time_iso(now()) }
+}
+
+route GET "/limits/{key}" (key: str) -> Limits {
+    let w = active(key) ?? Window { start: 0, used: 0 }
+    var reset = 0
+    if w.used > 0 {
+        reset = seconds_left(w)
+    }
+    return Limits { key, used: w.used, remaining: LIMIT - w.used, reset_in: reset }
+}

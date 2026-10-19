@@ -67,6 +67,78 @@ fn declare_local(name: str, t: int, mutable: bool) -> int {
     return add_local(name, t, mutable, -1, new_slot())
 }
 
+// Сужение: неизменяемые локальные T?, про которые известно, что они не none
+// (после x != none &&, x == none ||, внутри if x != none { } и после
+// if x == none { return }). Там они читаются как T.
+var narrowed: [int]
+
+fn is_narrowed(li: int) -> bool {
+    for x in narrowed {
+        if x == li {
+            return true
+        }
+    }
+    return false
+}
+
+fn narrow_to(n: int) {
+    while narrowed.len() > n {
+        narrowed.pop()
+    }
+}
+
+// Видимый тип локальной: для суженной — T вместо T?.
+fn local_view_ty(li: int) -> int {
+    if is_narrowed(li) {
+        return ty_inner(locals[li].ty)
+    }
+    return locals[li].ty
+}
+
+// Лексемы p, p+1, p+2 — «x == none» (op = T_EQ) или «x != none» (op = T_NE) для
+// неизменяемой локальной x типа T?: её номер, иначе -1.
+fn none_test_at(p: int, op: int) -> int {
+    if kind_at(p) != T_IDENT || kind_at(p + 1) != op || kind_at(p + 2) != T_NONE {
+        return -1
+    }
+    let li = find_local(toks[p].text)
+    if li < 0 || locals[li].mutable || tkind(locals[li].ty) != K_OPT || is_narrowed(li) {
+        return -1
+    }
+    return li
+}
+
+// Проверки «x op none» в цепочке операндов [from, to), соединённых sep (T_ANDAND
+// или T_OROR) на верхнем уровне скобок. Другой оператор на верхнем уровне — пусто.
+fn none_tests(from: int, to: int, sep: int, op: int) -> [int] {
+    var out: [int] = []
+    var start = from
+    var depth = 0
+    var j = from
+    while j <= to {
+        let k = kind_at(j)
+        if j == to || (depth == 0 && (k == T_ANDAND || k == T_OROR)) {
+            if j < to && k != sep {
+                let empty: [int] = []
+                return empty
+            }
+            if j - start == 3 {
+                let li = none_test_at(start, op)
+                if li >= 0 {
+                    out.push(li)
+                }
+            }
+            start = j + 1
+        } else if k == '(' || k == '[' || k == '\{' {
+            depth += 1
+        } else if k == ')' || k == ']' || k == '}' {
+            depth -= 1
+        }
+        j += 1
+    }
+    return out
+}
+
 fn find_local(name: str) -> int {
     var i = nlocals - 1
     while i >= local_floor {
@@ -356,6 +428,9 @@ fn peek_simple(level: int) -> bool {
     }
     if t.kind == T_IDENT {
         let li = find_local(t.text)
+        if li >= 0 && is_narrowed(li) {
+            return false
+        }
         if li >= 0 {
             op_kind = OPK_LOCAL
             op_val = li
@@ -608,21 +683,32 @@ fn parse_coalesce() -> int {
 }
 
 fn parse_or() -> int {
+    var start = pos
     let lt = parse_and()
     if kind() != T_OROR {
         return lt
     }
     check_bool(lt, tok(), "||")
+    let nn = narrowed.len()
     var holes: [int] = []
     while kind() == T_OROR {
+        if pos - start == 3 {
+            // x == none || ...: дальше x — не none
+            let li = none_test_at(start, T_EQ)
+            if li >= 0 {
+                narrowed.push(li)
+            }
+        }
         let at = tok()
         advance()
         emit_test_rax()
         holes.push(emit_jcc(CC_NE))
         want = ty_err
+        start = pos
         let rt = parse_and()
         check_bool(rt, at, "||")
     }
+    narrow_to(nn)
     let end = emit_jmp()
     let t = here()
     for h in holes {
@@ -634,21 +720,32 @@ fn parse_or() -> int {
 }
 
 fn parse_and() -> int {
+    var start = pos
     let lt = parse_cmp()
     if kind() != T_ANDAND {
         return lt
     }
     check_bool(lt, tok(), "&&")
+    let nn = narrowed.len()
     var holes: [int] = []
     while kind() == T_ANDAND {
+        if pos - start == 3 {
+            // x != none && ...: дальше x — не none
+            let li = none_test_at(start, T_NE)
+            if li >= 0 {
+                narrowed.push(li)
+            }
+        }
         let at = tok()
         advance()
         emit_test_rax()
         holes.push(emit_jcc(CC_E))
         want = ty_err
+        start = pos
         let rt = parse_cmp()
         check_bool(rt, at, "&&")
     }
+    narrow_to(nn)
     let end = emit_jmp()
     let f = here()
     for h in holes {

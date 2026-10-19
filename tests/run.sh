@@ -7,7 +7,8 @@
 #                       компилятора — из «// flags: ...»;
 #   tests/api/*.kh    — блоки test (khc test); вывод сравнивается с .out;
 #   tests/http.sh     — HTTP-сервер на Khrip отвечает правильно;
-#   tests/weather.sh  — погодный бэкенд: fetch, every, сохранение store.
+#   tests/weather.sh  — погодный бэкенд: fetch, every, сохранение store;
+#   eval/solutions/*/khrip — решения задач проверки проходят eval/run.sh.
 # Компилятор берётся из $KHC (по умолчанию build/khc).
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -82,6 +83,18 @@ fi
 if [[ -f tests/weather.sh ]] && command -v curl >/dev/null; then
 	# shellcheck source=tests/weather.sh
 	source tests/weather.sh
+fi
+
+# Решения задач проверки (eval/) на Khrip проходят свои сценарии запросов.
+if command -v curl >/dev/null && command -v python3 >/dev/null; then
+	for dir in eval/solutions/*/khrip; do
+		task=$(basename "$(dirname "$dir")")
+		if eval/run.sh "$task" khrip >"$tmp/eval.txt" 2>&1; then
+			pass=$((pass + 1))
+		else
+			failed "eval/$task" "$(cat "$tmp/eval.txt")"
+		fi
+	done
 fi
 
 echo "тестов пройдено: $pass, провалено: $fail"

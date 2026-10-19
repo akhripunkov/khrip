@@ -1,0 +1,108 @@
+type NewRoom { name: str, capacity: int }
+
+type Room { id: int, ...NewRoom }
+
+type NewBooking { room_id: int, title: str, start: str, end: str }
+
+type Booking { id: int, ...NewBooking }
+
+store rooms: map[int, Room]
+store bookings: map[int, Booking]
+store last_booking: int
+
+fn days_in_month(y: int, m: int) -> int {
+    if m == 2 {
+        return if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 29 } else { 28 }
+    }
+    return if m == 4 || m == 6 || m == 9 || m == 11 { 30 } else { 31 }
+}
+
+// Дни с 1970-01-01 для даты «YYYY-MM-DD» или -1, если дата неверна.
+fn parse_day(s: str) -> int {
+    if !s.matches(`\d{4}-\d{2}-\d{2}`) {
+        return -1
+    }
+    let y = s[0..4].to_int() ?? 0
+    let m = s[5..7].to_int() ?? 0
+    let d = s[8..10].to_int() ?? 0
+    if m < 1 || m > 12 || d < 1 || d > days_in_month(y, m) {
+        return -1
+    }
+    var days = d - 1
+    for yy in 1970..y {
+        days += if yy % 4 == 0 && (yy % 100 != 0 || yy % 400 == 0) { 366 } else { 365 }
+    }
+    for mm in 1..m {
+        days += days_in_month(y, mm)
+    }
+    return days
+}
+
+// Секунды с 1970 для «YYYY-MM-DDTHH:MM:SSZ» или -1.
+fn parse_time(s: str) -> int {
+    if !s.matches(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z`) {
+        return -1
+    }
+    let days = parse_day(s[0..10])
+    let h = s[11..13].to_int() ?? 99
+    let m = s[14..16].to_int() ?? 99
+    let sec = s[17..19].to_int() ?? 99
+    if days < 0 || h > 23 || m > 59 || sec > 59 {
+        return -1
+    }
+    return days * 86400 + h * 3600 + m * 60 + sec
+}
+
+route POST "/rooms" (body: NewRoom) -> 201 Room | 400 str {
+    if body.name.trim() == "" || body.capacity < 1 {
+        return 400 "name is required and capacity must be at least 1"
+    }
+    let room = Room { id: rooms.len() + 1, ...body }
+    rooms[room.id] = room
+    return 201 room
+}
+
+route POST "/bookings" (body: NewBooking) -> 201 Booking | 400 str | 404 | 409 str {
+    let start = parse_time(body.start)
+    let end = parse_time(body.end)
+    if start < 0 || end <= start || end - start > 8 * 3600 || body.title.trim() == "" {
+        return 400 "need a title and valid start < end, at most 8 hours apart"
+    }
+    if !rooms.has(body.room_id) {
+        return 404
+    }
+    let clash = bookings.values().any(b => b.room_id == body.room_id && parse_time(b.start) < end && start < parse_time(b.end))
+    if clash {
+        return 409 "the room is booked at that time"
+    }
+    last_booking += 1
+    let booking = Booking { id: last_booking, ...body }
+    bookings[booking.id] = booking
+    return 201 booking
+}
+
+route GET "/rooms/{id}/bookings" (id: int, date: str?) -> [Booking] | 400 str | 404 {
+    if !rooms.has(id) {
+        return 404
+    }
+    var from = 0
+    var to = 1 << 62
+    if date != none {
+        let day = parse_day(date)
+        if day < 0 {
+            return 400 "date must look like 2026-10-19"
+        }
+        from = day * 86400
+        to = from + 86400
+    }
+    return bookings.values()
+        .filter(b => b.room_id == id && parse_time(b.start) < to && from < parse_time(b.end))
+        .sort_by(b => b.start)
+}
+
+route DELETE "/bookings/{id}" (id: int) -> 204 | 404 {
+    bookings.remove(id) else {
+        return 404
+    }
+    return 204
+}

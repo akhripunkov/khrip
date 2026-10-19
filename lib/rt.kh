@@ -87,6 +87,190 @@ fn now_ms() -> int {
     return load64(ts) * 1000 + load64(ts + 8) / 1000000
 }
 
+fn __pad(v: int, width: int) -> str {
+    var r = v.to_str()
+    while r.len() < width {
+        r = "0" + r
+    }
+    return r
+}
+
+// Время t (секунды с 1970-01-01 UTC) в ISO 8601: 2026-10-19T15:04:05Z.
+fn time_iso(t: int) -> str {
+    var days = t / 86400
+    var secs = t % 86400
+    if secs < 0 {
+        secs += 86400
+        days -= 1
+    }
+    // дни → дата (civil_from_days Говарда Хиннанта)
+    let z = days + 719468
+    var era = z / 146097
+    if z < 0 {
+        era = (z - 146096) / 146097
+    }
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let day = doy - (153 * mp + 2) / 5 + 1
+    var month = mp + 3
+    if mp >= 10 {
+        month = mp - 9
+    }
+    var year = yoe + era * 400
+    if month <= 2 {
+        year += 1
+    }
+    return __pad(year, 4) + "-" + __pad(month, 2) + "-" + __pad(day, 2) + "T" + __pad(secs / 3600, 2) + ":" + __pad(secs / 60 % 60, 2) + ":" + __pad(secs % 60, 2) + "Z"
+}
+
+// Дни от 1970-01-01 до даты (days_from_civil Говарда Хиннанта).
+fn __days_from_civil(y0: int, m: int, d: int) -> int {
+    var y = y0
+    if m <= 2 {
+        y -= 1
+    }
+    var era = y / 400
+    if y < 0 {
+        era = (y - 399) / 400
+    }
+    let yoe = y - era * 400
+    var mp = m - 3
+    if m <= 2 {
+        mp = m + 9
+    }
+    let doy = (153 * mp + 2) / 5 + d - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+
+fn __days_in_month(y: int, m: int) -> int {
+    if m == 2 {
+        if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+            return 29
+        }
+        return 28
+    }
+    if m == 4 || m == 6 || m == 9 || m == 11 {
+        return 30
+    }
+    return 31
+}
+
+// n цифр с позиции i или -1.
+fn __digits(s: str, i: int, n: int) -> int {
+    if i + n > s.len() {
+        return -1
+    }
+    var v = 0
+    for k in i..i + n {
+        let c = s[k]
+        if c < '0' || c > '9' {
+            return -1
+        }
+        v = v * 10 + c - '0'
+    }
+    return v
+}
+
+// «YYYY-MM-DD» с позиции 0: дни от 1970-01-01 или none.
+fn __parse_ymd(s: str) -> int? {
+    let y = __digits(s, 0, 4)
+    let m = __digits(s, 5, 2)
+    let d = __digits(s, 8, 2)
+    if s.len() < 10 || s[4] != '-' || s[7] != '-' || y < 0 || m < 1 || m > 12 || d < 1 || d > __days_in_month(y, m) {
+        return none
+    }
+    return __days_from_civil(y, m, d)
+}
+
+// Дата «2026-10-19» → секунды с 1970 (полночь UTC), неверная дата — none.
+fn parse_date(s: str) -> int? {
+    if s.len() != 10 {
+        return none
+    }
+    let days = __parse_ymd(s) else {
+        return none
+    }
+    return days * 86400
+}
+
+// Время ISO 8601 / RFC 3339 → секунды с 1970: «2026-10-19T15:04:05Z», дробные
+// секунды отбрасываются, смещение «+03:00» учитывается. Неверное — none.
+fn parse_time(s: str) -> int? {
+    let days = __parse_ymd(s) else {
+        return none
+    }
+    let h = __digits(s, 11, 2)
+    let mi = __digits(s, 14, 2)
+    let sec = __digits(s, 17, 2)
+    if s.len() < 20 || (s[10] != 'T' && s[10] != 't' && s[10] != ' ') || s[13] != ':' || s[16] != ':' || h < 0 || h > 23 || mi < 0 || mi > 59 || sec < 0 || sec > 59 {
+        return none
+    }
+    var i = 19
+    if s[i] == '.' {
+        i += 1
+        let from = i
+        while i < s.len() && s[i] >= '0' && s[i] <= '9' {
+            i += 1
+        }
+        if i == from {
+            return none
+        }
+    }
+    var offset = 0
+    if i == s.len() - 1 && (s[i] == 'Z' || s[i] == 'z') {
+        offset = 0
+    } else if i == s.len() - 6 && (s[i] == '+' || s[i] == '-') && s[i + 3] == ':' {
+        let oh = __digits(s, i + 1, 2)
+        let om = __digits(s, i + 4, 2)
+        if oh < 0 || oh > 23 || om < 0 || om > 59 {
+            return none
+        }
+        offset = oh * 3600 + om * 60
+        if s[i] == '-' {
+            offset = -offset
+        }
+    } else {
+        return none
+    }
+    return days * 86400 + h * 3600 + mi * 60 + sec - offset
+}
+
+// ---- Случайность (getrandom) ----
+
+fn __random_bytes(p: int, n: int) {
+    var off = 0
+    while off < n {
+        let r = syscall(318, p + off, n - off, 0)
+        if r > 0 {
+            off += r
+        }
+    }
+}
+
+// Случайная строка из n латинских букв и цифр: коды, токены, ключи.
+fn random_str(n: int) -> str {
+    let abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    let b = buf_new(n + 1)
+    let raw = __alloc(64)
+    var i = 64
+    while b.len < n {
+        if i >= 64 {
+            __random_bytes(raw, 64)
+            i = 0
+        }
+        let v = load8(raw + i)
+        i += 1
+        // без перекоса: 248 = 4 × 62
+        if v < 248 {
+            buf_byte(b, abc[v % 62])
+        }
+    }
+    return __str_new(b.data, b.len)
+}
+
 // ---- Мьютекс на futex: 0 — свободен, 1 — занят, 2 — занят и есть ждущие ----
 
 fn __mutex_lock(m: int) {

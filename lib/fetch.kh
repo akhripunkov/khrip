@@ -295,12 +295,20 @@ fn __parse_response(raw: str) -> Response {
         return __fetch_fail("not an HTTP response")
     }
     let status = first[1].to_int() ?? 0
+    // ответ прокси на CONNECT и «100 Continue» — перед настоящим ответом
+    if (status == 100 || (status == 200 && head.lower().contains("connection established"))) && body.starts_with("HTTP/") {
+        return __parse_response(body)
+    }
     var chunked = false
     var length = -1
+    var hs: map[str, str] = {}
     for line in lines[1..lines.len()] {
         let c = line.find(":") ?? line.len()
-        let name = line[..c].lower()
+        let name = line[..c].trim().lower()
         let value = line[c + 1..].trim()
+        if c < line.len() {
+            hs[name] = value
+        }
         if name == "transfer-encoding" && value.lower().contains("chunked") {
             chunked = true
         } else if name == "content-length" {
@@ -312,7 +320,7 @@ fn __parse_response(raw: str) -> Response {
     } else if length >= 0 && length < body.len() {
         body = body[..length]
     }
-    return Response { status, body }
+    return Response { status, body, headers: hs }
 }
 
 fn __http_exchange(url: __Url, request: str) -> Response {
@@ -437,7 +445,7 @@ fn __fetch_curl(method: str, url: str, body: str, has_body: bool, ctype: str, he
     let curl = __find_exe("curl") else {
         return __fetch_fail("https needs curl in PATH: Khrip has no TLS of its own yet")
     }
-    var args = ["curl", "-sS", "--max-time", FETCH_TIMEOUT.to_str(), "-X", method, "-o", "-", "-w", "\n%\{http_code}"]
+    var args = ["curl", "-sS", "-i", "--max-time", FETCH_TIMEOUT.to_str(), "-X", method]
     for k, v in headers {
         args.push("-H")
         args.push(k + ": " + v)
@@ -453,20 +461,25 @@ fn __fetch_curl(method: str, url: str, body: str, has_body: bool, ctype: str, he
     args.push(url)
     let p = __run_capture(curl, args, body)
     if p.code != 0 {
-        // сообщение curl без кода ответа, который он дописал в конец
-        let cut = __last_nl(p.out)
-        if cut < p.out.len() {
-            return __fetch_fail(p.out[..cut].trim())
-        }
         return __fetch_fail(p.out.trim())
     }
-    // curl дописывает в конец «\nКОД»
-    let nl = __last_nl(p.out)
-    if nl >= p.out.len() {
-        return __fetch_fail("unexpected curl output")
+    // -i: блоки заголовков (ответ прокси на CONNECT, 100 Continue), затем
+    // заголовки настоящего ответа и тело, которое curl уже собрал из частей
+    var out = p.out
+    while true {
+        let e = out.find("\r\n\r\n") else {
+            return __fetch_fail("unexpected curl output")
+        }
+        let head = out[..e].lower()
+        let rest = out[e + 4..]
+        if rest.starts_with("HTTP/") && (head.contains(" 100") || head.contains("connection established")) {
+            out = rest
+            continue
+        }
+        let r = __parse_response(out[..e + 4])
+        return Response { status: r.status, body: rest, headers: r.headers }
     }
-    let status = p.out[nl + 1..].trim().to_int() ?? 0
-    return Response { status, body: p.out[..nl] }
+    return __fetch_fail("unexpected curl output")
 }
 
 fn __last_nl(s: str) -> int {

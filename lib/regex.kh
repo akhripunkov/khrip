@@ -1,0 +1,436 @@
+// Регулярные выражения: s.matches(pattern) — подходит ли строка целиком.
+// Шаблон разбирается в дерево, дерево — в программу автомата, программа
+// исполняется на всех состояниях сразу (Томпсон, Пайк): время линейно по длине
+// строки, без возвратов, поэтому шаблон и ввод не могут «подвесить» сервер.
+// Поддерживается: литералы, . [abc] [a-z] [^...] \d \w \s \D \W \S, экранирование
+// \. \\ и т. п., группы ( ), | , * + ? {n} {n,} {n,m}; ^ и $ по краям допустимы.
+// Работает с байтами: . — один байт.
+
+const RX_LIT = 1
+const RX_ANY = 2
+const RX_CLASS = 3
+const RX_CAT = 4
+const RX_ALT = 5
+const RX_REP = 6
+const RX_EMPTY = 7
+
+// инструкции программы
+const RI_BYTE = 1
+const RI_ANY = 2
+const RI_CLASS = 3
+const RI_SPLIT = 4
+const RI_JMP = 5
+const RI_MATCH = 6
+
+type __Rx {
+    pat: str
+    p: int
+    err: str
+    // узлы дерева: вид, a, b, c
+    kind: [int]
+    a: [int]
+    b: [int]
+    c: [int]
+    // классы символов: по 256 байт (1 — входит)
+    classes: [int]
+    nclasses: int
+    // программа
+    op: [int]
+    x: [int]
+    y: [int]
+}
+
+fn __rx_node(r: __Rx, kind: int, a: int, b: int, c: int) -> int {
+    r.kind.push(kind)
+    r.a.push(a)
+    r.b.push(b)
+    r.c.push(c)
+    return r.kind.len() - 1
+}
+
+fn __rx_fail(r: __Rx, msg: str) -> int {
+    if r.err == "" {
+        r.err = msg + " at position {r.p}"
+    }
+    return __rx_node(r, RX_EMPTY, 0, 0, 0)
+}
+
+fn __rx_peek(r: __Rx) -> int {
+    if r.p >= r.pat.len() {
+        return -1
+    }
+    return r.pat[r.p]
+}
+
+// Новый пустой класс: номер.
+fn __rx_class_new(r: __Rx) -> int {
+    let base = __alloc(256)
+    __memset(base, 0, 256)
+    r.classes.push(base)
+    r.nclasses += 1
+    return r.nclasses - 1
+}
+
+fn __rx_class_set(r: __Rx, k: int, from: int, to: int) {
+    let base = r.classes[k]
+    for c in from..=to {
+        store8(base + c, 1)
+    }
+}
+
+// \d \w \s в класс k; false, если e — не класс.
+fn __rx_class_escape(r: __Rx, k: int, e: int) -> bool {
+    let lower = e | 32
+    if lower != 'd' && lower != 'w' && lower != 's' {
+        return false
+    }
+    let tmp = __rx_class_new(r)
+    if lower == 'd' {
+        __rx_class_set(r, tmp, '0', '9')
+    } else if lower == 'w' {
+        __rx_class_set(r, tmp, 'a', 'z')
+        __rx_class_set(r, tmp, 'A', 'Z')
+        __rx_class_set(r, tmp, '0', '9')
+        __rx_class_set(r, tmp, '_', '_')
+    } else {
+        __rx_class_set(r, tmp, ' ', ' ')
+        __rx_class_set(r, tmp, 9, 13)
+    }
+    let src = r.classes[tmp]
+    let dst = r.classes[k]
+    let neg = e != lower
+    for c in 0..256 {
+        if (load8(src + c) == 1) != neg {
+            store8(dst + c, 1)
+        }
+    }
+    return true
+}
+
+// Байт после обратной косой черты вне класса: \n \t \r или сам символ.
+fn __rx_plain_escape(e: int) -> int {
+    if e == 'n' {
+        return 10
+    }
+    if e == 't' {
+        return 9
+    }
+    if e == 'r' {
+        return 13
+    }
+    return e
+}
+
+fn __rx_class(r: __Rx) -> int {
+    // текущий символ — '['
+    r.p += 1
+    let k = __rx_class_new(r)
+    var neg = false
+    if __rx_peek(r) == '^' {
+        neg = true
+        r.p += 1
+    }
+    var first = true
+    while true {
+        let c = __rx_peek(r)
+        if c < 0 {
+            return __rx_fail(r, "unclosed [")
+        }
+        if c == ']' && !first {
+            r.p += 1
+            break
+        }
+        first = false
+        var lo = c
+        r.p += 1
+        if c == '\\' {
+            let e = __rx_peek(r)
+            if e < 0 {
+                return __rx_fail(r, "pattern ends with \\")
+            }
+            r.p += 1
+            if __rx_class_escape(r, k, e) {
+                continue
+            }
+            lo = __rx_plain_escape(e)
+        }
+        var hi = lo
+        if __rx_peek(r) == '-' && r.p + 1 < r.pat.len() && r.pat[r.p + 1] != ']' {
+            r.p += 1
+            hi = __rx_peek(r)
+            r.p += 1
+            if hi == '\\' {
+                hi = __rx_plain_escape(__rx_peek(r))
+                r.p += 1
+            }
+            if hi < lo {
+                return __rx_fail(r, "bad range in []")
+            }
+        }
+        __rx_class_set(r, k, lo, hi)
+    }
+    if neg {
+        let base = r.classes[k]
+        for c in 0..256 {
+            store8(base + c, 1 - load8(base + c))
+        }
+    }
+    return __rx_node(r, RX_CLASS, k, 0, 0)
+}
+
+fn __rx_atom(r: __Rx) -> int {
+    let c = __rx_peek(r)
+    if c == '(' {
+        r.p += 1
+        if __rx_peek(r) == '?' && r.p + 1 < r.pat.len() && r.pat[r.p + 1] == ':' {
+            r.p += 2
+        }
+        let n = __rx_alt(r)
+        if __rx_peek(r) != ')' {
+            return __rx_fail(r, "unclosed (")
+        }
+        r.p += 1
+        return n
+    }
+    if c == '[' {
+        return __rx_class(r)
+    }
+    r.p += 1
+    if c == '.' {
+        return __rx_node(r, RX_ANY, 0, 0, 0)
+    }
+    if c == '\\' {
+        let e = __rx_peek(r)
+        if e < 0 {
+            return __rx_fail(r, "pattern ends with \\")
+        }
+        r.p += 1
+        let k = __rx_class_new(r)
+        if __rx_class_escape(r, k, e) {
+            return __rx_node(r, RX_CLASS, k, 0, 0)
+        }
+        return __rx_node(r, RX_LIT, __rx_plain_escape(e), 0, 0)
+    }
+    if c == '*' || c == '+' || c == '?' || c == '{' {
+        r.p -= 1
+        return __rx_fail(r, "nothing to repeat")
+    }
+    return __rx_node(r, RX_LIT, c, 0, 0)
+}
+
+fn __rx_int(r: __Rx) -> int {
+    var v = -1
+    while __rx_peek(r) >= '0' && __rx_peek(r) <= '9' {
+        if v < 0 {
+            v = 0
+        }
+        v = v * 10 + __rx_peek(r) - '0'
+        if v > 1000 {
+            return 1001
+        }
+        r.p += 1
+    }
+    return v
+}
+
+fn __rx_repeat(r: __Rx) -> int {
+    var n = __rx_atom(r)
+    while true {
+        let c = __rx_peek(r)
+        if c == '*' {
+            n = __rx_node(r, RX_REP, n, 0, -1)
+        } else if c == '+' {
+            n = __rx_node(r, RX_REP, n, 1, -1)
+        } else if c == '?' {
+            n = __rx_node(r, RX_REP, n, 0, 1)
+        } else if c == '{' {
+            r.p += 1
+            let lo = __rx_int(r)
+            var hi = lo
+            if __rx_peek(r) == ',' {
+                r.p += 1
+                hi = __rx_int(r)
+            }
+            if lo < 0 || __rx_peek(r) != '}' || (hi >= 0 && hi < lo) || lo > 1000 || hi > 1000 {
+                return __rx_fail(r, "bad \{n,m}")
+            }
+            n = __rx_node(r, RX_REP, n, lo, hi)
+        } else {
+            return n
+        }
+        r.p += 1
+    }
+    return n
+}
+
+fn __rx_concat(r: __Rx) -> int {
+    var n = -1
+    while true {
+        let c = __rx_peek(r)
+        if c < 0 || c == '|' || c == ')' {
+            break
+        }
+        let m = __rx_repeat(r)
+        if n < 0 {
+            n = m
+        } else {
+            n = __rx_node(r, RX_CAT, n, m, 0)
+        }
+    }
+    if n < 0 {
+        return __rx_node(r, RX_EMPTY, 0, 0, 0)
+    }
+    return n
+}
+
+fn __rx_alt(r: __Rx) -> int {
+    var n = __rx_concat(r)
+    while __rx_peek(r) == '|' {
+        r.p += 1
+        n = __rx_node(r, RX_ALT, n, __rx_concat(r), 0)
+    }
+    return n
+}
+
+// ---- Программа ----
+
+fn __rx_emit(r: __Rx, op: int, x: int, y: int) -> int {
+    r.op.push(op)
+    r.x.push(x)
+    r.y.push(y)
+    return r.op.len() - 1
+}
+
+fn __rx_gen(r: __Rx, n: int) {
+    let k = r.kind[n]
+    if k == RX_LIT {
+        __rx_emit(r, RI_BYTE, r.a[n], 0)
+    } else if k == RX_ANY {
+        __rx_emit(r, RI_ANY, 0, 0)
+    } else if k == RX_CLASS {
+        __rx_emit(r, RI_CLASS, r.a[n], 0)
+    } else if k == RX_CAT {
+        __rx_gen(r, r.a[n])
+        __rx_gen(r, r.b[n])
+    } else if k == RX_ALT {
+        let split = __rx_emit(r, RI_SPLIT, 0, 0)
+        r.x[split] = r.op.len()
+        __rx_gen(r, r.a[n])
+        let jmp = __rx_emit(r, RI_JMP, 0, 0)
+        r.y[split] = r.op.len()
+        __rx_gen(r, r.b[n])
+        r.x[jmp] = r.op.len()
+    } else if k == RX_REP {
+        let lo = r.b[n]
+        let hi = r.c[n]
+        for _ in 0..lo {
+            __rx_gen(r, r.a[n])
+        }
+        if hi < 0 {
+            let split = __rx_emit(r, RI_SPLIT, 0, 0)
+            r.x[split] = r.op.len()
+            __rx_gen(r, r.a[n])
+            __rx_emit(r, RI_JMP, split, 0)
+            r.y[split] = r.op.len()
+        } else {
+            var splits: [int] = []
+            for _ in lo..hi {
+                let split = __rx_emit(r, RI_SPLIT, 0, 0)
+                splits.push(split)
+                r.x[split] = r.op.len()
+                __rx_gen(r, r.a[n])
+            }
+            for s in splits {
+                r.y[s] = r.op.len()
+            }
+        }
+    }
+}
+
+fn __rx_compile(pattern: str) -> __Rx {
+    var pat = pattern
+    // ^ и $ по краям ничего не меняют: совпадение всегда целиком
+    if pat.starts_with("^") {
+        pat = pat[1..]
+    }
+    if pat.ends_with("$") && !pat.ends_with("\\$") {
+        pat = pat[..pat.len() - 1]
+    }
+    let r = __Rx { pat, p: 0, err: "", kind: [], a: [], b: [], c: [], classes: [], nclasses: 0, op: [], x: [], y: [] }
+    let root = __rx_alt(r)
+    if r.p < pat.len() && r.err == "" {
+        __rx_fail(r, "unexpected )")
+    }
+    if r.op.len() > 100000 {
+        __rx_fail(r, "pattern is too large")
+    }
+    __rx_gen(r, root)
+    __rx_emit(r, RI_MATCH, 0, 0)
+    return r
+}
+
+// Добавить состояние pc и всё, что достижимо из него без чтения байта.
+fn __rx_add(r: __Rx, list: [int], mark: [int], gen: int, pc: int) {
+    if mark[pc] == gen {
+        return
+    }
+    mark[pc] = gen
+    let op = r.op[pc]
+    if op == RI_JMP {
+        __rx_add(r, list, mark, gen, r.x[pc])
+    } else if op == RI_SPLIT {
+        __rx_add(r, list, mark, gen, r.x[pc])
+        __rx_add(r, list, mark, gen, r.y[pc])
+    } else {
+        list.push(pc)
+    }
+}
+
+fn __rx_run(r: __Rx, s: str) -> bool {
+    let n = r.op.len()
+    var mark = [0] * n
+    var cur: [int] = []
+    var next: [int] = []
+    var gen = 1
+    __rx_add(r, cur, mark, gen, 0)
+    for i in 0..s.len() {
+        let c = s[i]
+        gen += 1
+        next.clear()
+        for pc in cur {
+            let op = r.op[pc]
+            var ok = false
+            if op == RI_BYTE {
+                ok = r.x[pc] == c
+            } else if op == RI_ANY {
+                ok = true
+            } else if op == RI_CLASS {
+                ok = load8(r.classes[r.x[pc]] + c) == 1
+            }
+            if ok {
+                __rx_add(r, next, mark, gen, pc + 1)
+            }
+        }
+        let t = cur
+        cur = next
+        next = t
+        if cur.len() == 0 {
+            return false
+        }
+    }
+    for pc in cur {
+        if r.op[pc] == RI_MATCH {
+            return true
+        }
+    }
+    return false
+}
+
+// Строка целиком подходит под шаблон. Неверный шаблон — паника с объяснением.
+fn __str_matches(self: str, pattern: str) -> bool {
+    let r = __rx_compile(pattern)
+    if r.err != "" {
+        __panic_msg("invalid pattern \"" + pattern + "\": " + r.err)
+    }
+    return __rx_run(r, self)
+}

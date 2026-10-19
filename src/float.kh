@@ -20,7 +20,7 @@ fn float_follows() -> bool {
     }
     if k == T_IDENT {
         let li = find_local(tok().text)
-        return li >= 0 && locals[li].ty == ty_float
+        return li >= 0 && local_view_ty(li) == ty_float
     }
     return false
 }

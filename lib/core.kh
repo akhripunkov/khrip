@@ -311,6 +311,16 @@ fn __panic_text(kind: int) -> str {
 
 // Паника: текст запоминается в контексте; внутри запроса или теста управление
 // возвращается в рантайм (__panic_recover), иначе программа завершается.
+// Паника с готовым текстом.
+fn __panic_msg(text: str) {
+    let msg = "panic: " + text
+    let mh: int = __cast(msg)
+    store64(__ctx() + CTX_PANIC, mh)
+    __panic_recover()
+    eprint(msg)
+    exit(101)
+}
+
 fn __panic(kind: int, at: str) {
     let msg = "panic: " + __panic_text(kind) + " at " + at
     let mh: int = __cast(msg)
@@ -387,12 +397,24 @@ fn __str_byte(self: str, i: int) -> int {
     return load8(__str_ptr(self) + i)
 }
 
+// Границы среза прижимаются к [0, len], как в Python и JS: xs[a..a + n] не
+// паникует, а берёт, сколько есть.
+fn __clamp(v: int, lo: int, hi: int) -> int {
+    if v < lo {
+        return lo
+    }
+    if v > hi {
+        return hi
+    }
+    return v
+}
+
 // Подстрока [from, to) без копирования байтов.
 fn __str_slice(self: str, from: int, to: int) -> str {
-    if from < 0 || to > __str_len(self) || from > to {
-        __panic(PANIC_SLICE, "str")
-    }
-    return __str_new(__str_ptr(self) + from, to - from)
+    let n = __str_len(self)
+    let a = __clamp(from, 0, n)
+    let b = __clamp(to, a, n)
+    return __str_new(__str_ptr(self) + a, b - a)
 }
 
 fn __str_find_from(self: str, sub: str, from: int) -> int {
@@ -807,7 +829,8 @@ fn __list_remove_at(self: [T], i: int) -> T {
     return __cast(v)
 }
 
-fn __list_reverse(self: [T]) {
+// Разворачивает список на месте и возвращает его же (для цепочек).
+fn __list_reverse(self: [T]) -> [T] {
     let h: int = __cast(self)
     var a = 0
     var b = load64(h + 8) - 1
@@ -818,6 +841,7 @@ fn __list_reverse(self: [T]) {
         a += 1
         b -= 1
     }
+    return self
 }
 
 fn __list_copy(self: [T]) -> [T] {
@@ -1028,13 +1052,12 @@ fn __int_max(self: int, other: int) -> int {
 
 fn __list_slice(self: [T], from: int, to: int) -> [T] {
     let h: int = __cast(self)
-    if from < 0 || to > load64(h + 8) || from > to {
-        __panic(PANIC_SLICE, "list")
-    }
+    let a = __clamp(from, 0, load64(h + 8))
+    let b = __clamp(to, a, load64(h + 8))
     let es = load64(h + 24)
-    let n = __list_new(to - from, es)
-    __memcpy(load64(n), load64(h) + from * es, (to - from) * es)
-    store64(n + 8, to - from)
+    let n = __list_new(b - a, es)
+    __memcpy(load64(n), load64(h) + a * es, (b - a) * es)
+    store64(n + 8, b - a)
     return __cast(n)
 }
 
@@ -1500,14 +1523,16 @@ fn __opt_eq_str(a: int, b: int) -> bool {
     return __str_eq(__cast(a), __cast(b))
 }
 
-fn __list_sort_int(self: [int]) {
+fn __list_sort_int(self: [int]) -> [int] {
     let h: int = __cast(self)
     __sort_words(load64(h), load64(h + 8), false)
+    return self
 }
 
-fn __list_sort_str(self: [str]) {
+fn __list_sort_str(self: [str]) -> [str] {
     let h: int = __cast(self)
     __sort_words(load64(h), load64(h + 8), true)
+    return self
 }
 
 // ---- Словари ----

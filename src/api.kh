@@ -71,6 +71,8 @@ fn lib_files() -> [str] {
     names.push("core.kh")
     names.push("rt.kh")
     names.push("float.kh")
+    names.push("crypto.kh")
+    names.push("regex.kh")
     return names
 }
 
@@ -244,6 +246,9 @@ fn prescan_route() {
             j += 1
         }
         let k = tkind(p.ty)
+        if p.def >= 0 && (si >= 0 || k == K_STRUCT || k == K_LIST || k == K_MAP || k == K_OPT) {
+            error_tok(toks[p.def], "only a query parameter that is not optional can have a default", "")
+        }
         if si >= 0 {
             if p.ty != ty_int && p.ty != ty_str && p.ty != ty_bool && p.ty != ty_float && p.ty != ty_err && !is_enum(p.ty) {
                 error_tok(kw, "path parameter '" + p.name + "' must be int, float, str, bool or an enum, not " + ty_name(p.ty), "")
@@ -966,15 +971,33 @@ fn parse_call_expr() -> int {
     let ptype = parse_add()
     coerce(ptype, ty_str, pt)
     emit_push(RAX)
-    if starts_value(pos) && tok().line == pt.line {
+    var has_body = starts_value(pos) && tok().line == pt.line
+    if kind() == T_IDENT && tok().text == "headers" {
+        has_body = false
+    }
+    if has_body {
         let bt = parse_expr(ty_err)
-        emit_mov_rr(RDX, RAX)
-        emit_mov_imm(RCX, type_desc(bt))
+        emit_push(RAX)
+        emit_mov_imm(RAX, type_desc(bt))
+        emit_push(RAX)
     } else {
-        emit_mov_imm(RDX, 0)
-        emit_mov_imm(RCX, 0)
+        emit_mov_imm(RAX, 0)
+        emit_push(RAX)
+        emit_push(RAX)
+    }
+    if kind() == T_IDENT && tok().text == "headers" && tok().line == pt.line {
+        advance()
+        let ht = tok()
+        let hm = ty_map(ty_str, ty_str)
+        let t = parse_expr(hm)
+        coerce(t, hm, ht)
+    } else {
+        emit_mov_imm(RAX, 0)
     }
     no_struct = saved
+    emit_mov_rr(R8, RAX)
+    emit_pop(RCX)
+    emit_pop(RDX)
     emit_pop(RSI)
     emit_mov_imm(RDI, const_str(method))
     emit_call(rt_func("__call"))
@@ -1079,6 +1102,10 @@ fn gen_param(b: Buf, r: Route, i: int) {
     let inner = ty_inner(p.ty)
     let optional = tkind(p.ty) == K_OPT
     let q = "__query(__r.query, " + lit + ")"
+    if p.def >= 0 {
+        gen_default_param(b, p, q, lit)
+        return
+    }
     if is_enum(inner) {
         if optional {
             buf_add(b, "            var " + v + ": " + ty_name(p.ty) + " = none\n")
@@ -1115,6 +1142,42 @@ fn gen_param(b: Buf, r: Route, i: int) {
     buf_add(b, "            var " + v + ": " + ty_name(p.ty) + " = none\n")
     buf_add(b, "            if let " + v + "_s = " + q + " \{\n")
     buf_add(b, "                let " + v + "_x = " + conv + "(" + v + "_s, " + lit + ") else \{\n                    return\n                }\n")
+    buf_add(b, "                " + v + " = " + v + "_x\n            }\n")
+}
+
+// Текст литерала по умолчанию для сгенерированного кода.
+fn default_src(ti: int) -> str {
+    let t = toks[ti]
+    if t.kind == '-' {
+        return "-" + toks[ti + 1].text
+    }
+    if t.kind == T_STR {
+        return src_lit(strlits[t.val])
+    }
+    return t.text
+}
+
+// Параметр строки запроса со значением по умолчанию: (page: int = 1).
+fn gen_default_param(b: Buf, p: Param, q: str, lit: str) {
+    let v = "p_" + p.name
+    let dv = default_src(p.def)
+    if p.ty == ty_str {
+        buf_add(b, "            let " + v + " = " + q + " ?? " + dv + "\n")
+        return
+    }
+    buf_add(b, "            var " + v + ": " + ty_name(p.ty) + " = " + dv + "\n")
+    buf_add(b, "            if let " + v + "_s = " + q + " \{\n")
+    if is_enum(p.ty) {
+        gen_enum_param(b, v + "_x", p.ty, v + "_s", lit)
+    } else {
+        var conv = "__param_int"
+        if p.ty == ty_float {
+            conv = "__param_float"
+        } else if p.ty == ty_bool {
+            conv = "__param_bool"
+        }
+        buf_add(b, "                let " + v + "_x = " + conv + "(" + v + "_s, " + lit + ") else \{\n                    return\n                }\n")
+    }
     buf_add(b, "                " + v + " = " + v + "_x\n            }\n")
 }
 

@@ -1,0 +1,90 @@
+type NewProduct {
+    name: str
+    category: str
+    price: float
+    tags: [str] = []
+}
+
+type Product { id: int, ...NewProduct }
+
+type ProductPatch {
+    name: str?
+    category: str?
+    price: float?
+    tags: [str]?
+}
+
+type Page {
+    items: [Product]
+    total: int
+    page: int
+    per_page: int
+}
+
+type Category { name: str, count: int, avg_price: float }
+
+store products: map[int, Product]
+
+fn invalid(p: Product) -> bool {
+    return p.name.trim() == "" || p.category.trim() == "" || p.price < 0
+}
+
+route POST "/products" (body: NewProduct) -> 201 Product | 400 str {
+    let p = Product { id: products.len() + 1, ...body }
+    if invalid(p) {
+        return 400 "name and category are required, price must not be negative"
+    }
+    products[p.id] = p
+    return 201 p
+}
+
+route GET "/products/{id}" (id: int) -> Product | 404 {
+    return products[id] ?? 404
+}
+
+route PATCH "/products/{id}" (id: int, body: ProductPatch) -> Product | 400 str | 404 {
+    let old = products[id] else {
+        return 404
+    }
+    let p = Product { ...old, ...body }
+    if invalid(p) {
+        return 400 "name and category are required, price must not be negative"
+    }
+    products[id] = p
+    return p
+}
+
+route GET "/products" (q: str = "", category: str?, tag: str?, min_price: float?, max_price: float?, sort: str?, page: int = 1, per_page: int = 10) -> Page | 400 str {
+    if page < 1 || per_page < 1 || per_page > 100 {
+        return 400 "page must be at least 1, per_page from 1 to 100"
+    }
+    let items = products.values()
+        .filter(p => p.name.lower().contains(q.lower()))
+        .filter(p => category == none || p.category == category)
+        .filter(p => tag == none || p.tags.contains(tag))
+        .filter(p => min_price == none || p.price >= min_price)
+        .filter(p => max_price == none || p.price <= max_price)
+        .sort_by(p => p.id)
+    match sort ?? "" {
+        "" => {}
+        "price" => items.sort_by(p => p.price)
+        "-price" => items.sort_by(p => -p.price)
+        "name" => items.sort_by(p => p.name)
+        _ => return 400 "sort must be price, -price or name"
+    }
+    let start = (page - 1) * per_page
+    return Page { items: items[start..start + per_page], total: items.len(), page, per_page }
+}
+
+route GET "/categories" -> [Category] {
+    var cats: map[str, Category] = {}
+    for p in products.values() {
+        let c = cats[p.category] ?? Category { name: p.category, count: 0, avg_price: 0 }
+        c.count += 1
+        c.avg_price += p.price
+        cats[c.name] = c
+    }
+    return cats.values()
+        .map(c => Category { ...c, avg_price: (c.avg_price / c.count.to_float()).round_to(2) })
+        .sort_by(c => c.name)
+}

@@ -142,6 +142,15 @@ fn parse_ident(w: int) -> int {
     let li = find_local(name)
     if li >= 0 {
         emit_load_local(li)
+        let nk = kind()
+        let keeps_opt = nk == T_QQ || ((nk == T_EQ || nk == T_NE) && kind_at(pos + 1) == T_NONE)
+        if is_narrowed(li) && !keeps_opt {
+            let inner = ty_inner(locals[li].ty)
+            if !is_ref(inner) {
+                emit_load(RAX, RAX, 0)
+            }
+            return inner
+        }
         return locals[li].ty
     }
     let usi = struct_find(name)
@@ -195,7 +204,11 @@ fn emit_list_new(et: int) {
 
 // [a, b, ...]: список создаётся, когда известен тип элемента — из ожидаемого
 // типа или по первому элементу.
-fn parse_list_lit(w: int) -> int {
+fn parse_list_lit(want_ty: int) -> int {
+    var w = want_ty
+    if tkind(w) == K_OPT {
+        w = ty_inner(w)
+    }
     let at = tok()
     advance()
     let saved = no_struct
@@ -254,7 +267,11 @@ fn parse_list_lit(w: int) -> int {
     return ty_list(et)
 }
 
-fn parse_map_lit(w: int) -> int {
+fn parse_map_lit(want_ty: int) -> int {
+    var w = want_ty
+    if tkind(w) == K_OPT {
+        w = ty_inner(w)
+    }
     let at = tok()
     advance()
     let saved = no_struct
@@ -414,6 +431,18 @@ fn parse_struct_lit(si: int, at: Token) -> int {
                                 emit_load(RDX, RSP, 0)
                                 emit_store(RDX, j * 8, RCX)
                                 set[j] = true
+                            } else if sf[m].name == f.name && tkind(sf[m].ty) == K_OPT && assignable(ty_inner(sf[m].ty), f.ty) {
+                                // поле T? в поле T: берётся, только если есть, — как в PATCH:
+                                // Product \{ ...old, ...patch }
+                                emit_load(RCX, RAX, m * 8)
+                                emit_rr(0x85, RCX, RCX)
+                                let skip = emit_jcc(CC_E)
+                                if !is_ref(f.ty) {
+                                    emit_load(RCX, RCX, 0)
+                                }
+                                emit_load(RDX, RSP, 0)
+                                emit_store(RDX, j * 8, RCX)
+                                patch_here(skip)
                             }
                             m += 1
                         }
@@ -474,7 +503,12 @@ fn parse_struct_lit(si: int, at: Token) -> int {
     var missing = ""
     var j = 0
     while j < nf {
-        if !set[j] && !panic_mode {
+        if !set[j] && !panic_mode && tkind(fields[j].ty) == K_OPT && fields[j].def < 0 {
+            // необязательное поле без значения — none
+            emit_load(RCX, RSP, 0)
+            emit_mov_imm(RAX, 0)
+            emit_store(RCX, j * 8, RAX)
+        } else if !set[j] && !panic_mode {
             if fields[j].def >= 0 {
                 // значение по умолчанию из объявления типа
                 let save = pos
@@ -720,11 +754,23 @@ fn compile_args(ps: [Param], first: int, tt: int, kt: int, vt: int, name: str, a
             syntax_error(tok(), "expected ',' or ')' in the call, found " + tok_show(tok()), "")
         }
     }
+    // недостающие аргументы — значения по умолчанию (литералы из объявления)
+    let given = i
+    while kind() == ')' && i < ps.len() && ps[i].def >= 0 && !panic_mode {
+        let back = pos
+        pos = ps[i].def
+        let pt = subst(ps[i].ty, tt, kt, vt)
+        let t = parse_expr(pt)
+        coerce(t, pt, toks[ps[i].def])
+        pos = back
+        emit_push(RAX)
+        n += 1
+        i += 1
+    }
     expect_tok(')')
     no_struct = saved
     if i != ps.len() && !panic_mode {
-        let want_n = ps.len() - first
-        let got = i - first
+        var want_n = 0
         var sig = ""
         var j = first
         while j < ps.len() {
@@ -732,9 +778,17 @@ fn compile_args(ps: [Param], first: int, tt: int, kt: int, vt: int, name: str, a
                 sig += ", "
             }
             sig += ps[j].name + ": " + ty_name(ps[j].ty)
+            if ps[j].def < 0 {
+                want_n += 1
+            }
             j += 1
         }
-        error_tok(at, "'" + name + "' takes " + want_n.to_str() + " argument(s), got " + got.to_str(), name + "(" + sig + ")")
+        let got = given - first
+        var takes = want_n.to_str()
+        if want_n != ps.len() - first {
+            takes = want_n.to_str() + " to " + (ps.len() - first).to_str()
+        }
+        error_tok(at, "'" + name + "' takes " + takes + " argument(s), got " + got.to_str(), name + "(" + sig + ")")
     }
     return n
 }
@@ -1245,6 +1299,10 @@ fn parse_call(t: Token, w: int) -> int {
     }
     emit_call_args(fi, n)
     last_was_call = true
+    if f.is_lib && (name == "fail" || name == "exit") {
+        // не возвращаются: годятся для else { ... } и ветвей match
+        return ty_never
+    }
     return f.ret
 }
 

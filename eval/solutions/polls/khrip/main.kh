@@ -1,0 +1,76 @@
+type NewPoll { question: str, options: [str] }
+
+type Option { text: str, votes: int = 0 }
+
+type Poll { id: int, question: str, options: [Option], closed: bool = false }
+
+type Vote { option: int }
+
+type Result { text: str, votes: int, percent: float }
+
+type Results { total: int, results: [Result] }
+
+store polls: map[int, Poll]
+store voters: map[str, bool]
+
+route POST "/polls" (body: NewPoll) -> 201 Poll | 400 str {
+    let opts = body.options
+    let unique = opts.all(o => opts.count(x => x == o) == 1)
+    if body.question.trim() == "" || opts.len() < 2 || opts.len() > 10 || opts.any(o => o.trim() == "") || !unique {
+        return 400 "question and 2-10 different options are required"
+    }
+    let poll = Poll { id: polls.len() + 1, question: body.question, options: opts.map(o => Option { text: o }) }
+    polls[poll.id] = poll
+    return 201 poll
+}
+
+route GET "/polls/{id}" (id: int) -> Poll | 404 {
+    return polls[id] ?? 404
+}
+
+route GET "/polls" (open: bool?) -> [Poll] {
+    return polls.values().filter(p => open == none || p.closed != open).sort_by(p => p.id)
+}
+
+route POST "/polls/{id}/votes" (id: int, body: Vote) -> Poll | 400 str | 401 | 403 | 404 | 409 str {
+    let voter = header("X-Voter-Id") else {
+        return 401
+    }
+    let poll = polls[id] else {
+        return 404
+    }
+    if poll.closed {
+        return 403
+    }
+    if body.option < 0 || body.option >= poll.options.len() {
+        return 400 "no such option"
+    }
+    let key = "{id}/{voter}"
+    if voters.has(key) {
+        return 409 "already voted"
+    }
+    voters[key] = true
+    poll.options[body.option].votes += 1
+    return poll
+}
+
+route POST "/polls/{id}/close" (id: int) -> Poll | 404 {
+    let poll = polls[id] else {
+        return 404
+    }
+    poll.closed = true
+    return poll
+}
+
+route GET "/polls/{id}/results" (id: int) -> Results | 404 {
+    let poll = polls[id] else {
+        return 404
+    }
+    let total = poll.options.map(o => o.votes).sum()
+    let results = poll.options.map(o => Result {
+        text: o.text,
+        votes: o.votes,
+        percent: if total == 0 { 0 } else { (o.votes * 100).to_float() / total.to_float() }.round_to(1),
+    })
+    return Results { total, results: results.sort_by(r => -r.votes) }
+}

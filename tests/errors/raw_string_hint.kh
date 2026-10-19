@@ -1,0 +1,4 @@
+// expect: for a regex, a raw string
+fn main() {
+    print("12".matches("\d+").to_str())
+}

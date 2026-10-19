@@ -32,6 +32,8 @@ const CT_JSON = 2
 type Response {
     status: int
     body: str
+    // имена заголовков — строчными буквами
+    headers: map[str, str] = {}
 }
 
 type __Req {
@@ -39,6 +41,8 @@ type __Req {
     path: str
     query: str
     body: str
+    // строки заголовков «Имя: значение\r\n...»
+    headers: str = ""
 }
 
 // Состояние обработки запросов потока (CTX_WORKER).
@@ -49,6 +53,11 @@ type __Worker {
     jb: int
     json_err: str
     testing: bool
+    // текущий запрос (__Req) или 0; заголовки ответа от set_header
+    cur: int
+    extra: Buf
+    // код из fail() или 0
+    failed: int
 }
 
 fn __w() -> __Worker {
@@ -56,7 +65,7 @@ fn __w() -> __Worker {
 }
 
 fn __worker_init() -> __Worker {
-    let w = __Worker { status: 0, ctype: 0, body: buf_new(4096), jb: __alloc(64), json_err: "", testing: false }
+    let w = __Worker { status: 0, ctype: 0, body: buf_new(4096), jb: __alloc(64), json_err: "", testing: false, cur: 0, extra: buf_new(256), failed: 0 }
     store64(__ctx() + CTX_WORKER, __cast(w))
     return w
 }
@@ -426,19 +435,6 @@ fn __jd_word(j: __Json, w: str) -> bool {
         return true
     }
     return false
-}
-
-fn __hex_val(c: int) -> int {
-    if c >= '0' && c <= '9' {
-        return c - '0'
-    }
-    if c >= 'a' && c <= 'f' {
-        return c - 'a' + 10
-    }
-    if c >= 'A' && c <= 'F' {
-        return c - 'A' + 10
-    }
-    return -1
 }
 
 fn __jd_hex4(j: __Json) -> int {
@@ -1196,26 +1192,90 @@ fn __pmode_reset() {
     }
 }
 
+// Заголовок текущего запроса (имя без учёта регистра) или none.
+fn header(name: str) -> str? {
+    if load64(__ctx() + CTX_WORKER) == 0 {
+        return none
+    }
+    let w = __w()
+    if w.cur == 0 {
+        return none
+    }
+    let r: __Req = __cast(w.cur)
+    let want = name.lower()
+    for line in r.headers.split("\r\n") {
+        let c = line.find(":") ?? 0
+        if c > 0 && line[..c].trim().lower() == want {
+            return line[c + 1..].trim()
+        }
+    }
+    return none
+}
+
+// Заголовок ответа текущего запроса (Location, Retry-After, Set-Cookie, ...).
+fn set_header(name: str, value: str) {
+    if load64(__ctx() + CTX_WORKER) == 0 {
+        return
+    }
+    let w = __w()
+    // перевод строки в заголовке — подмена ответа; такие символы выбрасываются
+    buf_add(w.extra, name.replace("\r", "").replace("\n", "") + ": " + value.replace("\r", "").replace("\n", "") + "\r\n")
+}
+
+// Прервать текущий запрос из любой функции: ответ status с текстом message
+// ("" — стандартный текст: "Unauthorized"). Заголовки от set_header остаются,
+// изменения store до вызова — тоже.
+fn fail(status: int, message: str = "") {
+    let w = __w()
+    var msg = message
+    if w.cur != 0 && status >= 100 && status <= 599 {
+        w.failed = status
+    } else {
+        msg = "panic: fail({status}) outside a request"
+        if w.cur != 0 {
+            msg = "panic: fail({status}): not an HTTP status"
+        }
+    }
+    let mh: int = __cast(msg)
+    store64(__ctx() + CTX_PANIC, mh)
+    __panic_recover()
+    eprint(msg)
+    exit(101)
+}
+
 fn __serve_one(w: __Worker, req: __Req) {
     let c = __ctx()
     let prev = load64(c + CTX_CATCH)
     w.status = 0
     buf_clear(w.body)
+    buf_clear(w.extra)
+    w.cur = __cast(req)
     if __setjmp(w.jb) == 0 {
         store64(c + CTX_CATCH, w.jb)
         __dispatch(req)
     } else {
         __pmode_reset()
         let msg: str = __cast(load64(c + CTX_PANIC))
-        if w.testing {
-            __reply_text(500, msg)
+        if w.failed > 0 {
+            if msg.len() == 0 {
+                __reply_status(w.failed)
+            } else {
+                __reply_text(w.failed, msg)
+            }
+            w.failed = 0
         } else {
-            eprint(msg)
-            __reply_text(500, "Internal Server Error")
+            buf_clear(w.extra)
+            if w.testing {
+                __reply_text(500, msg)
+            } else {
+                eprint(msg)
+                __reply_text(500, "Internal Server Error")
+            }
         }
     }
     store64(c + CTX_CATCH, prev)
     __store_unlock()
+    w.cur = 0
 }
 
 // ---- Тесты: khc test ----
@@ -1285,8 +1345,27 @@ fn __expect_eq(l: str, r: str, want_eq: bool, at: str, text: str) {
     }
 }
 
-fn __call(method: str, target: str, body: int, d: int) -> Response {
+// Заголовки «Имя: значение\r\n...» → словарь со строчными именами.
+fn __header_map(text: str) -> map[str, str] {
+    var m: map[str, str] = {}
+    for line in text.split("\r\n") {
+        let c = line.find(":") ?? 0
+        if c > 0 {
+            m[line[..c].trim().lower()] = line[c + 1..].trim()
+        }
+    }
+    return m
+}
+
+fn __call(method: str, target: str, body: int, d: int, headers: int) -> Response {
     let w = __w()
+    var htext = ""
+    if headers != 0 {
+        let hm: map[str, str] = __cast(headers)
+        for k, v in hm {
+            htext += k + ": " + v + "\r\n"
+        }
+    }
     var path = target
     var query = ""
     if let q = target.find("?") {
@@ -1301,7 +1380,7 @@ fn __call(method: str, target: str, body: int, d: int) -> Response {
             text = __json_encode(body, d)
         }
     }
-    let req = __Req { method: method, path: path, query: query, body: text }
+    let req = __Req { method: method, path: path, query: query, body: text, headers: htext }
     // как в сервере: всё, что запрос выделил в арене, освобождается после ответа
     let c = __ctx()
     let mark = load64(c + CTX_PTR)
@@ -1309,5 +1388,5 @@ fn __call(method: str, target: str, body: int, d: int) -> Response {
     let used = load64(c + CTX_PTR) - mark
     __memset(mark, 0, used)
     store64(c + CTX_PTR, mark)
-    return Response { status: w.status, body: buf_str(w.body) }
+    return Response { status: w.status, body: buf_str(w.body), headers: __header_map(buf_str(w.extra)) }
 }

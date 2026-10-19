@@ -1,0 +1,83 @@
+type Credentials { username: str, password: str = "" }
+
+type User { id: int, username: str }
+
+type Token { token: str }
+
+type NewNote { title: str, text: str = "" }
+
+type Note { id: int, ...NewNote, created_at: str }
+
+store users: map[str, User]
+store hashes: map[str, str]
+store sessions: map[str, str]
+store notes: map[int, Note]
+store owners: map[int, str]
+store last_note: int
+
+// Имя пользователя по заголовку Authorization: Bearer <token>, иначе 401.
+fn current_user() -> str {
+    let auth = header("Authorization") ?? ""
+    if !auth.starts_with("Bearer ") {
+        fail(401)
+    }
+    return sessions[auth[7..]] ?? fail(401)
+}
+
+route POST "/register" (body: Credentials) -> 201 User | 400 str | 409 str {
+    if body.username.len() < 3 || body.username.len() > 32 || body.password.len() < 8 {
+        return 400 "username must be 3-32 characters, password at least 8"
+    }
+    if users.has(body.username) {
+        return 409 "username is taken"
+    }
+    let user = User { id: users.len() + 1, username: body.username }
+    users[user.username] = user
+    hashes[user.username] = hash_password(body.password)
+    return 201 user
+}
+
+route POST "/login" (body: Credentials) -> Token | 401 {
+    let hash = hashes[body.username] ?? ""
+    if !check_password(body.password, hash) {
+        return 401
+    }
+    let token = random_str(32)
+    sessions[token] = body.username
+    return Token { token }
+}
+
+route POST "/notes" (body: NewNote) -> 201 Note | 400 str {
+    let user = current_user()
+    if body.title.trim() == "" {
+        return 400 "title is required"
+    }
+    last_note += 1
+    let note = Note { id: last_note, ...body, created_at: time_iso(now()) }
+    notes[note.id] = note
+    owners[note.id] = user
+    return 201 note
+}
+
+route GET "/notes" -> [Note] {
+    let user = current_user()
+    return notes.values().filter(n => owners[n.id] == user).sort_by(n => n.id)
+}
+
+route GET "/notes/{id}" (id: int) -> Note | 404 {
+    let user = current_user()
+    if owners[id] != user {
+        return 404
+    }
+    return notes[id] ?? 404
+}
+
+route DELETE "/notes/{id}" (id: int) -> 204 | 404 {
+    let user = current_user()
+    if owners[id] != user {
+        return 404
+    }
+    notes.remove(id)
+    owners.remove(id)
+    return 204
+}

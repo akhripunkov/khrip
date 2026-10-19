@@ -1,0 +1,61 @@
+// v0.9: сужение T?, параметры по умолчанию, ... из необязательных полей,
+// сырые строки, regex, срезы с прижатием, время, случайность, хеши.
+
+type P { id: int, name: str, price: float, tags: [str], ok: bool }
+
+type Patch { name: str?, price: float?, tags: [str]?, ok: bool? }
+
+fn describe(a: int?, s: str?) -> str {
+    var out = ""
+    if a == none || a > 5 {
+        out += "A"
+    }
+    if s != none && s.len() > 2 {
+        out += s.upper()
+    }
+    if a == none {
+        return out + "!"
+    }
+    return out + "{a * 2}"
+}
+
+fn greet(name: str, greeting: str = "Hello", times: int = 1) -> str {
+    return "{greeting}, {name}!".repeat(times)
+}
+
+fn main() {
+    print(describe(none, "abc") + " " + describe(7, none) + " " + describe(3, "xy"))
+    let lim: int? = 4
+    print([1, 5, 9].filter(x => lim == none || x > lim).len().to_str())
+    print(greet("Ann") + " " + greet("Bob", "Hi") + " " + greet("Cy", "Yo", 2))
+
+    let old = P { id: 1, name: "a", price: 1.5, tags: ["x"], ok: true }
+    let p1: Patch? = from_json(`{"price": 2.25, "ok": false}`)
+    print(to_json(P { ...old, ...p1 ?? Patch {} }))
+    print(to_json(P { ...old, ...Patch { name: "b", tags: [] }, id: 7 }))
+
+    print(`raw \d {x} "q"`)
+    print("[a-z]{3,32} {2,}")
+    var m = ""
+    for s in ["my-docs_1", "ab", "no spaces"] {
+        m += s.matches(`[A-Za-z0-9_-]{3,32}`).to_str() + " "
+    }
+    m += "ann@x.io".matches(`[^@\s]+@[^@\s]+\.[a-z]{2,}`).to_str() + " "
+    m += "dogs".matches("(cat|dog)s?").to_str() + " "
+    m += ("a".repeat(40) + "b").matches(`(a*)*c`).to_str()
+    print(m)
+
+    let xs = [1, 2, 3, 4, 5]
+    print(to_json(xs[3..10]) + to_json(xs[-2..2]) + to_json(xs[4..1]) + "abc"[1..99])
+    print(to_json([3, 1, 2].sort().reverse()))
+
+    print(time_iso(0) + " " + time_iso(1792422245))
+    print((parse_time("2026-10-19T18:04:05+03:00") ?? 0).to_str() + " " + (parse_date("2028-02-29") ?? 0).to_str())
+    print((parse_time("2026-02-30T00:00:00Z") == none).to_str() + " " + (parse_date("19.10.2026") == none).to_str())
+
+    let r = random_str(16)
+    print("{r.len()} {r.matches(`[A-Za-z0-9]+`)} {r != random_str(16)}")
+    print(sha256("abc"))
+    let h = hash_password("correct horse")
+    print("{h.starts_with("pbkdf2_sha256$")} {check_password("correct horse", h)} {check_password("wrong", h)}")
+}

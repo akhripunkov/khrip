@@ -1,0 +1,7 @@
+// expect: operator + needs int operands, found int?
+fn main() {
+    var x: int? = 1
+    if x != none {
+        print((x + 1).to_str())
+    }
+}

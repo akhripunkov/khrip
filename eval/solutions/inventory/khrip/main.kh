@@ -1,0 +1,86 @@
+type Item { sku: str, name: str, stock: int }
+
+type Restock { amount: int }
+
+type Line { sku: str, qty: int }
+
+type NewOrder { lines: [Line] }
+
+type Status = placed | cancelled
+
+type Order { id: int, lines: [Line], status: Status, total_qty: int }
+
+store items: map[str, Item]
+store orders: map[int, Order]
+
+route POST "/items" (body: Item) -> 201 Item | 400 str | 409 str {
+    if !body.sku.matches("[A-Z0-9-]{3,20}") || body.name.trim() == "" || body.stock < 0 {
+        return 400 "sku must be 3-20 of A-Z, 0-9, -; name required; stock >= 0"
+    }
+    if items.has(body.sku) {
+        return 409 "sku exists"
+    }
+    items[body.sku] = body
+    return 201 body
+}
+
+route GET "/items" -> [Item] {
+    return items.values().sort_by(i => i.sku)
+}
+
+route POST "/items/{sku}/restock" (sku: str, body: Restock) -> Item | 400 str | 404 {
+    let item = items[sku] else {
+        return 404
+    }
+    if body.amount <= 0 {
+        return 400 "amount must be positive"
+    }
+    item.stock += body.amount
+    return item
+}
+
+route POST "/orders" (body: NewOrder) -> 201 Order | 400 str | 404 str | 409 str {
+    if body.lines.len() == 0 || body.lines.any(l => l.qty <= 0) {
+        return 400 "lines must not be empty and qty must be positive"
+    }
+    var need: map[str, int] = {}
+    for l in body.lines {
+        if !items.has(l.sku) {
+            return 404 "unknown sku {l.sku}"
+        }
+        need[l.sku] = (need[l.sku] ?? 0) + l.qty
+    }
+    for sku, qty in need {
+        if (items[sku] ?? Item { sku, name: "", stock: 0 }).stock < qty {
+            return 409 "not enough {sku}"
+        }
+    }
+    for l in body.lines {
+        if let item = items[l.sku] {
+            item.stock -= l.qty
+        }
+    }
+    let order = Order { id: orders.len() + 1, lines: body.lines, status: placed, total_qty: body.lines.map(l => l.qty).sum() }
+    orders[order.id] = order
+    return 201 order
+}
+
+route POST "/orders/{id}/cancel" (id: int) -> Order | 404 | 409 str {
+    let order = orders[id] else {
+        return 404
+    }
+    if order.status == cancelled {
+        return 409 "already cancelled"
+    }
+    order.status = cancelled
+    for l in order.lines {
+        if let item = items[l.sku] {
+            item.stock += l.qty
+        }
+    }
+    return order
+}
+
+route GET "/orders" (status: Status?) -> [Order] {
+    return orders.values().filter(o => status == none || o.status == status).sort_by(o => o.id)
+}

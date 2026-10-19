@@ -1,0 +1,80 @@
+// v0.9 в маршрутах: заголовки, fail, параметры по умолчанию, PATCH через ...
+
+type Role = Admin | Member
+
+type Item { id: int, name: str, price: float }
+
+type ItemPatch { name: str?, price: float? }
+
+type Page { items: [Item], page: int, size: int, role: Role }
+
+store items: map[int, Item]
+
+fn need_key() -> str {
+    let key = header("X-Key") else {
+        fail(401)
+    }
+    if key == "slow" {
+        set_header("Retry-After", "3")
+        fail(429, "too many requests")
+    }
+    return key
+}
+
+route POST "/items" (body: Item) -> 201 Item {
+    need_key()
+    items[body.id] = body
+    return 201 body
+}
+
+route PATCH "/items/{id}" (id: int, body: ItemPatch) -> Item | 404 {
+    let old = items[id] else {
+        return 404
+    }
+    let item = Item { ...old, ...body }
+    items[id] = item
+    return item
+}
+
+route GET "/items" (page: int = 1, size: int = 2, q: str = "", role: Role = Member, min: float?) -> Page {
+    let all = items.values()
+        .filter(i => i.name.contains(q))
+        .filter(i => min == none || i.price >= min)
+        .sort_by(i => i.id)
+    let start = (page - 1) * size
+    return Page { items: all[start..start + size], page, size, role }
+}
+
+route GET "/who" -> str {
+    let key = need_key()
+    set_header("X-Seen", key)
+    return "hi {key}"
+}
+
+test "headers and fail" {
+    expect (call GET "/who").status == 401
+    expect (call GET "/who").body == "Unauthorized"
+    let slow = call GET "/who" headers {"X-Key": "slow"}
+    expect slow.status == 429
+    expect slow.body == "too many requests"
+    expect slow.headers["retry-after"] == "3"
+    let ok = call GET "/who" headers {"x-key": "ann"}
+    expect ok.body == "hi ann"
+    expect ok.headers["x-seen"] == "ann"
+}
+
+test "defaults and patch" {
+    for i in 1..=5 {
+        let r = call POST "/items" Item { id: i, name: "item {i}", price: i.to_float() * 1.5 } headers {"X-Key": "k"}
+        expect r.status == 201
+    }
+    expect (call GET "/items").body == `{"items":[{"id":1,"name":"item 1","price":1.5},{"id":2,"name":"item 2","price":3}],"page":1,"size":2,"role":"Member"}`
+    let last: Page? = from_json((call GET "/items?page=3&role=Admin").body)
+    expect (last ?? Page { items: [], page: 0, size: 0, role: Member }).items.len() == 1
+    expect (call GET "/items?page=9").body.contains(`"items":[]`)
+    expect (call GET "/items?min=6&size=10").body.contains(`"items":[{"id":4`)
+    expect (call GET "/items?page=x").status == 400
+    let p = call PATCH "/items/2" `{"price": 9.25}`
+    expect p.body == `{"id":2,"name":"item 2","price":9.25}`
+    expect (call PATCH "/items/9" `{}`).status == 404
+}

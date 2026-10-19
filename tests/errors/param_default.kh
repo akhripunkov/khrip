@@ -1,0 +1,8 @@
+// expect: a default value must be a single literal
+fn f(a: int = 1 + 2) -> int {
+    return a
+}
+
+fn main() {
+    print(f().to_str())
+}

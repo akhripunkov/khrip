@@ -301,7 +301,7 @@ fn lex_char(end: int) -> int {
     if e == '\\' || e == '\'' || e == '"' || e == '\{' || e == '}' {
         return e
     }
-    lex_error("unknown escape sequence; use \\n \\t \\r \\0 \\\\ \\\" \\' or \\\{", start)
+    lex_error("unknown escape sequence; use \\n \\t \\r \\0 \\\\ \\\" \\' or \\\{ (for a regex, a raw string: `\\d+`)", start)
     return e
 }
 
@@ -458,6 +458,27 @@ fn raw_string_here() -> bool {
     return n >= 2 && toks[n - 1].kind == T_IDENT && toks[n - 2].kind == T_ROUTE
 }
 
+// [from, to) — «3», «3,32» или «2,»?
+fn is_quantifier(from: int, to: int) -> bool {
+    var digits = 0
+    var commas = 0
+    var i = from
+    while i < to {
+        let c = lx_text[i]
+        if c >= '0' && c <= '9' {
+            if commas == 0 {
+                digits += 1
+            }
+        } else if c == ',' {
+            commas += 1
+        } else {
+            return false
+        }
+        i += 1
+    }
+    return digits > 0 && commas <= 1
+}
+
 fn lex_string(end: int) {
     let start = lx_p
     lx_p += 1
@@ -501,6 +522,15 @@ fn lex_string(end: int) {
                 }
                 add_tok(T_STR, add_strlit(""), start, lx_p - start)
                 return
+            }
+            if is_quantifier(lx_p + 1, close) {
+                // {3}, {3,32}, {2,}: число в фигурных скобках — текст (как в регулярных
+                // выражениях), подставлять литерал смысла нет
+                while lx_p <= close {
+                    buf_byte(b, lx_text[lx_p])
+                    lx_p += 1
+                }
+                continue
             }
             if close == lx_p + 1 {
                 lex_error("empty \{} in string; write \\\{} for literal braces", lx_p)
@@ -594,6 +624,28 @@ fn lex_range(end: int) {
         }
         if c == '"' {
             lex_string(end)
+            continue
+        }
+        if c == '`' {
+            // сырая строка: без экранирования и подстановок, может занимать несколько строк
+            let line0 = lx_line
+            let col0 = start - lx_line_start + 1
+            var q = lx_p + 1
+            while q < end && lx_text[q] != '`' {
+                if lx_text[q] == '\n' {
+                    lx_line += 1
+                    lx_line_start = q + 1
+                }
+                q += 1
+            }
+            if q >= end {
+                lex_error("unterminated raw string: close it with `", start)
+                lx_p = end
+                return
+            }
+            let raw = lx_text[lx_p + 1..q]
+            lx_p = q + 1
+            toks.push(Token { kind: T_STR, val: add_strlit(raw), text: "`...`", line: line0, col: col0, file: lx_file })
             continue
         }
         if lx_p + 2 < end {

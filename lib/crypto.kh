@@ -1,0 +1,254 @@
+// SHA-256, HMAC-SHA256 и PBKDF2: sha256(text), hash_password, check_password.
+// Пароль хранится как «pbkdf2_sha256$итерации$соль$хеш» (соль — 16 случайных
+// байт); проверка сравнивает без раннего выхода.
+
+const PBKDF2_ITER = 20000
+
+fn __hex_val(c: int) -> int {
+    if c >= '0' && c <= '9' {
+        return c - '0'
+    }
+    if c >= 'a' && c <= 'f' {
+        return c - 'a' + 10
+    }
+    if c >= 'A' && c <= 'F' {
+        return c - 'A' + 10
+    }
+    return -1
+}
+
+fn __sha_kt() -> int {
+    let hex = "428a2f98 71374491 b5c0fbcf e9b5dba5 3956c25b 59f111f1 923f82a4 ab1c5ed5 d807aa98 12835b01 243185be 550c7dc3 72be5d74 80deb1fe 9bdc06a7 c19bf174 e49b69c1 efbe4786 0fc19dc6 240ca1cc 2de92c6f 4a7484aa 5cb0a9dc 76f988da 983e5152 a831c66d b00327c8 bf597fc7 c6e00bf3 d5a79147 06ca6351 14292967 27b70a85 2e1b2138 4d2c6dfc 53380d13 650a7354 766a0abb 81c2c92e 92722c85 a2bfe8a1 a81a664b c24b8b70 c76c51a3 d192e819 d6990624 f40e3585 106aa070 19a4c116 1e376c08 2748774c 34b0bcb5 391c0cb3 4ed8aa4a 5b9cca4f 682e6ff3 748f82ee 78a5636f 84c87814 8cc70208 90befffa a4506ceb bef9a3f7 c67178f2"
+    let t = __alloc(512)
+    var n = 0
+    var v = 0
+    for c in hex {
+        if c == ' ' {
+            store64(t + n * 8, v)
+            n += 1
+            v = 0
+        } else {
+            v = v * 16 + __hex_val(c)
+        }
+    }
+    store64(t + n * 8, v)
+    return t
+}
+
+fn __sha_init(st: int) {
+    store64(st, 0x6a09e667)
+    store64(st + 8, 0xbb67ae85)
+    store64(st + 16, 0x3c6ef372)
+    store64(st + 24, 0xa54ff53a)
+    store64(st + 32, 0x510e527f)
+    store64(st + 40, 0x9b05688c)
+    store64(st + 48, 0x1f83d9ab)
+    store64(st + 56, 0x5be0cd19)
+}
+
+fn __rotr(x: int, n: int) -> int {
+    return ((x >> n) | (x << (32 - n))) & 0xFFFFFFFF
+}
+
+// Один 64-байтовый блок p в состояние st (8 слов); k — константы, w — 64 слова.
+fn __sha_block(st: int, p: int, k: int, w: int) {
+    for t in 0..16 {
+        let q = p + t * 4
+        store64(w + t * 8, (load8(q) << 24) | (load8(q + 1) << 16) | (load8(q + 2) << 8) | load8(q + 3))
+    }
+    for t in 16..64 {
+        let x = load64(w + (t - 15) * 8)
+        let y = load64(w + (t - 2) * 8)
+        let s0 = __rotr(x, 7) ^ __rotr(x, 18) ^ (x >> 3)
+        let s1 = __rotr(y, 17) ^ __rotr(y, 19) ^ (y >> 10)
+        store64(w + t * 8, (load64(w + (t - 16) * 8) + s0 + load64(w + (t - 7) * 8) + s1) & 0xFFFFFFFF)
+    }
+    var a = load64(st)
+    var b = load64(st + 8)
+    var c = load64(st + 16)
+    var d = load64(st + 24)
+    var e = load64(st + 32)
+    var f = load64(st + 40)
+    var g = load64(st + 48)
+    var h = load64(st + 56)
+    for t in 0..64 {
+        let s1 = __rotr(e, 6) ^ __rotr(e, 11) ^ __rotr(e, 25)
+        let ch = (e & f) ^ ((e ^ 0xFFFFFFFF) & g)
+        let t1 = (h + s1 + ch + load64(k + t * 8) + load64(w + t * 8)) & 0xFFFFFFFF
+        let s0 = __rotr(a, 2) ^ __rotr(a, 13) ^ __rotr(a, 22)
+        let mj = (a & b) ^ (a & c) ^ (b & c)
+        h = g
+        g = f
+        f = e
+        e = (d + t1) & 0xFFFFFFFF
+        d = c
+        c = b
+        b = a
+        a = (t1 + s0 + mj) & 0xFFFFFFFF
+    }
+    store64(st, (load64(st) + a) & 0xFFFFFFFF)
+    store64(st + 8, (load64(st + 8) + b) & 0xFFFFFFFF)
+    store64(st + 16, (load64(st + 16) + c) & 0xFFFFFFFF)
+    store64(st + 24, (load64(st + 24) + d) & 0xFFFFFFFF)
+    store64(st + 32, (load64(st + 32) + e) & 0xFFFFFFFF)
+    store64(st + 40, (load64(st + 40) + f) & 0xFFFFFFFF)
+    store64(st + 48, (load64(st + 48) + g) & 0xFFFFFFFF)
+    store64(st + 56, (load64(st + 56) + h) & 0xFFFFFFFF)
+}
+
+// Состояние → 32 байта (старшими вперёд).
+fn __sha_out(st: int, out: int) {
+    for i in 0..8 {
+        let v = load64(st + i * 8)
+        store8(out + i * 4, (v >> 24) & 255)
+        store8(out + i * 4 + 1, (v >> 16) & 255)
+        store8(out + i * 4 + 2, (v >> 8) & 255)
+        store8(out + i * 4 + 3, v & 255)
+    }
+}
+
+// Последние байты сообщения [p, p + n) с дополнением; total — длина всего
+// сообщения в байтах (вместе с уже сжатыми блоками).
+fn __sha_finish(st: int, p: int, n: int, total: int, k: int, w: int) {
+    let blk = __alloc(128)
+    __memset(blk, 0, 128)
+    __memcpy(blk, p, n)
+    store8(blk + n, 0x80)
+    var size = 64
+    if n >= 56 {
+        size = 128
+    }
+    let bits = total * 8
+    for i in 0..8 {
+        store8(blk + size - 1 - i, (bits >> (i * 8)) & 255)
+    }
+    __sha_block(st, blk, k, w)
+    if size == 128 {
+        __sha_block(st, blk + 64, k, w)
+    }
+}
+
+fn __sha256(p: int, n: int, out: int) {
+    let st = __alloc(64)
+    let k = __sha_kt()
+    let w = __alloc(512)
+    __sha_init(st)
+    let full = n / 64
+    for i in 0..full {
+        __sha_block(st, p + i * 64, k, w)
+    }
+    __sha_finish(st, p + full * 64, n - full * 64, n, k, w)
+    __sha_out(st, out)
+}
+
+fn __hex_bytes(p: int, n: int) -> str {
+    let digits = "0123456789abcdef"
+    let b = buf_new(n * 2)
+    for i in 0..n {
+        let v = load8(p + i)
+        buf_byte(b, digits[v >> 4])
+        buf_byte(b, digits[v & 15])
+    }
+    return __str_new(b.data, b.len)
+}
+
+// SHA-256 текста — 64 шестнадцатеричные цифры.
+fn sha256(text: str) -> str {
+    let out = __alloc(32)
+    __sha256(__str_ptr(text), text.len(), out)
+    return __hex_bytes(out, 32)
+}
+
+// ---- HMAC-SHA256 и PBKDF2 ----
+
+// Состояние после блока «ключ ^ pad» (ключ длиннее 64 байт сначала хешируется).
+fn __hmac_state(key: int, klen: int, pad: int, k: int, w: int) -> int {
+    let blk = __alloc(64)
+    __memset(blk, 0, 64)
+    if klen > 64 {
+        __sha256(key, klen, blk)
+    } else {
+        __memcpy(blk, key, klen)
+    }
+    for i in 0..64 {
+        store8(blk + i, load8(blk + i) ^ pad)
+    }
+    let st = __alloc(64)
+    __sha_init(st)
+    __sha_block(st, blk, k, w)
+    return st
+}
+
+// HMAC короткого (до 55 байт) сообщения по готовым состояниям ist и ost.
+fn __hmac_short(ist: int, ost: int, msg: int, mlen: int, out: int, k: int, w: int, st: int) {
+    __memcpy(st, ist, 64)
+    __sha_finish(st, msg, mlen, 64 + mlen, k, w)
+    let inner = __alloc(32)
+    __sha_out(st, inner)
+    __memcpy(st, ost, 64)
+    __sha_finish(st, inner, 32, 96, k, w)
+    __sha_out(st, out)
+}
+
+// PBKDF2-HMAC-SHA256, 32 байта результата.
+fn __pbkdf2(pw: str, salt: int, slen: int, iter: int, out: int) {
+    let k = __sha_kt()
+    let w = __alloc(512)
+    let st = __alloc(64)
+    let ist = __hmac_state(__str_ptr(pw), pw.len(), 0x36, k, w)
+    let ost = __hmac_state(__str_ptr(pw), pw.len(), 0x5c, k, w)
+    let msg = __alloc(64)
+    __memcpy(msg, salt, slen)
+    store8(msg + slen + 3, 1)
+    let u = __alloc(32)
+    __hmac_short(ist, ost, msg, slen + 4, u, k, w, st)
+    __memcpy(out, u, 32)
+    for i in 1..iter {
+        __hmac_short(ist, ost, u, 32, u, k, w, st)
+        for j in 0..32 {
+            store8(out + j, load8(out + j) ^ load8(u + j))
+        }
+    }
+}
+
+fn __unhex(s: str, out: int) -> int {
+    let n = s.len() / 2
+    for i in 0..n {
+        store8(out + i, __hex_val(s[2 * i]) * 16 + __hex_val(s[2 * i + 1]))
+    }
+    return n
+}
+
+// Пароль для хранения: соль и медленный хеш, сам пароль не восстановить.
+fn hash_password(password: str) -> str {
+    let salt = __alloc(16)
+    __random_bytes(salt, 16)
+    let dk = __alloc(32)
+    __pbkdf2(password, salt, 16, PBKDF2_ITER, dk)
+    return "pbkdf2_sha256$" + PBKDF2_ITER.to_str() + "$" + __hex_bytes(salt, 16) + "$" + __hex_bytes(dk, 32)
+}
+
+fn check_password(password: str, stored: str) -> bool {
+    let parts = stored.split("$")
+    if parts.len() != 4 || parts[0] != "pbkdf2_sha256" || parts[2].len() > 64 {
+        return false
+    }
+    let iter = parts[1].to_int() ?? 0
+    if iter < 1 {
+        return false
+    }
+    let salt = __alloc(32)
+    let slen = __unhex(parts[2], salt)
+    let dk = __alloc(32)
+    __pbkdf2(password, salt, slen, iter, dk)
+    let got = __hex_bytes(dk, 32)
+    if got.len() != parts[3].len() {
+        return false
+    }
+    // без раннего выхода: время сравнения не зависит от места расхождения
+    var diff = 0
+    for i in 0..got.len() {
+        diff = diff | (got[i] ^ parts[3][i])
+    }
+    return diff == 0
+}
