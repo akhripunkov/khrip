@@ -161,7 +161,7 @@ fn name_hint(name: str) -> str {
         return "booleans are true and false"
     }
     if name == "func" || name == "def" || name == "function" || name == "fun" {
-        return "declare functions with fn name(arg: type) -> type { ... }"
+        return "declare functions with fn name(arg: type) -> type \{ ... }"
     }
     if name == "println" || name == "printf" || name == "console" || name == "fmt" || name == "puts" || name == "echo" {
         return "use print(x); it adds a newline"

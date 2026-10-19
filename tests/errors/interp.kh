@@ -1,0 +1,9 @@
+// expect: interp.kh:6:14: error: empty {} in string; write \{} for literal braces
+// expect: interp.kh:7:14: error: unclosed { in string; write \{ for a literal brace
+// expect: 2 errors
+fn main() {
+    let x = "a"
+    let h = "{}"
+    let t = "{" + x + "}"
+    print(h + t)
+}

@@ -8,7 +8,12 @@
 //   [T]            — [D_LIST, T]
 //   map[K, V]      — [D_MAP, K, V]
 //   T?             — [D_OPT, T]
-//   структура      — [D_STRUCT, n, имя, (имя поля, "имя":, описание поля) × n]
+//   структура      — [D_STRUCT, n, имя, метка, поле × n]; поле — 5 слов:
+//                    имя, «"имя":», описание, вид значения по умолчанию и оно само
+//                    (0 — нет, 1 — слово, 2 — пустой список с размером элемента,
+//                    3 — пустой словарь); метка ≥ 0 у вариантов (лежит по адресу − 8)
+//   вариант        — [D_SUM, n, имя, все без полей?, (имя, описание, значение
+//                    варианта без полей или 0) × n]
 
 const D_STR = 1
 const D_INT = 2
@@ -17,6 +22,7 @@ const D_LIST = 4
 const D_MAP = 5
 const D_OPT = 6
 const D_STRUCT = 7
+const D_SUM = 8
 
 const CT_TEXT = 1
 const CT_JSON = 2
@@ -59,8 +65,37 @@ fn __is_scalar(d: int) -> bool {
     return k == D_INT || k == D_BOOL
 }
 
+fn __field(d: int, i: int) -> int {
+    return d + 32 + i * 40
+}
+
 fn __field_desc(d: int, i: int) -> int {
-    return load64(d + 24 + i * 24 + 16)
+    return load64(d + 32 + i * 40 + 16)
+}
+
+// Память под структуру по описанию: у варианта перед полями — метка.
+fn __struct_alloc(d: int) -> int {
+    let n = load64(d + 8)
+    let tag = load64(d + 24)
+    if tag < 0 {
+        return __alloc(n * 8)
+    }
+    let p = __alloc(n * 8 + 8)
+    store64(p, tag)
+    return p + 8
+}
+
+// Описание варианта значения v типа-варианта d.
+fn __variant_entry(d: int, v: int) -> int {
+    let tag = load64(v - 8)
+    let n = load64(d + 8)
+    for i in 0..n {
+        let e = d + 32 + i * 24
+        if load64(load64(e + 8) + 24) == tag {
+            return e
+        }
+    }
+    return 0
 }
 
 // ---- Копирование в постоянную память ----
@@ -133,11 +168,18 @@ fn __deep_copy(v: int, d: int) -> int {
     }
     if k == D_STRUCT {
         let n = load64(d + 8)
-        let s = __alloc(n * 8)
+        let s = __struct_alloc(d)
         for i in 0..n {
             store64(s + i * 8, __deep_copy(load64(v + i * 8), __field_desc(d, i)))
         }
         return s
+    }
+    if k == D_SUM {
+        let e = __variant_entry(d, v)
+        if e == 0 {
+            return v
+        }
+        return __deep_copy(v, load64(e + 8))
     }
     return v
 }
@@ -226,7 +268,7 @@ fn __json_enc(b: Buf, v: int, d: int) {
             if i > 0 {
                 buf_byte(b, ',')
             }
-            buf_add(b, __cast(load64(d + 24 + i * 24 + 8)))
+            buf_add(b, __cast(load64(__field(d, i) + 8)))
             __json_enc(b, load64(v + i * 8), __field_desc(d, i))
         }
         buf_byte(b, '}')
@@ -243,6 +285,10 @@ fn __json_enc(b: Buf, v: int, d: int) {
             __json_enc(b, __lget(v, i), ed)
         }
         buf_byte(b, ']')
+        return
+    }
+    if k == D_SUM {
+        __json_enc_sum(b, v, d)
         return
     }
     if k == D_MAP {
@@ -272,6 +318,37 @@ fn __json_enc(b: Buf, v: int, d: int) {
         }
         buf_byte(b, '}')
     }
+}
+
+// Вариант: без полей у всех — строка с именем, иначе объект с полем "type".
+fn __json_enc_sum(b: Buf, v: int, d: int) {
+    let e = __variant_entry(d, v)
+    if e == 0 {
+        buf_add(b, "null")
+        return
+    }
+    let name: str = __cast(load64(e))
+    if load64(d + 24) != 0 {
+        __json_str(b, name)
+        return
+    }
+    let vd = load64(e + 8)
+    buf_add(b, "\{\"type\":")
+    __json_str(b, name)
+    let n = load64(vd + 8)
+    for i in 0..n {
+        buf_byte(b, ',')
+        buf_add(b, __cast(load64(__field(vd, i) + 8)))
+        __json_enc(b, load64(v + i * 8), __field_desc(vd, i))
+    }
+    buf_byte(b, '}')
+}
+
+// Строка в кавычках JSON.
+fn __json_quote(s: str) -> str {
+    let b = buf_new(s.len() + 8)
+    __json_str(b, s)
+    return __str_new(b.data, b.len)
 }
 
 fn __json_encode(v: int, d: int) -> str {
@@ -674,9 +751,12 @@ fn __jd(j: __Json, d: int, at: str) -> int {
         }
         return m
     }
+    if k == D_SUM {
+        return __jd_sum(j, d, at)
+    }
     if k == D_STRUCT {
         let n = load64(d + 8)
-        let s = __alloc(n * 8)
+        let s = __struct_alloc(d)
         if c != '\{' {
             __jd_expect(j, at, "an object")
             return s
@@ -695,7 +775,7 @@ fn __jd(j: __Json, d: int, at: str) -> int {
                 j.p += 1
                 var fi = -1
                 for i in 0..n {
-                    let fname: str = __cast(load64(d + 24 + i * 24))
+                    let fname: str = __cast(load64(__field(d, i)))
                     if fname == key {
                         fi = i
                         break
@@ -723,15 +803,101 @@ fn __jd(j: __Json, d: int, at: str) -> int {
         }
         if j.err.len() == 0 {
             for i in 0..n {
-                if i < 62 && (seen & (1 << i)) == 0 && load64(__field_desc(d, i)) != D_OPT {
-                    let fname: str = __cast(load64(d + 24 + i * 24))
-                    __jd_fail(j, at, "missing field '" + __jd_join(at, fname) + "'")
-                    break
+                if i < 62 && (seen & (1 << i)) == 0 {
+                    let f = __field(d, i)
+                    let dk = load64(f + 24)
+                    if dk == 1 {
+                        store64(s + i * 8, load64(f + 32))
+                    } else if dk == 2 {
+                        store64(s + i * 8, __list_new(4, load64(f + 32)))
+                    } else if dk == 3 {
+                        store64(s + i * 8, __map_new(load64(f + 32)))
+                    } else if load64(load64(f + 16)) != D_OPT {
+                        let fname: str = __cast(load64(f))
+                        __jd_fail(j, at, "missing field '" + __jd_join(at, fname) + "'")
+                        break
+                    }
                 }
             }
         }
         return s
     }
+    return 0
+}
+
+fn __sum_names(d: int) -> str {
+    var r = ""
+    let n = load64(d + 8)
+    for i in 0..n {
+        if i > 0 {
+            r += ", "
+        }
+        let name: str = __cast(load64(d + 32 + i * 24))
+        r += name
+    }
+    return r
+}
+
+// Значение поля "type" объекта; позиция чтения не меняется.
+fn __jd_type_tag(j: __Json, at: str) -> str {
+    let save = j.p
+    j.p += 1
+    var r = ""
+    var found = false
+    while j.err.len() == 0 && __jd_peek(j) != '}' {
+        let key = __jd_str(j, at)
+        if __jd_peek(j) != ':' {
+            __jd_expect(j, at, "':'")
+            break
+        }
+        j.p += 1
+        if key == "type" {
+            r = __jd_str(j, __jd_join(at, "type"))
+            found = true
+            break
+        }
+        __jd_skip(j, at)
+        if __jd_peek(j) == ',' {
+            j.p += 1
+        }
+    }
+    if !found && j.err.len() == 0 {
+        __jd_fail(j, at, "missing field 'type'")
+    }
+    j.p = save
+    return r
+}
+
+fn __jd_sum(j: __Json, d: int, at: str) -> int {
+    let n = load64(d + 8)
+    var name = ""
+    if load64(d + 24) != 0 {
+        name = __jd_str(j, at)
+    } else {
+        if __jd_peek(j) != '\{' {
+            __jd_expect(j, at, "an object")
+            return 0
+        }
+        name = __jd_type_tag(j, at)
+    }
+    if j.err.len() > 0 {
+        return 0
+    }
+    for i in 0..n {
+        let e = d + 32 + i * 24
+        let vn: str = __cast(load64(e))
+        if vn == name {
+            let unit = load64(e + 16)
+            if unit != 0 {
+                if load64(d + 24) == 0 {
+                    __jd_skip(j, at)
+                }
+                return unit
+            }
+            return __jd(j, load64(e + 8), at)
+        }
+    }
+    __jd_fail(j, at, "unknown variant '" + name + "', expected one of: " + __sum_names(d))
     return 0
 }
 

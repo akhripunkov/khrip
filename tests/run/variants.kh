@@ -1,0 +1,82 @@
+// Варианты и match, if и match как значения, лямбды в методах списков,
+// значения полей по умолчанию, JSON вариантов.
+type Shape = Circle { r: int } | Rect { w: int, h: int } | Empty
+
+type Role = Admin | Member | Guest
+
+type User {
+    name: str
+    role: Role = Member
+    tags: [str] = []
+    active: bool = true
+    score: int = -1
+}
+
+fn area(s: Shape) -> int {
+    return match s {
+        Circle c => 3 * c.r * c.r
+        Rect r => r.w * r.h
+        Empty => 0
+    }
+}
+
+fn label(code: int) -> str {
+    return match code {
+        200 | 201 => "ok"
+        404 => "not found"
+        _ => "other {code}"
+    }
+}
+
+fn describe(s: Shape) -> str {
+    match s {
+        Circle c => {
+            return "circle {c.r}"
+        }
+        _ => return "something"
+    }
+}
+
+fn main() {
+    let shapes: [Shape] = [Circle { r: 2 }, Rect { w: 3, h: 4 }, Empty]
+    for s in shapes {
+        print("area {area(s)} {describe(s)}")
+    }
+    print(label(200) + " " + label(404) + " " + label(500))
+    let u = User { name: "ann" }
+    print("{u.role == Member} {u.role == Admin} {u.tags.len()} {u.active} {u.score}")
+    let big = if u.score > 0 { "pos" } else if u.score == 0 { "zero" } else { "neg" }
+    print(big)
+    let total = if shapes.len() > 2 {
+        let a = area(shapes[0])
+        a + 1
+    } else {
+        0
+    }
+    print("total {total}")
+    let nums = [5, 3, 8, 1, 9, 2]
+    let limit = 4
+    let small = nums.filter(n => n < limit)
+    let doubled = nums.map(n => n * 2)
+    let names = nums.map(n => "n{n}")
+    let flags = nums.map(n => n > 4)
+    print("{small.len()} {small[0]} {small[1]} {doubled.sum()} {names.join(",")} {flags.len()} {flags[2]}")
+    print("{nums.any(n => n > 8)} {nums.all(n => n > 0)} {nums.count(n => n % 2 == 1)} {nums.find(n => n > 6) ?? -1} {nums.find(n => n > 100) ?? -1}")
+    var users = [User { name: "zed", score: 5 }, User { name: "amy", score: 9 }, User { name: "bob", score: 1 }]
+    let by_score = users.sort_by(x => x.score).map(x => x.name).join(",")
+    let by_name = users.sort_by(x => x.name).map(x => x.name).join(",")
+    print(by_score + " " + by_name)
+    let shape_json = to_json(shapes)
+    print(shape_json)
+    let back: [Shape]? = from_json(shape_json)
+    print("{(back ?? []).len()} {area((back ?? [])[1])}")
+    print(to_json(u))
+    let u2: User? = from_json("\{\"name\":\"x\",\"role\":\"Admin\"}")
+    if let x = u2 {
+        print("{x.role == Admin} {x.active} {x.score} {x.tags.len()}")
+    }
+    let bad: User? = from_json("\{\"name\":\"x\",\"role\":\"Boss\"}")
+    print(json_error())
+    let interp = "{(nums.len())} {-limit}"
+    print(interp)
+}

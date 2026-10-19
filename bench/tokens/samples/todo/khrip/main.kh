@@ -1,0 +1,56 @@
+type Status = Todo | Doing | Done
+
+type NewTask {
+    title: str
+    status: Status = Todo
+    tags: [str] = []
+}
+
+type Task {
+    id: int
+    ...NewTask
+}
+
+type Stats {
+    total: int
+    done: int
+    open: int
+}
+
+store tasks: map[int, Task]
+store last_id: int
+
+route POST "/tasks" (body: NewTask) -> 201 Task | 400 str {
+    if body.title.trim() == "" {
+        return 400 "title is required"
+    }
+    last_id += 1
+    let task = Task { id: last_id, ...body }
+    tasks[task.id] = task
+    return 201 task
+}
+
+route GET "/tasks" (status: Status?, tag: str?) -> [Task] {
+    return tasks.values()
+        .filter(t => status == none || t.status == status)
+        .filter(t => tag == none || t.tags.contains(tag ?? ""))
+        .sort_by(t => t.title)
+}
+
+route GET "/tasks/{id}" (id: int) -> Task | 404 {
+    return tasks[id] ?? 404
+}
+
+route PUT "/tasks/{id}/status" (id: int, status: Status) -> Task | 404 {
+    let task = tasks[id] else {
+        return 404
+    }
+    task.status = status
+    return task
+}
+
+route GET "/stats" -> Stats {
+    let all = tasks.values()
+    let done = all.count(t => t.status == Done)
+    return Stats { total: all.len(), done, open: all.len() - done }
+}

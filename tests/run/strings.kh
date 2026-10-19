@@ -2,7 +2,7 @@
 fn main() {
     print("tab:\t|")
     print("quotes: \"x\" 'y' \\")
-    print("braces: \{x} {} {\"k\": 1}")
+    print("braces: \{x} \{} \{\"k\": 1}")
     let name = "Khrip"
     let n = 3
     print("hello, {name}! n={n}, next={n + 1}, ok={n > 2}")

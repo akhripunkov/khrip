@@ -59,11 +59,15 @@ fn parse_atom() -> int {
     if k == T_CALL {
         return parse_call_expr()
     }
-    var hint = ""
+    if k == T_MATCH {
+        return parse_match(true, w)
+    }
     if k == T_IF {
-        hint = "if is a statement in Khrip; use a var and assign it in both branches"
-    } else if k == T_FN {
-        hint = "Khrip has no anonymous functions; declare a named fn"
+        return parse_if_expr(w)
+    }
+    var hint = ""
+    if k == T_FN {
+        hint = "lambdas are written x => expression and work in map, filter, find, any, all, count, sort_by; otherwise declare a named fn"
     }
     syntax_error(t, "expected a value, found " + tok_show(t), hint)
     if k != T_EOF && k != '}' && k != ')' {
@@ -126,6 +130,12 @@ fn parse_ident(w: int) -> int {
     if li >= 0 {
         emit_load_local(li)
         return locals[li].ty
+    }
+    let usi = struct_find(name)
+    if usi >= 0 && structs[usi].sum >= 0 && structs[usi].fields.len() == 0 {
+        // вариант без полей — готовое значение
+        emit_mov_imm(RAX, unit_addr(usi))
+        return ty_sum(structs[usi].sum)
     }
     let s = sym_find(name)
     if s >= 0 {
@@ -342,12 +352,18 @@ fn list_has(xs: [str], s: str) -> bool {
 // Имя { поле: значение, ...другое, поле }
 fn parse_struct_lit(si: int, at: Token) -> int {
     let open = pos
+    let fields = structs[si].fields
+    let nf = fields.len()
+    if nf == 0 && structs[si].sum >= 0 && kind_at(pos + 1) == '}' {
+        advance()
+        advance()
+        emit_mov_imm(RAX, unit_addr(si))
+        return ty_sum(structs[si].sum)
+    }
     let explicit = explicit_fields(open)
     advance()
     let saved = no_struct
     no_struct = false
-    let fields = structs[si].fields
-    let nf = fields.len()
     var set: [bool] = []
     var i = 0
     while i < nf {
@@ -356,6 +372,12 @@ fn parse_struct_lit(si: int, at: Token) -> int {
     }
     emit_mov_imm(RDI, nf * 8 + 8)
     emit_call(rt_func("__alloc"))
+    if structs[si].sum >= 0 {
+        // метка варианта перед полями
+        emit_mov_imm(RCX, si)
+        emit_store(RAX, 0, RCX)
+        emit_alu_imm(0, RAX, 8)
+    }
     emit_push(RAX)
     while kind() != '}' && kind() != T_EOF && !panic_mode {
         if kind() == T_ELLIPSIS {
@@ -440,10 +462,22 @@ fn parse_struct_lit(si: int, at: Token) -> int {
     var j = 0
     while j < nf {
         if !set[j] && !panic_mode {
-            if missing.len() > 0 {
-                missing += ", "
+            if fields[j].def >= 0 {
+                // значение по умолчанию из объявления типа
+                let save = pos
+                pos = fields[j].def
+                let dt = tok()
+                let t = parse_expr(fields[j].ty)
+                coerce(t, fields[j].ty, dt)
+                pos = save
+                emit_load(RCX, RSP, 0)
+                emit_store(RCX, j * 8, RAX)
+            } else {
+                if missing.len() > 0 {
+                    missing += ", "
+                }
+                missing += fields[j].name + ": " + ty_name(fields[j].ty)
             }
-            missing += fields[j].name + ": " + ty_name(fields[j].ty)
         }
         j += 1
     }
@@ -484,7 +518,7 @@ fn parse_postfix(t0: int, at: Token) -> int {
         } else if k == '[' {
             t = parse_index(t)
         } else if k == '?' && kind_at(pos + 1) == '.' {
-            syntax_error(tok(), "Khrip has no ?. operator", "unwrap first: let v = x else { ... } or if let v = x { ... }")
+            syntax_error(tok(), "Khrip has no ?. operator", "unwrap first: let v = x else \{ ... } or if let v = x \{ ... }")
             return ty_err
         } else {
             return t
@@ -498,7 +532,12 @@ fn field_load(t: int, nt: Token) -> int {
         return ty_err
     }
     if tkind(t) == K_OPT && tkind(ty_inner(t)) == K_STRUCT {
-        error_tok(nt, "the value may be none; unwrap it before reading ." + nt.text, "if let v = x { v." + nt.text + " } or let v = x else { return ... }")
+        error_tok(nt, "the value may be none; unwrap it before reading ." + nt.text, "if let v = x \{ v." + nt.text + " } or let v = x else \{ return ... }")
+        return ty_err
+    }
+    if tkind(t) == K_SUM {
+        let s = types[t].a
+        error_tok(nt, sums[s].name + " can be any of " + variant_names(s) + "; use match to read fields", "match x \{ " + structs[sums[s].variants[0]].name + " v => v." + nt.text + " ... }")
         return ty_err
     }
     if tkind(t) != K_STRUCT {
@@ -557,7 +596,7 @@ fn parse_index(t: int) -> int {
         return ty_opt(vt)
     }
     if k == K_OPT {
-        error_tok(at, "the value may be none; unwrap it before indexing", "let v = x else { return ... }")
+        error_tok(at, "the value may be none; unwrap it before indexing", "let v = x else \{ return ... }")
     } else if k != K_LIST && k != K_STR && t != ty_err {
         error_tok(at, ty_name(t) + " cannot be indexed", "")
     }
@@ -1217,7 +1256,7 @@ fn parse_method(rt: int, nt: Token) -> int {
         return ty_err
     }
     if k == K_OPT {
-        error_tok(nt, "the value may be none; unwrap it before calling ." + name + "()", "if let v = x { v." + name + "() } or (x ?? default)." + name + "()")
+        error_tok(nt, "the value may be none; unwrap it before calling ." + name + "()", "if let v = x \{ v." + name + "() } or (x ?? default)." + name + "()")
         skip_call_args()
         return ty_err
     }
@@ -1234,6 +1273,9 @@ fn parse_method(rt: int, nt: Token) -> int {
     var tt = ty_err
     if k == K_LIST {
         tt = ty_elem(rt)
+        if is_lambda_method(name) {
+            return parse_lambda_method(rt, nt)
+        }
         if name == "contains" || name == "sort" || name == "index_of" {
             return parse_list_typed_method(rt, nt)
         }

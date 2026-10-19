@@ -251,7 +251,7 @@ fn emit_box() {
 
 fn mismatch_hint(from: int, to: int) -> str {
     if tkind(from) == K_OPT && ty_inner(from) == to {
-        return "the value may be none; use x ?? default or let v = x else { return ... }"
+        return "the value may be none; use x ?? default or let v = x else \{ return ... }"
     }
     if to == ty_bool && from == ty_int {
         return "compare explicitly, e.g. x != 0"
@@ -273,7 +273,10 @@ fn mismatch_hint(from: int, to: int) -> str {
 
 // Значение типа from в rax используется как to: проверка и упаковка.
 fn coerce(from: int, to: int, at: Token) -> int {
-    if from == to || from == ty_err || to == ty_err {
+    if from == to || from == ty_err || to == ty_err || from == ty_never || is_variant_of(from, to) {
+        return to
+    }
+    if tkind(to) == K_OPT && is_variant_of(from, ty_inner(to)) {
         return to
     }
     if tkind(to) == K_OPT && (from == ty_none || from == ty_inner(to)) {
@@ -677,15 +680,29 @@ fn cmp_cc(op: int) -> int {
 }
 
 fn equatable(t: int) -> bool {
+    if tkind(t) == K_SUM {
+        return sum_unit_only(types[t].a)
+    }
     return t == ty_int || t == ty_bool || t == ty_str || t == ty_err
 }
 
 // Сравнение: левый операнд в rax, оператор уже прочитан. Выставляет флаги
 // и возвращает условие, при котором сравнение истинно.
+// Сравнение T? с T: x == value, где x может быть none.
+fn mixed_opt(a: int, b: int) -> bool {
+    if tkind(a) == K_OPT && b != ty_none && b == ty_inner(a) {
+        return tkind(b) != K_SUM
+    }
+    if tkind(b) == K_OPT && a != ty_none && a == ty_inner(b) {
+        return tkind(a) != K_SUM
+    }
+    return false
+}
+
 fn emit_compare(op: int, lt: int, at: Token) -> int {
     want = ty_err
     let ordered = op != T_EQ && op != T_NE
-    if lt != ty_str && peek_simple(3) {
+    if lt != ty_str && peek_simple(3) && !mixed_opt(lt, op_ty) {
         let rt = op_ty
         if compare_ok(lt, rt, ordered, at) {
             advance()
@@ -702,6 +719,28 @@ fn emit_compare(op: int, lt: int, at: Token) -> int {
     emit_push(RAX)
     let rt = parse_add()
     let ok = compare_ok(lt, rt, ordered, at)
+    if ok && mixed_opt(lt, rt) {
+        // левое → rdi, правое → rsi; необязательное значение — первым
+        emit_mov_rr(RSI, RAX)
+        emit_pop(RDI)
+        var inner = ty_inner(lt)
+        if tkind(lt) != K_OPT {
+            inner = ty_inner(rt)
+            emit_mov_rr(RCX, RDI)
+            emit_mov_rr(RDI, RSI)
+            emit_mov_rr(RSI, RCX)
+        }
+        if inner == ty_str {
+            emit_call(rt_func("__opt_eq_str"))
+        } else {
+            emit_call(rt_func("__opt_eq_word"))
+        }
+        emit_test_rax()
+        if op == T_EQ {
+            return CC_NE
+        }
+        return CC_E
+    }
     if ok && lt == ty_str && rt == ty_str {
         emit_mov_rr(RSI, RAX)
         emit_pop(RDI)
@@ -743,6 +782,10 @@ fn compare_ok(lt: int, rt: int, ordered: bool, at: Token) -> bool {
     if rt == ty_none || lt == ty_none {
         error_tok(at, ty_name(lt) + " is never none", "only optional types (T?) can be none")
         return false
+    }
+    // T? с T: равны, если значение есть и совпадает
+    if (tkind(lt) == K_OPT && ty_inner(lt) == rt && equatable(rt)) || (tkind(rt) == K_OPT && ty_inner(rt) == lt && equatable(lt)) {
+        return true
     }
     if tkind(lt) == K_OPT || tkind(rt) == K_OPT {
         error_tok(at, "cannot compare " + ty_name(lt) + " with " + ty_name(rt), "unwrap the optional first: (x ?? default) == y")

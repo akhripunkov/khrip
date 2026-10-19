@@ -1,0 +1,84 @@
+type Status = Todo | Doing | Done
+
+type NewTask {
+    title: str
+    status: Status = Todo
+    tags: [str] = []
+}
+
+type Task {
+    id: int
+    ...NewTask
+}
+
+type Stats {
+    total: int
+    done: int
+    open: int
+}
+
+store tasks: map[int, Task]
+store last_id: int
+
+route POST "/tasks" (body: NewTask) -> 201 Task | 400 str {
+    if body.title.trim() == "" {
+        return 400 "title is required"
+    }
+    last_id += 1
+    let task = Task { id: last_id, ...body }
+    tasks[task.id] = task
+    return 201 task
+}
+
+route GET "/tasks" (status: Status?, tag: str?) -> [Task] {
+    return tasks.values()
+        .filter(t => status == none || t.status == status)
+        .filter(t => tag == none || t.tags.contains(tag ?? ""))
+        .sort_by(t => t.title)
+}
+
+route GET "/tasks/{id}" (id: int) -> Task | 404 {
+    return tasks[id] ?? 404
+}
+
+route PUT "/tasks/{id}/status" (id: int, status: Status) -> Task | 404 {
+    let task = tasks[id] else {
+        return 404
+    }
+    task.status = status
+    return task
+}
+
+route GET "/stats" -> Stats {
+    let all = tasks.values()
+    let done = all.count(t => t.status == Done)
+    return Stats { total: all.len(), done, open: all.len() - done }
+}
+
+test "create with defaults" {
+    let r = call POST "/tasks" "\{\"title\":\"write docs\",\"tags\":[\"work\"]}"
+    expect r.status == 201
+    expect r.body == "\{\"id\":1,\"title\":\"write docs\",\"status\":\"Todo\",\"tags\":[\"work\"]}"
+    expect (call POST "/tasks" NewTask { title: "buy milk", status: Doing, tags: ["home"] }).status == 201
+    expect (call POST "/tasks" NewTask { title: "alpha" }).status == 201
+    expect (call POST "/tasks" NewTask { title: " " }).body == "title is required"
+    expect (call POST "/tasks" "\{\"title\":\"x\",\"status\":\"Bogus\"}").status == 400
+}
+
+test "filter, sort and stats" {
+    let all: [Task]? = from_json((call GET "/tasks").body)
+    expect (all ?? []).map(t => t.title).join(",") == "alpha,buy milk,write docs"
+    let doing: [Task]? = from_json((call GET "/tasks?status=Doing").body)
+    expect (doing ?? []).len() == 1
+    expect (call GET "/tasks?status=Nope").status == 400
+    expect (call PUT "/tasks/1/status?status=Done").status == 200
+    expect (call PUT "/tasks/9/status?status=Done").status == 404
+    let s: Stats? = from_json((call GET "/stats").body)
+    if let st = s {
+        expect st.total == 3
+        expect st.done == 1
+        expect st.open == 2
+    } else {
+        expect false
+    }
+}

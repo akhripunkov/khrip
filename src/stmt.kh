@@ -97,6 +97,10 @@ fn parse_stmt() -> bool {
     if k == T_IF {
         return parse_if()
     }
+    if k == T_MATCH {
+        parse_match(false, ty_err)
+        return match_div
+    }
     if k == T_WHILE {
         return parse_while()
     }
@@ -1432,6 +1436,10 @@ fn plan_regs(fi: int) {
             if prev == T_LET || prev == T_VAR || prev == T_FOR || (prev == ',' && i >= 3 && toks[i - 3].kind == T_FOR) {
                 decls[ix] += 1
             }
+            if kind_at(i + 1) == T_FATARROW {
+                // параметр лямбды или имя в ветке match
+                decls[ix] += 1
+            }
             var d = loops.len()
             if d > 4 {
                 d = 4
@@ -1662,7 +1670,7 @@ fn compile_main_wrapper(fi: int, test_mode: bool) {
             emit_mov_imm(RAX, 0)
         }
     } else {
-        report_at(files.len() - 1, 1, 1, "the program has no fn main", "add fn main() { ... } or declare routes")
+        report_at(files.len() - 1, 1, 1, "the program has no fn main", "add fn main() \{ ... } or declare routes")
     }
     // результат уже в rax
     end_fn(frame_at, true)

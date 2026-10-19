@@ -1,0 +1,14 @@
+// expect: error: a field default must be a literal
+// expect: error: the default does not fit field 'age' of type int
+type User {
+    name: str = "anon"
+    created: int = now()
+    age: int = "old"
+}
+
+fn now() -> int {
+    return 0
+}
+
+fn main() {
+}

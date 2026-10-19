@@ -1,0 +1,633 @@
+// ============================================================================
+// Варианты и match, if и match как значения, лямбды в методах списков.
+//
+// Значение типа-варианта — адрес структуры-варианта; метка варианта (номер
+// структуры) лежит по адресу − 8. Вариант без полей — одно значение в данных
+// программы, поэтому такие значения сравниваются через ==.
+// Лямбда x => выражение бывает только аргументом map, filter, find, any, all,
+// count, sort_by: цикл и тело лямбды компилируются прямо на месте вызова, поэтому
+// лямбда видит локальные переменные и ничего не выделяет.
+// ============================================================================
+
+var unit_addrs: [int]
+// Последний match-оператор: все ветки уходят (return, break).
+var match_div: bool
+
+// Значение варианта без полей.
+fn unit_addr(si: int) -> int {
+    while unit_addrs.len() < structs.len() {
+        unit_addrs.push(0)
+    }
+    if unit_addrs[si] == 0 {
+        data_align()
+        let off = data_len
+        data_u64(si)
+        data_u64(0)
+        unit_addrs[si] = DATA_BASE + off + 8
+    }
+    return unit_addrs[si]
+}
+
+fn int_in(xs: [int], v: int) -> bool {
+    for x in xs {
+        if x == v {
+            return true
+        }
+    }
+    return false
+}
+
+fn variant_names(s: int) -> str {
+    var r = ""
+    for v in sums[s].variants {
+        if r.len() > 0 {
+            r += ", "
+        }
+        r += structs[v].name
+    }
+    return r
+}
+
+// Тип ветки: первый, который не never; остальные приводятся к нему.
+fn unify(result: int, t: int, w: int, at: Token) -> int {
+    if t == ty_never {
+        return result
+    }
+    var r = result
+    if r == ty_never {
+        r = t
+        if w != ty_err && assignable(t, w) {
+            r = w
+        } else if tkind(t) == K_STRUCT && structs[types[t].a].sum >= 0 {
+            // ветки с разными вариантами дают общий тип-вариант
+            r = ty_sum(structs[types[t].a].sum)
+        }
+    }
+    coerce(t, r, at)
+    return r
+}
+
+// ---- Конец оператора и блоки со значением ----
+
+// Индекс токена, на котором кончается оператор, начинающийся в i: первый токен
+// вне скобок на новой строке (кроме else) или закрывающая скобка блока.
+fn stmt_end(i: int) -> int {
+    var depth = 0
+    var j = i
+    while true {
+        let k = kind_at(j)
+        if k == T_EOF {
+            return j
+        }
+        if depth == 0 && j > i {
+            if k == '}' {
+                return j
+            }
+            if toks[j].line != toks[j - 1].line && k != T_ELSE {
+                return j
+            }
+        }
+        if k == '(' || k == '[' || k == '\{' {
+            depth += 1
+        } else if k == ')' || k == ']' || k == '}' {
+            depth -= 1
+            if depth < 0 {
+                return j
+            }
+        }
+        j += 1
+    }
+    return j
+}
+
+// Последний оператор блока — выражение: оно и есть значение блока.
+fn value_stmt_here() -> bool {
+    let k = kind()
+    if k == T_LET || k == T_VAR || k == T_WHILE || k == T_FOR || k == T_RETURN || k == T_BREAK || k == T_CONTINUE || k == T_EXPECT || k == '\{' {
+        return false
+    }
+    if kind_at(stmt_end(pos)) != '}' {
+        return false
+    }
+    return !(k == T_IDENT && stmt_has_assign())
+}
+
+// { операторы; значение } → тип значения (never, если блок не завершается).
+fn parse_value_block(w: int) -> int {
+    let open = tok()
+    if !expect_tok('\{') {
+        sync_stmt()
+        return ty_err
+    }
+    let saved = nlocals
+    var t = -1
+    while kind() != '}' && kind() != T_EOF {
+        let before = pos
+        panic_mode = false
+        if value_stmt_here() {
+            let vt = tok()
+            t = parse_expr(w)
+            if t == ty_void {
+                error_tok(vt, "this block must end with a value, but this expression has none", "")
+                t = ty_err
+            }
+        } else if parse_stmt() {
+            t = ty_never
+        }
+        if panic_mode {
+            sync_stmt()
+        }
+        if pos == before {
+            advance()
+        }
+    }
+    expect_tok('}')
+    nlocals = saved
+    if t < 0 {
+        error_tok(open, "this block must end with a value", "put the value on the last line, e.g. \{ ...; total }")
+        return ty_err
+    }
+    return t
+}
+
+// Ветка match или if, используемая как значение.
+fn parse_arm_value(w: int) -> int {
+    let k = kind()
+    if k == '\{' {
+        return parse_value_block(w)
+    }
+    if k == T_RETURN || k == T_BREAK || k == T_CONTINUE {
+        parse_stmt()
+        return ty_never
+    }
+    return parse_expr(w)
+}
+
+// ---- if как значение ----
+
+// if условие { a } else { b } в позиции значения.
+fn parse_if_expr(w: int) -> int {
+    let at = tok()
+    advance()
+    if kind() == T_LET {
+        error_tok(tok(), "if let cannot be used as a value", "use x ?? default or match")
+        sync_stmt()
+        return ty_err
+    }
+    var fl: [int] = []
+    parse_cond(fl)
+    let t1 = parse_value_block(w)
+    var result = unify(ty_never, t1, w, at)
+    var end = -1
+    if t1 != ty_never {
+        end = emit_jmp()
+    }
+    patch_all(fl, here())
+    if kind() != T_ELSE {
+        error_tok(at, "an if used as a value needs an else branch", "if c \{ a } else \{ b }")
+        return result
+    }
+    advance()
+    var w2 = w
+    if result != ty_never {
+        w2 = result
+    }
+    var t2 = ty_err
+    let at2 = tok()
+    if kind() == T_IF {
+        t2 = parse_if_expr(w2)
+    } else {
+        t2 = parse_value_block(w2)
+    }
+    result = unify(result, t2, w2, at2)
+    if end >= 0 {
+        patch_here(end)
+    }
+    return result
+}
+
+// ---- match ----
+
+fn emit_cmp_imm(r: int, v: int) {
+    if fits_i32(v) {
+        emit_alu_imm(7, r, v)
+    } else {
+        emit_mov_imm(RCX, v)
+        emit_rr(0x39, RCX, r)
+    }
+}
+
+// match значение { Образец [имя] => ветка ... }. Образец — вариант, литерал
+// int, str или bool, или _; несколько образцов — через |.
+// as_value: значение match остаётся в rax. → тип значения.
+fn parse_match(as_value: bool, w: int) -> int {
+    let at = tok()
+    advance()
+    let saved_ns = no_struct
+    no_struct = true
+    let st_tok = tok()
+    let st = parse_expr(ty_err)
+    no_struct = saved_ns
+    let is_sum = tkind(st) == K_SUM
+    var sum = -1
+    if is_sum {
+        sum = types[st].a
+    } else if st != ty_int && st != ty_str && st != ty_bool && st != ty_err {
+        error_tok(st_tok, "match works on variant types, int, str and bool, not " + ty_name(st), "")
+    }
+    let sl = hidden_local(st)
+    emit_store_local(sl)
+    if !expect_tok('\{') {
+        release_hidden(sl)
+        return ty_err
+    }
+    var covered: [int] = []
+    var has_wild = false
+    var seen_true = false
+    var seen_false = false
+    var end_holes: [int] = []
+    var result = ty_never
+    var all_div = true
+    while kind() != '}' && kind() != T_EOF {
+        panic_mode = false
+        let arm_at = tok()
+        var body_holes: [int] = []
+        var wild = false
+        var bind_si = -1
+        var npat = 0
+        while true {
+            let pt = tok()
+            npat += 1
+            if pt.kind == T_IDENT && pt.text == "_" {
+                wild = true
+                advance()
+            } else if is_sum && pt.kind == T_IDENT {
+                advance()
+                let vsi = struct_find(pt.text)
+                if vsi < 0 || structs[vsi].sum != sum {
+                    error_tok(pt, "'" + pt.text + "' is not a variant of " + sums[sum].name, "variants: " + variant_names(sum))
+                } else {
+                    covered.push(vsi)
+                    bind_si = vsi
+                    emit_load_local(sl)
+                    emit_load(RAX, RAX, -8)
+                    emit_cmp_imm(RAX, vsi)
+                    body_holes.push(emit_jcc(CC_E))
+                }
+            } else if st == ty_str && pt.kind == T_STR {
+                advance()
+                emit_load_local(sl)
+                emit_mov_rr(RDI, RAX)
+                emit_mov_imm(RSI, strlit(pt.val))
+                emit_call(rt_func("__str_eq"))
+                emit_test_rax()
+                body_holes.push(emit_jcc(CC_NE))
+            } else if st == ty_bool && (pt.kind == T_TRUE || pt.kind == T_FALSE) {
+                advance()
+                emit_load_local(sl)
+                emit_test_rax()
+                if pt.kind == T_TRUE {
+                    seen_true = true
+                    body_holes.push(emit_jcc(CC_NE))
+                } else {
+                    seen_false = true
+                    body_holes.push(emit_jcc(CC_E))
+                }
+            } else if st == ty_int && (pt.kind == T_INT || (pt.kind == '-' && kind_at(pos + 1) == T_INT)) {
+                var v = 0
+                if pt.kind == '-' {
+                    advance()
+                    v = -tok().val
+                } else {
+                    v = pt.val
+                }
+                advance()
+                emit_load_local(sl)
+                emit_cmp_imm(RAX, v)
+                body_holes.push(emit_jcc(CC_E))
+            } else {
+                if st != ty_err {
+                    var hint = "patterns are literals, _ or variant names"
+                    if is_sum {
+                        hint = "variants: " + variant_names(sum)
+                    }
+                    syntax_error(pt, "expected a pattern for " + ty_name(st) + ", found " + tok_show(pt), hint)
+                }
+                break
+            }
+            if kind() != '|' {
+                break
+            }
+            advance()
+        }
+        if npat > 1 {
+            bind_si = -1
+        }
+        if panic_mode {
+            sync_stmt()
+            continue
+        }
+        var bind = tok()
+        var has_bind = false
+        if kind() == T_IDENT && kind_at(pos + 1) == T_FATARROW {
+            has_bind = true
+            advance()
+        }
+        if !expect_tok(T_FATARROW) {
+            sync_stmt()
+            continue
+        }
+        var next_hole = -1
+        if !wild {
+            next_hole = emit_jmp()
+        }
+        patch_all(body_holes, here())
+        let saved_n = nlocals
+        if has_bind {
+            var bt = st
+            if bind_si >= 0 {
+                bt = ty_struct(bind_si)
+            } else if is_sum && !wild {
+                error_tok(bind, "a name can follow only a single variant", "write one arm per variant to use its fields")
+            }
+            let li = declare_local(bind.text, bt, false)
+            emit_load_local(sl)
+            emit_store_local(li)
+        }
+        if as_value {
+            let vt = tok()
+            var aw = result
+            if aw == ty_never {
+                aw = w
+            }
+            let t = parse_arm_value(aw)
+            if t != ty_never {
+                if result == ty_never {
+                    result = unify(result, t, w, vt)
+                } else {
+                    coerce(t, result, vt)
+                }
+                end_holes.push(emit_jmp())
+                all_div = false
+            }
+        } else {
+            var div = false
+            if kind() == '\{' {
+                div = parse_block()
+            } else {
+                div = parse_stmt()
+            }
+            if !div {
+                end_holes.push(emit_jmp())
+                all_div = false
+            }
+        }
+        nlocals = saved_n
+        if next_hole >= 0 {
+            patch_here(next_hole)
+        }
+        if wild {
+            has_wild = true
+        }
+        if kind() == ',' {
+            advance()
+        }
+    }
+    expect_tok('}')
+    // полнота: каждый вариант или _
+    var complete = has_wild
+    if !has_wild {
+        if is_sum {
+            var missing = ""
+            for v in sums[sum].variants {
+                if !int_in(covered, v) {
+                    if missing.len() > 0 {
+                        missing += ", "
+                    }
+                    missing += structs[v].name
+                }
+            }
+            if missing.len() > 0 {
+                error_tok(at, "match does not handle " + missing, "add an arm for each, or _ => ...")
+            } else {
+                complete = true
+            }
+        } else if st == ty_bool {
+            if seen_true && seen_false {
+                complete = true
+            } else {
+                error_tok(at, "match on bool needs both true and false, or _ => ...", "")
+            }
+        } else if st != ty_err {
+            error_tok(at, "match on " + ty_name(st) + " needs a _ => arm for other values", "")
+        }
+    }
+    // сюда управление не доходит, если match полный
+    emit8(0x0F)
+    emit8(0x0B)
+    patch_all(end_holes, here())
+    release_hidden(sl)
+    match_div = all_div && complete
+    if as_value && result == ty_never && !all_div {
+        return ty_err
+    }
+    return result
+}
+
+// ---- Лямбды в методах списков ----
+
+fn is_lambda_method(name: str) -> bool {
+    return name == "map" || name == "filter" || name == "find" || name == "any" || name == "all" || name == "count" || name == "sort_by"
+}
+
+// rcx = значение локальной li.
+fn emit_local_to_rcx(li: int) {
+    let l = locals[li]
+    if l.reg >= 0 {
+        emit_mov_rr(RCX, l.reg)
+    } else {
+        emit_load(RCX, RBP, l.off)
+    }
+}
+
+// rsi = значение локальной li, rdi = значение локальной lj; вызов f.
+fn emit_call2(f: str, lj: int, li: int) {
+    emit_load_local(li)
+    emit_mov_rr(RSI, RAX)
+    emit_load_local(lj)
+    emit_mov_rr(RDI, RAX)
+    emit_call(rt_func(f))
+}
+
+// список.метод(x => выражение); список в rax, текущий токен — '('.
+fn parse_lambda_method(rt: int, nt: Token) -> int {
+    let name = nt.text
+    let et = ty_elem(rt)
+    advance()
+    if kind() != T_IDENT || kind_at(pos + 1) != T_FATARROW {
+        error_tok(tok(), "." + name + "() takes a lambda", "xs." + name + "(x => ...)")
+        skip_call_args_from_open()
+        return ty_err
+    }
+    let pn = tok()
+    advance()
+    advance()
+    let lst = hidden_local(rt)
+    emit_store_local(lst)
+    var esize_at = -1
+    var init = 0
+    if name == "all" {
+        init = 1
+    }
+    let makes_list = name == "map" || name == "filter" || name == "sort_by"
+    if makes_list {
+        emit_mov_imm(RDI, 4)
+        emit_mov_imm(RSI, esize_of(et))
+        esize_at = code_len - 4
+        emit_call(rt_func("__list_new"))
+    } else {
+        emit_mov_imm(RAX, init)
+    }
+    let res = hidden_local(ty_int)
+    emit_store_local(res)
+    let idx = hidden_local(ty_int)
+    emit_mov_imm(RAX, 0)
+    emit_store_local(idx)
+    var exits: [int] = []
+    let top = here()
+    // idx < len?
+    emit_load_local(lst)
+    emit_local_to_rcx(idx)
+    emit_mem(0x3B, RCX, RAX, 8)
+    exits.push(emit_jcc(CC_AE))
+    emit_load(RAX, RAX, 0)
+    if esize_of(et) == 1 {
+        // movzx eax, byte [rax + rcx]
+        emit8(0x0F)
+        emit8(0xB6)
+        emit8(0x04)
+        emit8(0x08)
+    } else {
+        // mov rax, [rax + rcx*8]
+        emit8(0x48)
+        emit8(0x8B)
+        emit8(0x04)
+        emit8(0xC8)
+    }
+    let saved_n = nlocals
+    let x = declare_local(pn.text, et, false)
+    emit_store_local(x)
+    var w = ty_bool
+    if name == "map" || name == "sort_by" {
+        w = ty_err
+    }
+    let saved_ns = no_struct
+    no_struct = false
+    let bt_tok = tok()
+    let bt = parse_expr(w)
+    no_struct = saved_ns
+    var rtype = ty_err
+    if name == "map" {
+        if bt == ty_void || bt == ty_none || bt == ty_never {
+            error_tok(bt_tok, "the lambda of map must produce a value", "")
+        }
+        put32_at(code + esize_at, esize_of(bt))
+        emit_mov_rr(RSI, RAX)
+        emit_load_local(res)
+        emit_mov_rr(RDI, RAX)
+        emit_call(rt_func("__list_push"))
+        rtype = ty_list(bt)
+    } else if name == "sort_by" {
+        if bt != ty_int && bt != ty_str && bt != ty_err {
+            error_tok(bt_tok, "sort_by needs an int or str key, found " + ty_name(bt), "")
+        }
+        put32_at(code + esize_at, 8)
+        emit_mov_rr(RSI, RAX)
+        emit_load_local(res)
+        emit_mov_rr(RDI, RAX)
+        emit_call(rt_func("__list_push"))
+        rtype = rt
+    } else {
+        check_bool(bt, bt_tok, name)
+        emit_test_rax()
+        if name == "all" {
+            let skip = emit_jcc(CC_NE)
+            emit_mov_imm(RAX, 0)
+            emit_store_local(res)
+            exits.push(emit_jmp())
+            patch_here(skip)
+            rtype = ty_bool
+        } else {
+            let skip = emit_jcc(CC_E)
+            if name == "filter" {
+                emit_call2("__list_push", res, x)
+                rtype = rt
+            } else if name == "count" {
+                emit_load_local(res)
+                emit_alu_imm(0, RAX, 1)
+                emit_store_local(res)
+                rtype = ty_int
+            } else if name == "any" {
+                emit_mov_imm(RAX, 1)
+                emit_store_local(res)
+                exits.push(emit_jmp())
+                rtype = ty_bool
+            } else {
+                // find: первый подходящий элемент
+                emit_load_local(x)
+                if !is_ref(et) {
+                    emit_box()
+                }
+                emit_store_local(res)
+                exits.push(emit_jmp())
+                rtype = ty_opt(et)
+            }
+            patch_here(skip)
+        }
+    }
+    nlocals = saved_n
+    // idx += 1
+    emit_load_local(idx)
+    emit_alu_imm(0, RAX, 1)
+    emit_store_local(idx)
+    emit_jmp_to(top)
+    patch_all(exits, here())
+    expect_tok(')')
+    if name == "sort_by" {
+        emit_load_local(lst)
+        emit_mov_rr(RDI, RAX)
+        emit_load_local(res)
+        emit_mov_rr(RSI, RAX)
+        if bt == ty_str {
+            emit_mov_imm(RDX, 1)
+        } else {
+            emit_mov_imm(RDX, 0)
+        }
+        emit_call(rt_func("__sort_by"))
+    } else {
+        emit_load_local(res)
+    }
+    release_hidden(idx)
+    release_hidden(res)
+    release_hidden(lst)
+    last_was_call = true
+    return rtype
+}
+
+// Пропуск аргументов, когда текущий токен — сразу после '('.
+fn skip_call_args_from_open() {
+    var depth = 1
+    while kind() != T_EOF {
+        let k = kind()
+        if k == '(' || k == '[' || k == '\{' {
+            depth += 1
+        } else if k == ')' || k == ']' || k == '}' {
+            depth -= 1
+            if depth == 0 {
+                advance()
+                return
+            }
+        }
+        advance()
+    }
+}

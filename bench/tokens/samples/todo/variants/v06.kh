@@ -1,0 +1,94 @@
+type NewTask {
+    title: str
+    status: str?
+    tags: [str]?
+}
+
+type Task {
+    id: int
+    title: str
+    status: str
+    tags: [str]
+}
+
+type Stats {
+    total: int
+    done: int
+    open: int
+}
+
+store tasks: map[int, Task]
+store last_id: int
+
+fn valid_status(s: str) -> bool {
+    return s == "Todo" || s == "Doing" || s == "Done"
+}
+
+route POST "/tasks" (body: NewTask) -> 201 Task | 400 str {
+    if body.title.trim() == "" {
+        return 400 "title is required"
+    }
+    let status = body.status ?? "Todo"
+    if !valid_status(status) {
+        return 400 "invalid status"
+    }
+    last_id += 1
+    let task = Task { id: last_id, title: body.title, status, tags: body.tags ?? [] }
+    tasks[task.id] = task
+    return 201 task
+}
+
+route GET "/tasks" (status: str?, tag: str?) -> [Task] | 400 str {
+    if let s = status {
+        if !valid_status(s) {
+            return 400 "invalid status"
+        }
+    }
+    var found: [Task] = []
+    for t in tasks.values() {
+        var ok = true
+        if let s = status {
+            if t.status != s {
+                ok = false
+            }
+        }
+        if let g = tag {
+            if !t.tags.contains(g) {
+                ok = false
+            }
+        }
+        if ok {
+            var i = found.len()
+            while i > 0 && found[i - 1].title > t.title {
+                i -= 1
+            }
+            found.insert(i, t)
+        }
+    }
+    return found
+}
+
+route GET "/tasks/{id}" (id: int) -> Task | 404 {
+    return tasks[id] ?? 404
+}
+
+route PUT "/tasks/{id}/status" (id: int, status: str) -> Task | 400 str | 404 {
+    if !valid_status(status) {
+        return 400 "invalid status"
+    }
+    let task = tasks[id] else {
+        return 404
+    }
+    task.status = status
+    return task
+}
+
+route GET "/stats" -> Stats {
+    var done = 0
+    for t in tasks.values() {
+        if t.status == "Done" {
+            done += 1
+        }
+    }
+    return Stats { total: tasks.len(), done, open: tasks.len() - done }
+}

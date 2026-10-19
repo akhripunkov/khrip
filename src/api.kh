@@ -53,6 +53,7 @@ const D_LIST = 4
 const D_MAP = 5
 const D_OPT = 6
 const D_STRUCT = 7
+const D_SUM = 8
 
 // Смещение CTX_STORE_HELD в контексте потока (lib/core.kh).
 const CTX_STORE_HELD_OFF = 72
@@ -234,8 +235,8 @@ fn prescan_route() {
         }
         let k = tkind(p.ty)
         if si >= 0 {
-            if p.ty != ty_int && p.ty != ty_str && p.ty != ty_bool && p.ty != ty_err {
-                error_tok(kw, "path parameter '" + p.name + "' must be int, str or bool, not " + ty_name(p.ty), "")
+            if p.ty != ty_int && p.ty != ty_str && p.ty != ty_bool && p.ty != ty_err && !is_enum(p.ty) {
+                error_tok(kw, "path parameter '" + p.name + "' must be int, str, bool or an enum, not " + ty_name(p.ty), "")
             }
             pkind.push(PK_PATH)
         } else if k == K_STRUCT || k == K_LIST || k == K_MAP {
@@ -246,8 +247,8 @@ fn prescan_route() {
             pkind.push(PK_BODY)
         } else {
             let inner = ty_inner(p.ty)
-            if inner != ty_int && inner != ty_str && inner != ty_bool && inner != ty_err {
-                error_tok(kw, "query parameter '" + p.name + "' must be int, str or bool (or optional), not " + ty_name(p.ty), "")
+            if inner != ty_int && inner != ty_str && inner != ty_bool && inner != ty_err && !is_enum(inner) {
+                error_tok(kw, "query parameter '" + p.name + "' must be int, str, bool or an enum (or optional), not " + ty_name(p.ty), "")
             }
             pkind.push(PK_QUERY)
         }
@@ -449,22 +450,92 @@ fn type_desc(t: int) -> int {
         return DATA_BASE + off
     }
     if k == K_STRUCT {
-        let st = structs[types[t].a]
+        let si = types[t].a
+        let st = structs[si]
         let n = st.fields.len()
-        off = desc_reserve(3 + 3 * n)
+        off = desc_reserve(4 + 5 * n)
         type_descs[t] = DATA_BASE + off
         desc_put(off, 0, D_STRUCT)
         desc_put(off, 1, n)
         desc_put(off, 2, const_str(st.name))
+        var tag = -1
+        if st.sum >= 0 {
+            tag = si
+        }
+        desc_put(off, 3, tag)
         var i = 0
         while i < n {
             let f = st.fields[i]
-            desc_put(off, 3 + 3 * i, const_str(f.name))
-            desc_put(off, 4 + 3 * i, const_str("\"" + f.name + "\":"))
-            desc_put(off, 5 + 3 * i, type_desc(f.ty))
+            let fo = 4 + 5 * i
+            desc_put(off, fo, const_str(f.name))
+            desc_put(off, fo + 1, const_str("\"" + f.name + "\":"))
+            desc_put(off, fo + 2, type_desc(f.ty))
+            if f.def >= 0 {
+                let dt = toks[f.def]
+                if dt.kind == '[' {
+                    desc_put(off, fo + 3, 2)
+                    desc_put(off, fo + 4, esize_of(ty_elem(f.ty)))
+                } else if dt.kind == '\{' {
+                    desc_put(off, fo + 3, 3)
+                    var sk = 0
+                    if tkind(f.ty) == K_MAP && types[f.ty].a == ty_str {
+                        sk = 1
+                    }
+                    desc_put(off, fo + 4, sk)
+                } else {
+                    desc_put(off, fo + 3, 1)
+                    desc_put(off, fo + 4, default_word(f.def))
+                }
+            }
             i += 1
         }
         return DATA_BASE + off
+    }
+    if k == K_SUM {
+        let su = sums[types[t].a]
+        let n = su.variants.len()
+        off = desc_reserve(4 + 3 * n)
+        type_descs[t] = DATA_BASE + off
+        desc_put(off, 0, D_SUM)
+        desc_put(off, 1, n)
+        desc_put(off, 2, const_str(su.name))
+        var unit_only = 0
+        if sum_unit_only(types[t].a) {
+            unit_only = 1
+        }
+        desc_put(off, 3, unit_only)
+        var i = 0
+        while i < n {
+            let vs = su.variants[i]
+            desc_put(off, 4 + 3 * i, const_str(structs[vs].name))
+            desc_put(off, 5 + 3 * i, type_desc(ty_struct(vs)))
+            if structs[vs].fields.len() == 0 {
+                desc_put(off, 6 + 3 * i, unit_addr(vs))
+            }
+            i += 1
+        }
+        return DATA_BASE + off
+    }
+    return 0
+}
+
+// Слово значения по умолчанию из литерала в позиции i.
+fn default_word(i: int) -> int {
+    let t = toks[i]
+    if t.kind == '-' {
+        return -toks[i + 1].val
+    }
+    if t.kind == T_INT {
+        return t.val
+    }
+    if t.kind == T_STR {
+        return strlit(t.val)
+    }
+    if t.kind == T_TRUE {
+        return 1
+    }
+    if t.kind == T_IDENT {
+        return unit_addr(struct_find(t.text))
     }
     return 0
 }
@@ -863,7 +934,9 @@ fn gen_param(b: Buf, r: Route, i: int) {
     let k = r.pkind[i]
     if k == PK_PATH {
         let seg = "__url_decode(__s[" + r.pseg[i].to_str() + "])"
-        if p.ty == ty_int {
+        if is_enum(p.ty) {
+            gen_enum_param(b, v, p.ty, seg, lit)
+        } else if p.ty == ty_int {
             buf_add(b, "            let " + v + " = __param_int(" + seg + ", " + lit + ") else \{\n                return\n            }\n")
         } else if p.ty == ty_bool {
             buf_add(b, "            let " + v + " = __param_bool(" + seg + ", " + lit + ") else \{\n                return\n            }\n")
@@ -880,6 +953,18 @@ fn gen_param(b: Buf, r: Route, i: int) {
     let inner = ty_inner(p.ty)
     let optional = tkind(p.ty) == K_OPT
     let q = "__query(__r.query, " + lit + ")"
+    if is_enum(inner) {
+        if optional {
+            buf_add(b, "            var " + v + ": " + ty_name(p.ty) + " = none\n")
+            buf_add(b, "            if let " + v + "_s = " + q + " \{\n")
+            gen_enum_param(b, v + "_x", inner, v + "_s", lit)
+            buf_add(b, "                " + v + " = " + v + "_x\n            }\n")
+        } else {
+            buf_add(b, "            let " + v + "_s = " + q + " else \{\n                __missing(" + lit + ")\n                return\n            }\n")
+            gen_enum_param(b, v, inner, v + "_s", lit)
+        }
+        return
+    }
     var conv = ""
     if inner == ty_int {
         conv = "__param_int"
@@ -903,6 +988,13 @@ fn gen_param(b: Buf, r: Route, i: int) {
     buf_add(b, "            if let " + v + "_s = " + q + " \{\n")
     buf_add(b, "                let " + v + "_x = " + conv + "(" + v + "_s, " + lit + ") else \{\n                    return\n                }\n")
     buf_add(b, "                " + v + " = " + v + "_x\n            }\n")
+}
+
+// Перечисление из текста: значение — имя варианта.
+fn gen_enum_param(b: Buf, v: str, t: int, text: str, lit: str) {
+    let names = src_lit(variant_names(types[t].a))
+    buf_add(b, "            let " + v + "_o: " + ty_name(t) + "? = from_json(__json_quote(" + text + "))\n")
+    buf_add(b, "            let " + v + " = " + v + "_o else \{\n                __reply_text(400, \"parameter '\" + " + lit + " + \"' must be one of: \" + " + names + ")\n                return\n            }\n")
 }
 
 fn gen_route_call(b: Buf, r: Route, ri: int) {

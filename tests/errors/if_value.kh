@@ -1,0 +1,13 @@
+// expect: error: an if used as a value needs an else branch
+// expect: error: .map() takes a lambda
+// expect: hint: xs.map(x => ...)
+fn double(x: int) -> int {
+    return x * 2
+}
+
+fn main() {
+    let n = 3
+    let d = if n > 0 { 1 }
+    let xs = [1, 2]
+    let g = xs.map(double)
+}

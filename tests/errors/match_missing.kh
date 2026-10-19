@@ -1,0 +1,25 @@
+// expect: match_missing.kh:10:13: error: match does not handle Rect, Empty
+// expect: hint: add an arm for each, or _ => ...
+// expect: match_missing.kh:16:15: error: Shape can be any of Circle, Rect, Empty; use match to read fields
+// expect: error: match on int needs a _ => arm for other values
+// expect: error: 'Square' is not a variant of Shape
+// expect: 4 errors
+type Shape = Circle { r: int } | Rect { w: int, h: int } | Empty
+
+fn f(s: Shape, n: int) -> int {
+    let a = match s {
+        Circle c => c.r
+    }
+    let b = match n {
+        1 => 10
+    }
+    let c = s.r
+    let e = match s {
+        Square q => 1
+        _ => 2
+    }
+    return a + b + c + e
+}
+
+fn main() {
+}

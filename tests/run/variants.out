@@ -1,0 +1,16 @@
+area 12 circle 2
+area 12 something
+area 0 something
+ok not found other 500
+true false 0 true -1
+neg
+total 13
+3 3 1 56 n5,n3,n8,n1,n9,n2 6 true
+true true 4 8 -1
+bob,zed,amy amy,bob,zed
+[{"type":"Circle","r":2},{"type":"Rect","w":3,"h":4},{"type":"Empty"}]
+3 12
+{"name":"ann","role":"Member","tags":[],"active":true,"score":-1}
+true true -1 0
+role: unknown variant 'Boss', expected one of: Admin, Member, Guest
+6 -4

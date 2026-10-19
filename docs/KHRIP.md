@@ -1,4 +1,4 @@
-# Khrip language reference (v0.6)
+# Khrip language reference (v0.7)
 
 Khrip is a compiled, strictly typed language for HTTP APIs on Linux x86-64.
 One project = one namespace: no imports, declaration order does not matter.
@@ -23,12 +23,17 @@ type Point {
 type Named {
     name: str
     ...Point          // spread: copies fields x, y
+    tags: [str] = []  // default: a literal, [], {} or an enum value
 }
+type Role = Admin | Member | Guest                     // enum
+type Shape = Circle { r: int } | Rect { w: int, h: int } | Empty
 ```
 
+A variant type holds one of its variants: `let s: Shape = Circle { r: 2 }`,
+`let r = Admin`. Enum values compare with `==`; read variant fields with `match`.
 No floats (use int cents), no null (use `T?` and `none`), no classes, generics,
-closures, exceptions or operator overloading. The only implicit conversion is
-`T` → `T?`. Conditions must be `bool`.
+exceptions or operator overloading. Implicit conversions: `T` → `T?` and
+variant → its type. Conditions must be `bool`.
 
 ## Declarations
 
@@ -53,6 +58,17 @@ if x > 0 && !done {
 } else if x == 0 {
 } else {
 }
+let size = if n > 100 { "big" } else { "small" }    // if is also a value
+let area = match s {                                // exhaustive
+    Circle c => 3 * c.r * c.r
+    Rect r => r.w * r.h
+    Empty => 0
+}
+let text = match code {
+    200 | 201 => "ok"
+    404 => "missing"
+    _ => "error {code}"
+}
 while i < n {
     i += 1                  // += -= *= /= %= ; there is no ++
 }
@@ -65,11 +81,15 @@ continue
 
 Operators: `+ - * / %` (int; `/` truncates, division by zero panics),
 `== != < <= > >=`, `&& || !`, `& | ^ ~ << >>`, `+` also joins strings.
-Comparisons do not chain. `'a'` is an int (byte).
+Comparisons do not chain. `'a'` is an int (byte). A block used as a value ends
+with its value: `if c { let a = f(); a + 1 } else { 0 }`. `match` arms may also be
+blocks or `return ...`; `match` works on variants, int, str and bool and must
+cover every case (or have `_ =>`).
 
-Strings: `"Hello, {name}!"` interpolates an expression that starts with a name
-(`{user.name}`, `{m["a"]}`, `{xs.len()}`); `\{` is a literal brace. Escapes:
-`\n \t \r \0 \\ \" \'`. `s[i]` is a byte (int), `s[a..b]` a substring.
+Strings: `"Hello, {name}!"` interpolates any expression (`{user.name}`,
+`{m["a"] ?? 0}`, `{n * 2}`); it must not start with a quote. Write `\{` for a
+literal brace: `"\{\"id\": {id}}"`. Escapes: `\n \t \r \0 \\ \" \'`.
+`s[i]` is a byte (int), `s[a..b]` a substring.
 
 ## Optionals
 
@@ -82,6 +102,7 @@ if let u = users[id] {
     print(u.name)
 }
 if user == none { }
+if role == Admin { }                   // role: Role? compares directly
 ```
 
 `m[k]` on a map, `.get(k)`, `.remove(k)`, `.find(s)`, `.to_int()`,
@@ -113,6 +134,9 @@ is `describe(p)`.
 - `[T]`: `len push pop last insert remove_at clear truncate reverse copy
   contains index_of sort` (sort: int or str), `join` ([str]), `sum` ([int]),
   `xs[i]`, `xs[a..b]`
+- lambdas `x => expr` in list methods: `map filter find` (T?) `any all count
+  sort_by` (int or str key, sorts in place and returns the list); they see local
+  variables: `users.filter(u => u.age >= min).map(u => u.name)`
 - `map[K, V]`: `len has get remove keys values clear`, `m[k]` (V?), `m[k] = v`
 
 Functions: `print(s)`, `eprint(s)`, `write(s)` (no newline), `len(x)`,
@@ -157,8 +181,10 @@ route GET "/users/{id}" (id: int) -> User | 404 {
     return users[id] ?? 404
 }
 
-route GET "/users" (limit: int?) -> [User] {
+route GET "/users" (min_age: int?) -> [User] {
     return users.values()
+        .filter(u => u.age >= (min_age ?? 0))
+        .sort_by(u => u.name)
 }
 
 route DELETE "/users/{id}" (id: int) -> 204 | 404 {
@@ -170,8 +196,10 @@ route DELETE "/users/{id}" (id: int) -> 204 | 404 {
 ```
 
 - Method: `GET POST PUT PATCH DELETE`. Path parameters `{id}` must be declared
-  (`int`, `str` or `bool`). A struct, list or map parameter is the JSON body;
-  other parameters come from the query string (`T?` makes one optional).
+  (`int`, `str`, `bool` or an enum). A struct, list or map parameter is the JSON
+  body; other parameters come from the query string (`T?` makes one optional).
+  Missing body fields take their defaults; enums are JSON strings ("Admin"),
+  other variants objects with a "type" field.
   Bad input gets 400 with a message, a wrong method 405, an unknown path 404.
 - Results: `-> Type`, `-> 201 Type | 400 str | 404`; a type without a status
   means 200. `return 201 user`, `return 404`, `return value` (status chosen by
@@ -203,4 +231,5 @@ both sides. Tests run in order and share store.
 `null nil None` → `none`; `and or not` → `&& || !`; `elif` → `else if`;
 `x++` → `x += 1`; `func def function` → `fn`; `String` → `str`;
 `x.length x.size() x.Count` → `x.len()`; `let mut` → `var`;
+`switch` → `match`; `enum` → `type Role = A | B`; `cond ? a : b` → `if`;
 `try/catch` → optionals and `else`; `import` → not needed.

@@ -8,6 +8,7 @@ const SK_FN = 1
 const SK_STRUCT = 2
 const SK_GLOBAL = 3
 const SK_CONST = 4
+const SK_SUM = 5
 
 const FK_USER = 0
 const FK_ROUTE = 1
@@ -136,7 +137,7 @@ fn expect_ident() -> Token {
         return t
     }
     var hint = ""
-    if t.kind >= T_FN && t.kind <= T_CALL {
+    if t.kind >= T_FN && t.kind <= T_MATCH {
         hint = "'" + t.text + "' is a keyword and cannot be used as a name"
     }
     syntax_error(t, "expected a name, found " + tok_show(t), hint)
@@ -246,8 +247,11 @@ fn parse_type() -> int {
             t = ty_make(K_GEN, name[0], 0)
         } else {
             let s = struct_find(name)
+            let u = sum_find(name)
             if s >= 0 {
                 t = ty_struct(s)
+            } else if u >= 0 {
+                t = ty_sum(u)
             } else {
                 error_tok(start, "unknown type '" + name + "'", type_hint(name))
             }
@@ -267,17 +271,141 @@ fn parse_type() -> int {
 var struct_state: [int]
 var struct_tok: [int]
 
-fn prescan_struct_name() {
+// Структура с телом в позиции body (-1 — вариант без полей).
+fn add_struct(name: Token, body: int, sum: int) -> int {
+    var fs: [Field] = []
+    structs.push(StructT { name: name.text, fields: fs, tok: body, sum: sum })
+    var st = 0
+    if body < 0 {
+        st = 2
+    }
+    struct_state.push(st)
+    struct_tok.push(body)
+    sym_add(name.text, SK_STRUCT, structs.len() - 1, name)
+    return structs.len() - 1
+}
+
+// type Имя { поля }  или  type Имя = Вариант { поля } | Вариант | ...
+fn prescan_type_name() {
     advance()
     let name = expect_ident()
     if name.kind != T_IDENT {
         return
     }
-    var fs: [Field] = []
-    structs.push(StructT { name: name.text, fields: fs, tok: pos })
-    struct_state.push(0)
-    struct_tok.push(pos)
-    sym_add(name.text, SK_STRUCT, structs.len() - 1, name)
+    if kind() != '=' {
+        add_struct(name, pos, -1)
+        return
+    }
+    advance()
+    let si = sums.len()
+    var vs: [int] = []
+    sums.push(SumT { name: name.text, variants: vs, tok: pos })
+    sym_add(name.text, SK_SUM, si, name)
+    if kind() == '|' {
+        advance()
+    }
+    while true {
+        let vn = expect_ident()
+        if vn.kind != T_IDENT {
+            return
+        }
+        var body = -1
+        if kind() == '\{' {
+            body = pos
+            pos = matching_close(pos)
+            advance()
+        }
+        sums[si].variants.push(add_struct(vn, body, si))
+        if kind() != '|' {
+            break
+        }
+        advance()
+    }
+}
+
+// Индекс последнего токена объявления type, которое начинается в i.
+fn type_decl_end(i: int) -> int {
+    var j = i + 2
+    if kind_at(j) == '\{' {
+        return matching_close(j)
+    }
+    if kind_at(j) != '=' {
+        return i + 1
+    }
+    j += 1
+    if kind_at(j) == '|' {
+        j += 1
+    }
+    while true {
+        if kind_at(j) != T_IDENT {
+            return j - 1
+        }
+        j += 1
+        if kind_at(j) == '\{' {
+            j = matching_close(j) + 1
+        }
+        if kind_at(j) != '|' {
+            return j - 1
+        }
+        j += 1
+    }
+    return j
+}
+
+// Значение поля по умолчанию — литерал; токены литерала пропускаются.
+// → тип литерала или -1, если это не литерал.
+fn default_literal() -> int {
+    let k = kind()
+    if k == '-' && kind_at(pos + 1) == T_INT {
+        advance()
+        advance()
+        return ty_int
+    }
+    if k == T_INT {
+        advance()
+        return ty_int
+    }
+    if k == T_STR {
+        advance()
+        return ty_str
+    }
+    if k == T_TRUE || k == T_FALSE {
+        advance()
+        return ty_bool
+    }
+    if k == T_NONE {
+        advance()
+        return ty_none
+    }
+    if k == T_IDENT {
+        // вариант без полей: role: Role = Member
+        let si = struct_find(tok().text)
+        if si >= 0 && structs[si].sum >= 0 && struct_tok[si] < 0 {
+            advance()
+            return ty_sum(structs[si].sum)
+        }
+    }
+    if k == '[' && kind_at(pos + 1) == ']' {
+        advance()
+        advance()
+        return ty_list(ty_err)
+    }
+    if k == '\{' && kind_at(pos + 1) == '}' {
+        advance()
+        advance()
+        return ty_map(ty_err, ty_err)
+    }
+    return -1
+}
+
+fn default_fits(lt: int, ft: int) -> bool {
+    if lt == ty_none {
+        return tkind(ft) == K_OPT
+    }
+    if tkind(lt) == K_LIST || tkind(lt) == K_MAP {
+        return tkind(ft) == tkind(lt)
+    }
+    return assignable(lt, ft)
 }
 
 // Поля структуры s; ...Другая подставляет поля другой структуры.
@@ -304,7 +432,7 @@ fn prescan_struct_fields(s: int) {
                 } else {
                     prescan_struct_fields(o)
                     for f in structs[o].fields {
-                        add_field(s, f.name, f.ty, other)
+                        add_field(s, f.name, f.ty, other, f.def)
                     }
                 }
             } else {
@@ -314,7 +442,21 @@ fn prescan_struct_fields(s: int) {
                     continue
                 }
                 let ft = parse_type()
-                add_field(s, fname.text, ft, fname)
+                var def = -1
+                if kind() == '=' {
+                    advance()
+                    let at = tok()
+                    def = pos
+                    let lt = default_literal()
+                    if lt < 0 {
+                        error_tok(at, "a field default must be a literal: a number, string, true, false, none, [], \{} or a variant without fields", "compute other values in the code that creates the value")
+                        def = -1
+                        skip_line()
+                    } else if !default_fits(lt, ft) && ft != ty_err {
+                        error_tok(at, "the default does not fit field '" + fname.text + "' of type " + ty_name(ft), "")
+                    }
+                }
+                add_field(s, fname.text, ft, fname, def)
             }
             if kind() == ',' {
                 advance()
@@ -325,12 +467,12 @@ fn prescan_struct_fields(s: int) {
     pos = saved
 }
 
-fn add_field(s: int, name: str, t: int, at: Token) {
+fn add_field(s: int, name: str, t: int, at: Token, def: int) {
     if field_find(s, name) >= 0 {
         error_tok(at, "field '" + name + "' is declared twice in '" + structs[s].name + "'", "")
         return
     }
-    structs[s].fields.push(Field { name: name, ty: t })
+    structs[s].fields.push(Field { name: name, ty: t, def: def })
 }
 
 // Пропуск до начала следующей строки.
@@ -382,7 +524,7 @@ fn prescan_fn(kind_: int) {
         advance()
         ret = parse_type()
     } else if kind() == ':' {
-        error_tok(tok(), "the result type is written after ->", "fn " + name.text + "(...) -> int { ... }")
+        error_tok(tok(), "the result type is written after ->", "fn " + name.text + "(...) -> int \{ ... }")
         advance()
         parse_type()
     }
@@ -505,7 +647,7 @@ fn decl_hint(t: Token) -> str {
         return "declare functions with fn"
     }
     if t.text == "struct" || t.text == "class" || t.text == "interface" || t.text == "record" {
-        return "declare types with type Name { field: type }"
+        return "declare types with type Name \{ field: type }"
     }
     if t.text == "import" || t.text == "package" || t.text == "use" || t.text == "include" {
         return "Khrip has no imports: the standard library and all project files are always available"
@@ -526,12 +668,19 @@ fn prescan_from(pass: int, from: int) {
     var depth = 0
     while toks[i].kind != T_EOF {
         let k = toks[i].kind
+        if depth == 0 && k == T_TYPE {
+            pos = i
+            panic_mode = false
+            if pass == 1 {
+                prescan_type_name()
+            }
+            i = type_decl_end(i) + 1
+            continue
+        }
         if depth == 0 {
             pos = i
             panic_mode = false
-            if pass == 1 && k == T_TYPE {
-                prescan_struct_name()
-            } else if pass == 2 {
+            if pass == 2 {
                 if k == T_FN {
                     prescan_fn(FK_USER)
                 } else if k == T_VAR {

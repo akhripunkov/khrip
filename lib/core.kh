@@ -1128,6 +1128,93 @@ fn __sort_words(data: int, n: int, by_str: bool) {
     }
 }
 
+// Устойчивая сортировка списка по ключам (int или str, по одному на элемент):
+// слияние снизу вверх по массиву номеров. Возвращает тот же список.
+fn __sort_by(self: [T], keys: [int], by_str: bool) -> [T] {
+    let h: int = __cast(self)
+    let kh: int = __cast(keys)
+    let n = load64(h + 8)
+    let kd = load64(kh)
+    var a = __alloc(n * 8 + 8)
+    var t = __alloc(n * 8 + 8)
+    var i = 0
+    while i < n {
+        store64(a + i * 8, i)
+        i += 1
+    }
+    var width = 1
+    while width < n {
+        var lo = 0
+        while lo < n {
+            var mid = lo + width
+            if mid > n {
+                mid = n
+            }
+            var hi = lo + 2 * width
+            if hi > n {
+                hi = n
+            }
+            var x = lo
+            var y = mid
+            var o = lo
+            while o < hi {
+                var take_x = y >= hi
+                if x < mid && y < hi {
+                    let kx = load64(kd + load64(a + x * 8) * 8)
+                    let ky = load64(kd + load64(a + y * 8) * 8)
+                    if by_str {
+                        take_x = __str_cmp(__cast(kx), __cast(ky)) <= 0
+                    } else {
+                        take_x = kx <= ky
+                    }
+                }
+                if x < mid && take_x {
+                    store64(t + o * 8, load64(a + x * 8))
+                    x += 1
+                } else {
+                    store64(t + o * 8, load64(a + y * 8))
+                    y += 1
+                }
+                o += 1
+            }
+            lo += 2 * width
+        }
+        let sw = a
+        a = t
+        t = sw
+        width *= 2
+    }
+    // переставить элементы по номерам
+    let es = load64(h + 24)
+    let data = load64(h)
+    let copy = __alloc(n * es + 8)
+    __memcpy(copy, data, n * es)
+    i = 0
+    while i < n {
+        let from = load64(a + i * 8)
+        if es == 1 {
+            store8(data + i, load8(copy + from))
+        } else {
+            store64(data + i * 8, load64(copy + from * 8))
+        }
+        i += 1
+    }
+    return self
+}
+
+// x == v, где x — int? или bool? (ячейка или 0).
+fn __opt_eq_word(box: int, v: int) -> bool {
+    return box != 0 && load64(box) == v
+}
+
+// x == v, где x — str? (0 — none).
+fn __opt_eq_str(a: int, b: int) -> bool {
+    if a == 0 {
+        return false
+    }
+    return __str_eq(__cast(a), __cast(b))
+}
+
 fn __list_sort_int(self: [int]) {
     let h: int = __cast(self)
     __sort_words(load64(h), load64(h + 8), false)
