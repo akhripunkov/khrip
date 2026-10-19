@@ -760,6 +760,7 @@ fn __timer_loop() {
 fn __run_timers() {
     __ignore_sigpipe()
     __store_init()
+    __store_rw_init()
     __store_lock()
     __store_unlock()
     __load_store()
@@ -776,6 +777,7 @@ fn __serve() {
     __http_port = __env_int("PORT", 8080)
     __ignore_sigpipe()
     __store_init()
+    __store_rw_init()
     __store_lock()
     __store_unlock()
     __load_store()

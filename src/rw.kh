@@ -1,0 +1,314 @@
+// ============================================================================
+// Какие маршруты только читают store. Их запросы берут разделяемую блокировку
+// и идут параллельно; остальные — по одному (lib/rt.kh, __store_lock).
+//
+// Анализ по лексемам и консервативный: всё, в чём он не уверен, — запись.
+// Запись — это:
+//   - присваивание чему-то, кроме локальной переменной или свежей коллекции
+//     (x.f = ..., store_name = ..., m[k] = ... для m из store);
+//   - изменяющий метод (push, pop, insert, remove_at, clear, truncate, reverse,
+//     sort, sort_by, remove) у значения, которое может быть из store. Свежие
+//     значения — литералы, результаты values, keys, filter, map, copy, split,
+//     срезы и локальные переменные, которым присвоено только свежее;
+//   - вызов функции программы, которая пишет, или функции библиотеки не из
+//     списка безопасных.
+// ============================================================================
+
+// По функциям: 0 — только читает store, 1 — может писать.
+var rw_writes: [int]
+var rw_done: bool
+
+fn rw_mutating(name: str) -> bool {
+    return name == "push" || name == "pop" || name == "insert" || name == "remove_at" || name == "clear" || name == "truncate" || name == "reverse" || name == "sort" || name == "sort_by" || name == "remove"
+}
+
+// Методы, которые возвращают новую коллекцию.
+fn rw_fresh_method(name: str) -> bool {
+    return name == "values" || name == "keys" || name == "filter" || name == "map" || name == "copy" || name == "split"
+}
+
+// Методы, которые возвращают свой получатель.
+fn rw_same_method(name: str) -> bool {
+    return name == "sort_by" || name == "sort" || name == "reverse"
+}
+
+// Функции библиотеки, которые не трогают store.
+fn rw_safe_lib(name: str) -> bool {
+    return name == "__to_str" || name == "print" || name == "eprint" || name == "write" || name == "args" || name == "env" || name == "read_file" || name == "write_file" || name == "exit" || name == "now" || name == "now_ms" || name == "time_iso" || name == "parse_time" || name == "parse_date" || name == "random_str" || name == "sha256" || name == "hash_password" || name == "check_password" || name == "url_encode" || name == "to_json" || name == "from_json" || name == "json_error" || name == "header" || name == "set_header" || name == "fail"
+}
+
+// Встроенные функции, которые пишут в память напрямую.
+fn rw_raw_builtin(name: str) -> bool {
+    return name == "store8" || name == "store32" || name == "store64" || name == "syscall" || name.starts_with("__")
+}
+
+fn rw_is_assign(k: int) -> bool {
+    return k == '=' || k == T_PLUSEQ || k == T_MINUSEQ || k == T_STAREQ || k == T_SLASHEQ || k == T_PERCENTEQ
+}
+
+// Парная открывающая скобка для закрывающей в позиции j (или -1).
+fn rw_open_of(j: int, from: int) -> int {
+    var depth = 0
+    var i = j
+    while i >= from {
+        let k = toks[i].kind
+        if k == ')' || k == ']' || k == '}' {
+            depth += 1
+        } else if k == '(' || k == '[' || k == '\{' {
+            depth -= 1
+            if depth == 0 {
+                return i
+            }
+        }
+        i -= 1
+    }
+    return -1
+}
+
+// Конец выражения, которое начинается в a: до новой строки на верхнем уровне
+// скобок (строка, начатая с «.», продолжает цепочку методов).
+fn rw_expr_end(a: int, limit: int) -> int {
+    var depth = 0
+    var i = a
+    while i < limit {
+        let k = toks[i].kind
+        if i > a && depth == 0 && toks[i].line != toks[i - 1].line && k != '.' {
+            return i
+        }
+        if k == '(' || k == '[' || k == '\{' {
+            depth += 1
+        } else if k == ')' || k == ']' || k == '}' {
+            depth -= 1
+            if depth < 0 {
+                return i
+            }
+        }
+        i += 1
+    }
+    return limit
+}
+
+// Свежее ли значение выражения, которое кончается лексемой last (начало — a
+// или -1, если неизвестно).
+fn rw_fresh_at(last: int, a: int, body: int, end: int, depth: int) -> bool {
+    if depth > 8 || last < body {
+        return false
+    }
+    let k = toks[last].kind
+    if k == ')' {
+        let m = rw_open_of(last, body)
+        if m < body + 2 || toks[m - 1].kind != T_IDENT || toks[m - 2].kind != '.' {
+            return false
+        }
+        let name = toks[m - 1].text
+        if rw_fresh_method(name) {
+            return true
+        }
+        if rw_same_method(name) {
+            return rw_fresh_at(m - 3, rw_recv_start(m - 3), body, end, depth + 1)
+        }
+        return false
+    }
+    if k == ']' {
+        let m = rw_open_of(last, body)
+        if m < 0 {
+            return false
+        }
+        if m == a {
+            return true
+        }
+        // срез xs[a..b] — копия
+        var i = m + 1
+        var d = 0
+        while i < last {
+            let ki = toks[i].kind
+            if ki == '(' || ki == '[' || ki == '\{' {
+                d += 1
+            } else if ki == ')' || ki == ']' || ki == '}' {
+                d -= 1
+            } else if d == 0 && (ki == T_DOTDOT || ki == T_DOTDOTEQ) {
+                return true
+            }
+            i += 1
+        }
+        return false
+    }
+    if k == '}' {
+        let m = rw_open_of(last, body)
+        // литерал словаря {..} или структуры Name { .. }
+        return m >= 0 && (m == a || (m == a + 1 && toks[a].kind == T_IDENT))
+    }
+    if k == T_IDENT && last == a {
+        return rw_fresh_local(toks[last].text, body, end, depth + 1)
+    }
+    return false
+}
+
+// Начало получателя, если он — просто имя (а не поле x.y): иначе -1.
+fn rw_recv_start(last: int) -> int {
+    if toks[last].kind == T_IDENT && toks[last - 1].kind != '.' {
+        return last
+    }
+    return -1
+}
+
+// Локальная переменная name свежая: объявлена через let/var, и всё, что ей
+// присваивается, — свежее. Параметры, переменные циклов и лямбд — не свежие.
+fn rw_fresh_local(name: str, body: int, end: int, depth: int) -> bool {
+    if depth > 8 {
+        return false
+    }
+    var found = false
+    var i = body
+    while i < end {
+        let t = toks[i]
+        if t.kind == T_IDENT && t.text == name {
+            let pk = toks[i - 1].kind
+            let nk = toks[i + 1].kind
+            if pk == T_LET || pk == T_VAR {
+                if toks[i - 2].kind == T_IF || toks[i - 2].kind == T_WHILE {
+                    return false
+                }
+                // let name[: тип] = выражение
+                var j = i + 1
+                while j < end && toks[j].kind != '=' && toks[j].line == t.line {
+                    j += 1
+                }
+                if j >= end || toks[j].kind != '=' {
+                    return false
+                }
+                let e = rw_expr_end(j + 1, end)
+                if !rw_fresh_at(e - 1, j + 1, body, end, depth + 1) {
+                    return false
+                }
+                found = true
+            } else if pk == T_FOR || nk == T_FATARROW || (pk == ',' && toks[i - 2].kind == T_IDENT && toks[i - 3].kind == T_FOR) {
+                return false
+            } else if nk == '=' && (pk == '\{' || pk == '}' || toks[i - 1].line != t.line) {
+                let e = rw_expr_end(i + 2, end)
+                if !rw_fresh_at(e - 1, i + 2, body, end, depth + 1) {
+                    return false
+                }
+            }
+        }
+        i += 1
+    }
+    return found
+}
+
+// Пишет ли функция fi сама (без учёта вызываемых); вызванные функции
+// программы — в callees.
+fn rw_scan(fi: int, callees: [int]) -> bool {
+    let body = funcs[fi].body
+    let end = funcs[fi].body_end
+    var i = body
+    while i < end {
+        let t = toks[i]
+        let k = t.kind
+        if rw_is_assign(k) {
+            // начало оператора: та же строка, после { или }
+            var s = i - 1
+            while s > body && toks[s - 1].line == toks[i].line && toks[s - 1].kind != '\{' && toks[s - 1].kind != '}' {
+                s -= 1
+            }
+            var decl = false
+            var j = s
+            while j < i {
+                if toks[j].kind == T_LET || toks[j].kind == T_VAR {
+                    decl = true
+                }
+                j += 1
+            }
+            if !decl {
+                let st = toks[s]
+                if st.kind != T_IDENT {
+                    return true
+                }
+                let sym = sym_find(st.text)
+                let is_global = sym >= 0 && sym_kind(sym) == SK_GLOBAL
+                if i == s + 1 {
+                    if is_global {
+                        return true
+                    }
+                } else if is_global || !rw_fresh_local(st.text, body, end, 0) {
+                    return true
+                } else {
+                    // свежая коллекция: xs[i] = ... или s.f = ... на один уровень
+                    let ok = (toks[s + 1].kind == '[' && matching_close(s + 1) == i - 1) || (toks[s + 1].kind == '.' && i == s + 3)
+                    if !ok {
+                        return true
+                    }
+                }
+            }
+        } else if k == T_IDENT && toks[i + 1].kind == '(' {
+            let name = t.text
+            let after_dot = toks[i - 1].kind == '.'
+            if after_dot && rw_mutating(name) {
+                if !rw_fresh_at(i - 2, rw_recv_start(i - 2), body, end, 0) {
+                    return true
+                }
+            } else {
+                let sym = sym_find(name)
+                if sym >= 0 && sym_kind(sym) == SK_FN {
+                    let f = sym_idx(sym)
+                    if funcs[f].is_lib {
+                        if !rw_safe_lib(name) {
+                            return true
+                        }
+                    } else {
+                        callees.push(f)
+                    }
+                } else if !after_dot && rw_raw_builtin(name) && name != "__to_str" {
+                    return true
+                }
+            }
+        }
+        i += 1
+    }
+    return false
+}
+
+fn rw_analyze() {
+    rw_done = true
+    // вызовы функций программы: пары (кто, кого)
+    var from: [int] = []
+    var to: [int] = []
+    var f = 0
+    while f < funcs.len() {
+        var w = 1
+        if funcs[f].body >= 0 && !funcs[f].is_lib {
+            var cs: [int] = []
+            w = 0
+            if rw_scan(f, cs) {
+                w = 1
+            }
+            for c in cs {
+                from.push(f)
+                to.push(c)
+            }
+        }
+        rw_writes.push(w)
+        f += 1
+    }
+    // пишет и тот, кто вызывает пишущего
+    var changed = true
+    while changed {
+        changed = false
+        var e = 0
+        while e < from.len() {
+            if rw_writes[to[e]] == 1 && rw_writes[from[e]] == 0 {
+                rw_writes[from[e]] = 1
+                changed = true
+            }
+            e += 1
+        }
+    }
+}
+
+// Маршрут только читает store.
+fn route_reads_only(r: Route) -> bool {
+    if !rw_done {
+        rw_analyze()
+    }
+    return r.fi < rw_writes.len() && rw_writes[r.fi] == 0
+}

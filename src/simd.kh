@@ -308,3 +308,116 @@ fn emit_cpu_avx2() {
     // pop rbx
     emit8(0x5B)
 }
+
+// ---- SHA-256 на инструкциях SHA-NI ----
+
+// __cpu_sha(): есть ли SHA-NI (cpuid 7: ebx бит 29) и SSSE3 + SSE4.1 (cpuid 1:
+// ecx биты 9 и 19), нужные для перестановок состояния.
+fn emit_cpu_sha() {
+    // push rbx; mov eax, 1; xor ecx, ecx; cpuid
+    emit_hex("53 B8 01 00 00 00 31 C9 0F A2")
+    // and ecx, (1 << 19) | (1 << 9); cmp ecx, то же
+    emit_hex("81 E1 00 02 08 00 81 F9 00 02 08 00")
+    let no = emit_jcc(CC_NE)
+    // mov eax, 7; xor ecx, ecx; cpuid; test ebx, 1 << 29
+    emit_hex("B8 07 00 00 00 31 C9 0F A2 F7 C3 00 00 00 20")
+    emit_setcc(CC_NE)
+    let done = emit_jmp()
+    patch_here(no)
+    emit_hex("31 C0")
+    patch_here(done)
+    emit8(0x5B)
+}
+
+// Инструкция над xmm-регистрами 0–7: префикс и код, затем ModRM «регистр-регистр».
+fn sse_rr(op: str, dst: int, src: int) {
+    emit_hex(op)
+    emit8(0xC0 + dst * 8 + src)
+}
+
+// То же с непосредственным байтом.
+fn sse_rri(op: str, dst: int, src: int, imm: int) {
+    sse_rr(op, dst, src)
+    emit8(imm)
+}
+
+// movdqu xmm, [base + disp] — base: 2 (rdx), 6 (rsi), 7 (rdi).
+fn sse_load(dst: int, base: int, disp: int) {
+    emit_hex("F3 0F 6F")
+    emit8(0x80 + dst * 8 + base)
+    emit32(disp)
+}
+
+fn sse_store(base: int, disp: int, src: int) {
+    emit_hex("F3 0F 7F")
+    emit8(0x80 + src * 8 + base)
+    emit32(disp)
+}
+
+// __simd_sha256(state, block, k): один 64-байтовый блок. rdi — состояние (8 слов
+// по 32 бита, a — первым), rsi — блок, rdx — 64 константы K по 32 бита и за ними
+// маска pshufb для перестановки байтов слова. Схема — как у Intel и в ядре Linux
+// (arch/x86/crypto/sha256_ni_asm.S): xmm1 = ABEF, xmm2 = CDGH, xmm0 — слова
+// сообщения плюс K, xmm3–xmm6 — расписание сообщения, xmm7 — маска, потом
+// временный. Исходное состояние на время раундов — в стеке.
+fn emit_sha256_ni() {
+    let movdqa = "66 0F 6F"
+    let pshufd = "66 0F 70"
+    let palignr = "66 0F 3A 0F"
+    let pblendw = "66 0F 3A 0E"
+    let pshufb = "66 0F 38 00"
+    let paddd = "66 0F FE"
+    let punpckhqdq = "66 0F 6D"
+    let rnds2 = "0F 38 CB"
+    let msg1 = "0F 38 CC"
+    let msg2 = "0F 38 CD"
+    // состояние: DCBA, HGFE → ABEF, CDGH
+    sse_load(1, 7, 0)
+    sse_load(2, 7, 16)
+    sse_rri(pshufd, 1, 1, 0xB1)
+    sse_rri(pshufd, 2, 2, 0x1B)
+    sse_rr(movdqa, 7, 1)
+    sse_rri(palignr, 1, 2, 8)
+    sse_rri(pblendw, 2, 7, 0xF0)
+    // sub rsp, 32; movdqu [rsp], xmm1; movdqu [rsp + 16], xmm2
+    emit_hex("48 83 EC 20 F3 0F 7F 0C 24 F3 0F 7F 54 24 10")
+    sse_load(7, 2, 256)
+    var i = 0
+    while i < 64 {
+        // m0..m3 — xmm3..xmm6 по кругу
+        let m0 = 3 + (i / 4) % 4
+        let m1 = 3 + (i / 4 + 1) % 4
+        let m3 = 3 + (i / 4 + 3) % 4
+        if i < 16 {
+            sse_load(m0, 6, i * 4)
+            sse_rr(pshufb, m0, 7)
+        }
+        sse_load(0, 2, i * 4)
+        sse_rr(paddd, 0, m0)
+        sse_rr(rnds2, 2, 1)
+        if i >= 12 && i < 60 {
+            sse_rr(movdqa, 7, m0)
+            sse_rri(palignr, 7, m3, 4)
+            sse_rr(paddd, m1, 7)
+            sse_rr(msg2, m1, m0)
+        }
+        sse_rr(punpckhqdq, 0, 0)
+        sse_rr(rnds2, 1, 2)
+        if i >= 4 && i < 52 {
+            sse_rr(msg1, m3, m0)
+        }
+        i += 4
+    }
+    // прибавить исходное состояние: movdqu xmm0, [rsp]; movdqu xmm7, [rsp + 16]
+    emit_hex("F3 0F 6F 04 24 F3 0F 6F 7C 24 10 48 83 C4 20")
+    sse_rr(paddd, 1, 0)
+    sse_rr(paddd, 2, 7)
+    // ABEF, CDGH → DCBA, HGFE
+    sse_rri(pshufd, 1, 1, 0x1B)
+    sse_rri(pshufd, 2, 2, 0xB1)
+    sse_rr(movdqa, 7, 1)
+    sse_rri(pblendw, 1, 2, 0xF0)
+    sse_rri(palignr, 2, 7, 8)
+    sse_store(7, 0, 1)
+    sse_store(7, 16, 2)
+}

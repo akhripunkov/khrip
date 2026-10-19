@@ -20,6 +20,8 @@ fn __entry(sp: int) {
 // ---- SIMD: 2 — AVX2, 1 — SSE2, 0 — побайтно (KHRIP_SIMD может понизить) ----
 
 var __simd_level: int
+// SHA-256 инструкциями процессора (SHA-NI); KHRIP_SIMD=0 выключает
+var __simd_sha: bool
 
 fn __simd_init() {
     var lvl = 1
@@ -33,6 +35,7 @@ fn __simd_init() {
         }
     }
     __simd_level = lvl
+    __simd_sha = lvl > 0 && __cpu_sha()
 }
 
 // Индекс первого байта b в [p, p + n) или n.
@@ -291,28 +294,87 @@ fn __mutex_unlock(m: int) {
     }
 }
 
-var __store_mutex: int
-// Сколько раз брали блокировку store: по нему видно, что store могли изменить.
+// Блокировка store: маршруты, которые store не меняют (так решил компилятор:
+// src/rw.kh), идут параллельно; остальные — по одному и без читателей.
+// Слова в __store_rw: [0] — мьютекс писателей, [8] — число читателей,
+// [16] — писатель ждёт или работает, [24] — сколько читателей спит.
+var __store_rw: int
+// Сколько раз store брали на запись: по нему видно, что store могли изменить.
 var __store_touches: int
+
+fn __store_rw_init() {
+    if __store_rw == 0 {
+        __store_rw = __mmap(64)
+    }
+}
+
+// Этот запрос только читает store.
+fn __store_shared() {
+    store64(__ctx() + CTX_STORE_MODE, 1)
+}
+
+fn __store_read_lock(rw: int) {
+    while true {
+        if load64(rw + 16) == 0 {
+            __xadd(rw + 8, 1)
+            if load64(rw + 16) == 0 {
+                return
+            }
+            // пришёл писатель: уступить ему
+            if __xadd(rw + 8, -1) == 1 {
+                syscall(SYS_FUTEX, rw + 8, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0)
+            }
+        }
+        __xadd(rw + 24, 1)
+        if load64(rw + 16) != 0 {
+            syscall(SYS_FUTEX, rw + 16, FUTEX_WAIT_PRIVATE, 1, 0, 0, 0)
+        }
+        __xadd(rw + 24, -1)
+    }
+}
 
 fn __store_lock() {
     let c = __ctx()
     if load64(c + CTX_STORE_HELD) != 0 {
         return
     }
-    if __store_mutex == 0 {
-        __store_mutex = __mmap(64)
+    __store_rw_init()
+    let rw = __store_rw
+    if load64(c + CTX_STORE_MODE) == 1 {
+        __store_read_lock(rw)
+        store64(c + CTX_STORE_HELD, 2)
+        return
     }
-    __mutex_lock(__store_mutex)
+    __mutex_lock(rw)
+    __xchg(rw + 16, 1)
+    while true {
+        let r = load64(rw + 8)
+        if r == 0 {
+            break
+        }
+        syscall(SYS_FUTEX, rw + 8, FUTEX_WAIT_PRIVATE, r, 0, 0, 0)
+    }
     store64(c + CTX_STORE_HELD, 1)
     __store_touches += 1
 }
 
 fn __store_unlock() {
     let c = __ctx()
-    if load64(c + CTX_STORE_HELD) == 0 {
+    let held = load64(c + CTX_STORE_HELD)
+    if held == 0 {
         return
     }
     store64(c + CTX_STORE_HELD, 0)
-    __mutex_unlock(__store_mutex)
+    let rw = __store_rw
+    if held == 2 {
+        if __xadd(rw + 8, -1) == 1 && load64(rw + 16) != 0 {
+            syscall(SYS_FUTEX, rw + 8, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0)
+        }
+        return
+    }
+    __xchg(rw + 16, 0)
+    if load64(rw + 24) != 0 {
+        syscall(SYS_FUTEX, rw + 16, FUTEX_WAKE_PRIVATE, 0x7FFFFFFF, 0, 0, 0)
+    }
+    __mutex_unlock(rw)
 }

@@ -29,7 +29,7 @@ route GET "/polls/{id}" (id: int) -> Poll | 404 {
 }
 
 route GET "/polls" (open: bool?) -> [Poll] {
-    return polls.values().filter(p => open == none || p.closed != open).sort_by(p => p.id)
+    return polls.values().filter(p => open == none || p.closed != open)
 }
 
 route POST "/polls/{id}/votes" (id: int, body: Vote) -> Poll | 400 str | 401 | 403 | 404 | 409 str {

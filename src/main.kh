@@ -185,6 +185,7 @@ fn main() -> int {
     var check_only = false
     var run = false
     var sizes = false
+    var locks = false
     var i = 1
     while i < argv.len() {
         let a = argv[i]
@@ -206,6 +207,8 @@ fn main() -> int {
             test_mode = true
         } else if a == "--sizes" {
             sizes = true
+        } else if a == "--locks" {
+            locks = true
         } else if a == "--version" {
             print("khc " + version())
             return 0
@@ -255,6 +258,16 @@ fn main() -> int {
     prescan(2)
     api_mode = routes.len() > 0 || tests.len() > 0 || everies.len() > 0 || test_mode
     check_api()
+    if locks {
+        // как маршруты берут блокировку store: read — параллельно с другими
+        for r in routes {
+            var mode = "write"
+            if route_reads_only(r) {
+                mode = "read"
+            }
+            print(r.method + " " + r.path + ": " + mode)
+        }
+    }
     if api_libs {
         add_generated(gen_api_source())
     }

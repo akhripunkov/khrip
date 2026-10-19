@@ -1190,6 +1190,9 @@ fn gen_enum_param(b: Buf, v: str, t: int, text: str, lit: str) {
 
 fn gen_route_call(b: Buf, r: Route, ri: int) {
     buf_add(b, "        if __m == " + src_lit(r.method) + " \{\n")
+    if route_reads_only(r) {
+        buf_add(b, "            __store_shared()\n")
+    }
     let ps = funcs[r.fi].params
     for i in 0..ps.len() {
         gen_param(b, r, i)

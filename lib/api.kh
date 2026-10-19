@@ -1250,6 +1250,7 @@ fn __serve_one(w: __Worker, req: __Req) {
     buf_clear(w.body)
     buf_clear(w.extra)
     w.cur = __cast(req)
+    store64(c + CTX_STORE_MODE, 0)
     if __setjmp(w.jb) == 0 {
         store64(c + CTX_CATCH, w.jb)
         __dispatch(req)
@@ -1275,6 +1276,7 @@ fn __serve_one(w: __Worker, req: __Req) {
     }
     store64(c + CTX_CATCH, prev)
     __store_unlock()
+    store64(c + CTX_STORE_MODE, 0)
     w.cur = 0
 }
 
@@ -1287,6 +1289,7 @@ var __test_log: str
 
 fn __tests_init() {
     __store_init()
+    __store_rw_init()
     __arena_init(0)
     let w = __worker_init()
     w.testing = true

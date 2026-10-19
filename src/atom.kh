@@ -922,7 +922,7 @@ fn builtin_args(n: int, at: Token, name: str) -> int {
 // Встроенные функции. → тип или -1, если это не встроенная.
 fn parse_builtin(t: Token, w: int) -> int {
     let name = t.text
-    if name == "load8" || name == "load64" {
+    if name == "load8" || name == "load32" || name == "load64" {
         advance()
         builtin_args(1, t, name)
         emit_pop(RAX)
@@ -930,18 +930,26 @@ fn parse_builtin(t: Token, w: int) -> int {
             emit8(0x0F)
             emit8(0xB6)
             emit8(0x00)
+        } else if name == "load32" {
+            // mov eax, [rax] (старшие 32 бита — нули)
+            emit8(0x8B)
+            emit8(0x00)
         } else {
             emit_load(RAX, RAX, 0)
         }
         return ty_int
     }
-    if name == "store8" || name == "store64" {
+    if name == "store8" || name == "store32" || name == "store64" {
         advance()
         builtin_args(2, t, name)
         emit_pop(RCX)
         emit_pop(RAX)
         if name == "store8" {
             emit8(0x88)
+            emit8(0x08)
+        } else if name == "store32" {
+            // mov [rax], ecx
+            emit8(0x89)
             emit8(0x08)
         } else {
             emit_store(RAX, 0, RCX)
@@ -1037,7 +1045,7 @@ fn parse_builtin(t: Token, w: int) -> int {
         emit_call(rt_func("__json_decode"))
         return ty_opt(inner)
     }
-    let lib_only = name == "__fsqrt" || name.starts_with("__simd_") || name == "__cpu_avx2" || name == "__spawn" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset"
+    let lib_only = name == "__fsqrt" || name.starts_with("__simd_") || name == "__cpu_avx2" || name == "__cpu_sha" || name == "__spawn" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset"
     if lib_only && !files[t.file].is_lib {
         return -1
     }
@@ -1102,6 +1110,21 @@ fn parse_builtin(t: Token, w: int) -> int {
             emit_simd_find_crlf2()
         }
         return ty_int
+    }
+    if name == "__cpu_sha" {
+        advance()
+        expect_tok(')')
+        emit_cpu_sha()
+        return ty_bool
+    }
+    if name == "__simd_sha256" {
+        advance()
+        builtin_args(3, t, name)
+        emit_pop(RDX)
+        emit_pop(RSI)
+        emit_pop(RDI)
+        emit_sha256_ni()
+        return ty_void
     }
     if name == "__cpu_avx2" {
         advance()

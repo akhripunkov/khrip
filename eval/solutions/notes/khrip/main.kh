@@ -61,7 +61,7 @@ route POST "/notes" (body: NewNote) -> 201 Note | 400 str {
 
 route GET "/notes" -> [Note] {
     let user = current_user()
-    return notes.values().filter(n => owners[n.id] == user).sort_by(n => n.id)
+    return notes.values().filter(n => owners[n.id] == user)
 }
 
 route GET "/notes/{id}" (id: int) -> Note | 404 {

@@ -131,7 +131,8 @@ Any function is also a method of its first argument: `p.describe()`.
 - lambdas `x => expr` in list methods: `map filter find` (T?) `any all count
   sort_by` (int, float or str key; stable, in place, returns the list); they see
   local variables: `users.filter(u => u.age >= min).map(u => u.name)`
-- `map[K, V]`: `len has get remove keys values clear`, `m[k]` (V?), `m[k] = v`
+- `map[K, V]`: `len has get remove keys values clear`, `m[k]` (V?), `m[k] = v`;
+  keys and values come in insertion order
 
 Functions: `print(s)`, `eprint(s)`, `write(s)`, `args()`, `env(name) -> str?`,
 `read_file(path) -> str?`, `write_file(path, text, executable) -> bool`,
@@ -199,7 +200,7 @@ route DELETE "/users/{id}" (id: int) -> 204 | 404 {
   ends the request from any function: `let key = header("X-API-Key") else {
   fail(401) }`.
 - `store name: T` outlives requests; handlers see it as if requests ran one at a
-  time (no locks needed).
+  time (no locks needed); routes that only read it run in parallel.
 
 ## Calling other services, background tasks
 
@@ -216,7 +217,7 @@ every 10 min {
 `fetch METHOD url [body] [headers map]` returns `Response { status, body,
 headers }` (names lower case); `status` 0 means unreachable (`body` says why). A
 body value is sent as JSON, a str as text; https uses `curl`. During `fetch`
-other requests may change store. `every N ms|s|min|h|d` runs a block in a
+and password hashing other requests may change store. `every N ms|s|min|h|d` runs a block in a
 background thread. `KHRIP_DATA=file.json` keeps store across restarts.
 
 ## Tests

@@ -82,5 +82,5 @@ route POST "/orders/{id}/cancel" (id: int) -> Order | 404 | 409 str {
 }
 
 route GET "/orders" (status: Status?) -> [Order] {
-    return orders.values().filter(o => status == none || o.status == status).sort_by(o => o.id)
+    return orders.values().filter(o => status == none || o.status == status)
 }

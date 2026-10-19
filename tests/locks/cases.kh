@@ -1,0 +1,137 @@
+// Какие маршруты берут разделяемую блокировку store (read). Ошибка в сторону
+// read — гонка данных, поэтому сомнительное должно быть write.
+
+type Item { id: int, name: str, tags: [str] }
+
+store items: map[int, Item]
+store log: [str]
+store counter: int
+
+fn touch(i: Item) {
+    i.name = "x"
+}
+
+fn names() -> [str] {
+    return items.values().map(i => i.name)
+}
+
+fn bump() {
+    counter += 1
+}
+
+fn indirect() {
+    bump()
+}
+
+route GET "/plain" -> [Item] {
+    return items.values()
+}
+
+route GET "/fresh-sort" -> [Item] {
+    let xs = items.values().filter(i => i.id > 0)
+    xs.sort_by(i => i.name)
+    return xs.reverse()
+}
+
+route GET "/fresh-var" -> [int] {
+    var out: [int] = []
+    for i in items.values() {
+        out.push(i.id)
+    }
+    out[0] = 1
+    return out
+}
+
+route GET "/slice" -> [str] {
+    let s = log[0..2]
+    s.push("a")
+    return s
+}
+
+route GET "/helper-read" -> [str] {
+    return names()
+}
+
+route GET "/assign-local" -> int {
+    var n = 0
+    n += items.len()
+    return n
+}
+
+route GET "/alias" -> [str] {
+    let xs = log
+    xs.push("leak")
+    return xs
+}
+
+route GET "/field" -> int {
+    let i = items[1] else {
+        return 404
+    }
+    i.name = "changed"
+    return 1
+}
+
+route GET "/nested" -> int {
+    let xs = items.values()
+    xs[0].tags.push("t")
+    return 1
+}
+
+route GET "/elem-field" -> int {
+    let xs = items.values()
+    xs[0].name = "n"
+    return 1
+}
+
+route GET "/loop-var" -> int {
+    for i in items.values() {
+        i.tags.clear()
+    }
+    return 1
+}
+
+route GET "/lambda" -> [Item] {
+    return items.values().filter(i => i.tags.pop() != "")
+}
+
+route GET "/calls-writer" -> int {
+    touch(Item { id: 1, name: "a", tags: [] })
+    return 1
+}
+
+route GET "/indirect" -> int {
+    indirect()
+    return counter
+}
+
+route GET "/method-writer" -> int {
+    let i = items[1] else {
+        return 404
+    }
+    i.touch()
+    return 1
+}
+
+route GET "/store-assign" -> int {
+    counter = 5
+    return counter
+}
+
+route GET "/map-remove" -> int {
+    items.remove(1)
+    return 1
+}
+
+route GET "/user-fn-result" -> [str] {
+    let xs = names()
+    xs.push("z")
+    return xs
+}
+
+route GET "/if-let" -> int {
+    if let i = items[1] {
+        i.tags.push("q")
+    }
+    return 1
+}

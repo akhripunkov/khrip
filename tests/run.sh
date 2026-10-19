@@ -6,6 +6,7 @@
 #                       содержать каждую строку «// expect: ...»; ключи
 #                       компилятора — из «// flags: ...»;
 #   tests/api/*.kh    — блоки test (khc test); вывод сравнивается с .out;
+#   tests/locks/*.kh  — какие маршруты берут store на чтение (khc check --locks);
 #   tests/http.sh     — HTTP-сервер на Khrip отвечает правильно;
 #   tests/weather.sh  — погодный бэкенд: fetch, every, сохранение store;
 #   eval/solutions/*/khrip — решения задач проверки проходят eval/run.sh.
@@ -69,6 +70,18 @@ for src in tests/api/*.kh; do
 	"$KHC" test "$src" >"$tmp/$name.out" 2>&1
 	if ! diff -u "tests/api/$name.out" "$tmp/$name.out" >"$tmp/$name.diff"; then
 		failed "$src" "вывод тестов отличается от ожидаемого"
+		cat "$tmp/$name.diff"
+		continue
+	fi
+	pass=$((pass + 1))
+done
+
+# Какие маршруты читают store параллельно: вывод khc check --locks.
+for src in tests/locks/*.kh; do
+	name=$(basename "$src" .kh)
+	"$KHC" check --locks "$src" >"$tmp/$name.locks" 2>&1
+	if ! diff -u "tests/locks/$name.out" "$tmp/$name.locks" >"$tmp/$name.diff"; then
+		failed "$src" "блокировки маршрутов отличаются от ожидаемых"
 		cat "$tmp/$name.diff"
 		continue
 	fi

@@ -64,7 +64,6 @@ route GET "/products" (q: str = "", category: str?, tag: str?, min_price: float?
         .filter(p => tag == none || p.tags.contains(tag))
         .filter(p => min_price == none || p.price >= min_price)
         .filter(p => max_price == none || p.price <= max_price)
-        .sort_by(p => p.id)
     match sort ?? "" {
         "" => {}
         "price" => items.sort_by(p => p.price)

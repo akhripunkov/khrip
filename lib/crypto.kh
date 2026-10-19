@@ -2,7 +2,7 @@
 // Пароль хранится как «pbkdf2_sha256$итерации$соль$хеш» (соль — 16 случайных
 // байт); проверка сравнивает без раннего выхода.
 
-const PBKDF2_ITER = 20000
+const PBKDF2_ITER = 100000
 
 fn __hex_val(c: int) -> int {
     if c >= '0' && c <= '9' {
@@ -17,41 +17,49 @@ fn __hex_val(c: int) -> int {
     return -1
 }
 
+// Константы K (64 слова по 32 бита) и за ними маска pshufb для SHA-NI.
 fn __sha_kt() -> int {
     let hex = "428a2f98 71374491 b5c0fbcf e9b5dba5 3956c25b 59f111f1 923f82a4 ab1c5ed5 d807aa98 12835b01 243185be 550c7dc3 72be5d74 80deb1fe 9bdc06a7 c19bf174 e49b69c1 efbe4786 0fc19dc6 240ca1cc 2de92c6f 4a7484aa 5cb0a9dc 76f988da 983e5152 a831c66d b00327c8 bf597fc7 c6e00bf3 d5a79147 06ca6351 14292967 27b70a85 2e1b2138 4d2c6dfc 53380d13 650a7354 766a0abb 81c2c92e 92722c85 a2bfe8a1 a81a664b c24b8b70 c76c51a3 d192e819 d6990624 f40e3585 106aa070 19a4c116 1e376c08 2748774c 34b0bcb5 391c0cb3 4ed8aa4a 5b9cca4f 682e6ff3 748f82ee 78a5636f 84c87814 8cc70208 90befffa a4506ceb bef9a3f7 c67178f2"
-    let t = __alloc(512)
+    let t = __alloc(288)
     var n = 0
     var v = 0
     for c in hex {
         if c == ' ' {
-            store64(t + n * 8, v)
+            store32(t + n * 4, v)
             n += 1
             v = 0
         } else {
             v = v * 16 + __hex_val(c)
         }
     }
-    store64(t + n * 8, v)
+    store32(t + n * 4, v)
+    store64(t + 256, 0x0405060700010203)
+    store64(t + 264, 0x0c0d0e0f08090a0b)
     return t
 }
 
+// Состояние — 8 слов по 32 бита.
 fn __sha_init(st: int) {
-    store64(st, 0x6a09e667)
-    store64(st + 8, 0xbb67ae85)
-    store64(st + 16, 0x3c6ef372)
-    store64(st + 24, 0xa54ff53a)
-    store64(st + 32, 0x510e527f)
-    store64(st + 40, 0x9b05688c)
-    store64(st + 48, 0x1f83d9ab)
-    store64(st + 56, 0x5be0cd19)
+    store32(st, 0x6a09e667)
+    store32(st + 4, 0xbb67ae85)
+    store32(st + 8, 0x3c6ef372)
+    store32(st + 12, 0xa54ff53a)
+    store32(st + 16, 0x510e527f)
+    store32(st + 20, 0x9b05688c)
+    store32(st + 24, 0x1f83d9ab)
+    store32(st + 28, 0x5be0cd19)
 }
 
 fn __rotr(x: int, n: int) -> int {
     return ((x >> n) | (x << (32 - n))) & 0xFFFFFFFF
 }
 
-// Один 64-байтовый блок p в состояние st (8 слов); k — константы, w — 64 слова.
+// Один 64-байтовый блок p в состояние st; k — константы, w — 64 слова.
 fn __sha_block(st: int, p: int, k: int, w: int) {
+    if __simd_sha {
+        __simd_sha256(st, p, k)
+        return
+    }
     for t in 0..16 {
         let q = p + t * 4
         store64(w + t * 8, (load8(q) << 24) | (load8(q + 1) << 16) | (load8(q + 2) << 8) | load8(q + 3))
@@ -63,18 +71,18 @@ fn __sha_block(st: int, p: int, k: int, w: int) {
         let s1 = __rotr(y, 17) ^ __rotr(y, 19) ^ (y >> 10)
         store64(w + t * 8, (load64(w + (t - 16) * 8) + s0 + load64(w + (t - 7) * 8) + s1) & 0xFFFFFFFF)
     }
-    var a = load64(st)
-    var b = load64(st + 8)
-    var c = load64(st + 16)
-    var d = load64(st + 24)
-    var e = load64(st + 32)
-    var f = load64(st + 40)
-    var g = load64(st + 48)
-    var h = load64(st + 56)
+    var a = load32(st)
+    var b = load32(st + 4)
+    var c = load32(st + 8)
+    var d = load32(st + 12)
+    var e = load32(st + 16)
+    var f = load32(st + 20)
+    var g = load32(st + 24)
+    var h = load32(st + 28)
     for t in 0..64 {
         let s1 = __rotr(e, 6) ^ __rotr(e, 11) ^ __rotr(e, 25)
         let ch = (e & f) ^ ((e ^ 0xFFFFFFFF) & g)
-        let t1 = (h + s1 + ch + load64(k + t * 8) + load64(w + t * 8)) & 0xFFFFFFFF
+        let t1 = (h + s1 + ch + load32(k + t * 4) + load64(w + t * 8)) & 0xFFFFFFFF
         let s0 = __rotr(a, 2) ^ __rotr(a, 13) ^ __rotr(a, 22)
         let mj = (a & b) ^ (a & c) ^ (b & c)
         h = g
@@ -86,20 +94,20 @@ fn __sha_block(st: int, p: int, k: int, w: int) {
         b = a
         a = (t1 + s0 + mj) & 0xFFFFFFFF
     }
-    store64(st, (load64(st) + a) & 0xFFFFFFFF)
-    store64(st + 8, (load64(st + 8) + b) & 0xFFFFFFFF)
-    store64(st + 16, (load64(st + 16) + c) & 0xFFFFFFFF)
-    store64(st + 24, (load64(st + 24) + d) & 0xFFFFFFFF)
-    store64(st + 32, (load64(st + 32) + e) & 0xFFFFFFFF)
-    store64(st + 40, (load64(st + 40) + f) & 0xFFFFFFFF)
-    store64(st + 48, (load64(st + 48) + g) & 0xFFFFFFFF)
-    store64(st + 56, (load64(st + 56) + h) & 0xFFFFFFFF)
+    store32(st, load32(st) + a)
+    store32(st + 4, load32(st + 4) + b)
+    store32(st + 8, load32(st + 8) + c)
+    store32(st + 12, load32(st + 12) + d)
+    store32(st + 16, load32(st + 16) + e)
+    store32(st + 20, load32(st + 20) + f)
+    store32(st + 24, load32(st + 24) + g)
+    store32(st + 28, load32(st + 28) + h)
 }
 
 // Состояние → 32 байта (старшими вперёд).
 fn __sha_out(st: int, out: int) {
     for i in 0..8 {
-        let v = load64(st + i * 8)
+        let v = load32(st + i * 4)
         store8(out + i * 4, (v >> 24) & 255)
         store8(out + i * 4 + 1, (v >> 16) & 255)
         store8(out + i * 4 + 2, (v >> 8) & 255)
@@ -129,7 +137,7 @@ fn __sha_finish(st: int, p: int, n: int, total: int, k: int, w: int) {
 }
 
 fn __sha256(p: int, n: int, out: int) {
-    let st = __alloc(64)
+    let st = __alloc(32)
     let k = __sha_kt()
     let w = __alloc(512)
     __sha_init(st)
@@ -173,7 +181,7 @@ fn __hmac_state(key: int, klen: int, pad: int, k: int, w: int) -> int {
     for i in 0..64 {
         store8(blk + i, load8(blk + i) ^ pad)
     }
-    let st = __alloc(64)
+    let st = __alloc(32)
     __sha_init(st)
     __sha_block(st, blk, k, w)
     return st
@@ -181,33 +189,70 @@ fn __hmac_state(key: int, klen: int, pad: int, k: int, w: int) -> int {
 
 // HMAC короткого (до 55 байт) сообщения по готовым состояниям ist и ost.
 fn __hmac_short(ist: int, ost: int, msg: int, mlen: int, out: int, k: int, w: int, st: int) {
-    __memcpy(st, ist, 64)
+    __memcpy(st, ist, 32)
     __sha_finish(st, msg, mlen, 64 + mlen, k, w)
     let inner = __alloc(32)
     __sha_out(st, inner)
-    __memcpy(st, ost, 64)
+    __memcpy(st, ost, 32)
     __sha_finish(st, inner, 32, 96, k, w)
     __sha_out(st, out)
 }
 
-// PBKDF2-HMAC-SHA256, 32 байта результата.
+// Состояние → 32 байта digest в out (слова старшими байтами вперёд).
+fn __sha_put(st: int, out: int) {
+    for i in 0..8 {
+        let v = load32(st + i * 4)
+        store32(out + i * 4, ((v >> 24) & 0xFF) | ((v >> 8) & 0xFF00) | ((v << 8) & 0xFF0000) | ((v << 24) & 0xFF000000))
+    }
+}
+
+// Блок для хеша 32 байт после блока ключа: [32 байта | 0x80 | нули | длина 768 бит].
+fn __hmac32_block() -> int {
+    let b = __alloc(64)
+    __memset(b, 0, 64)
+    store8(b + 32, 0x80)
+    store8(b + 62, 0x03)
+    return b
+}
+
+// PBKDF2-HMAC-SHA256, 32 байта результата. Каждая итерация — два сжатия
+// по готовым блокам, без выделения памяти.
 fn __pbkdf2(pw: str, salt: int, slen: int, iter: int, out: int) {
     let k = __sha_kt()
     let w = __alloc(512)
-    let st = __alloc(64)
+    let st = __alloc(32)
     let ist = __hmac_state(__str_ptr(pw), pw.len(), 0x36, k, w)
     let ost = __hmac_state(__str_ptr(pw), pw.len(), 0x5c, k, w)
     let msg = __alloc(64)
     __memcpy(msg, salt, slen)
-    store8(msg + slen + 3, 1)
-    let u = __alloc(32)
-    __hmac_short(ist, ost, msg, slen + 4, u, k, w, st)
-    __memcpy(out, u, 32)
-    for i in 1..iter {
-        __hmac_short(ist, ost, u, 32, u, k, w, st)
-        for j in 0..32 {
-            store8(out + j, load8(out + j) ^ load8(u + j))
+    store32(msg + slen, 0x01000000)
+    let ib = __hmac32_block()
+    let ob = __hmac32_block()
+    __hmac_short(ist, ost, msg, slen + 4, ib, k, w, st)
+    __memcpy(out, ib, 32)
+    for _ in 1..iter {
+        __memcpy(st, ist, 32)
+        __sha_block(st, ib, k, w)
+        __sha_put(st, ob)
+        __memcpy(st, ost, 32)
+        __sha_block(st, ob, k, w)
+        __sha_put(st, ib)
+        for j in 0..4 {
+            store64(out + j * 8, load64(out + j * 8) ^ load64(ib + j * 8))
         }
+    }
+}
+
+// PBKDF2 считается без блокировки store, как fetch ждёт сеть: медленная
+// проверка пароля не задерживает остальные запросы.
+fn __pbkdf2_unlocked(pw: str, salt: int, slen: int, iter: int, out: int) {
+    let held = load64(__ctx() + CTX_STORE_HELD) != 0
+    if held {
+        __store_unlock()
+    }
+    __pbkdf2(pw, salt, slen, iter, out)
+    if held {
+        __store_lock()
     }
 }
 
@@ -224,7 +269,7 @@ fn hash_password(password: str) -> str {
     let salt = __alloc(16)
     __random_bytes(salt, 16)
     let dk = __alloc(32)
-    __pbkdf2(password, salt, 16, PBKDF2_ITER, dk)
+    __pbkdf2_unlocked(password, salt, 16, PBKDF2_ITER, dk)
     return "pbkdf2_sha256$" + PBKDF2_ITER.to_str() + "$" + __hex_bytes(salt, 16) + "$" + __hex_bytes(dk, 32)
 }
 
@@ -240,7 +285,7 @@ fn check_password(password: str, stored: str) -> bool {
     let salt = __alloc(32)
     let slen = __unhex(parts[2], salt)
     let dk = __alloc(32)
-    __pbkdf2(password, salt, slen, iter, dk)
+    __pbkdf2_unlocked(password, salt, slen, iter, dk)
     let got = __hex_bytes(dk, 32)
     if got.len() != parts[3].len() {
         return false

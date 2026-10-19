@@ -53,6 +53,8 @@ const CTX_CATCH = 88
 const CTX_PANIC = 96
 // HTTP-сервер потока
 const CTX_SERVER = 104
+// 1 — запрос только читает store (так решил компилятор): блокировка разделяемая
+const CTX_STORE_MODE = 112
 const CTX_SIZE = 256
 
 const CHUNK = 1048576
@@ -370,8 +372,16 @@ fn __str_cmp(a: str, b: str) -> int {
     let bn = __str_len(b)
     let ap = __str_ptr(a)
     let bp = __str_ptr(b)
+    var n = an
+    if bn < n {
+        n = bn
+    }
+    // равные куски по 8 байт пропускаются целиком
     var i = 0
-    while i < an && i < bn {
+    while i + 8 <= n && load64(ap + i) == load64(bp + i) {
+        i += 8
+    }
+    while i < n {
         let d = load8(ap + i) - load8(bp + i)
         if d != 0 {
             return d
@@ -422,9 +432,18 @@ fn __str_find_from(self: str, sub: str, from: int) -> int {
     let m = __str_len(sub)
     let p = __str_ptr(self)
     let q = __str_ptr(sub)
+    if m == 0 {
+        if from <= n {
+            return from
+        }
+        return -1
+    }
+    // сравнение целиком — только там, где совпал первый байт
+    let first = load8(q)
     var i = from
-    while i + m <= n {
-        if __memeq(p + i, q, m) {
+    let last = n - m
+    while i <= last {
+        if load8(p + i) == first && __memeq(p + i + 1, q + 1, m - 1) {
             return i
         }
         i += 1
@@ -472,15 +491,32 @@ fn __str_trim(self: str) -> str {
     return __str_new(p + a, b - a)
 }
 
-fn __str_lower(self: str) -> str {
+// Смена регистра ASCII по 4 байта за шаг (SWAR): в каждой половине слова
+// старший бит байта в m отмечает буквы from..from+25; m >> 2 — это 0x20 в тех же
+// байтах. Половины по 32 бита — чтобы сложение не переполняло int.
+fn __case4(v: int, below: int, past: int) -> int {
+    let h = v & 0x7F7F7F7F
+    return ((h + below) & ~(h + past) & ~v & 0x80808080) >> 2
+}
+
+// Копия [src, src + n) в новую строку; буквы в диапазоне [lo, lo + 25] меняют
+// регистр (xor 0x20). below = 0x80 - lo, past = 0x80 - lo - 26 в каждом байте.
+fn __str_case(self: str, lo: int, below: int, past: int) -> str {
     let n = __str_len(self)
     let src = __str_ptr(self)
     let p = __alloc(n + 1)
     var i = 0
+    while i + 8 <= n {
+        let x = load64(src + i)
+        let a = x & 0xFFFFFFFF
+        let b = (x >> 32) & 0xFFFFFFFF
+        store64(p + i, x ^ (__case4(a, below, past) | (__case4(b, below, past) << 32)))
+        i += 8
+    }
     while i < n {
         var c = load8(src + i)
-        if c >= 'A' && c <= 'Z' {
-            c += 32
+        if c >= lo && c < lo + 26 {
+            c = c ^ 32
         }
         store8(p + i, c)
         i += 1
@@ -488,20 +524,12 @@ fn __str_lower(self: str) -> str {
     return __str_new(p, n)
 }
 
+fn __str_lower(self: str) -> str {
+    return __str_case(self, 'A', 0x3F3F3F3F, 0x25252525)
+}
+
 fn __str_upper(self: str) -> str {
-    let n = __str_len(self)
-    let src = __str_ptr(self)
-    let p = __alloc(n + 1)
-    var i = 0
-    while i < n {
-        var c = load8(src + i)
-        if c >= 'a' && c <= 'z' {
-            c -= 32
-        }
-        store8(p + i, c)
-        i += 1
-    }
-    return __str_new(p, n)
+    return __str_case(self, 'a', 0x1F1F1F1F, 0x05050505)
 }
 
 fn __str_split(self: str, sep: str) -> [str] {

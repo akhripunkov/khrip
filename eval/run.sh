@@ -6,7 +6,7 @@
 # Папка по умолчанию — eval/solutions/<задача>/<язык>. Сервер слушает порт 8080.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
-root=$(cd "$here/.." && pwd)
+. "$here/server.sh"
 task=$1
 lang=$2
 dir=$(cd "${3:-$here/solutions/$task/$lang}" && pwd) || exit 2
@@ -14,40 +14,16 @@ tmp=$(mktemp -d)
 pid=
 trap '[[ -n $pid ]] && kill $pid 2>/dev/null; wait 2>/dev/null; rm -rf "$tmp"' EXIT
 
-if curl -s -o /dev/null --max-time 1 http://127.0.0.1:8080/; then
+if port_busy; then
 	echo "порт 8080 уже занят" >&2
 	exit 2
 fi
-export WINDOW_SECONDS=2 ASPNETCORE_URLS=http://127.0.0.1:8080
-case $lang in
-khrip)
-	"$root/build/khc" -o "$tmp/server" "$dir/main.kh" || exit 2
-	"$tmp/server" 2>"$tmp/log" &
-	;;
-go)
-	(cd "$dir" && go build -o "$tmp/server" .) || exit 2
-	"$tmp/server" &
-	;;
-csharp)
-	dotnet build "$dir" -c Release -o "$tmp/cs" --nologo -v q >/dev/null || exit 2
-	name=$(basename "$(ls "$dir"/*.csproj)" .csproj)
-	dotnet "$tmp/cs/$name.dll" >/dev/null &
-	;;
-python)
-	(cd "$dir" && exec python3 -m uvicorn main:app --port 8080 --log-level error) &
-	;;
-*)
-	(cd "$dir" && exec bash -c "$START") &
-	;;
-esac
-pid=$!
-for _ in $(seq 600); do
-	curl -s -o /dev/null --max-time 1 http://127.0.0.1:8080/ && break
-	kill -0 $pid 2>/dev/null || {
-		echo "сервер завершился при запуске" >&2
-		exit 2
-	}
-	sleep 0.05
-done
+export WINDOW_SECONDS=2
+build_solution "$lang" "$dir" "$tmp" || exit 2
+start_solution "$lang" "$dir" "$tmp"
+wait_up || {
+	echo "сервер не запустился" >&2
+	exit 2
+}
 echo "== $task / $lang"
 bash "$here/tasks/$task/check.sh"
