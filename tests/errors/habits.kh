@@ -1,0 +1,10 @@
+// expect: hint: use .len()
+// expect: hint: Khrip uses && || ! instead of and, or, not
+// expect: 2 errors
+fn main() {
+    let xs = [1, 2]
+    let n = xs.Count
+    if n > 1 and n < 5 {
+        print("ok")
+    }
+}

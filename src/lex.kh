@@ -342,13 +342,31 @@ fn add_strlit(s: str) -> int {
 }
 
 // Позиция закрывающей } выражения внутри строки (начало — сразу после {).
+// Внутри выражения могут быть свои строки: "{m["a"]}".
 fn interp_end(from: int, end: int) -> int {
     var depth = 0
     var i = from
     while i < end {
         let c = lx_text[i]
-        if c == '"' || c == '\n' {
+        if c == '\n' {
             return -1
+        }
+        if c == '"' {
+            i += 1
+            while i < end && lx_text[i] != '"' {
+                if lx_text[i] == '\n' {
+                    return -1
+                }
+                if lx_text[i] == '\\' {
+                    i += 1
+                }
+                i += 1
+            }
+            if i >= end {
+                return -1
+            }
+            i += 1
+            continue
         }
         if c == '\{' {
             depth += 1

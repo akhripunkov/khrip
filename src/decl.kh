@@ -117,8 +117,13 @@ fn expect_tok(k: int) -> bool {
         return true
     }
     var hint = ""
+    let found = tok().text
     if k == '{' && kind() == ':' {
         hint = "Khrip blocks use braces, not a colon"
+    } else if found == "and" || found == "or" || found == "not" {
+        hint = "Khrip uses && || ! instead of and, or, not"
+    } else if found == "then" || found == "do" {
+        hint = "write the block in braces: if x \{ ... }"
     }
     syntax_error(tok(), "expected " + tok_desc(k) + ", found " + tok_show(tok()), hint)
     return false

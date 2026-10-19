@@ -502,8 +502,8 @@ fn field_load(t: int, nt: Token) -> int {
         return ty_err
     }
     if tkind(t) != K_STRUCT {
-        var hint = ""
-        if nt.text == "length" || nt.text == "size" || nt.text == "len" || nt.text == "count" {
+        var hint = method_hint(nt.text)
+        if nt.text == "len" {
             hint = "use .len()"
         }
         error_tok(nt, ty_name(t) + " has no field '" + nt.text + "'", hint)

@@ -1,0 +1,54 @@
+// exit: 3
+// Методы строк, чисел, списков и словарей; строки внутри {...} в интерполяции.
+fn main() {
+    let s = "  Hello, World  "
+    let t = s.trim()
+    print(t.lower() + "|" + t.upper() + "|" + t.replace("World", "Khrip"))
+    let parts = "a,b,c".split(",")
+    print(parts.join("-") + " {parts.len()} {len(parts)}")
+    let pos = t.find("World") ?? -1
+    print("{pos} {t.starts_with("He")} {t.ends_with("ld")} {t.contains(", ")} {parts[1]}")
+    let num = "42".to_int() ?? 0
+    let bad = "4x".to_int() ?? -1
+    let neg = -7
+    print("{num} {bad} {neg.abs()} {num.min(9)} {num.max(99)} {num.to_str().len()}")
+    let less = "ab" < "b"
+    print("{t[0]} {t[0] == 'H'} {t[1..5]} {less}")
+    var count = 0
+    for c in "banana" {
+        if c == 'a' {
+            count += 1
+        }
+    }
+    print("a: {count}")
+    var zeros = [0] * 5
+    zeros[2] = 7
+    zeros.insert(0, 9)
+    let removed = zeros.remove_at(1)
+    let last = zeros.pop()
+    print("{zeros.len()} {removed} {last} {zeros.index_of(7) ?? -1}")
+    var m: map[int, str] = {}
+    m[1] = "one"
+    m[2] = "two"
+    if let v = m.get(2) {
+        print("got " + v)
+    }
+    let gone = m.remove(1) ?? "?"
+    print(gone + " {m.keys().len()} " + m.values().join(","))
+    var i = 0
+    while true {
+        i += 1
+        if i > 3 {
+            break
+        }
+    }
+    print("i {i} args {args().len()} home {env("NO_SUCH_VAR") ?? "unset"}")
+    let text = read_file("tests/run/stdlib.kh") ?? ""
+    print("read {text.len() > 0}")
+    let words = ["pear", "apple"]
+    var ws = words.copy()
+    ws.sort()
+    ws.reverse()
+    print(ws.join(" ") + " " + "ab".repeat(3))
+    exit(3)
+}
