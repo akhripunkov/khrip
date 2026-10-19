@@ -29,7 +29,7 @@ JSON_BODY='{"message":"Hello, World!"}'
 
 build_khrip() {
 	(cd .. && ./build.sh >/dev/null &&
-		build/khc -o "bench/$BUILD/khrip/server" lib/std.kh lib/net.kh lib/json.kh lib/http.kh bench/khrip/server.kh)
+		build/khc -o "bench/$BUILD/khrip/server" bench/khrip/server.kh)
 }
 build_go()         { (cd go && go build -o "../$BUILD/go/server" .); }
 build_csharp()     { dotnet publish csharp -c Release -o "$BUILD/csharp" --nologo -v q >/dev/null; }
@@ -46,7 +46,7 @@ size_go()         { stat -c %s "$BUILD/go/server"; }
 size_csharp()     { du -sb --exclude='*.pdb' "$BUILD/csharp" | cut -f1; }
 size_csharp_aot() { stat -c %s "$BUILD/csharp-aot/Api"; }
 
-title_khrip()      { echo "Khrip v0.2 (1 поток)"; }
+title_khrip()      { echo "Khrip v0.4 (1 поток)"; }
 title_go()         { echo "Go 1.24 net/http"; }
 title_csharp()     { echo "C# .NET 10 ASP.NET Core (JIT)*"; }
 title_csharp_aot() { echo "C# .NET 10 ASP.NET Core (Native AOT)"; }

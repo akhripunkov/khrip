@@ -1,158 +1,127 @@
-// HTTP/1.1-сервер на epoll: один поток, неблокирующие сокеты, keep-alive,
-// конвейерные запросы. Нужны lib/std.kh и lib/net.kh.
-//
-// Приложение определяет обработчик
-//
-//     fn handle(req: i64) { ... }
-//
-// и отвечает из него через respond / respond_text. Если обработчик не ответил,
-// клиент получает 404. Запускается сервер вызовом http_serve(port).
-//
-// Это временный интерфейс шага v0.2: позже его заменят объявления route.
+// HTTP/1.1-сервер на epoll: неблокирующие сокеты, keep-alive, конвейерные
+// запросы, тело по Content-Length. Каждый рабочий поток — свой epoll, свой
+// слушающий сокет (SO_REUSEPORT), свои соединения и своя арена запроса.
+// Маршрутизатор __dispatch генерирует компилятор из объявлений route.
 
-const HTTP_IN_SIZE = 16384
+const SYS_RT_SIGACTION = 13
+const SYS_SOCKET = 41
+const SYS_ACCEPT4 = 288
+const SYS_BIND = 49
+const SYS_LISTEN = 50
+const SYS_SETSOCKOPT = 54
+const SYS_TIME = 201
+const SYS_EPOLL_WAIT = 232
+const SYS_EPOLL_CTL = 233
+const SYS_EPOLL_CREATE1 = 291
+
+const AF_INET = 2
+const SOCK_STREAM = 1
+const SOCK_NONBLOCK = 0x800
+const SOL_SOCKET = 1
+const SO_REUSEADDR = 2
+const SO_REUSEPORT = 15
+const IPPROTO_TCP = 6
+const TCP_NODELAY = 1
+const SIGPIPE = 13
+const EAGAIN = 11
+
+const EPOLL_CTL_ADD = 1
+const EPOLL_CTL_MOD = 3
+const EPOLLIN = 1
+const EPOLLOUT = 4
+const EPOLLERR = 8
+const EPOLLHUP = 16
+const EPOLL_EVENT_SIZE = 12
+
+const HTTP_IN_SIZE = 65536
 const HTTP_OUT_SIZE = 65536
-const HTTP_SCRATCH_SIZE = 65536
 const HTTP_MAX_FD = 65536
 const HTTP_MAX_EVENTS = 512
 const HTTP_DATE_LEN = 29
 
-// Соединение
-const CONN_IN = 0
-const CONN_IN_LEN = 8
-const CONN_OUT = 16
-const CONN_SENT = 24
-const CONN_CLOSE = 32
-const CONN_WAIT_OUT = 40
-const CONN_SIZE = 48
-
-// Запрос, который получает обработчик
-const REQ_METHOD = 0
-const REQ_METHOD_LEN = 8
-const REQ_PATH = 16
-const REQ_PATH_LEN = 24
-const REQ_QUERY = 32
-const REQ_QUERY_LEN = 40
-const REQ_BODY = 48
-const REQ_BODY_LEN = 56
-const REQ_SCRATCH = 64
-const REQ_OUT = 72
-const REQ_DONE = 80
-const REQ_CLOSE = 88
-const REQ_SIZE = 96
-
-var http_ep: i64
-var http_conns: i64
-var http_events: i64
-var http_req: i64
-var http_date: i64
-var http_date_sec: i64
-
-// ---- Интерфейс для обработчиков ----
-
-fn req_method_is(req: i64, method: i64) -> i64 {
-    return mem_eq(load64(req + REQ_METHOD), load64(req + REQ_METHOD_LEN), method, strlen(method))
+type __Conn {
+    inp: int
+    in_len: int
+    out: int
+    out_len: int
+    out_cap: int
+    sent: int
+    close: bool
+    wait_out: bool
 }
 
-fn req_path_is(req: i64, path: i64) -> i64 {
-    return mem_eq(load64(req + REQ_PATH), load64(req + REQ_PATH_LEN), path, strlen(path))
+// Состояние сервера в потоке.
+type __Server {
+    ep: int
+    lfd: int
+    conns: int
+    events: int
+    date: int
+    date_sec: int
+    tmp: int
+    w: __Worker
 }
 
-fn req_is(req: i64, method: i64, path: i64) -> i64 {
-    return req_path_is(req, path) && req_method_is(req, method)
+var __http_port: int
+
+fn __srv() -> __Server {
+    return __cast(load64(__ctx() + CTX_SERVER))
 }
 
-fn req_body(req: i64) -> i64 {
-    return load64(req + REQ_BODY)
+// ---- Сокеты ----
+
+fn __setsockopt(tmp: int, fd: int, level: int, opt: int, value: int) {
+    store64(tmp, value)
+    syscall(SYS_SETSOCKOPT, fd, level, opt, tmp, 4)
 }
 
-fn req_body_len(req: i64) -> i64 {
-    return load64(req + REQ_BODY_LEN)
+fn __ignore_sigpipe() {
+    let act = __alloc(32)
+    store64(act, 1)
+    syscall(SYS_RT_SIGACTION, SIGPIPE, act, 0, 8)
 }
 
-// Буфер для сборки тела ответа; очищается перед каждым запросом.
-fn req_scratch(req: i64) -> i64 {
-    return load64(req + REQ_SCRATCH)
+// Неблокирующий слушающий сокет на 0.0.0.0:port → дескриптор или код ошибки.
+fn __tcp_listen(tmp: int, port: int) -> int {
+    let fd = syscall(SYS_SOCKET, AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)
+    if fd < 0 {
+        return fd
+    }
+    __setsockopt(tmp, fd, SOL_SOCKET, SO_REUSEADDR, 1)
+    __setsockopt(tmp, fd, SOL_SOCKET, SO_REUSEPORT, 1)
+    let addr = tmp + 16
+    store64(addr, 0)
+    store64(addr + 8, 0)
+    store8(addr, AF_INET)
+    store8(addr + 2, (port >> 8) & 255)
+    store8(addr + 3, port & 255)
+    let r = syscall(SYS_BIND, fd, addr, 16)
+    if r < 0 {
+        return r
+    }
+    let l = syscall(SYS_LISTEN, fd, 4096)
+    if l < 0 {
+        return l
+    }
+    return fd
 }
 
-fn http_reason(status: i64) -> i64 {
-    if status == 200 {
-        return "OK"
-    }
-    if status == 201 {
-        return "Created"
-    }
-    if status == 204 {
-        return "No Content"
-    }
-    if status == 400 {
-        return "Bad Request"
-    }
-    if status == 404 {
-        return "Not Found"
-    }
-    if status == 405 {
-        return "Method Not Allowed"
-    }
-    if status == 413 {
-        return "Payload Too Large"
-    }
-    if status == 431 {
-        return "Request Header Fields Too Large"
-    }
-    if status == 500 {
-        return "Internal Server Error"
-    }
-    if status == 501 {
-        return "Not Implemented"
-    }
-    return "Unknown"
-}
-
-fn respond(req: i64, status: i64, content_type: i64, body: i64, body_len: i64) {
-    if load64(req + REQ_DONE) {
-        return
-    }
-    store64(req + REQ_DONE, 1)
-    if body_len > HTTP_OUT_SIZE / 2 - 512 {
-        store64(req + REQ_CLOSE, 1)
-        status = 500
-        content_type = "text/plain"
-        body = "response too large"
-        body_len = 18
-    }
-    let out = load64(req + REQ_OUT)
-    buf_add(out, "HTTP/1.1 ", 9)
-    buf_int(out, status)
-    buf_byte(out, ' ')
-    buf_str(out, http_reason(status))
-    buf_add(out, "\r\nServer: Khrip\r\nDate: ", 23)
-    buf_add(out, http_date, HTTP_DATE_LEN)
-    buf_add(out, "\r\nContent-Type: ", 16)
-    buf_str(out, content_type)
-    buf_add(out, "\r\nContent-Length: ", 18)
-    buf_int(out, body_len)
-    if load64(req + REQ_CLOSE) {
-        buf_add(out, "\r\nConnection: close", 19)
-    }
-    buf_add(out, "\r\n\r\n", 4)
-    buf_add(out, body, body_len)
-}
-
-fn respond_text(req: i64, status: i64, text: i64) {
-    respond(req, status, "text/plain", text, strlen(text))
+// struct epoll_event на x86-64 упакована: u32 events, затем u64 data (здесь — fd).
+fn __epoll_ctl(s: __Server, op: int, fd: int, events: int) {
+    store64(s.tmp, events)
+    store64(s.tmp + 4, fd)
+    syscall(SYS_EPOLL_CTL, s.ep, op, fd, s.tmp)
 }
 
 // ---- Дата для заголовка Date: «Sun, 06 Nov 1994 08:49:37 GMT» ----
 
-fn put_2digits(p: i64, v: i64) {
+fn __put2(p: int, v: int) {
     store8(p, '0' + v / 10)
     store8(p + 1, '0' + v % 10)
 }
 
-// Unix-время → дата по RFC 7231. Перевод дней в дату — алгоритм civil_from_days
-// Говарда Хиннанта.
-fn format_http_date(out: i64, t: i64) {
+// Unix-время → дата по RFC 7231 (civil_from_days Говарда Хиннанта).
+fn __format_date(out: int, t: int) {
     let days = t / 86400
     let secs = t % 86400
     let z = days + 719468
@@ -168,41 +137,122 @@ fn format_http_date(out: i64, t: i64) {
     }
     var year = yoe + era * 400
     if month <= 2 {
-        year = year + 1
+        year += 1
     }
-    memcpy(out, "SunMonTueWedThuFriSat" + (days + 4) % 7 * 3, 3)
+    let wd = "SunMonTueWedThuFriSat"
+    __memcpy(out, __str_ptr(wd) + (days + 4) % 7 * 3, 3)
     store8(out + 3, ',')
     store8(out + 4, ' ')
-    put_2digits(out + 5, day)
+    __put2(out + 5, day)
     store8(out + 7, ' ')
-    memcpy(out + 8, "JanFebMarAprMayJunJulAugSepOctNovDec" + (month - 1) * 3, 3)
+    let mn = "JanFebMarAprMayJunJulAugSepOctNovDec"
+    __memcpy(out + 8, __str_ptr(mn) + (month - 1) * 3, 3)
     store8(out + 11, ' ')
-    put_2digits(out + 12, year / 100)
-    put_2digits(out + 14, year % 100)
+    __put2(out + 12, year / 100)
+    __put2(out + 14, year % 100)
     store8(out + 16, ' ')
-    put_2digits(out + 17, secs / 3600)
+    __put2(out + 17, secs / 3600)
     store8(out + 19, ':')
-    put_2digits(out + 20, secs / 60 % 60)
+    __put2(out + 20, secs / 60 % 60)
     store8(out + 22, ':')
-    put_2digits(out + 23, secs % 60)
-    memcpy(out + 25, " GMT", 4)
+    __put2(out + 23, secs % 60)
+    __memcpy(out + 25, __str_ptr(" GMT"), 4)
 }
 
-// Дата пересчитывается не чаще раза в секунду.
-fn http_update_date() {
+fn __update_date(s: __Server) {
     let t = syscall(SYS_TIME, 0)
-    if t != http_date_sec {
-        http_date_sec = t
-        format_http_date(http_date, t)
+    if t != s.date_sec {
+        s.date_sec = t
+        __format_date(s.date, t)
     }
+}
+
+// ---- Выходной буфер соединения ----
+
+fn __out_reserve(c: __Conn, n: int) {
+    if c.out_len + n <= c.out_cap {
+        return
+    }
+    var cap = c.out_cap * 2
+    while cap < c.out_len + n {
+        cap *= 2
+    }
+    let p = __mmap(cap)
+    __memcpy(p, c.out, c.out_len)
+    syscall(SYS_MUNMAP, c.out, c.out_cap)
+    c.out = p
+    c.out_cap = cap
+}
+
+fn __out_raw(c: __Conn, p: int, n: int) {
+    __memcpy(c.out + c.out_len, p, n)
+    c.out_len += n
+}
+
+fn __out_str(c: __Conn, s: str) {
+    __out_raw(c, __str_ptr(s), s.len())
+}
+
+fn __out_int(c: __Conn, x: int) {
+    if x == 0 {
+        store8(c.out + c.out_len, '0')
+        c.out_len += 1
+        return
+    }
+    var n = 0
+    var v = x
+    while v > 0 {
+        n += 1
+        v = v / 10
+    }
+    v = x
+    var i = n - 1
+    while i >= 0 {
+        store8(c.out + c.out_len + i, '0' + v % 10)
+        v = v / 10
+        i -= 1
+    }
+    c.out_len += n
+}
+
+// Заголовки и тело ответа из состояния потока.
+fn __write_response(s: __Server, c: __Conn) {
+    let w = s.w
+    let n = w.body.len
+    __out_reserve(c, n + 256)
+    __out_str(c, "HTTP/1.1 ")
+    __out_int(c, w.status)
+    store8(c.out + c.out_len, ' ')
+    c.out_len += 1
+    __out_str(c, __reason(w.status))
+    __out_str(c, "\r\nServer: Khrip\r\nDate: ")
+    __out_raw(c, s.date, HTTP_DATE_LEN)
+    if w.ctype == CT_JSON {
+        __out_str(c, "\r\nContent-Type: application/json")
+    } else if n > 0 {
+        __out_str(c, "\r\nContent-Type: text/plain")
+    }
+    __out_str(c, "\r\nContent-Length: ")
+    __out_int(c, n)
+    if c.close {
+        __out_str(c, "\r\nConnection: close")
+    }
+    __out_str(c, "\r\n\r\n")
+    __out_raw(c, w.body.data, n)
+}
+
+// Ошибка протокола; соединение закроется после отправки.
+fn __http_error(s: __Server, c: __Conn, status: int) {
+    c.close = true
+    __reply_status(status)
+    __write_response(s, c)
 }
 
 // ---- Разбор запросов ----
 
-// Позиция сразу за «\r\n\r\n» или 0, если заголовки ещё не пришли целиком.
-// Если байт — не \r и не \n, конец заголовков не может его включать,
-// поэтому можно сразу перескочить на 4 байта.
-fn http_header_end(p: i64, n: i64) -> i64 {
+// Позиция сразу за «\r\n\r\n» или 0. Байт не \r и не \n не может входить
+// в конец заголовков, поэтому можно перескочить сразу на 4 байта.
+fn __header_end(p: int, n: int) -> int {
     var i = 3
     while i < n {
         let c = load8(p + i)
@@ -210,313 +260,333 @@ fn http_header_end(p: i64, n: i64) -> i64 {
             if load8(p + i - 1) == '\r' && load8(p + i - 2) == '\n' && load8(p + i - 3) == '\r' {
                 return i + 1
             }
-            i = i + 1
+            i += 1
         } else if c == '\r' {
-            i = i + 1
+            i += 1
         } else {
-            i = i + 4
+            i += 4
         }
     }
     return 0
 }
 
-// Ответ об ошибке протокола; соединение закроется после отправки.
-fn http_error(c: i64, status: i64) {
-    store64(c + CONN_CLOSE, 1)
-    let r = http_req
-    store64(r + REQ_OUT, load64(c + CONN_OUT))
-    store64(r + REQ_DONE, 0)
-    store64(r + REQ_CLOSE, 1)
-    respond_text(r, status, http_reason(status))
+fn __lower(c: int) -> int {
+    if c >= 'A' && c <= 'Z' {
+        return c + 32
+    }
+    return c
 }
 
-// Разбирает один запрос с начала p и вызывает обработчик.
+// Сравнение без учёта регистра с образцом в нижнем регистре.
+fn __ieq(p: int, n: int, s: str) -> bool {
+    if n != s.len() {
+        return false
+    }
+    let q = __str_ptr(s)
+    for i in 0..n {
+        if __lower(load8(p + i)) != load8(q + i) {
+            return false
+        }
+    }
+    return true
+}
+
+fn __parse_len(p: int, n: int) -> int {
+    if n == 0 || n > 15 {
+        return -1
+    }
+    var v = 0
+    for i in 0..n {
+        let c = load8(p + i)
+        if c < '0' || c > '9' {
+            return -1
+        }
+        v = v * 10 + (c - '0')
+    }
+    return v
+}
+
+// Разбирает один запрос с начала p, вызывает маршрутизатор и дописывает ответ.
 // → сколько байтов занял запрос, или 0, если он ещё не пришёл целиком.
-fn http_request(c: i64, p: i64, n: i64) -> i64 {
-    let hend = http_header_end(p, n)
+fn __http_request(s: __Server, c: __Conn, p: int, n: int) -> int {
+    let hend = __header_end(p, n)
     if hend == 0 {
         return 0
     }
-
-    // Строка запроса: МЕТОД ПУТЬ ВЕРСИЯ
+    // строка запроса: МЕТОД ПУТЬ ВЕРСИЯ
     var i = 0
     while i < hend && load8(p + i) != ' ' {
-        i = i + 1
+        i += 1
     }
     let method_len = i
-    i = i + 1
-    let path = p + i
+    i += 1
+    let target = p + i
     while i < hend && load8(p + i) != ' ' && load8(p + i) != '\r' {
-        i = i + 1
+        i += 1
     }
-    let target_len = p + i - path
-    if method_len == 0 || target_len == 0 || load8(p + i) != ' ' || load8(path) != '/' {
-        http_error(c, 400)
+    let target_len = p + i - target
+    if method_len == 0 || target_len == 0 || load8(p + i) != ' ' || load8(target) != '/' || i + 9 > hend {
+        __http_error(s, c, 400)
         return n
     }
-    i = i + 1
-    if i + 8 > hend {
-        http_error(c, 400)
-        return n
-    }
-    var keep_alive = 1
-    if mem_eq(p + i, 8, "HTTP/1.0", 8) {
-        keep_alive = 0
-    } else if !mem_eq(p + i, 8, "HTTP/1.1", 8) {
-        http_error(c, 400)
+    i += 1
+    var keep_alive = true
+    if __memeq(p + i, __str_ptr("HTTP/1.0"), 8) {
+        keep_alive = false
+    } else if !__memeq(p + i, __str_ptr("HTTP/1.1"), 8) {
+        __http_error(s, c, 400)
         return n
     }
     while load8(p + i) != '\n' {
-        i = i + 1
+        i += 1
     }
-    i = i + 1
-
-    // Заголовки: нужны только Content-Length, Connection и Transfer-Encoding.
+    i += 1
+    // заголовки: нужны Content-Length, Connection и Transfer-Encoding
     var body_len = 0
     while i < hend - 2 {
         let line = p + i
         var j = i
         while load8(p + j) != '\r' {
-            j = j + 1
+            j += 1
         }
         let line_len = p + j - line
         var k = 0
         while k < line_len && load8(line + k) != ':' {
-            k = k + 1
+            k += 1
+        }
+        if k == line_len {
+            __http_error(s, c, 400)
+            return n
         }
         var v = k + 1
         while v < line_len && (load8(line + v) == ' ' || load8(line + v) == '\t') {
-            v = v + 1
+            v += 1
         }
         let value = line + v
         let value_len = line_len - v
-        if k == line_len {
-            http_error(c, 400)
-            return n
-        }
-        if mem_ieq(line, k, "content-length", 14) {
-            body_len = parse_uint(value, value_len)
+        let first = __lower(load8(line))
+        if first == 'c' && __ieq(line, k, "content-length") {
+            body_len = __parse_len(value, value_len)
             if body_len < 0 {
-                http_error(c, 400)
+                __http_error(s, c, 400)
                 return n
             }
-        } else if mem_ieq(line, k, "connection", 10) {
-            if mem_ieq(value, value_len, "close", 5) {
-                keep_alive = 0
-            } else if mem_ieq(value, value_len, "keep-alive", 10) {
-                keep_alive = 1
+        } else if first == 'c' && __ieq(line, k, "connection") {
+            if __ieq(value, value_len, "close") {
+                keep_alive = false
+            } else if __ieq(value, value_len, "keep-alive") {
+                keep_alive = true
             }
-        } else if mem_ieq(line, k, "transfer-encoding", 17) {
-            http_error(c, 501)
+        } else if first == 't' && __ieq(line, k, "transfer-encoding") {
+            __http_error(s, c, 501)
             return n
         }
         i = j + 2
     }
-
-    // Тело
     if body_len > HTTP_IN_SIZE - hend {
-        http_error(c, 413)
+        __http_error(s, c, 413)
         return n
     }
     if hend + body_len > n {
         return 0
     }
-
-    // Путь и строка запроса после «?»
+    // путь и строка запроса после «?»
     var path_len = 0
-    while path_len < target_len && load8(path + path_len) != '?' {
-        path_len = path_len + 1
+    while path_len < target_len && load8(target + path_len) != '?' {
+        path_len += 1
     }
     var query_len = target_len - path_len - 1
     if query_len < 0 {
         query_len = 0
     }
-
     if !keep_alive {
-        store64(c + CONN_CLOSE, 1)
+        c.close = true
     }
-    let r = http_req
-    store64(r + REQ_METHOD, p)
-    store64(r + REQ_METHOD_LEN, method_len)
-    store64(r + REQ_PATH, path)
-    store64(r + REQ_PATH_LEN, path_len)
-    store64(r + REQ_QUERY, path + path_len + 1)
-    store64(r + REQ_QUERY_LEN, query_len)
-    store64(r + REQ_BODY, p + hend)
-    store64(r + REQ_BODY_LEN, body_len)
-    store64(r + REQ_OUT, load64(c + CONN_OUT))
-    store64(r + REQ_DONE, 0)
-    store64(r + REQ_CLOSE, !keep_alive)
-    buf_reset(load64(r + REQ_SCRATCH))
-    handle(r)
-    if !load64(r + REQ_DONE) {
-        respond_text(r, 404, "Not Found")
+    __arena_begin()
+    let req = __Req {
+        method: __str_new(p, method_len),
+        path: __str_new(target, path_len),
+        query: __str_new(target + path_len + 1, query_len),
+        body: __str_new(p + hend, body_len)
     }
+    __serve_one(s.w, req)
+    __write_response(s, c)
+    __arena_end()
     return hend + body_len
 }
 
 // ---- Соединения ----
 
-fn http_conn(fd: i64) -> i64 {
-    return load64(http_conns + fd * 8)
+fn __conn(s: __Server, fd: int) -> __Conn {
+    return __cast(load64(s.conns + fd * 8))
 }
 
-fn http_close(fd: i64) {
-    syscall(SYS_CLOSE, fd)
-}
-
-// Отправляет накопленные ответы. → 1, если всё отправлено и соединение живо;
-// 0, если ждём готовности сокета к записи или соединение закрыто.
-fn http_flush(fd: i64, c: i64) -> i64 {
-    let out = load64(c + CONN_OUT)
-    var sent = load64(c + CONN_SENT)
-    let total = buf_len(out)
-    while sent < total {
-        let w = syscall(SYS_WRITE, fd, buf_ptr(out) + sent, total - sent)
+// Отправляет накопленные ответы. → true, если всё отправлено и соединение живо.
+fn __flush(s: __Server, fd: int, c: __Conn) -> bool {
+    while c.sent < c.out_len {
+        let w = syscall(SYS_WRITE, fd, c.out + c.sent, c.out_len - c.sent)
         if w == -EAGAIN {
-            store64(c + CONN_SENT, sent)
-            if !load64(c + CONN_WAIT_OUT) {
-                store64(c + CONN_WAIT_OUT, 1)
-                epoll_ctl(http_ep, EPOLL_CTL_MOD, fd, EPOLLOUT)
+            if !c.wait_out {
+                c.wait_out = true
+                __epoll_ctl(s, EPOLL_CTL_MOD, fd, EPOLLOUT)
             }
-            return 0
+            return false
         }
         if w <= 0 {
-            http_close(fd)
-            return 0
+            syscall(SYS_CLOSE, fd)
+            return false
         }
-        sent = sent + w
+        c.sent += w
     }
-    buf_reset(out)
-    store64(c + CONN_SENT, 0)
-    if load64(c + CONN_CLOSE) {
-        http_close(fd)
-        return 0
+    c.out_len = 0
+    c.sent = 0
+    if c.close {
+        syscall(SYS_CLOSE, fd)
+        return false
     }
-    if load64(c + CONN_WAIT_OUT) {
-        store64(c + CONN_WAIT_OUT, 0)
-        epoll_ctl(http_ep, EPOLL_CTL_MOD, fd, EPOLLIN)
+    if c.wait_out {
+        c.wait_out = false
+        __epoll_ctl(s, EPOLL_CTL_MOD, fd, EPOLLIN)
     }
-    return 1
+    return true
 }
 
-// Обрабатывает все полные запросы из входного буфера и отправляет ответы.
-fn http_process(fd: i64, c: i64) {
-    while 1 {
-        let inp = load64(c + CONN_IN)
-        let len = load64(c + CONN_IN_LEN)
-        let out = load64(c + CONN_OUT)
+// Все полные запросы из входного буфера, затем отправка ответов.
+fn __process(s: __Server, fd: int, c: __Conn) {
+    while true {
         var off = 0
-        var more = 0
-        while off < len && !load64(c + CONN_CLOSE) {
-            if buf_len(out) >= HTTP_OUT_SIZE / 2 {
-                more = 1
+        var more = false
+        while off < c.in_len && !c.close {
+            if c.out_len >= HTTP_OUT_SIZE {
+                more = true
                 break
             }
-            let used = http_request(c, inp + off, len - off)
+            let used = __http_request(s, c, c.inp + off, c.in_len - off)
             if used == 0 {
                 break
             }
-            off = off + used
+            off += used
         }
         if off > 0 {
-            memcpy(inp, inp + off, len - off)
-            store64(c + CONN_IN_LEN, len - off)
+            __memcpy(c.inp, c.inp + off, c.in_len - off)
+            c.in_len -= off
         }
-        if !load64(c + CONN_CLOSE) && load64(c + CONN_IN_LEN) == HTTP_IN_SIZE {
-            http_error(c, 431)
+        if !c.close && c.in_len == HTTP_IN_SIZE {
+            __http_error(s, c, 431)
         }
-        if !http_flush(fd, c) || !more {
+        if !__flush(s, fd, c) || !more {
             return
         }
     }
 }
 
-fn http_read(fd: i64, c: i64) {
-    let inp = load64(c + CONN_IN)
-    let len = load64(c + CONN_IN_LEN)
-    let n = syscall(SYS_READ, fd, inp + len, HTTP_IN_SIZE - len)
+fn __read(s: __Server, fd: int, c: __Conn) {
+    let n = syscall(SYS_READ, fd, c.inp + c.in_len, HTTP_IN_SIZE - c.in_len)
     if n == -EAGAIN {
         return
     }
     if n <= 0 {
-        http_close(fd)
+        syscall(SYS_CLOSE, fd)
         return
     }
-    store64(c + CONN_IN_LEN, len + n)
-    http_process(fd, c)
+    c.in_len += n
+    __process(s, fd, c)
 }
 
-fn http_accept(lfd: i64) {
-    while 1 {
-        let fd = tcp_accept(lfd)
+fn __accept(s: __Server) {
+    while true {
+        let fd = syscall(SYS_ACCEPT4, s.lfd, 0, 0, SOCK_NONBLOCK)
         if fd < 0 {
             return
         }
         if fd >= HTTP_MAX_FD {
-            http_close(fd)
+            syscall(SYS_CLOSE, fd)
             continue
         }
-        tcp_nodelay(fd)
-        var c = http_conn(fd)
-        if c == 0 {
-            c = alloc(CONN_SIZE)
-            store64(c + CONN_IN, alloc(HTTP_IN_SIZE))
-            store64(c + CONN_OUT, buf_new(HTTP_OUT_SIZE))
-            store64(http_conns + fd * 8, c)
+        __setsockopt(s.tmp, fd, IPPROTO_TCP, TCP_NODELAY, 1)
+        var a = load64(s.conns + fd * 8)
+        if a == 0 {
+            let c = __Conn { inp: __mmap(HTTP_IN_SIZE), in_len: 0, out: __mmap(HTTP_OUT_SIZE * 2), out_len: 0, out_cap: HTTP_OUT_SIZE * 2, sent: 0, close: false, wait_out: false }
+            a = __cast(c)
+            store64(s.conns + fd * 8, a)
         }
-        store64(c + CONN_IN_LEN, 0)
-        buf_reset(load64(c + CONN_OUT))
-        store64(c + CONN_SENT, 0)
-        store64(c + CONN_CLOSE, 0)
-        store64(c + CONN_WAIT_OUT, 0)
-        epoll_ctl(http_ep, EPOLL_CTL_ADD, fd, EPOLLIN)
+        let c = __conn(s, fd)
+        c.in_len = 0
+        c.out_len = 0
+        c.sent = 0
+        c.close = false
+        c.wait_out = false
+        __epoll_ctl(s, EPOLL_CTL_ADD, fd, EPOLLIN)
     }
 }
 
-fn http_event(fd: i64, flags: i64) {
-    let c = http_conn(fd)
-    if flags & (EPOLLERR | EPOLLHUP) {
-        http_close(fd)
+fn __event(s: __Server, fd: int, flags: int) {
+    let c = __conn(s, fd)
+    if (flags & (EPOLLERR | EPOLLHUP)) != 0 {
+        syscall(SYS_CLOSE, fd)
         return
     }
-    if load64(c + CONN_WAIT_OUT) {
-        if flags & EPOLLOUT && http_flush(fd, c) {
-            http_process(fd, c)
+    if c.wait_out {
+        if (flags & EPOLLOUT) != 0 && __flush(s, fd, c) {
+            __process(s, fd, c)
         }
         return
     }
-    http_read(fd, c)
+    __read(s, fd, c)
 }
 
-fn http_serve(port: i64) {
-    ignore_sigpipe()
-    let lfd = tcp_listen(port)
+// Рабочий цикл потока id.
+fn __http_worker(id: int) {
+    let w = __worker_init()
+    __arena_init(id)
+    let tmp = __alloc(64)
+    let lfd = __tcp_listen(tmp, __http_port)
     if lfd < 0 {
-        eprint("http: cannot listen on the port\n")
+        eprint("khrip: cannot listen on port {__http_port}")
         exit(1)
     }
-    http_ep = epoll_new()
-    http_conns = alloc(HTTP_MAX_FD * 8)
-    http_events = alloc(HTTP_MAX_EVENTS * EPOLL_EVENT_SIZE)
-    http_req = alloc(REQ_SIZE)
-    store64(http_req + REQ_SCRATCH, buf_new(HTTP_SCRATCH_SIZE))
-    http_date = alloc(32)
-    http_update_date()
-    epoll_ctl(http_ep, EPOLL_CTL_ADD, lfd, EPOLLIN)
-    while 1 {
-        let n = epoll_wait(http_ep, http_events, HTTP_MAX_EVENTS, -1)
-        http_update_date()
+    let s = __Server {
+        ep: syscall(SYS_EPOLL_CREATE1, 0),
+        lfd: lfd,
+        conns: __mmap(HTTP_MAX_FD * 8),
+        events: __alloc(HTTP_MAX_EVENTS * EPOLL_EVENT_SIZE),
+        date: __alloc(32),
+        date_sec: 0,
+        tmp: tmp,
+        w: w
+    }
+    store64(__ctx() + CTX_SERVER, __cast(s))
+    __update_date(s)
+    __epoll_ctl(s, EPOLL_CTL_ADD, lfd, EPOLLIN)
+    while true {
+        let n = syscall(SYS_EPOLL_WAIT, s.ep, s.events, HTTP_MAX_EVENTS, -1)
+        __update_date(s)
         var i = 0
         while i < n {
-            let e = http_events + i * EPOLL_EVENT_SIZE
-            let fd = epoll_event_fd(e)
+            let e = s.events + i * EPOLL_EVENT_SIZE
+            let fd = load64(e + 4) & 0xFFFFFFFF
             if fd == lfd {
-                http_accept(lfd)
+                __accept(s)
             } else {
-                http_event(fd, epoll_event_flags(e))
+                __event(s, fd, load64(e) & 0xFFFFFFFF)
             }
-            i = i + 1
+            i += 1
         }
     }
+}
+
+fn __env_int(name: str, default: int) -> int {
+    let v = env(name) else {
+        return default
+    }
+    return v.to_int() ?? default
+}
+
+// Точка входа сервера: программа с route.
+fn __serve() {
+    __http_port = __env_int("PORT", 8080)
+    __ignore_sigpipe()
+    __store_init()
+    eprint("khrip: listening on http://0.0.0.0:{__http_port}")
+    __http_worker(0)
 }

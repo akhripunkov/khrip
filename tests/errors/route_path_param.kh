@@ -1,0 +1,5 @@
+// expect: error: path parameter {id} has no matching parameter
+// expect: add (id: int) or (id: str) after the path
+route GET "/users/{id}" -> str {
+    return "x"
+}

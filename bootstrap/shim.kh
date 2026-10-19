@@ -20,6 +20,13 @@ fn __cast(x: int) -> int {
 fn __panic_recover() {
 }
 
+// Потоков и store у загрузчика нет.
+fn __store_lock() {
+}
+
+fn __store_unlock() {
+}
+
 // Точка входа: загрузчик вызывает её после инициализации глобальных переменных.
 fn __start(argc: int, argv: int) -> int {
     __argc = argc

@@ -1,0 +1,13 @@
+// expect: route_type.kh:10:16: error: this route returns User | 404, found str
+type User {
+    id: int
+}
+
+store users: map[int, User]
+
+route GET "/users/{id}" (id: int) -> User | 404 {
+    if id == 0 {
+        return "zero"
+    }
+    return users[id] ?? 404
+}

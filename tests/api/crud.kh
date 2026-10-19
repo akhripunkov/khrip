@@ -1,0 +1,77 @@
+type NewUser {
+    name: str
+    email: str
+    age: int
+}
+
+type User {
+    id: int
+    ...NewUser
+}
+
+store users: map[int, User]
+store last_id: int
+
+route POST "/users" (body: NewUser) -> 201 User | 400 str {
+    if body.name == "" {
+        return 400 "name is required"
+    }
+    if !body.email.contains("@") {
+        return 400 "email is invalid"
+    }
+    if body.age < 0 || body.age > 150 {
+        return 400 "age is out of range"
+    }
+    last_id += 1
+    let user = User { id: last_id, ...body }
+    users[user.id] = user
+    return 201 user
+}
+
+route GET "/users/{id}" (id: int) -> User | 404 {
+    return users[id] ?? 404
+}
+
+route GET "/users" -> [User] {
+    return users.values()
+}
+
+route DELETE "/users/{id}" (id: int) -> 204 | 404 {
+    users.remove(id) else {
+        return 404
+    }
+    return 204
+}
+
+test "create" {
+    let r = call POST "/users" NewUser { name: "Ann", email: "ann@x.io", age: 30 }
+    expect r.status == 201
+    expect r.body == "\{\"id\":1,\"name\":\"Ann\",\"email\":\"ann@x.io\",\"age\":30}"
+    expect (call POST "/users" NewUser { name: "Bob", email: "bob@x.io", age: 41 }).status == 201
+}
+
+test "validation" {
+    expect (call POST "/users" NewUser { name: "", email: "a@b", age: 1 }).body == "name is required"
+    expect (call POST "/users" NewUser { name: "C", email: "bad", age: 1 }).body == "email is invalid"
+    expect (call POST "/users" NewUser { name: "C", email: "c@x", age: 200 }).status == 400
+    let r = call POST "/users" "\{\"name\":\"C\",\"email\":\"c@x\"}"
+    expect r.status == 400
+    expect r.body == "invalid JSON body: missing field 'age'"
+}
+
+test "read and list" {
+    let r = call GET "/users/1"
+    expect r.status == 200
+    let user: User? = from_json(r.body)
+    expect (user ?? User { id: 0, name: "", email: "", age: 0 }).name == "Ann"
+    expect (call GET "/users/7").status == 404
+    expect (call GET "/users/abc").status == 400
+    let all: [User]? = from_json((call GET "/users").body)
+    expect (all ?? []).len() == 2
+}
+
+test "delete" {
+    expect (call DELETE "/users/1").status == 204
+    expect (call DELETE "/users/1").status == 404
+    expect (call GET "/users").body == "[\{\"id\":2,\"name\":\"Bob\",\"email\":\"bob@x.io\",\"age\":41}]"
+}

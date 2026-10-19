@@ -1,0 +1,10 @@
+// expect: route_status.kh:7:16: error: status 404 is not declared by this route
+// expect: add it to the result: -> str | 404
+store names: map[int, str]
+
+route GET "/names/{id}" (id: int) -> str {
+    if id < 0 {
+        return 404
+    }
+    return names[id] ?? "?"
+}

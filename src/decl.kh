@@ -199,7 +199,6 @@ fn rt_func(name: str) -> int {
         error_tok(tok(), "internal: missing runtime function " + name, "")
         return 0
     }
-    funcs[f].used = true
     return f
 }
 
@@ -514,7 +513,11 @@ fn decl_hint(t: Token) -> str {
 
 // Проход по объявлениям верхнего уровня. pass 1 — имена типов, pass 2 — всё остальное.
 fn prescan(pass: int) {
-    var i = 0
+    prescan_from(pass, 0)
+}
+
+fn prescan_from(pass: int, from: int) {
+    var i = from
     var depth = 0
     while toks[i].kind != T_EOF {
         let k = toks[i].kind

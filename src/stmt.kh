@@ -141,6 +141,15 @@ fn parse_stmt() -> bool {
         return false
     }
     let ty = parse_expr(ty_err)
+    if kind() == T_ELSE && tkind(ty) == K_OPT {
+        // выражение else { ... } — блок выполняется, если значения нет
+        advance()
+        emit_test_rax()
+        let has = emit_jcc(CC_NE)
+        parse_block()
+        patch_here(has)
+        return false
+    }
     if !last_was_call && ty != ty_err && !panic_mode {
         var hint = ""
         if ty == ty_bool {
@@ -580,6 +589,7 @@ fn assign_field(t: int, f: Token, op: int, at: Token) {
         emit_push(RAX)
         compound_value(op, ft, at)
     }
+    emit_barrier(0, ft)
     emit_pop(RCX)
     emit_store(RCX, fi * 8, RAX)
 }
@@ -618,8 +628,16 @@ fn assign_index(t: int) {
             emit_push(RAX)
             compound_value(op, vt, opt)
         }
-        if is_store_value(t) {
-            store_write(vt)
+        emit_barrier(8, vt)
+        if kt == ty_str && barrier_on(kt) {
+            // строковый ключ тоже попадает внутрь словаря
+            emit_push(RAX)
+            emit_load(RSI, RSP, 8)
+            emit_load(RDI, RSP, 16)
+            emit_mov_imm(RDX, type_desc(ty_str))
+            emit_call(rt_func("__barrier"))
+            emit_store(RSP, 8, RAX)
+            emit_pop(RAX)
         }
         emit_mov_rr(RDX, RAX)
         emit_pop(RSI)
@@ -632,7 +650,7 @@ fn assign_index(t: int) {
     } else if k != K_LIST && t != ty_err {
         error_tok(at, ty_name(t) + " cannot be indexed", "")
     }
-    if k == K_LIST && fast_index_store(t, at) {
+    if k == K_LIST && !barrier_on(ty_elem(t)) && fast_index_store(t, at) {
         return
     }
     emit_push(RAX)
@@ -664,6 +682,7 @@ fn assign_index(t: int) {
         emit_push(RAX)
         compound_value(op, et, opt)
     }
+    emit_barrier(8, et)
     emit_mov_rr(RDX, RAX)
     emit_pop(RCX)
     emit_pop(RAX)
@@ -1564,11 +1583,16 @@ fn compile_fn(fi: int) {
         i += 1
     }
     if f.kind == FK_ROUTE {
-        route_ctx = fi
+        route_ctx = route_of(fi)
     }
     pos = f.body
     let close = toks[f.body_end]
     let div = parse_block()
+    if f.kind == FK_ROUTE && !div {
+        route_end(close)
+        end_fn(frame_at, true)
+        return
+    }
     if !div && f.ret != ty_void {
         error_tok(close, "'" + f.name + "' must return a value of type " + ty_name(f.ret) + " on every path", "add a return at the end")
     }
@@ -1622,6 +1646,9 @@ fn compile_main_wrapper(fi: int, test_mode: bool) {
     let m = func_find("main")
     if test_mode {
         emit_call(rt_func("__run_tests"))
+    } else if routes.len() > 0 {
+        emit_call(rt_func("__serve"))
+        emit_mov_imm(RAX, 0)
     } else if m >= 0 && !funcs[m].is_lib {
         let f = funcs[m]
         if f.params.len() > 0 {
@@ -1630,14 +1657,10 @@ fn compile_main_wrapper(fi: int, test_mode: bool) {
         if f.ret != ty_void && f.ret != ty_int {
             error_tok(toks[f.tok], "main may return nothing or int (the exit code)", "")
         }
-        funcs[m].used = true
         emit_call(m)
         if f.ret == ty_void {
             emit_mov_imm(RAX, 0)
         }
-    } else if routes.len() > 0 {
-        emit_call(rt_func("__serve"))
-        emit_mov_imm(RAX, 0)
     } else {
         report_at(files.len() - 1, 1, 1, "the program has no fn main", "add fn main() { ... } or declare routes")
     }

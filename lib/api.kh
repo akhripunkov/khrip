@@ -1,0 +1,1095 @@
+// API-слой: описания типов, копирование в постоянную память (store), JSON,
+// ответы маршрутов, разбор параметров, тесты. Подключается к программам,
+// где есть route, store или test (и к тем, что вызывают to_json/from_json).
+//
+// Описание типа строит компилятор (type_desc в src/api.kh), оно лежит в данных
+// программы. Слова описания:
+//   str, int, bool — [D_STR], [D_INT], [D_BOOL]
+//   [T]            — [D_LIST, T]
+//   map[K, V]      — [D_MAP, K, V]
+//   T?             — [D_OPT, T]
+//   структура      — [D_STRUCT, n, имя, (имя поля, "имя":, описание поля) × n]
+
+const D_STR = 1
+const D_INT = 2
+const D_BOOL = 3
+const D_LIST = 4
+const D_MAP = 5
+const D_OPT = 6
+const D_STRUCT = 7
+
+const CT_TEXT = 1
+const CT_JSON = 2
+
+// Ответ теста на вызов call.
+type Response {
+    status: int
+    body: str
+}
+
+type __Req {
+    method: str
+    path: str
+    query: str
+    body: str
+}
+
+// Состояние обработки запросов потока (CTX_WORKER).
+type __Worker {
+    status: int
+    ctype: int
+    body: Buf
+    jb: int
+    json_err: str
+    testing: bool
+}
+
+fn __w() -> __Worker {
+    return __cast(load64(__ctx() + CTX_WORKER))
+}
+
+fn __worker_init() -> __Worker {
+    let w = __Worker { status: 0, ctype: 0, body: buf_new(4096), jb: __alloc(64), json_err: "", testing: false }
+    store64(__ctx() + CTX_WORKER, __cast(w))
+    return w
+}
+
+fn __is_scalar(d: int) -> bool {
+    let k = load64(d)
+    return k == D_INT || k == D_BOOL
+}
+
+fn __field_desc(d: int, i: int) -> int {
+    return load64(d + 24 + i * 24 + 16)
+}
+
+// ---- Копирование в постоянную память ----
+// Объект вне арены не может ссылаться на арену: арена освобождается после
+// ответа. Поэтому значение, которое кладут внутрь такого объекта, копируется.
+
+fn __barrier(obj: int, v: int, d: int) -> int {
+    if __in_arena(obj) || !__in_arena(v) {
+        return v
+    }
+    return __persist(v, d)
+}
+
+fn __persist(v: int, d: int) -> int {
+    if __is_scalar(d) || !__in_arena(v) {
+        return v
+    }
+    let on = __pmode_on()
+    let r = __deep_copy(v, d)
+    if on {
+        __pmode_off()
+    }
+    return r
+}
+
+fn __deep_copy(v: int, d: int) -> int {
+    let k = load64(d)
+    if k == D_INT || k == D_BOOL || v == 0 || !__in_arena(v) {
+        return v
+    }
+    if k == D_STR {
+        let s = __str_copy(load64(v), load64(v + 8))
+        return __cast(s)
+    }
+    if k == D_OPT {
+        let inner = load64(d + 8)
+        if __is_scalar(inner) {
+            let b = __alloc(8)
+            store64(b, load64(v))
+            return b
+        }
+        return __deep_copy(v, inner)
+    }
+    if k == D_LIST {
+        let ed = load64(d + 8)
+        let n = load64(v + 8)
+        let es = load64(v + 24)
+        let h = __list_new(n, es)
+        __memcpy(load64(h), load64(v), n * es)
+        store64(h + 8, n)
+        if !__is_scalar(ed) {
+            let data = load64(h)
+            for i in 0..n {
+                store64(data + i * 8, __deep_copy(load64(data + i * 8), ed))
+            }
+        }
+        return h
+    }
+    if k == D_MAP {
+        let kd = load64(d + 8)
+        let vd = load64(d + 16)
+        let m = __map_new(load64(v + 48))
+        let n = load64(load64(v) + 8)
+        for i in 0..n {
+            if __word_at(load64(v + 24), i) != 0 {
+                __map_set(m, __deep_copy(__word_at(load64(v), i), kd), __deep_copy(__word_at(load64(v + 16), i), vd))
+            }
+        }
+        return m
+    }
+    if k == D_STRUCT {
+        let n = load64(d + 8)
+        let s = __alloc(n * 8)
+        for i in 0..n {
+            store64(s + i * 8, __deep_copy(load64(v + i * 8), __field_desc(d, i)))
+        }
+        return s
+    }
+    return v
+}
+
+// ---- JSON: запись ----
+
+fn __hex_digit(x: int) -> int {
+    if x < 10 {
+        return '0' + x
+    }
+    return 'a' + x - 10
+}
+
+// Строка JSON в кавычках. Безопасные участки копируются целиком.
+fn __json_str(b: Buf, s: str) {
+    let p = __str_ptr(s)
+    let n = s.len()
+    buf_reserve(b, n + 2)
+    buf_byte(b, '"')
+    var start = 0
+    var i = 0
+    while i < n {
+        let c = load8(p + i)
+        if c >= 0x20 && c != '"' && c != '\\' {
+            i += 1
+            continue
+        }
+        buf_add_raw(b, p + start, i - start)
+        if c == '"' {
+            buf_add(b, "\\\"")
+        } else if c == '\\' {
+            buf_add(b, "\\\\")
+        } else if c == '\n' {
+            buf_add(b, "\\n")
+        } else if c == '\r' {
+            buf_add(b, "\\r")
+        } else if c == '\t' {
+            buf_add(b, "\\t")
+        } else {
+            buf_add(b, "\\u00")
+            buf_byte(b, __hex_digit(c >> 4))
+            buf_byte(b, __hex_digit(c & 15))
+        }
+        i += 1
+        start = i
+    }
+    buf_add_raw(b, p + start, n - start)
+    buf_byte(b, '"')
+}
+
+fn __json_enc(b: Buf, v: int, d: int) {
+    let k = load64(d)
+    if k == D_INT {
+        buf_int(b, v)
+        return
+    }
+    if k == D_STR {
+        __json_str(b, __cast(v))
+        return
+    }
+    if k == D_BOOL {
+        if v != 0 {
+            buf_add(b, "true")
+        } else {
+            buf_add(b, "false")
+        }
+        return
+    }
+    if k == D_OPT {
+        if v == 0 {
+            buf_add(b, "null")
+            return
+        }
+        let inner = load64(d + 8)
+        if __is_scalar(inner) {
+            __json_enc(b, load64(v), inner)
+        } else {
+            __json_enc(b, v, inner)
+        }
+        return
+    }
+    if k == D_STRUCT {
+        let n = load64(d + 8)
+        buf_byte(b, '\{')
+        for i in 0..n {
+            if i > 0 {
+                buf_byte(b, ',')
+            }
+            buf_add(b, __cast(load64(d + 24 + i * 24 + 8)))
+            __json_enc(b, load64(v + i * 8), __field_desc(d, i))
+        }
+        buf_byte(b, '}')
+        return
+    }
+    if k == D_LIST {
+        let ed = load64(d + 8)
+        let n = load64(v + 8)
+        buf_byte(b, '[')
+        for i in 0..n {
+            if i > 0 {
+                buf_byte(b, ',')
+            }
+            __json_enc(b, __lget(v, i), ed)
+        }
+        buf_byte(b, ']')
+        return
+    }
+    if k == D_MAP {
+        let vd = load64(d + 16)
+        let str_keys = load64(v + 48) != 0
+        let n = load64(load64(v) + 8)
+        buf_byte(b, '\{')
+        var first = true
+        for i in 0..n {
+            if __word_at(load64(v + 24), i) == 0 {
+                continue
+            }
+            if !first {
+                buf_byte(b, ',')
+            }
+            first = false
+            let key = __word_at(load64(v), i)
+            if str_keys {
+                __json_str(b, __cast(key))
+            } else {
+                buf_byte(b, '"')
+                buf_int(b, key)
+                buf_byte(b, '"')
+            }
+            buf_byte(b, ':')
+            __json_enc(b, __word_at(load64(v + 16), i), vd)
+        }
+        buf_byte(b, '}')
+    }
+}
+
+fn __json_encode(v: int, d: int) -> str {
+    let b = buf_new(64)
+    __json_enc(b, v, d)
+    return __str_new(b.data, b.len)
+}
+
+// ---- JSON: чтение ----
+
+type __Json {
+    p: int
+    end: int
+    err: str
+}
+
+fn __jd_ws(j: __Json) {
+    while j.p < j.end {
+        let c = load8(j.p)
+        if c != ' ' && c != '\n' && c != '\r' && c != '\t' {
+            return
+        }
+        j.p += 1
+    }
+}
+
+fn __jd_peek(j: __Json) -> int {
+    __jd_ws(j)
+    if j.p >= j.end {
+        return -1
+    }
+    return load8(j.p)
+}
+
+fn __jd_found(j: __Json) -> str {
+    if j.p >= j.end {
+        return "end of input"
+    }
+    var n = 0
+    while j.p + n < j.end && n < 12 && load8(j.p + n) != '\n' {
+        n += 1
+    }
+    return "'" + __str_new(j.p, n) + "'"
+}
+
+fn __jd_fail(j: __Json, at: str, msg: str) {
+    if j.err.len() > 0 {
+        return
+    }
+    if at.len() > 0 {
+        j.err = at + ": " + msg
+    } else {
+        j.err = msg
+    }
+}
+
+fn __jd_expect(j: __Json, at: str, what: str) {
+    __jd_fail(j, at, "expected " + what + ", found " + __jd_found(j))
+}
+
+fn __jd_word(j: __Json, w: str) -> bool {
+    let n = w.len()
+    if j.p + n <= j.end && __memeq(j.p, __str_ptr(w), n) {
+        j.p += n
+        return true
+    }
+    return false
+}
+
+fn __hex_val(c: int) -> int {
+    if c >= '0' && c <= '9' {
+        return c - '0'
+    }
+    if c >= 'a' && c <= 'f' {
+        return c - 'a' + 10
+    }
+    if c >= 'A' && c <= 'F' {
+        return c - 'A' + 10
+    }
+    return -1
+}
+
+fn __jd_hex4(j: __Json) -> int {
+    if j.p + 4 > j.end {
+        return -1
+    }
+    var v = 0
+    for i in 0..4 {
+        let h = __hex_val(load8(j.p + i))
+        if h < 0 {
+            return -1
+        }
+        v = v * 16 + h
+    }
+    j.p += 4
+    return v
+}
+
+fn __buf_utf8(b: Buf, cp: int) {
+    if cp < 0x80 {
+        buf_byte(b, cp)
+    } else if cp < 0x800 {
+        buf_byte(b, 0xC0 | (cp >> 6))
+        buf_byte(b, 0x80 | (cp & 63))
+    } else if cp < 0x10000 {
+        buf_byte(b, 0xE0 | (cp >> 12))
+        buf_byte(b, 0x80 | ((cp >> 6) & 63))
+        buf_byte(b, 0x80 | (cp & 63))
+    } else {
+        buf_byte(b, 0xF0 | (cp >> 18))
+        buf_byte(b, 0x80 | ((cp >> 12) & 63))
+        buf_byte(b, 0x80 | ((cp >> 6) & 63))
+        buf_byte(b, 0x80 | (cp & 63))
+    }
+}
+
+// Строка: без экранирования — без копирования (ссылка на входные байты).
+fn __jd_str(j: __Json, at: str) -> str {
+    if __jd_peek(j) != '"' {
+        __jd_expect(j, at, "a string")
+        return ""
+    }
+    j.p += 1
+    let start = j.p
+    while j.p < j.end {
+        let c = load8(j.p)
+        if c == '"' {
+            let s = __str_new(start, j.p - start)
+            j.p += 1
+            return s
+        }
+        if c == '\\' {
+            break
+        }
+        if c < 0x20 {
+            __jd_fail(j, at, "control character in a string")
+            return ""
+        }
+        j.p += 1
+    }
+    let b = buf_new(j.p - start + 16)
+    buf_add_raw(b, start, j.p - start)
+    while j.p < j.end {
+        let c = load8(j.p)
+        if c == '"' {
+            j.p += 1
+            return __str_new(b.data, b.len)
+        }
+        if c < 0x20 {
+            __jd_fail(j, at, "control character in a string")
+            return ""
+        }
+        if c != '\\' {
+            buf_byte(b, c)
+            j.p += 1
+            continue
+        }
+        if j.p + 1 >= j.end {
+            break
+        }
+        let e = load8(j.p + 1)
+        j.p += 2
+        if e == 'n' {
+            buf_byte(b, '\n')
+        } else if e == 't' {
+            buf_byte(b, '\t')
+        } else if e == 'r' {
+            buf_byte(b, '\r')
+        } else if e == 'b' {
+            buf_byte(b, 8)
+        } else if e == 'f' {
+            buf_byte(b, 12)
+        } else if e == '"' || e == '\\' || e == '/' {
+            buf_byte(b, e)
+        } else if e == 'u' {
+            var cp = __jd_hex4(j)
+            if cp < 0 {
+                __jd_fail(j, at, "bad \\u escape")
+                return ""
+            }
+            if cp >= 0xD800 && cp < 0xDC00 && __jd_word(j, "\\u") {
+                let lo = __jd_hex4(j)
+                if lo >= 0xDC00 && lo < 0xE000 {
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+                }
+            }
+            __buf_utf8(b, cp)
+        } else {
+            __jd_fail(j, at, "bad escape in a string")
+            return ""
+        }
+    }
+    __jd_fail(j, at, "unterminated string")
+    return ""
+}
+
+fn __jd_int(j: __Json, at: str) -> int {
+    let c = __jd_peek(j)
+    var neg = false
+    if c == '-' {
+        neg = true
+        j.p += 1
+    }
+    let start = j.p
+    var v = 0
+    while j.p < j.end {
+        let d = load8(j.p)
+        if d < '0' || d > '9' {
+            break
+        }
+        if v > 922337203685477580 {
+            __jd_fail(j, at, "integer is too large")
+            return 0
+        }
+        v = v * 10 + (d - '0')
+        j.p += 1
+    }
+    if j.p == start {
+        if neg {
+            j.p -= 1
+        }
+        __jd_expect(j, at, "an integer")
+        return 0
+    }
+    if j.p < j.end && (load8(j.p) == '.' || load8(j.p) == 'e' || load8(j.p) == 'E') {
+        __jd_fail(j, at, "expected an integer, found a fractional number")
+        return 0
+    }
+    if neg {
+        return -v
+    }
+    return v
+}
+
+// Пропуск любого значения (поля, которых нет в типе).
+fn __jd_skip(j: __Json, at: str) {
+    let c = __jd_peek(j)
+    if c == '"' {
+        __jd_str(j, at)
+        return
+    }
+    if c == '\{' || c == '[' {
+        j.p += 1
+        var close = ']'
+        if c == '\{' {
+            close = '}'
+        }
+        if __jd_peek(j) == close {
+            j.p += 1
+            return
+        }
+        while j.err.len() == 0 {
+            if c == '\{' {
+                __jd_str(j, at)
+                if __jd_peek(j) != ':' {
+                    __jd_expect(j, at, "':'")
+                    return
+                }
+                j.p += 1
+            }
+            __jd_skip(j, at)
+            let e = __jd_peek(j)
+            j.p += 1
+            if e == close {
+                return
+            }
+            if e != ',' {
+                j.p -= 1
+                __jd_expect(j, at, "',' or '" + __str_from_byte(close) + "'")
+                return
+            }
+        }
+        return
+    }
+    if __jd_word(j, "true") || __jd_word(j, "false") || __jd_word(j, "null") {
+        return
+    }
+    if c == '-' || (c >= '0' && c <= '9') {
+        j.p += 1
+        while j.p < j.end {
+            let d = load8(j.p)
+            if (d >= '0' && d <= '9') || d == '.' || d == 'e' || d == 'E' || d == '+' || d == '-' {
+                j.p += 1
+            } else {
+                break
+            }
+        }
+        return
+    }
+    __jd_expect(j, at, "a JSON value")
+}
+
+fn __jd_join(at: str, name: str) -> str {
+    if at.len() == 0 {
+        return name
+    }
+    return at + "." + name
+}
+
+fn __jd(j: __Json, d: int, at: str) -> int {
+    let k = load64(d)
+    let c = __jd_peek(j)
+    if k == D_INT {
+        return __jd_int(j, at)
+    }
+    if k == D_STR {
+        return __cast(__jd_str(j, at))
+    }
+    if k == D_BOOL {
+        if __jd_word(j, "true") {
+            return 1
+        }
+        if __jd_word(j, "false") {
+            return 0
+        }
+        __jd_expect(j, at, "true or false")
+        return 0
+    }
+    if k == D_OPT {
+        if __jd_word(j, "null") {
+            return 0
+        }
+        let inner = load64(d + 8)
+        let v = __jd(j, inner, at)
+        if __is_scalar(inner) {
+            let b = __alloc(8)
+            store64(b, v)
+            return b
+        }
+        return v
+    }
+    if k == D_LIST {
+        let ed = load64(d + 8)
+        var es = 8
+        if load64(ed) == D_BOOL {
+            es = 1
+        }
+        let xs: [int] = __cast(__list_new(4, es))
+        if c != '[' {
+            __jd_expect(j, at, "an array")
+            return __cast(xs)
+        }
+        j.p += 1
+        if __jd_peek(j) == ']' {
+            j.p += 1
+            return __cast(xs)
+        }
+        while j.err.len() == 0 {
+            xs.push(__jd(j, ed, at + "[" + xs.len().to_str() + "]"))
+            let e = __jd_peek(j)
+            if e == ']' {
+                j.p += 1
+                break
+            }
+            if e != ',' {
+                __jd_expect(j, at, "',' or ']'")
+                break
+            }
+            j.p += 1
+        }
+        return __cast(xs)
+    }
+    if k == D_MAP {
+        let kd = load64(d + 8)
+        let vd = load64(d + 16)
+        let str_keys = load64(kd) == D_STR
+        var sk = 0
+        if str_keys {
+            sk = 1
+        }
+        let m = __map_new(sk)
+        if c != '\{' {
+            __jd_expect(j, at, "an object")
+            return m
+        }
+        j.p += 1
+        if __jd_peek(j) == '}' {
+            j.p += 1
+            return m
+        }
+        while j.err.len() == 0 {
+            let key = __jd_str(j, at)
+            if __jd_peek(j) != ':' {
+                __jd_expect(j, at, "':'")
+                break
+            }
+            j.p += 1
+            var kw = 0
+            if str_keys {
+                kw = __cast(key)
+            } else {
+                let ki = key.to_int() else {
+                    __jd_fail(j, at, "key '" + key + "' is not an integer")
+                    break
+                }
+                kw = ki
+            }
+            __map_set(m, kw, __jd(j, vd, __jd_join(at, key)))
+            let e = __jd_peek(j)
+            if e == '}' {
+                j.p += 1
+                break
+            }
+            if e != ',' {
+                __jd_expect(j, at, "',' or '}'")
+                break
+            }
+            j.p += 1
+        }
+        return m
+    }
+    if k == D_STRUCT {
+        let n = load64(d + 8)
+        let s = __alloc(n * 8)
+        if c != '\{' {
+            __jd_expect(j, at, "an object")
+            return s
+        }
+        j.p += 1
+        var seen = 0
+        if __jd_peek(j) == '}' {
+            j.p += 1
+        } else {
+            while j.err.len() == 0 {
+                let key = __jd_str(j, at)
+                if __jd_peek(j) != ':' {
+                    __jd_expect(j, at, "':'")
+                    break
+                }
+                j.p += 1
+                var fi = -1
+                for i in 0..n {
+                    let fname: str = __cast(load64(d + 24 + i * 24))
+                    if fname == key {
+                        fi = i
+                        break
+                    }
+                }
+                if fi < 0 {
+                    __jd_skip(j, __jd_join(at, key))
+                } else {
+                    store64(s + fi * 8, __jd(j, __field_desc(d, fi), __jd_join(at, key)))
+                    if fi < 62 {
+                        seen = seen | (1 << fi)
+                    }
+                }
+                let e = __jd_peek(j)
+                if e == '}' {
+                    j.p += 1
+                    break
+                }
+                if e != ',' {
+                    __jd_expect(j, at, "',' or '}'")
+                    break
+                }
+                j.p += 1
+            }
+        }
+        if j.err.len() == 0 {
+            for i in 0..n {
+                if i < 62 && (seen & (1 << i)) == 0 && load64(__field_desc(d, i)) != D_OPT {
+                    let fname: str = __cast(load64(d + 24 + i * 24))
+                    __jd_fail(j, at, "missing field '" + __jd_join(at, fname) + "'")
+                    break
+                }
+            }
+        }
+        return s
+    }
+    return 0
+}
+
+// Значение типа T? из текста JSON: none, если текст не подходит (текст ошибки —
+// в __json_error()). Для int и bool результат — ячейка.
+fn __json_decode(s: str, d: int) -> int {
+    let j = __Json { p: __str_ptr(s), end: __str_ptr(s) + s.len(), err: "" }
+    let v = __jd(j, d, "")
+    if j.err.len() == 0 && __jd_peek(j) != -1 {
+        __jd_fail(j, "", "unexpected " + __jd_found(j) + " after the value")
+    }
+    if j.err.len() > 0 {
+        if load64(__ctx() + CTX_WORKER) != 0 {
+            let w = __w()
+            w.json_err = j.err
+        }
+        __json_last_err = j.err
+        return 0
+    }
+    if __is_scalar(d) {
+        let b = __alloc(8)
+        store64(b, v)
+        return b
+    }
+    return v
+}
+
+var __json_last_err: str
+
+fn json_error() -> str {
+    return __json_last_err
+}
+
+// ---- Ответы маршрутов ----
+
+fn __reason(status: int) -> str {
+    if status == 200 {
+        return "OK"
+    }
+    if status == 201 {
+        return "Created"
+    }
+    if status == 202 {
+        return "Accepted"
+    }
+    if status == 204 {
+        return "No Content"
+    }
+    if status == 301 {
+        return "Moved Permanently"
+    }
+    if status == 302 {
+        return "Found"
+    }
+    if status == 304 {
+        return "Not Modified"
+    }
+    if status == 400 {
+        return "Bad Request"
+    }
+    if status == 401 {
+        return "Unauthorized"
+    }
+    if status == 403 {
+        return "Forbidden"
+    }
+    if status == 404 {
+        return "Not Found"
+    }
+    if status == 405 {
+        return "Method Not Allowed"
+    }
+    if status == 409 {
+        return "Conflict"
+    }
+    if status == 413 {
+        return "Payload Too Large"
+    }
+    if status == 422 {
+        return "Unprocessable Entity"
+    }
+    if status == 429 {
+        return "Too Many Requests"
+    }
+    if status == 431 {
+        return "Request Header Fields Too Large"
+    }
+    if status == 500 {
+        return "Internal Server Error"
+    }
+    if status == 501 {
+        return "Not Implemented"
+    }
+    if status == 503 {
+        return "Service Unavailable"
+    }
+    return "Unknown"
+}
+
+// Ответ со значением: str — текстом, остальное — JSON.
+fn __reply(status: int, v: int, d: int) {
+    let w = __w()
+    w.status = status
+    buf_clear(w.body)
+    if load64(d) == D_STR {
+        w.ctype = CT_TEXT
+        let s: str = __cast(v)
+        buf_add(w.body, s)
+        return
+    }
+    w.ctype = CT_JSON
+    __json_enc(w.body, v, d)
+}
+
+// Ответ без значения: у 204 и 304 тела нет, у остальных — текст статуса.
+fn __reply_status(status: int) {
+    let w = __w()
+    w.status = status
+    buf_clear(w.body)
+    w.ctype = CT_TEXT
+    if status != 204 && status != 304 {
+        buf_add(w.body, __reason(status))
+    }
+}
+
+fn __reply_text(status: int, text: str) {
+    let w = __w()
+    w.status = status
+    w.ctype = CT_TEXT
+    buf_clear(w.body)
+    buf_add(w.body, text)
+}
+
+fn __reply_json_error() {
+    __reply_text(400, "invalid JSON body: " + __w().json_err)
+}
+
+// ---- Разбор пути и строки запроса ----
+
+fn __path_segs(p: str) -> [str] {
+    var segs: [str] = []
+    let n = p.len()
+    var start = 1
+    var i = 1
+    while i <= n {
+        if i == n || p[i] == '/' {
+            segs.push(p[start..i])
+            start = i + 1
+        }
+        i += 1
+    }
+    return segs
+}
+
+fn __url_decode(s: str) -> str {
+    let n = s.len()
+    var plain = true
+    for i in 0..n {
+        let c = s[i]
+        if c == '%' || c == '+' {
+            plain = false
+            break
+        }
+    }
+    if plain {
+        return s
+    }
+    let b = buf_new(n)
+    var i = 0
+    while i < n {
+        let c = s[i]
+        if c == '+' {
+            buf_byte(b, ' ')
+        } else if c == '%' && i + 2 < n && __hex_val(s[i + 1]) >= 0 && __hex_val(s[i + 2]) >= 0 {
+            buf_byte(b, __hex_val(s[i + 1]) * 16 + __hex_val(s[i + 2]))
+            i += 2
+        } else {
+            buf_byte(b, c)
+        }
+        i += 1
+    }
+    return __str_new(b.data, b.len)
+}
+
+// Значение параметра name из строки запроса «a=1&b=2» или none.
+fn __query(q: str, name: str) -> str? {
+    let n = q.len()
+    var start = 0
+    var i = 0
+    while i <= n {
+        if i == n || q[i] == '&' {
+            let part = q[start..i]
+            let eq = part.find("=") ?? part.len()
+            if __url_decode(part[..eq]) == name {
+                if eq >= part.len() {
+                    return ""
+                }
+                return __url_decode(part[eq + 1..])
+            }
+            start = i + 1
+        }
+        i += 1
+    }
+    return none
+}
+
+fn __param_int(s: str, name: str) -> int? {
+    let v = s.to_int() else {
+        __reply_text(400, "parameter '" + name + "' must be an integer, found '" + s + "'")
+        return none
+    }
+    return v
+}
+
+fn __param_bool(s: str, name: str) -> bool? {
+    if s == "true" || s == "1" {
+        return true
+    }
+    if s == "false" || s == "0" {
+        return false
+    }
+    __reply_text(400, "parameter '" + name + "' must be true or false, found '" + s + "'")
+    return none
+}
+
+fn __missing(name: str) {
+    __reply_text(400, "missing query parameter '" + name + "'")
+}
+
+// ---- Один запрос: маршрутизатор под защитой от паник ----
+
+fn __pmode_reset() {
+    if load64(__ctx() + CTX_PSAVE_PTR) != 0 {
+        __pmode_off()
+    }
+}
+
+fn __serve_one(w: __Worker, req: __Req) {
+    let c = __ctx()
+    let prev = load64(c + CTX_CATCH)
+    w.status = 0
+    buf_clear(w.body)
+    if __setjmp(w.jb) == 0 {
+        store64(c + CTX_CATCH, w.jb)
+        __dispatch(req)
+    } else {
+        __pmode_reset()
+        let msg: str = __cast(load64(c + CTX_PANIC))
+        if w.testing {
+            __reply_text(500, msg)
+        } else {
+            eprint(msg)
+            __reply_text(500, "Internal Server Error")
+        }
+    }
+    store64(c + CTX_CATCH, prev)
+    __store_unlock()
+}
+
+// ---- Тесты: khc test ----
+
+var __tests_run: int
+var __tests_failed: int
+var __test_bad: bool
+var __test_log: str
+
+fn __tests_init() {
+    __store_init()
+    __arena_init(0)
+    let w = __worker_init()
+    w.testing = true
+}
+
+fn __test_begin(name: str, jb: int) {
+    __test_bad = false
+    __test_log = ""
+    __tests_run += 1
+    store64(__ctx() + CTX_CATCH, jb)
+    __arena_begin()
+}
+
+fn __test_fail(msg: str) {
+    __test_bad = true
+    __test_log = __test_log + "    " + msg + "\n"
+}
+
+fn __test_end(name: str) {
+    let c = __ctx()
+    if load64(c + CTX_CATCH) == 0 {
+        // тест прерван паникой
+        __pmode_reset()
+        let msg: str = __cast(load64(c + CTX_PANIC))
+        __test_fail(msg)
+    }
+    store64(c + CTX_CATCH, 0)
+    __store_unlock()
+    if __test_bad {
+        __tests_failed += 1
+        write("FAIL  " + name + "\n" + __test_log)
+    } else {
+        print("ok    " + name)
+    }
+    __arena_end()
+}
+
+fn __tests_done() -> int {
+    let passed = __tests_run - __tests_failed
+    print("{__tests_run} tests: {passed} passed, {__tests_failed} failed")
+    if __tests_failed > 0 {
+        return 1
+    }
+    return 0
+}
+
+fn __expect(ok: bool, at: str, text: str) {
+    if !ok {
+        __test_fail(at + ": expect " + text)
+    }
+}
+
+fn __expect_eq(l: str, r: str, want_eq: bool, at: str, text: str) {
+    if (l == r) != want_eq {
+        __test_fail(at + ": expect " + text + "\n      left:  " + l + "\n      right: " + r)
+    }
+}
+
+fn __call(method: str, target: str, body: int, d: int) -> Response {
+    let w = __w()
+    var path = target
+    var query = ""
+    if let q = target.find("?") {
+        path = target[..q]
+        query = target[q + 1..]
+    }
+    var text = ""
+    if d != 0 {
+        if load64(d) == D_STR {
+            text = __cast(body)
+        } else {
+            text = __json_encode(body, d)
+        }
+    }
+    let req = __Req { method: method, path: path, query: query, body: text }
+    // как в сервере: всё, что запрос выделил в арене, освобождается после ответа
+    let c = __ctx()
+    let mark = load64(c + CTX_PTR)
+    __serve_one(w, req)
+    let used = load64(c + CTX_PTR) - mark
+    __memset(mark, 0, used)
+    store64(c + CTX_PTR, mark)
+    return Response { status: w.status, body: buf_str(w.body) }
+}

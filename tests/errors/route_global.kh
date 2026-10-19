@@ -1,0 +1,7 @@
+// expect: error: global 'hits' would be shared by all requests
+// expect: declare it with store
+var hits: int = 0
+
+route GET "/" -> int {
+    return hits
+}

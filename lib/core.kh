@@ -31,18 +31,42 @@ const STDERR = 2
 // контекст как fs:[0]. Остальные поля — состояние выделителя памяти и рантайма.
 
 const CTX_SELF = 0
+// текущий выделитель: следующий свободный байт и конец доступной памяти
 const CTX_PTR = 8
 const CTX_END = 16
-const CTX_ARENA = 24
-const CTX_ARENA_START = 32
-const CTX_CATCH = 40
-const CTX_STORE_HELD = 48
-const CTX_WORKER = 56
-const CTX_JMPBUF = 64
+// обычная память потока, пока выделение идёт из арены запроса
+const CTX_SAVE_PTR = 24
+const CTX_SAVE_END = 32
+// арена потока: начало и конец подключённой части (0 — арены нет)
+const CTX_ARENA = 40
+const CTX_ARENA_END = 48
+// арена, пока выделение идёт из постоянной памяти store (0 — не идёт)
+const CTX_PSAVE_PTR = 56
+const CTX_PSAVE_END = 64
+// поток держит блокировку store
+const CTX_STORE_HELD = 72
+// состояние HTTP-сервера потока
+const CTX_WORKER = 80
+// куда вернуться при панике (буфер __setjmp) или 0
+const CTX_CATCH = 88
+// текст последней паники
+const CTX_PANIC = 96
+// HTTP-сервер потока
+const CTX_SERVER = 104
 const CTX_SIZE = 256
 
 const CHUNK = 1048576
 const BIG = 262144
+
+// Области адресов. Арена запроса освобождается целиком после ответа, поэтому
+// всё, что переживает запрос (store), копируется в постоянную память. Принадлежность
+// адреса определяется по старшим битам: адрес >> 40.
+const ARENA_REGION = 0x200000000000
+const ARENA_SIZE = 0x100000000
+const ARENA_TAG = 0x20
+const STORE_REGION = 0x100000000000
+const STORE_SIZE = 0x4000000000
+const COMMIT = 4194304
 
 // ---- Паники ----
 
@@ -85,13 +109,139 @@ fn __alloc(n: int) -> int {
 }
 
 fn __alloc_slow(c: int, size: int) -> int {
+    let p = load64(c + CTX_PTR)
+    let tag = p >> 40
+    if tag == ARENA_TAG || tag == (STORE_REGION >> 40) {
+        // арена или постоянная память: зарезервированная область подключается кусками
+        var limit = STORE_REGION + STORE_SIZE
+        if tag == ARENA_TAG {
+            limit = load64(c + CTX_ARENA) + ARENA_SIZE
+        }
+        let end = load64(c + CTX_END)
+        var new_end = (p + size + COMMIT - 1) & ~(COMMIT - 1)
+        if new_end > limit {
+            __panic(PANIC_MEMORY, "region")
+        }
+        if syscall(10, end, new_end - end, 3) < 0 {
+            __panic(PANIC_MEMORY, "mprotect")
+        }
+        store64(c + CTX_END, new_end)
+        store64(c + CTX_PTR, p + size)
+        return p
+    }
     if size >= BIG {
         return __mmap(size)
     }
-    let p = __mmap(CHUNK)
-    store64(c + CTX_PTR, p + size)
-    store64(c + CTX_END, p + CHUNK)
-    return p
+    let q = __mmap(CHUNK)
+    store64(c + CTX_PTR, q + size)
+    store64(c + CTX_END, q + CHUNK)
+    return q
+}
+
+// Резерв адресов без памяти: память подключается по мере выделения.
+fn __reserve(at: int, size: int) -> bool {
+    // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE
+    let p = syscall(SYS_MMAP, at, size, 0, 0x22 | 0x4000 | 0x100000, -1, 0)
+    return p == at
+}
+
+fn __in_arena(p: int) -> bool {
+    return (p >> 40) == ARENA_TAG
+}
+
+// Память для внутренностей объекта h (рост списка, таблица словаря): объект
+// вне арены не должен ссылаться на арену, поэтому его память — постоянная.
+fn __alloc_for(h: int, n: int) -> int {
+    let c = __ctx()
+    if __in_arena(load64(c + CTX_PTR)) && !__in_arena(h) {
+        let on = __pmode_on()
+        let p = __alloc(n)
+        if on {
+            __pmode_off()
+        }
+        return p
+    }
+    return __alloc(n)
+}
+
+// ---- Постоянная память store: одна область на процесс ----
+
+var __store_ptr: int
+var __store_end: int
+
+fn __store_init() {
+    if __store_ptr == 0 {
+        if !__reserve(STORE_REGION, STORE_SIZE) {
+            __panic(PANIC_MEMORY, "store region")
+        }
+        __store_ptr = STORE_REGION
+        __store_end = STORE_REGION
+    }
+}
+
+// Переключить выделение на постоянную память. → false, если уже переключено.
+fn __pmode_on() -> bool {
+    let c = __ctx()
+    if load64(c + CTX_PSAVE_PTR) != 0 || __store_ptr == 0 {
+        return false
+    }
+    __store_lock()
+    store64(c + CTX_PSAVE_PTR, load64(c + CTX_PTR))
+    store64(c + CTX_PSAVE_END, load64(c + CTX_END))
+    store64(c + CTX_PTR, __store_ptr)
+    store64(c + CTX_END, __store_end)
+    return true
+}
+
+fn __pmode_off() {
+    let c = __ctx()
+    __store_ptr = load64(c + CTX_PTR)
+    __store_end = load64(c + CTX_END)
+    store64(c + CTX_PTR, load64(c + CTX_PSAVE_PTR))
+    store64(c + CTX_END, load64(c + CTX_PSAVE_END))
+    store64(c + CTX_PSAVE_PTR, 0)
+}
+
+// Блокировка store (__store_lock, __store_unlock) — в lib/rt.kh: ей нужны
+// атомарные операции.
+
+// ---- Арена запроса: одна на поток ----
+
+fn __arena_init(id: int) {
+    let c = __ctx()
+    let base = ARENA_REGION + id * ARENA_SIZE
+    if !__reserve(base, ARENA_SIZE) {
+        __panic(PANIC_MEMORY, "arena region")
+    }
+    store64(c + CTX_ARENA, base)
+    store64(c + CTX_ARENA_END, base)
+}
+
+// Дальше память выделяется из арены.
+fn __arena_begin() {
+    let c = __ctx()
+    store64(c + CTX_SAVE_PTR, load64(c + CTX_PTR))
+    store64(c + CTX_SAVE_END, load64(c + CTX_END))
+    store64(c + CTX_PTR, load64(c + CTX_ARENA))
+    store64(c + CTX_END, load64(c + CTX_ARENA_END))
+}
+
+// Освободить всё, что выделено в арене, и вернуться к обычной памяти.
+// Арена обнуляется: выделитель обещает нулевую память.
+fn __arena_end() {
+    let c = __ctx()
+    let base = load64(c + CTX_ARENA)
+    let used = load64(c + CTX_PTR) - base
+    let end = load64(c + CTX_END)
+    if used > 8 * COMMIT {
+        // большой запрос: вернуть страницы системе (они вернутся нулевыми)
+        syscall(28, base, end - base, 4)
+    } else {
+        __memset(base, 0, used)
+    }
+    store64(c + CTX_ARENA_END, end)
+    store64(c + CTX_PTR, load64(c + CTX_SAVE_PTR))
+    store64(c + CTX_END, load64(c + CTX_SAVE_END))
 }
 
 fn __memcpy(dst: int, src: int, n: int) {
@@ -159,9 +309,14 @@ fn __panic_text(kind: int) -> str {
     return "panic"
 }
 
+// Паника: текст запоминается в контексте; внутри запроса или теста управление
+// возвращается в рантайм (__panic_recover), иначе программа завершается.
 fn __panic(kind: int, at: str) {
-    eprint("panic: " + __panic_text(kind) + " at " + at)
+    let msg = "panic: " + __panic_text(kind) + " at " + at
+    let mh: int = __cast(msg)
+    store64(__ctx() + CTX_PANIC, mh)
     __panic_recover()
+    eprint(msg)
     exit(101)
 }
 
@@ -475,7 +630,8 @@ fn buf_reserve(b: Buf, n: int) {
     while c < b.len + n {
         c *= 2
     }
-    let p = __alloc(c)
+    let bh: int = __cast(b)
+    let p = __alloc_for(bh, c)
     __memcpy(p, b.data, b.len)
     b.data = p
     b.cap = c
@@ -570,7 +726,7 @@ fn __list_grow(h: int, need: int) {
         cap *= 2
     }
     let es = load64(h + 24)
-    let data = __alloc(cap * es)
+    let data = __alloc_for(h, cap * es)
     __memcpy(data, load64(h), load64(h + 8) * es)
     store64(h, data)
     store64(h + 16, cap)
@@ -1091,7 +1247,7 @@ fn __map_rehash(m: int) {
     while size < w * 4 {
         size *= 2
     }
-    store64(m + 32, __alloc(size * 8))
+    store64(m + 32, __alloc_for(m, size * 8))
     store64(m + 40, size - 1)
     var i = 0
     while i < w {

@@ -1,0 +1,6 @@
+// expect: error: the route must return a response on every path
+route GET "/x" (n: int) -> str {
+    if n > 0 {
+        return "positive"
+    }
+}

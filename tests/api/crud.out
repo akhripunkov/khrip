@@ -1,0 +1,5 @@
+ok    create
+ok    validation
+ok    read and list
+ok    delete
+4 tests: 4 passed, 0 failed

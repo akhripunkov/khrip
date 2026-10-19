@@ -1,0 +1,7 @@
+// expect: error: a program with routes is an HTTP server and has no fn main
+route GET "/" -> str {
+    return "hi"
+}
+
+fn main() {
+}

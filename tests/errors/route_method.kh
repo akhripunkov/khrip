@@ -1,0 +1,5 @@
+// expect: error: expected an HTTP method (GET, POST, PUT, PATCH, DELETE), found 'get'
+// expect: write the method in upper case: GET
+route get "/" -> str {
+    return "hi"
+}

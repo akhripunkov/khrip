@@ -2,7 +2,6 @@
 # (использует его переменные KHC, tmp и функцию failed).
 
 HTTP_PORT=${HTTP_PORT:-18181}
-HTTP_LIBS="lib/std.kh lib/net.kh lib/json.kh lib/http.kh"
 
 http_ok() {
 	pass=$((pass + 1))
@@ -39,12 +38,11 @@ if ! command -v curl >/dev/null; then
 	return 0
 fi
 
-# shellcheck disable=SC2086
-if ! "$KHC" -o "$tmp/server" $HTTP_LIBS bench/khrip/server.kh 2>"$tmp/server.err"; then
+if ! "$KHC" -o "$tmp/server" bench/khrip/server.kh 2>"$tmp/server.err"; then
 	failed "http" "сервер не скомпилировался: $(cat "$tmp/server.err")"
 	return 0
 fi
-PORT=$HTTP_PORT "$tmp/server" &
+PORT=$HTTP_PORT "$tmp/server" 2>/dev/null &
 server_pid=$!
 for _ in $(seq 100); do
 	curl -s -o /dev/null "http://127.0.0.1:$HTTP_PORT/plaintext" && break
@@ -69,6 +67,9 @@ expect_count "строка запроса не мешает маршруту" "$
 r=$(curl -s -i "$url/nope" | tr -d '\r')
 expect_count "неизвестный путь" "$r" "^HTTP/1.1 404 Not Found$" 1
 
+r=$(curl -s -i -X DELETE "$url/plaintext" | tr -d '\r')
+expect_count "известный путь, другой метод" "$r" "^HTTP/1.1 405 Method Not Allowed$" 1
+
 r=$(curl -s -o /dev/null -o /dev/null -w '%{num_connects}\n' "$url/plaintext" "$url/json")
 expect_count "keep-alive: второй запрос в том же соединении" "$r" "^0$" 1
 
@@ -81,10 +82,10 @@ r=$(http_raw 'GET /plain' 'text HTTP/1.1\r\nConnection: close\r\n\r\n')
 expect_count "запрос, пришедший по частям" "$r" "^Hello, World!$" 1
 
 r=$(http_raw 'POST /plaintext HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /plaintext HTTP/1.1\r\nConnection: close\r\n\r\n')
-expect_count "тело пропускается, следующий запрос цел" "$(grep -oE 'HTTP/1.1 [0-9]+' <<<"$r" | tr '\n' ' ')" "^HTTP/1.1 404 HTTP/1.1 200 $" 1
+expect_count "тело пропускается, следующий запрос цел" "$(grep -oE 'HTTP/1.1 [0-9]+' <<<"$r" | tr '\n' ' ')" "^HTTP/1.1 405 HTTP/1.1 200 $" 1
 
 r=$(http_raw 'POST /plaintext HTTP/1.1\r\nContent-Length: 5\r\n\r\nhel' 'loGET /plaintext HTTP/1.1\r\nConnection: close\r\n\r\n')
-expect_count "тело, пришедшее по частям" "$(grep -oE 'HTTP/1.1 [0-9]+' <<<"$r" | tr '\n' ' ')" "^HTTP/1.1 404 HTTP/1.1 200 $" 1
+expect_count "тело, пришедшее по частям" "$(grep -oE 'HTTP/1.1 [0-9]+' <<<"$r" | tr '\n' ' ')" "^HTTP/1.1 405 HTTP/1.1 200 $" 1
 
 r=$(http_raw 'GET /plaintext HTTP/1.0\r\n\r\n')
 expect_count "HTTP/1.0 закрывает соединение" "$r" "^Connection: close$" 1
@@ -95,7 +96,7 @@ expect_count "мусор вместо запроса" "$r" "^HTTP/1.1 400 Bad Re
 r=$(http_raw 'GET /plaintext HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n')
 expect_count "chunked пока не поддерживается" "$r" "^HTTP/1.1 501 Not Implemented$" 1
 
-r=$(http_raw "GET /plaintext HTTP/1.1\r\nX-Big: $(head -c 17000 /dev/zero | tr '\0' 'a')")
+r=$(http_raw "GET /plaintext HTTP/1.1\r\nX-Big: $(head -c 70000 /dev/zero | tr '\0' 'a')")
 expect_count "слишком большие заголовки" "$r" "^HTTP/1.1 431 Request Header Fields Too Large$" 1
 
 r=$(curl -s "$url/plaintext")

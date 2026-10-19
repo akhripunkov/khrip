@@ -5,6 +5,7 @@
 #   tests/errors/*.kh — не должны компилироваться; вывод компилятора должен
 #                       содержать каждую строку «// expect: ...»; ключи
 #                       компилятора — из «// flags: ...»;
+#   tests/api/*.kh    — блоки test (khc test); вывод сравнивается с .out;
 #   tests/http.sh     — HTTP-сервер на Khrip отвечает правильно.
 # Компилятор берётся из $KHC (по умолчанию build/khc).
 set -uo pipefail
@@ -59,6 +60,17 @@ for src in tests/errors/*.kh; do
 		fi
 	done < <(sed -n 's|^// expect: *||p' "$src")
 	[[ $ok -eq 1 ]] && pass=$((pass + 1))
+done
+
+for src in tests/api/*.kh; do
+	name=$(basename "$src" .kh)
+	"$KHC" test "$src" >"$tmp/$name.out" 2>&1
+	if ! diff -u "tests/api/$name.out" "$tmp/$name.out" >"$tmp/$name.diff"; then
+		failed "$src" "вывод тестов отличается от ожидаемого"
+		cat "$tmp/$name.diff"
+		continue
+	fi
+	pass=$((pass + 1))
 done
 
 if [[ -f tests/http.sh ]]; then

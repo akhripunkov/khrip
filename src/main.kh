@@ -2,8 +2,10 @@
 // khc — компилятор Khrip-1, написанный на Khrip-1.
 //
 //   khc -o <выход> <файл.kh>...     собрать программу
+//   khc run <файл.kh>...            собрать и сразу запустить
+//   khc test <файл.kh>...           собрать и запустить блоки test
 //   khc check <файл.kh>...          только проверить
-//   ключи: --json (ошибки в JSON), --test (собрать запуск тестов)
+//   ключи: --json (ошибки в JSON), --test (собрать запуск тестов в -o)
 //
 // Стандартная библиотека (lib/*.kh) подключается сама: каталог lib ищется
 // рядом с исполняемым файлом компилятора (../lib) или в $KHRIP_LIB.
@@ -52,7 +54,7 @@ fn load_file(path: str, is_lib: bool) -> bool {
 }
 
 // Статический ELF: код с CODE_BASE (вместе с заголовками), данные с DATA_BASE.
-fn write_elf(path: str) -> bool {
+fn elf_image() -> str {
     let code_end = HDR_SIZE + code_len
     let data_off = (code_end + 0xFFF) & ~0xFFF
     let total = data_off + data_len
@@ -91,7 +93,66 @@ fn write_elf(path: str) -> bool {
     put64_at(img + 168, 0x1000)
     __memcpy(img + HDR_SIZE, code, code_len)
     __memcpy(img + data_off, data, data_len)
-    return write_file(path, __str_new(img, total), true)
+    return __str_new(img, total)
+}
+
+// Запуск собранной программы без файла на диске: memfd_create + execveat.
+fn run_image(img: str, name: str) -> int {
+    let fd = syscall(319, __cstr(name), 0)
+    if fd < 0 {
+        eprint("khc: memfd_create failed")
+        return 1
+    }
+    var off = 0
+    while off < img.len() {
+        let w = syscall(1, fd, __str_ptr(img) + off, img.len() - off)
+        if w <= 0 {
+            eprint("khc: cannot write the program image")
+            return 1
+        }
+        off += w
+    }
+    let argv = __alloc(16)
+    store64(argv, __cstr(name))
+    let envp = __argv + (__argc + 1) * 8
+    // execveat(fd, "", argv, envp, AT_EMPTY_PATH)
+    syscall(322, fd, __cstr(""), argv, envp, 0x1000)
+    eprint("khc: cannot run the program")
+    return 1
+}
+
+// Сгенерированный исходный текст дописывается к программе.
+fn add_generated(text: str) {
+    files.push(SrcFile { path: "<generated>", text: text, is_lib: true })
+    toks.pop()
+    let start = toks.len()
+    lex_file(files.len() - 1)
+    add_tok_text(T_EOF, 0, "", lx_p)
+    prescan_from(2, start)
+}
+
+// Размер кода каждой скомпилированной функции (ключ --sizes).
+fn print_sizes() {
+    var starts: [int] = []
+    for f in funcs {
+        if f.code >= 0 {
+            starts.push(f.code)
+        }
+    }
+    var total = 0
+    for f in funcs {
+        if f.code >= 0 {
+            var end = code_len
+            for x in starts {
+                if x > f.code && x < end {
+                    end = x
+                }
+            }
+            print((end - f.code).to_str() + " " + f.name)
+            total += end - f.code
+        }
+    }
+    print(total.to_str() + " code total, " + data_len.to_str() + " data")
 }
 
 fn resolve_fixups() {
@@ -107,7 +168,9 @@ fn resolve_fixups() {
 
 fn usage() -> int {
     eprint("usage: khc -o <output> <file.kh>...")
-    eprint("       khc check <file.kh>...")
+    eprint("       khc run <file.kh>...     build and run")
+    eprint("       khc test <file.kh>...    build and run the test blocks")
+    eprint("       khc check <file.kh>...   only check")
     eprint("options: --json  report errors as JSON")
     eprint("         --test  build a runner for test blocks")
     return 2
@@ -119,6 +182,8 @@ fn main() -> int {
     var inputs: [str] = []
     var test_mode = false
     var check_only = false
+    var run = false
+    var sizes = false
     var i = 1
     while i < argv.len() {
         let a = argv[i]
@@ -133,6 +198,13 @@ fn main() -> int {
             test_mode = true
         } else if a == "check" {
             check_only = true
+        } else if a == "run" && inputs.len() == 0 {
+            run = true
+        } else if a == "test" && inputs.len() == 0 {
+            run = true
+            test_mode = true
+        } else if a == "--sizes" {
+            sizes = true
         } else if a == "--version" {
             print("khc " + version())
             return 0
@@ -141,7 +213,7 @@ fn main() -> int {
         }
         i += 1
     }
-    if inputs.len() == 0 || (out.len() == 0 && !check_only) {
+    if inputs.len() == 0 || (out.len() == 0 && !check_only && !run) {
         return usage()
     }
     types_init()
@@ -164,12 +236,27 @@ fn main() -> int {
         lex_file(fi)
         fi += 1
     }
+    // библиотека API — только программам с route, test, store или JSON
+    if test_mode || uses_api() {
+        api_libs = true
+        for name in api_lib_files() {
+            if !load_file(lib + "/" + name, true) {
+                return 2
+            }
+            lex_file(files.len() - 1)
+        }
+    }
     lx_file = files.len() - 1
     add_tok_text(T_EOF, 0, "", lx_p)
     let init_fn = gen_func("__init_globals", ty_void)
     let main_fn = gen_func("__main", ty_int)
     prescan(1)
     prescan(2)
+    api_mode = routes.len() > 0 || tests.len() > 0 || test_mode
+    check_api()
+    if api_libs {
+        add_generated(gen_api_source())
+    }
     // точка входа: mov rdi, rsp; call __entry; ud2
     emit8(0x48)
     emit8(0x89)
@@ -177,16 +264,26 @@ fn main() -> int {
     emit_call(rt_func("__entry"))
     emit8(0x0F)
     emit8(0x0B)
+    // Функции программы компилируются все (ради ошибок), функции библиотеки —
+    // только вызванные: очередь work пополняет emit_call.
     var f = 0
     while f < funcs.len() {
-        if funcs[f].body >= 0 {
+        if funcs[f].body >= 0 && !funcs[f].is_lib && !funcs[f].used {
+            funcs[f].used = true
             compile_fn(f)
         }
         f += 1
     }
-    compile_api()
     compile_init_globals(init_fn)
     compile_main_wrapper(main_fn, test_mode)
+    var w = 0
+    while w < work.len() {
+        let fi = work[w]
+        if funcs[fi].body >= 0 && funcs[fi].code < 0 {
+            compile_fn(fi)
+        }
+        w += 1
+    }
     resolve_fixups()
     if diags.len() > 0 {
         print_diags()
@@ -195,7 +292,13 @@ fn main() -> int {
     if check_only {
         return 0
     }
-    if !write_elf(out) {
+    if sizes {
+        print_sizes()
+    }
+    if run {
+        return run_image(elf_image(), inputs[0])
+    }
+    if !write_file(out, elf_image(), true) {
         eprint("khc: cannot write " + out)
         return 1
     }

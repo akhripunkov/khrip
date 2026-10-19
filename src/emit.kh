@@ -260,10 +260,17 @@ fn emit_setcc(cc: int) {
 
 // ---- Вызовы ----
 
+// Функции компилируются только если их вызывают: вызов ставит функцию в очередь.
+var work: [int]
+
 fn emit_call(fi: int) {
     emit8(0xE8)
     fixups.push(Fixup { at: code_len, func: fi })
     emit32(0)
+    if !funcs[fi].used {
+        funcs[fi].used = true
+        work.push(fi)
+    }
 }
 
 // Аргументы лежат в стеке (последний сверху); первые шесть уходят в регистры.

@@ -1,0 +1,5 @@
+// expect: error: from_json needs to know the result type
+// expect: let user: User? = from_json(text)
+fn main() {
+    let x = from_json("1")
+}

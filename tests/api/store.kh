@@ -1,0 +1,70 @@
+// Данные store переживают запрос: значения, созданные в обработчике,
+// копируются в постоянную память при записи внутрь объектов store.
+
+type Item {
+    name: str
+    tags: [str]
+    note: str?
+}
+
+store items: map[int, Item]
+store names: [str]
+store by_name: map[str, int]
+
+route POST "/items/{id}" (id: int, name: str) -> 201 Item {
+    let item = Item { name: name + "", tags: [], note: none }
+    items[id] = item
+    by_name[name + "-key"] = id
+    return 201 item
+}
+
+route PUT "/items/{id}/tag" (id: int, tag: str) -> 204 | 404 {
+    let it = items[id] else {
+        return 404
+    }
+    it.tags.push(tag + "")
+    it.name = it.name + "!"
+    it.note = "tagged with " + tag
+    names.push("{tag}#{names.len()}")
+    return 204
+}
+
+route GET "/items/{id}" (id: int) -> Item | 404 {
+    return items[id] ?? 404
+}
+
+route GET "/names" -> [str] {
+    return names
+}
+
+route GET "/by-name/{name}" (name: str) -> int | 404 {
+    return by_name[name] ?? 404
+}
+
+test "create" {
+    expect (call POST "/items/1?name=box").status == 201
+    expect (call POST "/items/2?name=bag").body == "\{\"name\":\"bag\",\"tags\":[],\"note\":null}"
+    for i in 0..20 {
+        expect (call PUT "/items/1/tag?tag=t{i}").status == 204
+    }
+    expect (call PUT "/items/9/tag?tag=x").status == 404
+}
+
+test "read after the arena is reset" {
+    let r = call GET "/items/1"
+    expect r.status == 200
+    let item: Item? = from_json(r.body)
+    if let it = item {
+        expect it.tags.len() == 20
+        expect it.tags[19] == "t19"
+        expect it.name == "box!!!!!!!!!!!!!!!!!!!!"
+        expect (it.note ?? "") == "tagged with t19"
+    } else {
+        expect false
+    }
+    expect (call GET "/names").body.starts_with("[\"t0#0\",\"t1#1\"")
+    expect (call GET "/by-name/bag-key").body == "2"
+    expect (call GET "/by-name/nope").status == 404
+    expect (call GET "/items/x").status == 400
+    expect (call DELETE "/items/1").status == 405
+}

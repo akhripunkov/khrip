@@ -168,20 +168,25 @@ type PanicSite {
 
 var panic_sites: [PanicSite]
 
+// Место паники — число: номер файла << 24 | строка (имя файла — __file_name).
+fn panic_loc(at: Token) -> int {
+    return (at.file << 24) | at.line
+}
+
 fn emit_panic_jump(cc: int, kind: int, at: Token) {
     let h = emit_jcc(cc)
-    panic_sites.push(PanicSite { hole: h, kind: kind, where: const_str(files[at.file].path + ":" + at.line.to_str()) })
+    panic_sites.push(PanicSite { hole: h, kind: kind, where: panic_loc(at) })
 }
 
 fn emit_panic(kind: int, at: Token) {
     emit_mov_imm(RDI, kind)
-    emit_mov_imm(RSI, const_str(files[at.file].path + ":" + at.line.to_str()))
-    emit_call(rt_func("__panic"))
+    emit_mov_imm(RSI, panic_loc(at))
+    emit_call(rt_func("__panic_at"))
 }
 
 // Вызовы паник для всех отложенных переходов функции.
 fn emit_panic_stubs() {
-    let f = rt_func("__panic")
+    let f = rt_func("__panic_at")
     for ps in panic_sites {
         patch_here(ps.hole)
         emit_mov_imm(RDI, ps.kind)
@@ -191,8 +196,42 @@ fn emit_panic_stubs() {
     panic_sites.clear()
 }
 
+// Переполнение проверяется в коде программы; код библиотеки считает сам.
 fn emit_overflow_check(at: Token) {
+    if files[at.file].is_lib {
+        return
+    }
     emit_panic_jump(CC_O, PANIC_OVERFLOW, at)
+}
+
+var file_tab: int
+
+// Таблица имён файлов для мест паник: адреса строк по номеру файла.
+fn file_table() -> int {
+    if file_tab == 0 {
+        data_align()
+        let off = data_len
+        var i = 0
+        while i < files.len() {
+            data_u64(0)
+            i += 1
+        }
+        file_tab = DATA_BASE + off
+        i = 0
+        while i < files.len() {
+            var name = files[i].path
+            if files[i].is_lib && name != "<generated>" {
+                var j = name.len()
+                while j > 0 && name[j - 1] != '/' {
+                    j -= 1
+                }
+                name = "lib/" + name[j..name.len()]
+            }
+            store64(data + off + i * 8, data_str(name))
+            i += 1
+        }
+    }
+    return file_tab
 }
 
 // Индекс в rcx, получатель в rax, длина по смещению 8.
@@ -514,12 +553,17 @@ fn parse_expr(w: int) -> int {
 // a ?? b — значение a, если оно не none, иначе b. Если b тоже T?, результат T?.
 fn parse_coalesce() -> int {
     let w = want
+    let allow_status = route_qq
+    route_qq = false
     let lt = parse_or()
     if kind() != T_QQ {
         return lt
     }
     let at = tok()
     advance()
+    if allow_status && tkind(lt) == K_OPT && route_qq_ok() {
+        return route_qq_status(lt)
+    }
     if tkind(lt) != K_OPT {
         if lt != ty_err {
             error_tok(at, "?? needs an optional value on the left, found " + ty_name(lt), "")

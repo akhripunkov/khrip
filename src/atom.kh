@@ -698,7 +698,6 @@ fn in_inline_stack(fi: int) -> bool {
 
 // Вызов функции fi, аргументы (n штук) в стеке.
 fn emit_call_args(fi: int, n: int) {
-    funcs[fi].used = true
     if n == funcs[fi].params.len() && funcs[fi].inline_ok && inline_depth < 3 && fi != cur_fn && !in_inline_stack(fi) && diags.len() == 0 {
         inline_call(fi, n)
         return
@@ -891,8 +890,136 @@ fn parse_builtin(t: Token, w: int) -> int {
         emit_to_str(t1, a)
         return ty_str
     }
-    if (name == "__memcpy" || name == "__memset") && !files[t.file].is_lib {
+    if name == "to_json" {
+        advance()
+        let a = tok()
+        let saved = no_struct
+        no_struct = false
+        let t1 = parse_expr(ty_err)
+        no_struct = saved
+        expect_tok(')')
+        let d = type_desc(t1)
+        if d == 0 {
+            if t1 != ty_err {
+                error_tok(a, "cannot turn " + ty_name(t1) + " into JSON", "")
+            }
+            return ty_str
+        }
+        emit_mov_rr(RDI, RAX)
+        emit_mov_imm(RSI, d)
+        emit_call(rt_func("__json_encode"))
+        return ty_str
+    }
+    if name == "from_json" {
+        advance()
+        let a = tok()
+        let t1 = parse_expr(ty_str)
+        coerce(t1, ty_str, a)
+        expect_tok(')')
+        let inner = ty_inner(w)
+        let d = type_desc(inner)
+        if w == ty_err || d == 0 {
+            error_tok(t, "from_json needs to know the result type", "let user: User? = from_json(text)")
+            return ty_err
+        }
+        emit_mov_rr(RDI, RAX)
+        emit_mov_imm(RSI, d)
+        emit_call(rt_func("__json_decode"))
+        return ty_opt(inner)
+    }
+    let lib_only = name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset"
+    if lib_only && !files[t.file].is_lib {
         return -1
+    }
+    if name == "__setjmp" {
+        // буфер: rip, rsp, rbp, rbx, r12–r15; повторный возврат — с 1
+        advance()
+        builtin_args(1, t, name)
+        emit_pop(RAX)
+        emit8(0x48)
+        emit8(0x8D)
+        emit8(0x0D)
+        let lea = emit_hole()
+        emit_store(RAX, 0, RCX)
+        emit_store(RAX, 8, RSP)
+        emit_store(RAX, 16, RBP)
+        emit_store(RAX, 24, RBX)
+        emit_store(RAX, 32, R12)
+        emit_store(RAX, 40, R13)
+        emit_store(RAX, 48, R14)
+        emit_store(RAX, 56, R15)
+        emit8(0x31)
+        emit8(0xC0)
+        emit8(0xEB)
+        emit8(0x05)
+        patch_rel(lea, code_len)
+        emit8(0xB8)
+        emit32(1)
+        barrier = code_len
+        return ty_int
+    }
+    if name == "__longjmp" {
+        advance()
+        builtin_args(1, t, name)
+        emit_pop(RAX)
+        emit_load(RBX, RAX, 24)
+        emit_load(R12, RAX, 32)
+        emit_load(R13, RAX, 40)
+        emit_load(R14, RAX, 48)
+        emit_load(R15, RAX, 56)
+        emit_load(RBP, RAX, 16)
+        emit_load(RSP, RAX, 8)
+        // jmp [rax]
+        emit8(0xFF)
+        emit8(0x20)
+        return ty_void
+    }
+    if name == "__file_name" {
+        advance()
+        builtin_args(1, t, name)
+        emit_pop(RAX)
+        // mov rax, [таблица + rax*8]
+        emit8(0x48)
+        emit8(0x8B)
+        emit8(0x04)
+        emit8(0xC5)
+        emit32(file_table())
+        return ty_str
+    }
+    if name == "__cas" {
+        // lock cmpxchg [rdx], rcx; rax — ожидаемое значение
+        advance()
+        builtin_args(3, t, name)
+        emit_pop(RCX)
+        emit_pop(RAX)
+        emit_pop(RDX)
+        emit8(0xF0)
+        emit8(0x48)
+        emit8(0x0F)
+        emit8(0xB1)
+        emit8(0x0A)
+        emit_setcc(CC_E)
+        return ty_bool
+    }
+    if name == "__xchg" || name == "__xadd" {
+        advance()
+        builtin_args(2, t, name)
+        emit_pop(RAX)
+        emit_pop(RDX)
+        if name == "__xchg" {
+            // xchg [rdx], rax
+            emit8(0x48)
+            emit8(0x87)
+            emit8(0x02)
+        } else {
+            // lock xadd [rdx], rax
+            emit8(0xF0)
+            emit8(0x48)
+            emit8(0x0F)
+            emit8(0xC1)
+            emit8(0x02)
+        }
+        return ty_int
     }
     if name == "__memset" {
         // rep stosb: rdi = куда, al = байт, rcx = сколько
@@ -1079,6 +1206,14 @@ fn parse_method(rt: int, nt: Token) -> int {
     if n != f.params.len() {
         emit_alu_imm(0, RSP, n * 8)
         return subst(f.ret, tt, ty_err, ty_err)
+    }
+    if k == K_LIST && (name == "push" || name == "insert") && barrier_on(tt) {
+        // элемент попадает внутрь списка
+        emit_load(RSI, RSP, 0)
+        emit_load(RDI, RSP, 8 * (n - 1))
+        emit_mov_imm(RDX, type_desc(tt))
+        emit_call(rt_func("__barrier"))
+        emit_store(RSP, 0, RAX)
     }
     emit_call_args(fi, n)
     last_was_call = true

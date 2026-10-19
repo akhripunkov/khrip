@@ -364,11 +364,21 @@ fn interp_end(from: int, end: int) -> int {
     return -1
 }
 
+// Путь маршрута и имя теста — без интерполяции: {id} в пути — параметр.
+fn raw_string_here() -> bool {
+    let n = toks.len()
+    if n >= 1 && toks[n - 1].kind == T_TEST {
+        return true
+    }
+    return n >= 2 && toks[n - 1].kind == T_IDENT && toks[n - 2].kind == T_ROUTE
+}
+
 fn lex_string(end: int) {
     let start = lx_p
     lx_p += 1
     let b = buf_new(32)
     var parts = 0
+    let raw = raw_string_here()
     while true {
         if lx_p >= end || lx_text[lx_p] == '\n' {
             lex_error("unterminated string; close it with \" on the same line", start)
@@ -379,7 +389,7 @@ fn lex_string(end: int) {
             lx_p += 1
             break
         }
-        if c == '\{' && lx_p + 1 < end && is_alpha(lx_text[lx_p + 1]) {
+        if c == '\{' && !raw && lx_p + 1 < end && is_alpha(lx_text[lx_p + 1]) {
             let close = interp_end(lx_p + 1, end)
             if close < 0 {
                 lex_error("unclosed \{ in string; write \\\{ for a literal brace", lx_p)

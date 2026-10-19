@@ -1,9 +1,61 @@
 // ============================================================================
-// API-слой: route, store, test. Заполняется на шаге v0.4.
+// API-слой: route, store, test.
+//
+// Маршрут компилируется в обычную функцию __route_N с объявленными параметрами;
+// return в маршруте — это ответ (статус и значение). Разбор запроса и выбор
+// маршрута — сгенерированный исходный текст на Khrip (__dispatch), который
+// компилируется вместе с программой. JSON и копирование в постоянную память
+// работают по описаниям типов (type_desc) — данным, которые строит компилятор.
 // ============================================================================
 
-var routes: [int]
+type Variant {
+    status: int
+    ty: int
+}
+
+// Как параметр маршрута получает значение.
+const PK_PATH = 0
+const PK_QUERY = 1
+const PK_BODY = 2
+
+type Route {
+    method: str
+    path: str
+    segs: [str]
+    fi: int
+    tok: int
+    variants: [Variant]
+    pkind: [int]
+    pseg: [int]
+}
+
+type TestDecl {
+    name: str
+    fi: int
+}
+
+var routes: [Route]
+var tests: [TestDecl]
+// Индекс маршрута, тело которого компилируется, или -1.
 var route_ctx: int
+// В текущем return маршрута разрешено «x ?? статус».
+var route_qq: bool
+// В программе есть route или test: запросы выполняются в арене, и запись
+// в объекты вне арены копирует значения в постоянную память.
+var api_mode: bool
+var api_libs: bool
+
+// Описания типов (см. lib/api.kh).
+const D_STR = 1
+const D_INT = 2
+const D_BOOL = 3
+const D_LIST = 4
+const D_MAP = 5
+const D_OPT = 6
+const D_STRUCT = 7
+
+// Смещение CTX_STORE_HELD в контексте потока (lib/core.kh).
+const CTX_STORE_HELD_OFF = 72
 
 fn lib_files() -> [str] {
     var names: [str] = []
@@ -12,34 +64,926 @@ fn lib_files() -> [str] {
     return names
 }
 
-fn prescan_api(k: int) {
-    error_tok(tok(), "route and test are not supported yet", "")
+fn api_lib_files() -> [str] {
+    var names: [str] = []
+    names.push("api.kh")
+    names.push("http.kh")
+    return names
 }
 
-fn compile_api() {
-}
-
-fn route_return(at: Token, has_value: bool) {
-}
-
-fn store_touch() {
-}
-
-fn store_write(t: int) {
-}
-
-fn is_store_value(t: int) -> bool {
+// Нужна ли программе библиотека API: есть route, test, store или JSON.
+fn uses_api() -> bool {
+    for t in toks {
+        if t.kind == T_ROUTE || t.kind == T_TEST || t.kind == T_STORE {
+            return true
+        }
+        if t.kind == T_IDENT && (t.text == "to_json" || t.text == "from_json") {
+            return true
+        }
+    }
     return false
 }
 
-fn parse_expect() {
-    error_tok(tok(), "expect is only allowed inside test blocks", "")
-    advance()
-    parse_expr(ty_err)
+fn is_http_method(s: str) -> bool {
+    return s == "GET" || s == "POST" || s == "PUT" || s == "PATCH" || s == "DELETE" || s == "HEAD" || s == "OPTIONS"
 }
 
-fn parse_call_expr() -> int {
-    error_tok(tok(), "call is only allowed inside test blocks", "")
+fn is_scalar_ty(t: int) -> bool {
+    return t == ty_int || t == ty_bool || t == ty_err || t == ty_void || t == ty_none
+}
+
+// ---- Предварительный проход: route и test ----
+
+fn prescan_api(k: int) {
+    if k == T_ROUTE {
+        prescan_route()
+    } else {
+        prescan_test()
+    }
+}
+
+fn path_name_ok(s: str) -> bool {
+    if s.len() == 0 || !is_alpha(s[0]) {
+        return false
+    }
+    var i = 0
+    while i < s.len() {
+        if !is_ident_char(s[i]) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// Сегменты пути "/users/{id}" → ["users", "{id}"].
+fn route_segments(path: str, at: Token) -> [str] {
+    var segs: [str] = []
+    if path.len() == 0 || path[0] != '/' {
+        error_tok(at, "a route path must start with /", "e.g. \"/users/\{id}\"")
+        return segs
+    }
+    var start = 1
+    var i = 1
+    while i <= path.len() {
+        if i == path.len() || path[i] == '/' {
+            let seg = path[start..i]
+            if seg.starts_with("\{") {
+                if !seg.ends_with("}") || !path_name_ok(seg[1..seg.len() - 1]) {
+                    error_tok(at, "bad path parameter '" + seg + "'", "path parameters look like \{id}")
+                }
+            } else if seg.contains("\{") || seg.contains("}") || seg.contains(" ") || seg.contains("?") {
+                error_tok(at, "bad path segment '" + seg + "'", "a segment is either text or a parameter like \{id}")
+            }
+            segs.push(seg)
+            start = i + 1
+        }
+        i += 1
+    }
+    return segs
+}
+
+fn parse_variants() -> [Variant] {
+    var vs: [Variant] = []
+    while true {
+        var st = 200
+        var has_st = false
+        var ty = -1
+        let at = tok()
+        if kind() == T_INT {
+            st = at.val
+            has_st = true
+            if st < 100 || st > 599 {
+                error_tok(at, "HTTP status must be between 100 and 599", "")
+            }
+            advance()
+        }
+        if kind() == T_IDENT || kind() == '[' {
+            ty = parse_type()
+        }
+        if !has_st && ty < 0 {
+            syntax_error(tok(), "expected a status code or a type after ->", "e.g. -> 201 User | 400 str")
+            break
+        }
+        for v in vs {
+            if v.status == st {
+                error_tok(at, "status " + st.to_str() + " is declared twice", "a type without a status means 200")
+            }
+        }
+        vs.push(Variant { status: st, ty: ty })
+        if kind() != '|' {
+            break
+        }
+        advance()
+    }
+    return vs
+}
+
+fn prescan_route() {
+    let kw_at = pos
+    let kw = tok()
     advance()
-    return ty_err
+    let mt = tok()
+    var method = "GET"
+    if mt.kind == T_IDENT && is_http_method(mt.text) {
+        method = mt.text
+        advance()
+    } else {
+        var hint = "e.g. route GET \"/users\" -> [User] \{ ... }"
+        if mt.kind == T_IDENT && is_http_method(mt.text.upper()) {
+            hint = "write the method in upper case: " + mt.text.upper()
+            advance()
+        }
+        error_tok(mt, "expected an HTTP method (GET, POST, PUT, PATCH, DELETE), found " + tok_show(mt), hint)
+    }
+    let pt = tok()
+    if pt.kind != T_STR {
+        error_tok(pt, "expected the route path as a string, found " + tok_show(pt), "e.g. route GET \"/users/\{id}\" (id: int) -> User \{ ... }")
+        return
+    }
+    let path = strlits[pt.val]
+    advance()
+    let segs = route_segments(path, pt)
+    var ps: [Param] = []
+    if kind() == '(' {
+        ps = parse_params()
+    }
+    var vs: [Variant] = []
+    if kind() == T_ARROW {
+        advance()
+        vs = parse_variants()
+    }
+    if kind() != '\{' {
+        syntax_error(tok(), "expected '\{' to start the body of the route, found " + tok_show(tok()), "")
+        return
+    }
+    let body = pos
+    let end = matching_close(body)
+    // параметры: из пути, тело JSON (структура, список, словарь) или строка запроса
+    var pkind: [int] = []
+    var pseg: [int] = []
+    var has_body = false
+    for p in ps {
+        var si = -1
+        var j = 0
+        while j < segs.len() {
+            if segs[j] == "\{" + p.name + "}" {
+                si = j
+            }
+            j += 1
+        }
+        let k = tkind(p.ty)
+        if si >= 0 {
+            if p.ty != ty_int && p.ty != ty_str && p.ty != ty_bool && p.ty != ty_err {
+                error_tok(kw, "path parameter '" + p.name + "' must be int, str or bool, not " + ty_name(p.ty), "")
+            }
+            pkind.push(PK_PATH)
+        } else if k == K_STRUCT || k == K_LIST || k == K_MAP {
+            if has_body {
+                error_tok(kw, "a route takes at most one body parameter; '" + p.name + "' is the second", "combine them into one type")
+            }
+            has_body = true
+            pkind.push(PK_BODY)
+        } else {
+            let inner = ty_inner(p.ty)
+            if inner != ty_int && inner != ty_str && inner != ty_bool && inner != ty_err {
+                error_tok(kw, "query parameter '" + p.name + "' must be int, str or bool (or optional), not " + ty_name(p.ty), "")
+            }
+            pkind.push(PK_QUERY)
+        }
+        pseg.push(si)
+    }
+    for seg in segs {
+        if seg.starts_with("\{") && seg.ends_with("}") {
+            let name = seg[1..seg.len() - 1]
+            var found = false
+            for p in ps {
+                if p.name == name {
+                    found = true
+                }
+            }
+            if !found {
+                error_tok(pt, "path parameter \{" + name + "} has no matching parameter", "add (" + name + ": int) or (" + name + ": str) after the path")
+            }
+        }
+    }
+    for r in routes {
+        if r.method == method && route_shape(r.segs) == route_shape(segs) {
+            error_tok(kw, "route " + method + " " + path + " is declared twice", "")
+        }
+    }
+    let ri = routes.len()
+    let name = "__route_" + ri.to_str()
+    funcs.push(Func {
+        name: name,
+        params: ps,
+        ret: ty_void,
+        tok: kw_at,
+        body: body,
+        body_end: end,
+        code: -1,
+        kind: FK_ROUTE,
+        inline_ok: false,
+        is_lib: files[kw.file].is_lib,
+        used: false,
+        size: end - body
+    })
+    sym_add(name, SK_FN, funcs.len() - 1, kw)
+    routes.push(Route { method: method, path: path, segs: segs, fi: funcs.len() - 1, tok: kw_at, variants: vs, pkind: pkind, pseg: pseg })
+}
+
+// Форма пути без имён параметров: /users/{} — для поиска повторов.
+fn route_shape(segs: [str]) -> str {
+    var s = ""
+    for seg in segs {
+        if seg.starts_with("\{") {
+            s += "/\{}"
+        } else {
+            s += "/" + seg
+        }
+    }
+    return s
+}
+
+fn str_in(xs: [str], s: str) -> bool {
+    for x in xs {
+        if x == s {
+            return true
+        }
+    }
+    return false
+}
+
+fn route_is_static(r: Route) -> bool {
+    for seg in r.segs {
+        if seg.starts_with("\{") {
+            return false
+        }
+    }
+    return true
+}
+
+fn prescan_test() {
+    let kw_at = pos
+    let kw = tok()
+    advance()
+    let nt = tok()
+    var name = "test"
+    if nt.kind == T_STR {
+        name = strlits[nt.val]
+        advance()
+    } else {
+        error_tok(nt, "expected the test name as a string, found " + tok_show(nt), "test \"creates a user\" \{ ... }")
+    }
+    if kind() != '\{' {
+        syntax_error(tok(), "expected '\{' to start the test, found " + tok_show(tok()), "")
+        return
+    }
+    let body = pos
+    let end = matching_close(body)
+    var ps: [Param] = []
+    let fname = "__test_" + tests.len().to_str()
+    funcs.push(Func {
+        name: fname,
+        params: ps,
+        ret: ty_void,
+        tok: kw_at,
+        body: body,
+        body_end: end,
+        code: -1,
+        kind: FK_TEST,
+        inline_ok: false,
+        is_lib: false,
+        used: false,
+        size: end - body
+    })
+    sym_add(fname, SK_FN, funcs.len() - 1, kw)
+    tests.push(TestDecl { name: name, fi: funcs.len() - 1 })
+}
+
+fn route_of(fi: int) -> int {
+    var i = 0
+    while i < routes.len() {
+        if routes[i].fi == fi {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+// Проверки программы-сервера после предварительного прохода.
+fn check_api() {
+    if routes.len() == 0 {
+        return
+    }
+    let m = func_find("main")
+    if m >= 0 && !funcs[m].is_lib {
+        error_tok(toks[funcs[m].tok], "a program with routes is an HTTP server and has no fn main", "remove fn main; the server starts by itself (set the port with PORT)")
+    }
+    for g in globals {
+        if !g.is_store && !files[toks[g.tok].file].is_lib {
+            error_tok(toks[g.tok], "global '" + g.name + "' would be shared by all requests", "declare it with store (or use const for a constant)")
+        }
+    }
+}
+
+// ---- Описания типов ----
+
+var type_descs: [int]
+
+fn desc_reserve(n: int) -> int {
+    data_align()
+    let off = data_len
+    var i = 0
+    while i < n {
+        data_u64(0)
+        i += 1
+    }
+    return off
+}
+
+fn desc_put(off: int, i: int, v: int) {
+    store64(data + off + i * 8, v)
+}
+
+// Адрес описания типа t в данных программы (0 — у типа нет значений).
+fn type_desc(t: int) -> int {
+    while type_descs.len() < types.len() {
+        type_descs.push(0)
+    }
+    if type_descs[t] != 0 {
+        return type_descs[t]
+    }
+    let k = tkind(t)
+    var off = 0
+    if k == K_STR || k == K_INT || k == K_BOOL {
+        off = desc_reserve(1)
+        var d = D_STR
+        if k == K_INT {
+            d = D_INT
+        } else if k == K_BOOL {
+            d = D_BOOL
+        }
+        desc_put(off, 0, d)
+        type_descs[t] = DATA_BASE + off
+        return DATA_BASE + off
+    }
+    if k == K_LIST || k == K_OPT {
+        off = desc_reserve(2)
+        type_descs[t] = DATA_BASE + off
+        var d = D_LIST
+        if k == K_OPT {
+            d = D_OPT
+        }
+        desc_put(off, 0, d)
+        desc_put(off, 1, type_desc(types[t].a))
+        return DATA_BASE + off
+    }
+    if k == K_MAP {
+        off = desc_reserve(3)
+        type_descs[t] = DATA_BASE + off
+        desc_put(off, 0, D_MAP)
+        desc_put(off, 1, type_desc(types[t].a))
+        desc_put(off, 2, type_desc(types[t].b))
+        return DATA_BASE + off
+    }
+    if k == K_STRUCT {
+        let st = structs[types[t].a]
+        let n = st.fields.len()
+        off = desc_reserve(3 + 3 * n)
+        type_descs[t] = DATA_BASE + off
+        desc_put(off, 0, D_STRUCT)
+        desc_put(off, 1, n)
+        desc_put(off, 2, const_str(st.name))
+        var i = 0
+        while i < n {
+            let f = st.fields[i]
+            desc_put(off, 3 + 3 * i, const_str(f.name))
+            desc_put(off, 4 + 3 * i, const_str("\"" + f.name + "\":"))
+            desc_put(off, 5 + 3 * i, type_desc(f.ty))
+            i += 1
+        }
+        return DATA_BASE + off
+    }
+    return 0
+}
+
+// ---- Ответы маршрутов ----
+
+fn variants_text(r: Route) -> str {
+    var s = ""
+    for v in r.variants {
+        if s.len() > 0 {
+            s += " | "
+        }
+        if v.ty < 0 {
+            s += v.status.to_str()
+        } else if v.status == 200 {
+            s += ty_name(v.ty)
+        } else {
+            s += v.status.to_str() + " " + ty_name(v.ty)
+        }
+    }
+    return s
+}
+
+fn find_variant(r: Route, status: int) -> int {
+    var i = 0
+    while i < r.variants.len() {
+        if r.variants[i].status == status {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+// Значение типа t в rax → ответ со статусом и выход из маршрута.
+fn emit_reply(status: int, t: int) {
+    emit_mov_rr(RSI, RAX)
+    emit_mov_imm(RDI, status)
+    emit_mov_imm(RDX, type_desc(t))
+    emit_call(rt_func("__reply"))
+    ret_holes.push(emit_jmp())
+}
+
+fn emit_reply_status(status: int) {
+    emit_mov_imm(RDI, status)
+    emit_call(rt_func("__reply_status"))
+    ret_holes.push(emit_jmp())
+}
+
+// return СТАТУС без значения: статус должен быть объявлен без типа.
+fn route_status_only(st: Token) {
+    let r = routes[route_ctx]
+    let vi = find_variant(r, st.val)
+    if vi < 0 {
+        error_tok(st, "status " + st.val.to_str() + " is not declared by this route", "add it to the result: -> " + variants_text(r) + " | " + st.val.to_str())
+    } else if r.variants[vi].ty >= 0 {
+        error_tok(st, "status " + st.val.to_str() + " needs a value of type " + ty_name(r.variants[vi].ty), "return " + st.val.to_str() + " value")
+    }
+    emit_reply_status(st.val)
+}
+
+// Токен i может начинать значение после статуса: return 201 user.
+fn starts_value(i: int) -> bool {
+    if ends_stmt(i) {
+        return false
+    }
+    let k = kind_at(i)
+    return k == T_IDENT || k == T_STR || k == T_INT || k == '[' || k == '(' || k == T_TRUE || k == T_FALSE || k == T_NONE || k == '!'
+}
+
+fn route_return(at: Token, has_value: bool) {
+    let r = routes[route_ctx]
+    if !has_value {
+        if r.variants.len() > 0 {
+            error_tok(at, "return in a route needs a status or a value", "this route returns " + variants_text(r))
+            ret_holes.push(emit_jmp())
+            return
+        }
+        emit_reply_status(204)
+        return
+    }
+    if r.variants.len() == 0 {
+        error_tok(at, "this route declares no result", "declare it after the parameters: -> 200 str")
+        parse_expr(ty_err)
+        ret_holes.push(emit_jmp())
+        return
+    }
+    let t0 = tok()
+    if t0.kind == T_INT {
+        let vi = find_variant(r, t0.val)
+        if ends_stmt(pos + 1) && (vi >= 0 || !returns_int(r)) {
+            advance()
+            route_status_only(t0)
+            return
+        }
+        if starts_value(pos + 1) {
+            advance()
+            if vi < 0 || r.variants[vi].ty < 0 {
+                route_status_only(t0)
+                parse_expr(ty_err)
+                return
+            }
+            let vt = r.variants[vi].ty
+            let vtok = tok()
+            let t = parse_expr(vt)
+            coerce(t, vt, vtok)
+            emit_reply(t0.val, vt)
+            return
+        }
+    }
+    // значение без статуса: вариант выбирается по типу
+    var only = -1
+    var ntyped = 0
+    var i = 0
+    while i < r.variants.len() {
+        if r.variants[i].ty >= 0 {
+            ntyped += 1
+            only = i
+        }
+        i += 1
+    }
+    var w = ty_err
+    if ntyped == 1 {
+        w = r.variants[only].ty
+    }
+    let vtok = tok()
+    route_qq = true
+    let t = parse_expr(w)
+    route_qq = false
+    if t == ty_err {
+        ret_holes.push(emit_jmp())
+        return
+    }
+    var vi = -1
+    i = 0
+    while i < r.variants.len() {
+        let v = r.variants[i]
+        if v.ty >= 0 && v.ty == t && vi < 0 {
+            vi = i
+        }
+        i += 1
+    }
+    i = 0
+    while i < r.variants.len() {
+        let v = r.variants[i]
+        if v.ty >= 0 && assignable(t, v.ty) && vi < 0 {
+            vi = i
+        }
+        i += 1
+    }
+    if vi < 0 {
+        var hint = ""
+        if t0.kind == T_INT {
+            hint = "a status without a value must be declared: -> " + variants_text(r) + " | " + t0.val.to_str()
+        } else if tkind(t) == K_OPT {
+            hint = "the value may be none: return x ?? 404 (and declare 404)"
+        }
+        error_tok(vtok, "this route returns " + variants_text(r) + ", found " + ty_name(t), hint)
+        ret_holes.push(emit_jmp())
+        return
+    }
+    let v = r.variants[vi]
+    coerce(t, v.ty, vtok)
+    emit_reply(v.status, v.ty)
+}
+
+fn returns_int(r: Route) -> bool {
+    for v in r.variants {
+        if v.ty == ty_int {
+            return true
+        }
+    }
+    return false
+}
+
+// Конец тела маршрута без return.
+fn route_end(close: Token) {
+    let r = routes[route_ctx]
+    if r.variants.len() > 0 {
+        error_tok(close, "the route must return a response on every path", "end it with return; it returns " + variants_text(r))
+    }
+    emit_reply_status(204)
+}
+
+// «x ?? СТАТУС» в return маршрута: значение x или ответ без тела.
+// Левое значение (T?) в rax, текущий токен — статус. → тип T.
+fn route_qq_status(lt: int) -> int {
+    let st = tok()
+    advance()
+    let inner = ty_inner(lt)
+    emit_test_rax()
+    let has = emit_jcc(CC_NE)
+    route_status_only(st)
+    patch_here(has)
+    if !is_ref(inner) {
+        emit_load(RAX, RAX, 0)
+    }
+    return inner
+}
+
+fn route_qq_ok() -> bool {
+    return route_ctx >= 0 && inline_depth == 0 && kind() == T_INT && ends_stmt(pos + 1)
+}
+
+// ---- store ----
+
+// Первое обращение к store в запросе берёт блокировку store.
+fn store_touch() {
+    if !api_mode || inline_depth > 0 || funcs[cur_fn].is_lib {
+        return
+    }
+    // cmp qword fs:[CTX_STORE_HELD], 0
+    emit8(0x64)
+    emit8(0x48)
+    emit8(0x83)
+    emit8(0x3C)
+    emit8(0x25)
+    emit32(CTX_STORE_HELD_OFF)
+    emit8(0)
+    let skip = emit_jcc(CC_NE)
+    emit_call(rt_func("__store_lock"))
+    patch_here(skip)
+}
+
+// Значение (rax), которое записывается в store, копируется в постоянную память.
+fn store_write(t: int) {
+    if !api_mode || is_scalar_ty(t) {
+        return
+    }
+    emit_mov_rr(RDI, RAX)
+    emit_mov_imm(RSI, type_desc(t))
+    emit_call(rt_func("__persist"))
+}
+
+fn barrier_on(t: int) -> bool {
+    return api_mode && !is_scalar_ty(t) && !files[tok().file].is_lib
+}
+
+// Значение (rax) кладётся внутрь объекта, адрес которого лежит в [rsp + off]:
+// если объект вне арены, а значение в ней — значение копируется.
+fn emit_barrier(off: int, t: int) {
+    if !barrier_on(t) {
+        return
+    }
+    emit_mov_rr(RSI, RAX)
+    emit_load(RDI, RSP, off)
+    emit_mov_imm(RDX, type_desc(t))
+    emit_call(rt_func("__barrier"))
+}
+
+// ---- test, expect, call ----
+
+fn in_test() -> bool {
+    return inline_depth == 0 && funcs[cur_fn].kind == FK_TEST
+}
+
+fn expect_text(at: Token) -> str {
+    var line = source_line(at.file, at.line).trim()
+    if line.starts_with("expect ") {
+        line = line[7..line.len()].trim()
+    }
+    return line
+}
+
+fn parse_expect() {
+    let at = tok()
+    advance()
+    if !in_test() {
+        error_tok(at, "expect is only allowed inside test blocks", "test \"name\" \{ expect x == 1 }")
+        parse_expr(ty_err)
+        return
+    }
+    let where = files[at.file].path + ":" + at.line.to_str()
+    let text = expect_text(at)
+    // a == b и a != b: при ошибке показать обе стороны
+    var simple_eq = false
+    var depth = 0
+    var j = pos
+    var neq = 0
+    while !ends_stmt(j) || j == pos {
+        let k = kind_at(j)
+        if k == '(' || k == '[' || k == '\{' {
+            depth += 1
+        } else if k == ')' || k == ']' || k == '}' {
+            depth -= 1
+        } else if depth == 0 && (k == T_EQ || k == T_NE) {
+            neq += 1
+        } else if depth == 0 && (k == T_ANDAND || k == T_OROR || k == T_QQ) {
+            neq += 10
+        }
+        j += 1
+    }
+    simple_eq = neq == 1
+    if simple_eq {
+        let lt_tok = tok()
+        want = ty_err
+        let lt = parse_add()
+        let op = kind()
+        let op_tok = tok()
+        advance()
+        if lt == ty_int || lt == ty_str || lt == ty_bool {
+            emit_to_str(lt, lt_tok)
+            emit_push(RAX)
+            let rt_tok = tok()
+            want = lt
+            let rt = parse_add()
+            compare_ok(lt, rt, false, op_tok)
+            emit_to_str(rt, rt_tok)
+            emit_mov_rr(RSI, RAX)
+            emit_pop(RDI)
+            var eq = 1
+            if op == T_NE {
+                eq = 0
+            }
+            emit_mov_imm(RDX, eq)
+            emit_mov_imm(RCX, const_str(where))
+            emit_mov_imm(R8, const_str(text))
+            emit_call(rt_func("__expect_eq"))
+            return
+        }
+        let cc = emit_compare(op, lt, op_tok)
+        emit_setcc(cc)
+    } else {
+        let ct = tok()
+        let t = parse_expr(ty_bool)
+        check_bool(t, ct, "expect")
+    }
+    emit_mov_rr(RDI, RAX)
+    emit_mov_imm(RSI, const_str(where))
+    emit_mov_imm(RDX, const_str(text))
+    emit_call(rt_func("__expect"))
+}
+
+// call МЕТОД "путь" [тело] → Response
+fn parse_call_expr() -> int {
+    let at = tok()
+    advance()
+    if !in_test() {
+        error_tok(at, "call is only allowed inside test blocks", "")
+    }
+    let mt = tok()
+    var method = "GET"
+    if mt.kind == T_IDENT && is_http_method(mt.text) {
+        method = mt.text
+        advance()
+    } else {
+        error_tok(mt, "expected an HTTP method after call, found " + tok_show(mt), "call GET \"/users/1\"")
+    }
+    let saved = no_struct
+    no_struct = false
+    let pt = tok()
+    let ptype = parse_add()
+    coerce(ptype, ty_str, pt)
+    emit_push(RAX)
+    if starts_value(pos) && tok().line == pt.line {
+        let bt = parse_expr(ty_err)
+        emit_mov_rr(RDX, RAX)
+        emit_mov_imm(RCX, type_desc(bt))
+    } else {
+        emit_mov_imm(RDX, 0)
+        emit_mov_imm(RCX, 0)
+    }
+    no_struct = saved
+    emit_pop(RSI)
+    emit_mov_imm(RDI, const_str(method))
+    emit_call(rt_func("__call"))
+    last_was_call = true
+    let s = struct_find("Response")
+    if s < 0 {
+        return ty_err
+    }
+    return ty_struct(s)
+}
+
+// ---- Сгенерированный исходный текст ----
+
+// Строковый литерал Khrip с экранированием.
+fn src_lit(s: str) -> str {
+    var r = "\""
+    var i = 0
+    while i < s.len() {
+        let c = s[i]
+        if c == '"' || c == '\\' || c == '\{' {
+            r += "\\"
+        }
+        r += __str_from_byte(c)
+        i += 1
+    }
+    return r + "\""
+}
+
+fn gen_param(b: Buf, r: Route, i: int) {
+    let p = funcs[r.fi].params[i]
+    let v = "p_" + p.name
+    let lit = src_lit(p.name)
+    let k = r.pkind[i]
+    if k == PK_PATH {
+        let seg = "__url_decode(__s[" + r.pseg[i].to_str() + "])"
+        if p.ty == ty_int {
+            buf_add(b, "            let " + v + " = __param_int(" + seg + ", " + lit + ") else \{\n                return\n            }\n")
+        } else if p.ty == ty_bool {
+            buf_add(b, "            let " + v + " = __param_bool(" + seg + ", " + lit + ") else \{\n                return\n            }\n")
+        } else {
+            buf_add(b, "            let " + v + " = " + seg + "\n")
+        }
+        return
+    }
+    if k == PK_BODY {
+        buf_add(b, "            let " + v + "_o: " + ty_name(p.ty) + "? = from_json(__r.body)\n")
+        buf_add(b, "            let " + v + " = " + v + "_o else \{\n                __reply_json_error()\n                return\n            }\n")
+        return
+    }
+    let inner = ty_inner(p.ty)
+    let optional = tkind(p.ty) == K_OPT
+    let q = "__query(__r.query, " + lit + ")"
+    var conv = ""
+    if inner == ty_int {
+        conv = "__param_int"
+    } else if inner == ty_bool {
+        conv = "__param_bool"
+    }
+    if !optional {
+        buf_add(b, "            let " + v + "_s = " + q + " else \{\n                __missing(" + lit + ")\n                return\n            }\n")
+        if conv.len() == 0 {
+            buf_add(b, "            let " + v + " = " + v + "_s\n")
+        } else {
+            buf_add(b, "            let " + v + " = " + conv + "(" + v + "_s, " + lit + ") else \{\n                return\n            }\n")
+        }
+        return
+    }
+    if conv.len() == 0 {
+        buf_add(b, "            let " + v + " = " + q + "\n")
+        return
+    }
+    buf_add(b, "            var " + v + ": " + ty_name(p.ty) + " = none\n")
+    buf_add(b, "            if let " + v + "_s = " + q + " \{\n")
+    buf_add(b, "                let " + v + "_x = " + conv + "(" + v + "_s, " + lit + ") else \{\n                    return\n                }\n")
+    buf_add(b, "                " + v + " = " + v + "_x\n            }\n")
+}
+
+fn gen_route_call(b: Buf, r: Route, ri: int) {
+    buf_add(b, "        if __m == " + src_lit(r.method) + " \{\n")
+    let ps = funcs[r.fi].params
+    for i in 0..ps.len() {
+        gen_param(b, r, i)
+    }
+    var args = ""
+    for p in ps {
+        if args.len() > 0 {
+            args += ", "
+        }
+        args += "p_" + p.name
+    }
+    buf_add(b, "            __route_" + ri.to_str() + "(" + args + ")\n            return\n        }\n")
+}
+
+// Маршрутизатор: сначала пути без параметров, затем с параметрами;
+// путь найден, а метод нет — 405.
+fn gen_dispatch(b: Buf) {
+    buf_add(b, "fn __dispatch(__r: __Req) \{\n    let __m = __r.method\n    let __p = __r.path\n    var __allowed = false\n")
+    var done: [str] = []
+    var segs_made = false
+    for pass in 0..2 {
+        var ri = 0
+        while ri < routes.len() {
+            let r = routes[ri]
+            ri += 1
+            let shape = route_shape(r.segs)
+            if route_is_static(r) != (pass == 0) || str_in(done, shape) {
+                continue
+            }
+            done.push(shape)
+            if pass == 0 {
+                buf_add(b, "    if __p == " + src_lit(r.path) + " \{\n")
+            } else {
+                if !segs_made {
+                    buf_add(b, "    let __s = __path_segs(__p)\n")
+                    segs_made = true
+                }
+                var cond = "__s.len() == " + r.segs.len().to_str()
+                var j = 0
+                while j < r.segs.len() {
+                    let seg = r.segs[j]
+                    if !seg.starts_with("\{") {
+                        cond += " && __s[" + j.to_str() + "] == " + src_lit(seg)
+                    }
+                    j += 1
+                }
+                buf_add(b, "    if " + cond + " \{\n")
+            }
+            var rj = 0
+            while rj < routes.len() {
+                if route_shape(routes[rj].segs) == shape {
+                    gen_route_call(b, routes[rj], rj)
+                }
+                rj += 1
+            }
+            buf_add(b, "        __allowed = true\n    }\n")
+        }
+    }
+    buf_add(b, "    if __allowed \{\n        __reply_status(405)\n        return\n    }\n    __reply_status(404)\n}\n\n")
+}
+
+fn gen_tests(b: Buf) {
+    buf_add(b, "fn __run_tests() -> int \{\n    __tests_init()\n    let __jb = __alloc(64)\n")
+    var i = 0
+    while i < tests.len() {
+        let t = tests[i]
+        i += 1
+        let lit = src_lit(t.name)
+        buf_add(b, "    if __setjmp(__jb) == 0 \{\n        __test_begin(" + lit + ", __jb)\n        __test_" + (i - 1).to_str() + "()\n    }\n")
+        buf_add(b, "    __test_end(" + lit + ")\n")
+    }
+    buf_add(b, "    return __tests_done()\n}\n")
+}
+
+fn gen_api_source() -> str {
+    let b = buf_new(4096)
+    gen_dispatch(b)
+    gen_tests(b)
+    return buf_str(b)
 }

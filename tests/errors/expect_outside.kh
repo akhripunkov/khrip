@@ -1,0 +1,4 @@
+// expect: error: expect is only allowed inside test blocks
+fn main() {
+    expect 1 == 1
+}

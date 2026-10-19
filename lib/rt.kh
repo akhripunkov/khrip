@@ -1,7 +1,11 @@
-// Рантайм программ, собранных khc: точка входа и контекст потока.
+// Рантайм программ, собранных khc: точка входа, контекст потока, паники,
+// блокировка store.
 
 const SYS_ARCH_PRCTL = 158
 const ARCH_SET_FS = 0x1002
+const SYS_FUTEX = 202
+const FUTEX_WAIT_PRIVATE = 128
+const FUTEX_WAKE_PRIVATE = 129
 
 // Компилятор начинает программу с «mov rdi, rsp; call __entry».
 fn __entry(sp: int) {
@@ -19,5 +23,61 @@ fn __thread_init() {
     syscall(SYS_ARCH_PRCTL, ARCH_SET_FS, ctx)
 }
 
+// Паника внутри обработчика запроса или теста не завершает процесс:
+// управление возвращается туда, где был вызван __setjmp.
 fn __panic_recover() {
+    let c = __ctx()
+    let jb = load64(c + CTX_CATCH)
+    if jb != 0 {
+        store64(c + CTX_CATCH, 0)
+        __longjmp(jb)
+    }
+}
+
+// Паника из проверки в скомпилированном коде: место — номер файла и строка.
+fn __panic_at(kind: int, loc: int) {
+    __panic(kind, __file_name(loc >> 24) + ":" + (loc & 0xFFFFFF).to_str())
+}
+
+// ---- Мьютекс на futex: 0 — свободен, 1 — занят, 2 — занят и есть ждущие ----
+
+fn __mutex_lock(m: int) {
+    if __cas(m, 0, 1) {
+        return
+    }
+    while true {
+        if __xchg(m, 2) == 0 {
+            return
+        }
+        syscall(SYS_FUTEX, m, FUTEX_WAIT_PRIVATE, 2, 0, 0, 0)
+    }
+}
+
+fn __mutex_unlock(m: int) {
+    if __xchg(m, 0) == 2 {
+        syscall(SYS_FUTEX, m, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0)
+    }
+}
+
+var __store_mutex: int
+
+fn __store_lock() {
+    let c = __ctx()
+    if load64(c + CTX_STORE_HELD) != 0 {
+        return
+    }
+    if __store_mutex == 0 {
+        __store_mutex = __mmap(64)
+    }
+    __mutex_lock(__store_mutex)
+    store64(c + CTX_STORE_HELD, 1)
+}
+
+fn __store_unlock() {
+    let c = __ctx()
+    if load64(c + CTX_STORE_HELD) == 0 {
+        return
+    }
+    store64(c + CTX_STORE_HELD, 0)
+    __mutex_unlock(__store_mutex)
 }
