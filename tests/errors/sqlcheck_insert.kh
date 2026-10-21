@@ -1,0 +1,7 @@
+// expect: INSERT INTO users leaves out name, which is NOT NULL and has no default
+migration 1 `CREATE TABLE users (id bigserial PRIMARY KEY, email text NOT NULL, name text NOT NULL);`
+type NewUser { email: str }
+route POST "/u" (body: NewUser) -> 201 {
+    sql "INSERT INTO users {body}"
+    return 201
+}

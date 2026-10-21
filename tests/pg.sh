@@ -87,4 +87,15 @@ for src in tests/pg/*.kh; do
 	pass=$((pass + 1))
 done
 
+# Корпус правильного SQL: PostgreSQL подтверждает каждый запрос (khc test).
+for src in tests/sqlcheck/*.kh; do
+	name=$(basename "$src" .kh)
+	"${as_pg[@]}" "$pg_bin/psql" -q -h "$pg_dir" -p "$PG_PORT" -U postgres -d postgres -c "create database s_$name" >/dev/null 2>&1
+	if DATABASE_URL="postgres://u_scram:pw-u_scram@127.0.0.1:$PG_PORT/s_$name?sslmode=disable" "$KHC" test "$src" >"$tmp/pg/s_$name.out" 2>&1; then
+		pass=$((pass + 1))
+	else
+		failed "$src" "PostgreSQL не принял корпус:"$'\n'"$(tail -20 "$tmp/pg/s_$name.out")"
+	fi
+done
+
 pg_stop

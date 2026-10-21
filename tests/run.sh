@@ -7,6 +7,7 @@
 #                       компилятора — из «// flags: ...»;
 #   tests/api/*.kh    — блоки test (khc test); вывод сравнивается с .out;
 #   tests/locks/*.kh  — какие маршруты берут store на чтение (khc check --locks);
+#   tests/sqlcheck/   — правильный SQL: khc check без базы не находит ошибок;
 #   docs/tutorial/    — примеры учебника выполняются, их тесты проходят;
 #   tests/http.sh     — HTTP-сервер на Khrip отвечает правильно;
 #   tests/coro.sh     — запросы, которые ждут (sleep, fetch), не держат поток;
@@ -92,6 +93,15 @@ for src in docs/tutorial/*.kh docs/tutorial/answers/*.kh; do
 		pass=$((pass + 1))
 	else
 		failed "$src" "$(cat "$tmp/tutorial.out")"
+	fi
+done
+
+# Правильный SQL: проверка без базы не должна найти в нём ни одной ошибки.
+for src in tests/sqlcheck/*.kh; do
+	if "$KHC" check "$src" >"$tmp/sqlcheck.txt" 2>&1; then
+		pass=$((pass + 1))
+	else
+		failed "$src" "ложные ошибки проверки SQL:"$'\n'"$(cat "$tmp/sqlcheck.txt")"
 	fi
 done
 

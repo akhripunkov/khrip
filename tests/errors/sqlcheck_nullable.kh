@@ -1,0 +1,7 @@
+// expect: User.bio is str, but column bio can be NULL
+// expect: make the field str?
+migration 1 `CREATE TABLE users (id bigserial PRIMARY KEY, bio text);`
+type User { id: int, bio: str }
+route GET "/u/{id}" (id: int) -> User | 404 {
+    return sql "SELECT * FROM users WHERE id = {id}"
+}

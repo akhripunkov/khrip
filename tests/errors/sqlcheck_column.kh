@@ -1,0 +1,7 @@
+// expect: no column emial in users
+// expect: did you mean email? users: id, email, name
+migration 1 `CREATE TABLE users (id bigserial PRIMARY KEY, email text NOT NULL, name text NOT NULL);`
+type U { id: int }
+route GET "/u" (e: str) -> [U] {
+    return sql "SELECT id FROM users WHERE emial = {e}"
+}

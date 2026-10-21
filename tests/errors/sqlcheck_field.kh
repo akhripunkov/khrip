@@ -1,0 +1,6 @@
+// expect: User.email has no column: the query returns id, name
+migration 1 `CREATE TABLE users (id bigserial PRIMARY KEY, name text NOT NULL);`
+type User { id: int, name: str, email: str }
+route GET "/u/{id}" (id: int) -> User | 404 {
+    return sql "SELECT * FROM users WHERE id = {id}"
+}

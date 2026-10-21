@@ -1,0 +1,10 @@
+// expect: posts has no column titel
+// expect: did you mean title?
+migration 1 `
+CREATE TABLE users (id bigserial PRIMARY KEY, name text NOT NULL);
+CREATE TABLE posts (id bigserial PRIMARY KEY, user_id bigint NOT NULL REFERENCES users, title text NOT NULL);
+`
+type Row { name: str, title: str }
+route GET "/p" -> [Row] {
+    return sql "SELECT u.name, p.titel AS title FROM posts p JOIN users u ON u.id = p.user_id"
+}

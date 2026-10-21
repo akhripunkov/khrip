@@ -1,0 +1,99 @@
+// Правильный SQL, который проверка без базы обязана пропустить без ошибок
+// (tests/run.sh: khc check). tests/pg.sh дополнительно запускает его тест —
+// так PostgreSQL подтверждает, что каждый запрос правильный.
+
+migration 1 `
+CREATE TYPE mood AS ENUM ('happy', 'sad');
+CREATE TABLE users (
+    id bigserial PRIMARY KEY,
+    email text NOT NULL UNIQUE,
+    name varchar(100) NOT NULL,
+    "order" integer NOT NULL DEFAULT 0,
+    born date,
+    mood mood NOT NULL DEFAULT 'happy',
+    tags text[] NOT NULL DEFAULT '{}',
+    meta jsonb NOT NULL DEFAULT '{}',
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    score double precision NOT NULL DEFAULT 0
+);
+CREATE TABLE posts (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id bigint NOT NULL REFERENCES users ON DELETE CASCADE,
+    title text NOT NULL CHECK (title <> ''),
+    body text,
+    likes int NOT NULL DEFAULT 0,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX ON posts (user_id, created_at DESC);
+CREATE VIEW recent AS SELECT * FROM posts WHERE created_at > now() - interval '7 days';
+`
+
+migration 2 `
+ALTER TABLE users ADD COLUMN nick text;
+ALTER TABLE posts RENAME COLUMN body TO text;
+ALTER TABLE users ALTER COLUMN born SET NOT NULL;
+ALTER TABLE users ALTER COLUMN born DROP NOT NULL;
+`
+
+type User { id: int, email: str, name: str, born: str?, tags: [str], created_at: str, score: float, nick: str?, mood: str }
+type Post { id: int, user_id: int, title: str, text: str?, likes: int, created_at: int }
+type Count { user_id: int, n: int }
+type Stat { name: str, posts: int, last: str?, avg_likes: float? }
+type Pair { a: str, b: str }
+
+fn queries(id: int, q: str, ids: [int], since: int, tag: str?, limit: int) {
+    let u: User? = sql "SELECT * FROM users WHERE id = {id}"
+    let us: [User] = sql `SELECT u.* FROM users u WHERE u.email ILIKE '%{q}%' ORDER BY u."order" DESC NULLS LAST, u.id LIMIT {limit} OFFSET 0`
+    let ps: [Post] = sql "SELECT * FROM posts WHERE user_id = ANY({ids}) AND created_at > to_timestamp({since}) ORDER BY id"
+    let cs: [Count] = sql "SELECT user_id, count(*) AS n FROM posts GROUP BY user_id HAVING count(*) > 1"
+    let st: [Stat] = sql `
+        SELECT u.name, count(p.id) AS posts, max(p.created_at)::text AS last, avg(p.likes)::float8 AS avg_likes
+        FROM users u LEFT JOIN posts p ON p.user_id = u.id
+        GROUP BY u.id, u.name ORDER BY posts DESC`
+    let ranked: [Count] = sql `SELECT user_id, row_number() OVER (PARTITION BY user_id ORDER BY likes DESC)::bigint AS n FROM posts`
+    let cte: [Count] = sql `WITH top AS (SELECT user_id, sum(likes) AS total FROM posts GROUP BY user_id)
+        SELECT user_id, total::bigint AS n FROM top WHERE total > 0`
+    let lat: [Pair] = sql `SELECT u.name AS a, x.title AS b FROM users u,
+        LATERAL (SELECT title FROM posts WHERE posts.user_id = u.id ORDER BY created_at DESC LIMIT 1) x`
+    let years: [int] = sql "SELECT EXTRACT(year FROM created_at)::bigint FROM posts"
+    let firsts: [str] = sql "SELECT substring(email FROM 1 FOR 3) FROM users WHERE position('@' in email) > 0"
+    let trimmed: [str] = sql "SELECT trim(both ' ' FROM name) FROM users"
+    let typed: int = sql "SELECT count(*) FROM users WHERE born < date '2000-01-01' AND created_at > now() - interval '1 day'"
+    let zone: [str] = sql "SELECT (created_at AT TIME ZONE 'UTC')::text FROM users"
+    let distinct_from: [User] = sql "SELECT * FROM users WHERE nick IS DISTINCT FROM {tag}"
+    let guarded: [User] = sql "SELECT * FROM users WHERE ({tag} IS NULL OR {tag} = ANY(tags))"
+    let js: [str] = sql "SELECT meta->>'city' FROM users WHERE meta ? 'city' AND meta @> '\{\"vip\": true}'"
+    let arr: [int] = sql "SELECT x FROM unnest({ids}) AS t(x) ORDER BY x"
+    let series: [int] = sql "SELECT g FROM generate_series(1, 3) g"
+    let exists_: bool = sql "SELECT EXISTS (SELECT 1 FROM posts WHERE user_id = {id})"
+    let not_in: [User] = sql "SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM posts WHERE likes > 10)"
+    let unioned: [str] = sql "SELECT email FROM users UNION SELECT title FROM posts"
+    let cased: [str] = sql "SELECT CASE WHEN score > 1 THEN 'hi' ELSE 'lo' END FROM users"
+    let distinct_on: [Post] = sql "SELECT DISTINCT ON (user_id) * FROM posts ORDER BY user_id, created_at DESC"
+    let view_rows: [str] = sql "SELECT title FROM recent"
+    let locked: Post? = sql "SELECT * FROM posts WHERE id = {id} FOR UPDATE SKIP LOCKED"
+    let moods: [str] = sql "SELECT mood::text FROM users WHERE mood = 'happy'"
+    let filt: int = sql "SELECT count(*) FILTER (WHERE likes > 0) FROM posts"
+}
+
+fn writes(id: int, email: str, name: str, title: str) {
+    tx {
+        let u: User = sql `INSERT INTO users (email, name) VALUES ({email}, {name})
+            ON CONFLICT (email) DO UPDATE SET name = excluded.name, "order" = users."order" + 1 RETURNING *`
+        let p: Post = sql "INSERT INTO posts (user_id, title) VALUES ({u.id}, {title}) RETURNING *"
+        sql "UPDATE posts SET likes = likes + 1, text = coalesce(text, '') || '!' WHERE id = {p.id}"
+        sql "UPDATE users SET tags = array_append(tags, {title}) WHERE id = {u.id}"
+        sql "DELETE FROM posts p USING users u WHERE p.user_id = u.id AND u.email = {email} AND p.id <> {p.id}"
+        let n = sql `WITH gone AS (DELETE FROM posts WHERE likes < 0 RETURNING user_id)
+            UPDATE users SET score = score - 1 WHERE id IN (SELECT user_id FROM gone)`
+    }
+}
+
+fn main() {
+}
+
+test "every query is valid PostgreSQL" {
+    writes(1, "a@x.io", "Ann", "Hello")
+    queries(1, "a", [1, 2], 0, none, 10)
+    queries(1, "a", [], 0, "x", 1)
+}

@@ -1,0 +1,7 @@
+// expect: no table user in the migrations
+// expect: did you mean users?
+migration 1 `CREATE TABLE users (id bigserial PRIMARY KEY, email text NOT NULL);`
+type U { id: int, email: str }
+route GET "/u" -> [U] {
+    return sql "SELECT * FROM user"
+}

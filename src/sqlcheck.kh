@@ -1,0 +1,1535 @@
+// ============================================================================
+// Проверка sql без базы (khc check): схема — из миграций, запросы — против неё.
+//
+// Компилятор разбирает DDL миграций (CREATE/ALTER/DROP TABLE, CREATE TYPE AS
+// ENUM, VIEW) в каталог и сверяет с ним каждый запрос: неизвестная таблица или
+// столбец (с «может быть, …»), поле типа без столбца, несовпадение типа поля и
+// столбца, столбец без NOT NULL в поле без «?», INSERT без обязательного
+// столбца. Ошибка — только когда проверка уверена: всё, что она не понимает
+// (функции, сложные подзапросы, DO-блоки в миграциях), молча проверяет сам
+// PostgreSQL при запуске программы (lib/db.kh).
+// ============================================================================
+
+// Лексемы SQL
+const SQ_WORD = 1
+const SQ_QUOTED = 2
+const SQ_STR = 3
+const SQ_NUM = 4
+const SQ_PARAM = 5
+const SQ_PUNCT = 6
+
+type SqTok {
+    kind: int
+    // слово — в нижнем регистре (имя в "кавычках" — как есть)
+    text: str
+    at: int
+}
+
+type SqCol {
+    name: str
+    ty: str
+    notnull: bool
+    // есть значение по умолчанию (DEFAULT, serial, identity, generated)
+    auto: bool
+}
+
+type SqTable {
+    name: str
+    cols: [SqCol]
+    // столбцы неизвестны (представление, CREATE TABLE AS)
+    opaque: bool
+}
+
+var sq_tables: [SqTable]
+var sq_enums: [str]
+// схему нельзя считать полной (DO-блок, непонятный DDL): о неизвестных таблицах молчать
+var sq_uncertain: bool
+var sq_built: bool
+
+// ---- Лексемы ----
+
+fn sq_lex(s: str) -> [SqTok] {
+    var out: [SqTok] = []
+    var i = 0
+    let n = s.len()
+    while i < n {
+        let c = s[i]
+        if c == ' ' || c == '\n' || c == '\t' || c == '\r' {
+            i += 1
+            continue
+        }
+        if c == '-' && i + 1 < n && s[i + 1] == '-' {
+            while i < n && s[i] != '\n' {
+                i += 1
+            }
+            continue
+        }
+        if c == '/' && i + 1 < n && s[i + 1] == '*' {
+            i += 2
+            while i + 1 < n && !(s[i] == '*' && s[i + 1] == '/') {
+                i += 1
+            }
+            i += 2
+            continue
+        }
+        let start = i
+        if c == '\'' || ((c == 'e' || c == 'E') && i + 1 < n && s[i + 1] == '\'') {
+            if c != '\'' {
+                i += 1
+            }
+            i += 1
+            while i < n {
+                if s[i] == '\'' {
+                    if i + 1 < n && s[i + 1] == '\'' {
+                        i += 2
+                        continue
+                    }
+                    break
+                }
+                if s[i] == '\\' && c != '\'' {
+                    i += 1
+                }
+                i += 1
+            }
+            i += 1
+            out.push(SqTok { kind: SQ_STR, text: "", at: start })
+            continue
+        }
+        if c == '$' && i + 1 < n && is_digit(s[i + 1]) {
+            i += 1
+            while i < n && is_digit(s[i]) {
+                i += 1
+            }
+            out.push(SqTok { kind: SQ_PARAM, text: s[start..i], at: start })
+            continue
+        }
+        if c == '$' {
+            // $$...$$ или $tag$...$tag$
+            var j = i + 1
+            while j < n && is_ident_char(s[j]) {
+                j += 1
+            }
+            if j < n && s[j] == '$' {
+                let tag = s[i..j + 1]
+                var k = j + 1
+                while k + tag.len() <= n && s[k..k + tag.len()] != tag {
+                    k += 1
+                }
+                i = k + tag.len()
+                out.push(SqTok { kind: SQ_STR, text: "", at: start })
+                continue
+            }
+        }
+        if c == '"' {
+            i += 1
+            let b = buf_new(16)
+            while i < n && s[i] != '"' {
+                buf_byte(b, s[i])
+                i += 1
+            }
+            i += 1
+            out.push(SqTok { kind: SQ_QUOTED, text: buf_str(b), at: start })
+            continue
+        }
+        if is_alpha(c) {
+            let b = buf_new(16)
+            while i < n && (is_ident_char(s[i]) || s[i] == '$') {
+                buf_byte(b, sql_lower(s[i]))
+                i += 1
+            }
+            out.push(SqTok { kind: SQ_WORD, text: buf_str(b), at: start })
+            continue
+        }
+        if is_digit(c) || (c == '.' && i + 1 < n && is_digit(s[i + 1])) {
+            while i < n && (is_ident_char(s[i]) || s[i] == '.') {
+                i += 1
+            }
+            out.push(SqTok { kind: SQ_NUM, text: s[start..i], at: start })
+            continue
+        }
+        // знаки: ::, двухсимвольные операторы, остальное по одному
+        if i + 1 < n {
+            let two = s[i..i + 2]
+            if two == "::" || two == "<=" || two == ">=" || two == "<>" || two == "!=" || two == "||" || two == "->" || two == "=>" {
+                i += 2
+                if two == "->" && i < n && s[i] == '>' {
+                    i += 1
+                }
+                out.push(SqTok { kind: SQ_PUNCT, text: s[start..i], at: start })
+                continue
+            }
+        }
+        i += 1
+        out.push(SqTok { kind: SQ_PUNCT, text: s[start..i], at: start })
+    }
+    return out
+}
+
+fn sq_is(t: [SqTok], i: int, w: str) -> bool {
+    return i >= 0 && i < t.len() && (t[i].kind == SQ_WORD || t[i].kind == SQ_PUNCT) && t[i].text == w
+}
+
+fn sq_name(t: [SqTok], i: int) -> bool {
+    return i >= 0 && i < t.len() && (t[i].kind == SQ_WORD || t[i].kind == SQ_QUOTED)
+}
+
+// Индекс за закрывающей скобкой (t[i] — открывающая).
+fn sq_skip_parens(t: [SqTok], i: int) -> int {
+    var d = 0
+    var k = i
+    while k < t.len() {
+        if sq_is(t, k, "(") || sq_is(t, k, "[") {
+            d += 1
+        } else if sq_is(t, k, ")") || sq_is(t, k, "]") {
+            d -= 1
+            if d == 0 {
+                return k + 1
+            }
+        }
+        k += 1
+    }
+    return k
+}
+
+// Имя таблицы (с необязательной схемой): индекс за ним; имя — в sq_last_name.
+var sq_last_name: str
+
+fn sq_table_name(t: [SqTok], i: int) -> int {
+    var k = i
+    if !sq_name(t, k) {
+        sq_last_name = ""
+        return k
+    }
+    sq_last_name = t[k].text
+    k += 1
+    if sq_is(t, k, ".") && sq_name(t, k + 1) {
+        if sq_last_name == "public" {
+            sq_last_name = t[k + 1].text
+        } else {
+            // другая схема — не наша
+            sq_last_name = t[k].text + "." + t[k + 1].text
+        }
+        k += 2
+    }
+    return k
+}
+
+// ---- Каталог из миграций ----
+
+fn sq_table(name: str) -> int {
+    for i in 0..sq_tables.len() {
+        if sq_tables[i].name == name {
+            return i
+        }
+    }
+    return -1
+}
+
+// Тип столбца из лексем начиная с i: нормальное имя и индекс за типом.
+var sq_type_end: int
+
+fn sq_parse_type(t: [SqTok], i: int) -> str {
+    var k = i
+    var words: [str] = []
+    while k < t.len() && t[k].kind == SQ_WORD {
+        let w = t[k].text
+        // слова, с которых начинаются ограничения столбца
+        if w == "not" || w == "null" || w == "primary" || w == "unique" || w == "default" || w == "references" || w == "check" || w == "generated" || w == "collate" || w == "constraint" {
+            break
+        }
+        words.push(w)
+        k += 1
+        if sq_is(t, k, "(") {
+            k = sq_skip_parens(t, k)
+        }
+    }
+    var arr = false
+    while sq_is(t, k, "[") {
+        k = sq_skip_parens(t, k)
+        arr = true
+    }
+    if k < t.len() && t[k].kind == SQ_QUOTED && words.len() == 0 {
+        words.push(t[k].text)
+        k += 1
+    }
+    sq_type_end = k
+    var ty = words.join(" ")
+    if ty == "int" || ty == "integer" || ty == "int4" || ty == "serial" || ty == "serial4" {
+        ty = "integer"
+    } else if ty == "bigint" || ty == "int8" || ty == "bigserial" || ty == "serial8" {
+        ty = "bigint"
+    } else if ty == "smallint" || ty == "int2" || ty == "smallserial" || ty == "serial2" {
+        ty = "smallint"
+    } else if ty == "numeric" || ty == "decimal" {
+        ty = "numeric"
+    } else if ty == "real" || ty == "float4" {
+        ty = "real"
+    } else if ty == "double precision" || ty == "float8" || ty == "float" {
+        ty = "double precision"
+    } else if ty == "bool" || ty == "boolean" {
+        ty = "boolean"
+    } else if ty == "varchar" || ty == "character varying" || ty == "char" || ty == "character" || ty == "bpchar" || ty == "citext" || ty == "name" {
+        ty = "text"
+    } else if ty == "timestamptz" || ty == "timestamp with time zone" {
+        ty = "timestamptz"
+    } else if ty == "timestamp" || ty == "timestamp without time zone" {
+        ty = "timestamp"
+    } else if ty == "time" || ty == "time without time zone" || ty == "timetz" || ty == "time with time zone" {
+        ty = "time"
+    }
+    if arr {
+        ty = ty + "[]"
+    }
+    return ty
+}
+
+fn sq_serial(t: [SqTok], i: int) -> bool {
+    return i < t.len() && t[i].kind == SQ_WORD && (t[i].text == "serial" || t[i].text == "bigserial" || t[i].text == "smallserial" || t[i].text == "serial4" || t[i].text == "serial8" || t[i].text == "serial2")
+}
+
+// Описание столбца: имя тип [ограничения]. → индекс за ним (до , или ) верхнего уровня).
+var sq_col: SqCol = SqCol { name: "", ty: "", notnull: false, auto: false }
+
+fn sq_parse_column(t: [SqTok], i: int) -> int {
+    let name = t[i].text
+    let serial = sq_serial(t, i + 1)
+    let ty = sq_parse_type(t, i + 1)
+    var k = sq_type_end
+    var notnull = serial
+    var auto = serial
+    while k < t.len() && !sq_is(t, k, ",") && !sq_is(t, k, ")") {
+        if sq_is(t, k, "not") && sq_is(t, k + 1, "null") {
+            notnull = true
+            k += 2
+            continue
+        }
+        if sq_is(t, k, "primary") {
+            notnull = true
+        }
+        if sq_is(t, k, "default") || sq_is(t, k, "generated") {
+            auto = true
+            if sq_is(t, k, "generated") {
+                notnull = notnull || sq_is(t, k + 2, "identity") || sq_is(t, k + 3, "identity")
+            }
+        }
+        if sq_is(t, k, "(") || sq_is(t, k, "[") {
+            k = sq_skip_parens(t, k)
+            continue
+        }
+        k += 1
+    }
+    sq_col = SqCol { name: name, ty: ty, notnull: notnull, auto: auto }
+    return k
+}
+
+// CREATE TABLE имя ( ... ): столбцы и ограничения.
+fn sq_create_table(t: [SqTok], i: int) {
+    var k = i
+    if sq_is(t, k, "if") {
+        k += 3
+    }
+    k = sq_table_name(t, k)
+    let name = sq_last_name
+    if name.len() == 0 {
+        sq_uncertain = true
+        return
+    }
+    let old = sq_table(name)
+    if old >= 0 {
+        // CREATE TABLE IF NOT EXISTS второй раз — ничего не меняет
+        return
+    }
+    if !sq_is(t, k, "(") {
+        // CREATE TABLE ... AS / LIKE / OF / PARTITION OF
+        sq_tables.push(SqTable { name: name, cols: [], opaque: true })
+        return
+    }
+    let tb = SqTable { name: name, cols: [], opaque: false }
+    k += 1
+    while k < t.len() && !sq_is(t, k, ")") {
+        if sq_is(t, k, ",") {
+            k += 1
+            continue
+        }
+        if sq_is(t, k, "constraint") {
+            k += 2
+        }
+        if sq_is(t, k, "primary") && sq_is(t, k + 1, "key") && sq_is(t, k + 2, "(") {
+            // PRIMARY KEY (a, b): эти столбцы — NOT NULL
+            var j = k + 3
+            while j < t.len() && !sq_is(t, j, ")") {
+                for ci in 0..tb.cols.len() {
+                    if tb.cols[ci].name == t[j].text {
+                        tb.cols[ci].notnull = true
+                    }
+                }
+                j += 1
+            }
+            k = j + 1
+            continue
+        }
+        if sq_is(t, k, "unique") || sq_is(t, k, "foreign") || sq_is(t, k, "check") || sq_is(t, k, "exclude") || sq_is(t, k, "primary") || sq_is(t, k, "like") {
+            while k < t.len() && !sq_is(t, k, ",") && !sq_is(t, k, ")") {
+                if sq_is(t, k, "(") {
+                    k = sq_skip_parens(t, k)
+                } else {
+                    k += 1
+                }
+            }
+            continue
+        }
+        if !sq_name(t, k) {
+            k += 1
+            continue
+        }
+        k = sq_parse_column(t, k)
+        tb.cols.push(sq_col)
+    }
+    sq_tables.push(tb)
+}
+
+fn sq_alter_table(t: [SqTok], i: int) {
+    var k = i
+    if sq_is(t, k, "if") {
+        k += 2
+    }
+    if sq_is(t, k, "only") {
+        k += 1
+    }
+    k = sq_table_name(t, k)
+    let ti = sq_table(sq_last_name)
+    if ti < 0 {
+        return
+    }
+    while k < t.len() {
+        if sq_is(t, k, ",") {
+            k += 1
+            continue
+        }
+        if sq_is(t, k, "add") {
+            k += 1
+            if sq_is(t, k, "column") {
+                k += 1
+            }
+            if sq_is(t, k, "if") {
+                k += 3
+            }
+            if sq_is(t, k, "constraint") || sq_is(t, k, "primary") || sq_is(t, k, "unique") || sq_is(t, k, "foreign") || sq_is(t, k, "check") || sq_is(t, k, "exclude") {
+                if sq_is(t, k, "constraint") {
+                    k += 2
+                }
+                if sq_is(t, k, "primary") && sq_is(t, k + 2, "(") {
+                    var j = k + 3
+                    while j < t.len() && !sq_is(t, j, ")") {
+                        for ci in 0..sq_tables[ti].cols.len() {
+                            if sq_tables[ti].cols[ci].name == t[j].text {
+                                sq_tables[ti].cols[ci].notnull = true
+                            }
+                        }
+                        j += 1
+                    }
+                }
+                while k < t.len() && !sq_is(t, k, ",") {
+                    if sq_is(t, k, "(") {
+                        k = sq_skip_parens(t, k)
+                    } else {
+                        k += 1
+                    }
+                }
+                continue
+            }
+            if sq_name(t, k) {
+                k = sq_parse_column(t, k)
+                var exists = false
+                for c in sq_tables[ti].cols {
+                    exists = exists || c.name == sq_col.name
+                }
+                if !exists {
+                    sq_tables[ti].cols.push(sq_col)
+                }
+            }
+            continue
+        }
+        if sq_is(t, k, "drop") {
+            k += 1
+            if sq_is(t, k, "column") {
+                k += 1
+            }
+            if sq_is(t, k, "if") {
+                k += 2
+            }
+            if sq_is(t, k, "constraint") {
+                while k < t.len() && !sq_is(t, k, ",") {
+                    k += 1
+                }
+                continue
+            }
+            if sq_name(t, k) {
+                let gone = t[k].text
+                var keep: [SqCol] = []
+                for c in sq_tables[ti].cols {
+                    if c.name != gone {
+                        keep.push(c)
+                    }
+                }
+                sq_tables[ti].cols = keep
+            }
+            while k < t.len() && !sq_is(t, k, ",") {
+                k += 1
+            }
+            continue
+        }
+        if sq_is(t, k, "rename") {
+            k += 1
+            if sq_is(t, k, "to") && sq_name(t, k + 1) {
+                sq_tables[ti].name = t[k + 1].text
+                return
+            }
+            if sq_is(t, k, "column") {
+                k += 1
+            }
+            if sq_name(t, k) && sq_is(t, k + 1, "to") && sq_name(t, k + 2) {
+                for ci in 0..sq_tables[ti].cols.len() {
+                    if sq_tables[ti].cols[ci].name == t[k].text {
+                        sq_tables[ti].cols[ci].name = t[k + 2].text
+                    }
+                }
+            }
+            while k < t.len() && !sq_is(t, k, ",") {
+                k += 1
+            }
+            continue
+        }
+        if sq_is(t, k, "alter") {
+            k += 1
+            if sq_is(t, k, "column") {
+                k += 1
+            }
+            let cn = t[k].text
+            var ci = -1
+            for j in 0..sq_tables[ti].cols.len() {
+                if sq_tables[ti].cols[j].name == cn {
+                    ci = j
+                }
+            }
+            k += 1
+            if ci >= 0 {
+                if sq_is(t, k, "set") && sq_is(t, k + 1, "not") {
+                    sq_tables[ti].cols[ci].notnull = true
+                } else if sq_is(t, k, "drop") && sq_is(t, k + 1, "not") {
+                    sq_tables[ti].cols[ci].notnull = false
+                } else if sq_is(t, k, "set") && sq_is(t, k + 1, "default") {
+                    sq_tables[ti].cols[ci].auto = true
+                } else if sq_is(t, k, "drop") && sq_is(t, k + 1, "default") {
+                    sq_tables[ti].cols[ci].auto = false
+                } else if sq_is(t, k, "type") || (sq_is(t, k, "set") && sq_is(t, k + 1, "data")) {
+                    var p = k + 1
+                    if sq_is(t, k, "set") {
+                        p = k + 3
+                    }
+                    sq_tables[ti].cols[ci].ty = sq_parse_type(t, p)
+                }
+            }
+            while k < t.len() && !sq_is(t, k, ",") {
+                if sq_is(t, k, "(") {
+                    k = sq_skip_parens(t, k)
+                } else {
+                    k += 1
+                }
+            }
+            continue
+        }
+        // остальное (SET, OWNER, ENABLE ...) на столбцы не влияет
+        while k < t.len() && !sq_is(t, k, ",") {
+            k += 1
+        }
+    }
+}
+
+// Одна команда DDL (лексемы одной команды).
+fn sq_apply(t: [SqTok]) {
+    if t.len() == 0 {
+        return
+    }
+    let w = t[0].text
+    var k = 1
+    if w == "create" {
+        if sq_is(t, k, "or") {
+            k += 2
+        }
+        while sq_is(t, k, "temp") || sq_is(t, k, "temporary") || sq_is(t, k, "unlogged") {
+            k += 1
+        }
+        if sq_is(t, k, "table") {
+            sq_create_table(t, k + 1)
+            return
+        }
+        if sq_is(t, k, "type") {
+            k = sq_table_name(t, k + 1)
+            if sq_is(t, k, "as") && sq_is(t, k + 1, "enum") {
+                sq_enums.push(sq_last_name)
+            }
+            return
+        }
+        if sq_is(t, k, "view") || sq_is(t, k, "materialized") {
+            if sq_is(t, k, "materialized") {
+                k += 1
+            }
+            k += 1
+            if sq_is(t, k, "if") {
+                k += 3
+            }
+            sq_table_name(t, k)
+            if sq_table(sq_last_name) < 0 {
+                sq_tables.push(SqTable { name: sq_last_name, cols: [], opaque: true })
+            }
+            return
+        }
+        if sq_is(t, k, "domain") {
+            // домен: тип неизвестен проверке — столбцы с ним проверит PostgreSQL
+            return
+        }
+        return
+    }
+    if w == "alter" && sq_is(t, 1, "table") {
+        sq_alter_table(t, 2)
+        return
+    }
+    if w == "drop" && sq_is(t, 1, "table") {
+        var j = 2
+        if sq_is(t, j, "if") {
+            j += 2
+        }
+        while j < t.len() {
+            j = sq_table_name(t, j)
+            let ti = sq_table(sq_last_name)
+            if ti >= 0 {
+                var keep: [SqTable] = []
+                for x in 0..sq_tables.len() {
+                    if x != ti {
+                        keep.push(sq_tables[x])
+                    }
+                }
+                sq_tables = keep
+            }
+            if !sq_is(t, j, ",") {
+                break
+            }
+            j += 1
+        }
+        return
+    }
+    if w == "do" {
+        sq_uncertain = true
+    }
+}
+
+// Каталог из всех миграций (один раз).
+fn sq_build() {
+    if sq_built {
+        return
+    }
+    sq_built = true
+    for m in sql_migs {
+        let all = sq_lex(m.sql)
+        var cmd: [SqTok] = []
+        for t in all {
+            if t.kind == SQ_PUNCT && t.text == ";" {
+                sq_apply(cmd)
+                cmd = []
+            } else {
+                cmd.push(t)
+            }
+        }
+        sq_apply(cmd)
+    }
+}
+
+// ---- Проверка запроса ----
+
+// Слова SQL, которые не бывают именами столбцов в запросе.
+fn sq_keyword(w: str) -> bool {
+    let words = " all and any array as asc at between both by case cast collate column concurrently constraint cross current_date current_time current_timestamp current_user default deferrable desc distinct do else end except exists false fetch filter first following for from full group having ilike in inner intersect interval into is isnull join last lateral leading left like limit local localtime localtimestamp natural not notnull null nulls offset on only or order outer over overlaps partition placing preceding range recursive returning right row rows select session_user set similar some symmetric table then ties to trailing true unbounded union unique update using values when where window with within zone insert delete conflict nothing excluded escape key primary references only ordinality time nowait skip locked of share no action cascade restrict "
+    let fields = " epoch year month day hour minute second dow doy week quarter isodow isoyear century decade millennium milliseconds microseconds timezone timezone_hour timezone_minute julian "
+    return words.contains(" " + w + " ") || fields.contains(" " + w + " ")
+}
+
+type SqScope {
+    // таблицы запроса: имя в каталоге и псевдоним
+    tables: [int]
+    aliases: [str]
+    // имена, которые запрос определяет сам: псевдонимы, CTE, AS x, списки столбцов
+    defined: [str]
+    // встретилось то, чего проверка не понимает в FROM (функция, подзапрос)
+    loose: bool
+}
+
+fn sq_has(xs: [str], s: str) -> bool {
+    for x in xs {
+        if x == s {
+            return true
+        }
+    }
+    return false
+}
+
+// Похожее имя из списка: «может быть, …».
+fn sq_similar(name: str, names: [str]) -> str {
+    var best = ""
+    var bd = 3
+    for n in names {
+        let d = edit_distance(name, n)
+        if d < bd && d <= (name.len() + 2) / 3 {
+            bd = d
+            best = n
+        }
+    }
+    return best
+}
+
+fn sq_table_cols(ti: int) -> [str] {
+    var out: [str] = []
+    for c in sq_tables[ti].cols {
+        out.push(c.name)
+    }
+    return out
+}
+
+fn sq_find_col(ti: int, name: str) -> int {
+    let cs = sq_tables[ti].cols
+    for i in 0..cs.len() {
+        if cs[i].name == name {
+            return i
+        }
+    }
+    return -1
+}
+
+// Место ошибки в исходнике: первое вхождение слова в тексте запроса.
+fn sq_report(at: Token, lit: SqlLit, word: str, msg: str, hint: str) {
+    for si in 0..lit.segs.len() {
+        let seg = lit.segs[si]
+        let p = sq_word_pos(seg, word)
+        if p >= 0 {
+            var line = lit.lines[si]
+            var col = lit.cols[si]
+            for k in 0..p {
+                if seg[k] == '\n' {
+                    line += 1
+                    col = 1
+                } else {
+                    col += 1
+                }
+            }
+            if quiet == 0 && !panic_mode {
+                report_at(at.file, line, col, msg, hint)
+            }
+            return
+        }
+    }
+    error_tok(at, msg, hint)
+}
+
+fn sq_word_pos(seg: str, word: str) -> int {
+    let n = seg.len()
+    let w = word.len()
+    var i = 0
+    while i + w <= n {
+        var ok = (i == 0 || !is_ident_char(seg[i - 1])) && (i + w == n || !is_ident_char(seg[i + w]))
+        if ok {
+            for k in 0..w {
+                if sql_lower(seg[i + k]) != word[k] {
+                    ok = false
+                    break
+                }
+            }
+        }
+        if ok {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+// Скобки вызова функции: для каждой лексемы — внутри ли она аргументов
+// функции (extract(epoch FROM x), substring(s FROM 2), trim(both FROM s)).
+fn sq_in_call(t: [SqTok]) -> [bool] {
+    var out: [bool] = []
+    var stack: [bool] = []
+    for i in 0..t.len() {
+        var inside = false
+        if stack.len() > 0 {
+            inside = stack[stack.len() - 1]
+        }
+        out.push(inside)
+        if sq_is(t, i, "(") {
+            stack.push(i > 0 && t[i - 1].kind == SQ_WORD && !sq_keyword(t[i - 1].text))
+        } else if sq_is(t, i, ")") && stack.len() > 0 {
+            stack = stack[0..stack.len() - 1]
+        }
+    }
+    return out
+}
+
+// t[i] вводит таблицу: FROM, JOIN, INSERT INTO, UPDATE (в начале команды),
+// DELETE FROM, USING t (не JOIN ... USING (столбцы)).
+fn sq_table_kw(t: [SqTok], i: int, calls: [bool]) -> bool {
+    if t[i].kind != SQ_WORD || calls[i] {
+        return false
+    }
+    let w = t[i].text
+    if w == "from" {
+        return !sq_is(t, i - 1, "distinct")
+    }
+    if w == "join" {
+        return true
+    }
+    if w == "into" {
+        return i > 0 && (sq_is(t, i - 1, "insert") || sq_is(t, i - 1, "merge"))
+    }
+    if w == "update" {
+        // не FOR UPDATE, DO UPDATE, ON UPDATE, NO KEY UPDATE
+        return !(sq_is(t, i - 1, "for") || sq_is(t, i - 1, "do") || sq_is(t, i - 1, "on") || sq_is(t, i - 1, "key"))
+    }
+    if w == "using" {
+        return !sq_is(t, i + 1, "(")
+    }
+    return false
+}
+
+// Таблицы запроса (FROM, JOIN, INTO, UPDATE, USING) и имена, которые он определяет.
+fn sq_scope(t: [SqTok]) -> SqScope {
+    let sc = SqScope { tables: [], aliases: [], defined: [], loose: false }
+    let calls = sq_in_call(t)
+    var i = 0
+    while i < t.len() {
+        let tk = t[i]
+        if sq_table_kw(t, i, calls) {
+            var k = i + 1
+            if sq_is(t, k, "only") || sq_is(t, k, "lateral") {
+                k += 1
+            }
+            if sq_is(t, k, "(") {
+                // подзапрос или функция в скобках
+                sc.loose = true
+                i = sq_skip_parens(t, k)
+                i = sq_alias(t, i, sc, -1)
+                continue
+            }
+            if sq_name(t, k) && sq_is(t, k + 1, "(") {
+                // функция: unnest(...), jsonb_to_recordset(...)
+                sc.loose = true
+                i = sq_skip_parens(t, k + 1)
+                i = sq_alias(t, i, sc, -1)
+                continue
+            }
+            if sq_name(t, k) {
+                let e = sq_table_name(t, k)
+                let name = sq_last_name
+                let ti = sq_table(name)
+                i = sq_alias(t, e, sc, ti)
+                if ti >= 0 {
+                    sc.tables.push(ti)
+                    sc.aliases.push(name)
+                }
+                continue
+            }
+        }
+        if tk.kind == SQ_WORD && tk.text == "as" && i + 1 < t.len() && sq_name(t, i + 1) {
+            sc.defined.push(t[i + 1].text)
+            if sq_is(t, i + 2, "(") {
+                // псевдоним со списком столбцов: AS l(product_id bigint, ...)
+                var j = i + 3
+                while j < t.len() && !sq_is(t, j, ")") {
+                    if sq_name(t, j) && (sq_is(t, j - 1, "(") || sq_is(t, j - 1, ",")) {
+                        sc.defined.push(t[j].text)
+                    }
+                    j += 1
+                }
+            }
+        }
+        if tk.kind == SQ_WORD && tk.text == "with" {
+            // CTE: WITH имя [(столбцы)] AS (...)
+            var k = i + 1
+            if sq_is(t, k, "recursive") {
+                k += 1
+            }
+            while sq_name(t, k) {
+                sc.defined.push(t[k].text)
+                k += 1
+                if sq_is(t, k, "(") {
+                    var j = k + 1
+                    while j < t.len() && !sq_is(t, j, ")") {
+                        if sq_name(t, j) {
+                            sc.defined.push(t[j].text)
+                        }
+                        j += 1
+                    }
+                    k = j + 1
+                }
+                if !sq_is(t, k, "as") {
+                    break
+                }
+                k += 1
+                if sq_is(t, k, "not") {
+                    k += 1
+                }
+                if sq_is(t, k, "materialized") {
+                    k += 1
+                }
+                if !sq_is(t, k, "(") {
+                    break
+                }
+                k = sq_skip_parens(t, k)
+                if !sq_is(t, k, ",") {
+                    break
+                }
+                k += 1
+            }
+        }
+        i += 1
+    }
+    return sc
+}
+
+// Псевдоним после таблицы, подзапроса или функции: [AS] имя [(столбцы)].
+fn sq_alias(t: [SqTok], i: int, sc: SqScope, ti: int) -> int {
+    var k = i
+    if sq_is(t, k, "as") {
+        k += 1
+    }
+    if sq_name(t, k) && (t[k].kind == SQ_QUOTED || !sq_keyword(t[k].text)) {
+        sc.defined.push(t[k].text)
+        if ti >= 0 {
+            sc.tables.push(ti)
+            sc.aliases.push(t[k].text)
+        }
+        k += 1
+        if sq_is(t, k, "(") {
+            var j = k + 1
+            while j < t.len() && !sq_is(t, j, ")") {
+                if sq_name(t, j) && (sq_is(t, j - 1, "(") || sq_is(t, j - 1, ",")) {
+                    sc.defined.push(t[j].text)
+                }
+                j += 1
+            }
+            k = j + 1
+        }
+    }
+    return k
+}
+
+// Столбец запроса для сопоставления с полем: имя, тип, NOT NULL (тип "" — неизвестен).
+type SqOut {
+    name: str
+    ty: str
+    notnull: bool
+}
+
+// Тип Khrip поля и тип столбца: ошибка, только если точно несовместимы.
+fn sq_fits(field_ty: int, col_ty: str) -> str {
+    var t = ty_inner(field_ty)
+    let k = tkind(t)
+    var base = col_ty
+    var arr = false
+    if col_ty.ends_with("[]") {
+        base = col_ty[0..col_ty.len() - 2]
+        arr = true
+    }
+    let ints = base == "integer" || base == "bigint" || base == "smallint"
+    let floats = base == "real" || base == "double precision" || base == "numeric"
+    let times = base == "timestamptz" || base == "timestamp" || base == "date"
+    let texts = base == "text" || base == "uuid" || base == "time" || base == "interval" || base == "inet" || base == "bytea" || sq_has(sq_enums, base)
+    let json = base == "json" || base == "jsonb"
+    let known = ints || floats || times || texts || json || base == "boolean"
+    if !known || json {
+        return ""
+    }
+    if arr {
+        if k != K_LIST {
+            return "an array"
+        }
+        let e = ty_inner(ty_elem(t))
+        if (ints && e != ty_int) || (floats && e != ty_float) || (base == "boolean" && e != ty_bool) || ((texts || times) && e != ty_str) {
+            return "an array of " + base
+        }
+        return ""
+    }
+    if k == K_INT && (ints || times || base == "numeric") {
+        return ""
+    }
+    if k == K_FLOAT && (floats || ints) {
+        return ""
+    }
+    if k == K_BOOL && base == "boolean" {
+        return ""
+    }
+    if k == K_STR && (texts || times || base == "numeric") {
+        return ""
+    }
+    if k == K_SUM && (texts || sq_has(sq_enums, base)) {
+        return ""
+    }
+    if k == K_STRUCT || k == K_MAP || k == K_LIST {
+        return base
+    }
+    return base
+}
+
+fn sq_kh_for(col_ty: str) -> str {
+    if col_ty.ends_with("[]") {
+        return "[" + sq_kh_for(col_ty[0..col_ty.len() - 2]) + "]"
+    }
+    if col_ty == "integer" || col_ty == "bigint" || col_ty == "smallint" {
+        return "int"
+    }
+    if col_ty == "real" || col_ty == "double precision" || col_ty == "numeric" {
+        return "float"
+    }
+    if col_ty == "boolean" {
+        return "bool"
+    }
+    return "str"
+}
+
+// Проверить запрос cur (уже с $n) места sql; inner — тип строки результата.
+fn sq_check(at: Token, lit: SqlLit, cur: str, shape: int, inner: int, ps: [SqlParam]) {
+    if sql_migs.len() == 0 {
+        return
+    }
+    sq_build()
+    let t = sq_lex(cur)
+    if t.len() == 0 {
+        return
+    }
+    let sc = sq_scope(t)
+    // 1. неизвестные таблицы
+    var all_names: [str] = []
+    for tb in sq_tables {
+        all_names.push(tb.name)
+    }
+    let calls = sq_in_call(t)
+    var i = 0
+    while i < t.len() {
+        if sq_table_kw(t, i, calls) && !sq_uncertain {
+            var k = i + 1
+            if sq_is(t, k, "only") || sq_is(t, k, "lateral") {
+                k += 1
+            }
+            if !sq_name(t, k) || sq_is(t, k + 1, "(") {
+                i += 1
+                continue
+            }
+            let w = t[k].text
+            sq_table_name(t, k)
+            let nm = sq_last_name
+            if !nm.contains(".") && !nm.starts_with("pg_") && !sq_has(sc.defined, nm) && sq_table(nm) < 0 && (t[k].kind == SQ_QUOTED || !sq_keyword(w)) {
+                let s = sq_similar(nm, all_names)
+                var hint = "tables: " + all_names.join(", ")
+                if s.len() > 0 {
+                    hint = "did you mean " + s + "? " + hint
+                }
+                sq_report(at, lit, nm, "no table " + nm + " in the migrations", hint)
+                return
+            }
+        }
+        i += 1
+    }
+    // 2. столбцы через псевдоним таблицы: a.col
+    var scope_cols: [str] = []
+    var opaque = sc.loose
+    for ti in sc.tables {
+        if sq_tables[ti].opaque {
+            opaque = true
+        }
+        for c in sq_tables[ti].cols {
+            scope_cols.push(c.name)
+        }
+    }
+    i = 0
+    while i + 2 < t.len() {
+        if sq_name(t, i) && sq_is(t, i + 1, ".") && sq_name(t, i + 2) && !sq_is(t, i + 3, "(") && (i == 0 || !sq_is(t, i - 1, ".")) {
+            let al = t[i].text
+            let cn = t[i + 2].text
+            for x in 0..sc.aliases.len() {
+                if sc.aliases[x] == al {
+                    let ti = sc.tables[x]
+                    if !sq_tables[ti].opaque && sq_find_col(ti, cn) < 0 {
+                        let names = sq_table_cols(ti)
+                        let s = sq_similar(cn, names)
+                        var hint = sq_tables[ti].name + " has " + names.join(", ")
+                        if s.len() > 0 {
+                            hint = "did you mean " + s + "? " + hint
+                        }
+                        sq_report(at, lit, cn, sq_tables[ti].name + " has no column " + cn, hint)
+                        return
+                    }
+                }
+            }
+        }
+        i += 1
+    }
+    // 3. имена без таблицы: должны быть столбцом какой-то таблицы запроса
+    if !opaque && sc.tables.len() > 0 {
+        i = 0
+        while i < t.len() {
+            let tk = t[i]
+            if (tk.kind == SQ_WORD || tk.kind == SQ_QUOTED) && !sq_bare_skip(t, i, sc) {
+                let w = tk.text
+                if !sq_has(scope_cols, w) {
+                    var where = sq_tables[sc.tables[0]].name
+                    var names = sq_table_cols(sc.tables[0])
+                    if sc.tables.len() > 1 {
+                        where = "the tables of this query"
+                        names = scope_cols
+                    }
+                    let s = sq_similar(w, names)
+                    var hint = where + ": " + names.join(", ")
+                    if s.len() > 0 {
+                        hint = "did you mean " + s + "? " + hint
+                    }
+                    sq_report(at, lit, w, "no column " + w + " in " + where, hint)
+                    return
+                }
+            }
+            i += 1
+        }
+    }
+    // 4. INSERT: столбцы списка и обязательные столбцы без значения
+    if sq_is(t, 0, "insert") && sq_is(t, 1, "into") {
+        let k = sq_table_name(t, 2)
+        let ti = sq_table(sq_last_name)
+        if ti >= 0 && !sq_tables[ti].opaque && sq_is(t, k, "(") {
+            var given: [str] = []
+            var j = k + 1
+            while j < t.len() && !sq_is(t, j, ")") {
+                if sq_name(t, j) {
+                    given.push(t[j].text)
+                }
+                j += 1
+            }
+            for c in sq_tables[ti].cols {
+                if c.notnull && !c.auto && !sq_has(given, c.name) {
+                    sq_report(at, lit, sq_tables[ti].name, "INSERT INTO " + sq_tables[ti].name + " leaves out " + c.name + ", which is NOT NULL and has no default", "add " + c.name + " to the columns (or a field " + c.name + " to the inserted type)")
+                    return
+                }
+            }
+        }
+    }
+    // 5. параметры против столбцов: col = $n, SET col = $n, INSERT (cols) VALUES ($n, ...)
+    if sq_check_params(at, t, sc, ps) {
+        return
+    }
+    // 6. строки результата против полей типа
+    if shape == SH_COUNT || opaque {
+        return
+    }
+    let outs = sq_outputs(t, sc)
+    if outs.len() == 0 {
+        return
+    }
+    var unknown_name = false
+    for o in outs {
+        unknown_name = unknown_name || o.name == "?"
+    }
+    if tkind(inner) != K_STRUCT {
+        // одно значение: ровно один столбец подходящего типа
+        if outs.len() > 1 && !(tkind(inner) == K_LIST && shape != SH_LIST) {
+            var names: [str] = []
+            for o in outs {
+                names.push(o.name)
+            }
+            error_tok(at, ty_name(inner) + " takes one column, but the query returns " + outs.len().to_str() + ": " + names.join(", "), "select one column, or use a type with these fields")
+            return
+        }
+        if outs.len() == 1 && outs[0].ty.len() > 0 {
+            let why = sq_fits(inner, outs[0].ty)
+            if why.len() > 0 {
+                error_tok(at, "column " + outs[0].name + " is " + outs[0].ty + ", but " + ty_name(inner) + " is expected", "make it " + sq_kh_for(outs[0].ty) + " (or cast in SQL)")
+            }
+        }
+        return
+    }
+    if tkind(inner) == K_STRUCT {
+        let st = structs[types[inner].a]
+        var out_names: [str] = []
+        for o in outs {
+            out_names.push(o.name)
+        }
+        for f in st.fields {
+            var oi = -1
+            for x in 0..outs.len() {
+                if outs[x].name == f.name {
+                    oi = x
+                }
+            }
+            if oi < 0 {
+                if f.def < 0 && tkind(f.ty) != K_OPT && !unknown_name {
+                    error_tok(at, st.name + "." + f.name + " has no column: the query returns " + out_names.join(", "), "select it (or rename a column with AS " + f.name + "), or give the field a default")
+                    return
+                }
+                continue
+            }
+            let o = outs[oi]
+            if o.ty.len() > 0 {
+                let why = sq_fits(f.ty, o.ty)
+                if why.len() > 0 {
+                    error_tok(at, st.name + "." + f.name + " is " + ty_name(f.ty) + ", but column " + o.name + " is " + o.ty, "make the field " + sq_kh_for(o.ty) + " (or cast in SQL)")
+                    return
+                }
+                if !o.notnull && tkind(f.ty) != K_OPT {
+                    error_tok(at, st.name + "." + f.name + " is " + ty_name(f.ty) + ", but column " + o.name + " can be NULL", "make the field " + ty_name(f.ty) + "?, add NOT NULL to the column, or select coalesce(" + o.name + ", ...) AS " + f.name)
+                    return
+                }
+            }
+        }
+    }
+}
+
+// Тип столбца по имени (c или a.c перед/после знака сравнения) или "".
+fn sq_col_type(t: [SqTok], i: int, sc: SqScope) -> str {
+    var name = ""
+    var al = ""
+    if sq_name(t, i) && !sq_is(t, i - 1, ".") && !sq_is(t, i + 1, ".") {
+        name = t[i].text
+    } else if sq_name(t, i) && sq_is(t, i - 1, ".") && sq_name(t, i - 2) {
+        name = t[i].text
+        al = t[i - 2].text
+    } else if sq_name(t, i) && sq_is(t, i + 1, ".") && sq_name(t, i + 2) {
+        name = t[i + 2].text
+        al = t[i].text
+    }
+    if name.len() == 0 || sq_left_joined(t) {
+        return ""
+    }
+    var ty = ""
+    var found = 0
+    for x in 0..sc.tables.len() {
+        if al.len() == 0 || sc.aliases[x] == al {
+            let ci = sq_find_col(sc.tables[x], name)
+            if ci >= 0 {
+                ty = sq_tables[sc.tables[x]].cols[ci].ty
+                found += 1
+            }
+        }
+    }
+    if found != 1 {
+        return ""
+    }
+    return ty
+}
+
+// Подходит ли значение Khrip к столбцу: "" или почему нет.
+fn sq_param_fits(kt: int, col_ty: str) -> str {
+    let t = ty_inner(kt)
+    let k = tkind(t)
+    let ints = col_ty == "integer" || col_ty == "bigint" || col_ty == "smallint"
+    let floats = col_ty == "real" || col_ty == "double precision" || col_ty == "numeric"
+    let times = col_ty == "timestamptz" || col_ty == "timestamp" || col_ty == "date"
+    let texty = col_ty == "text" || col_ty == "uuid" || col_ty == "time" || col_ty == "interval" || col_ty == "inet" || col_ty == "bytea" || col_ty == "json" || col_ty == "jsonb" || sq_has(sq_enums, col_ty)
+    if !(ints || floats || times || texty || col_ty == "boolean") {
+        return ""
+    }
+    if k == K_INT && (ints || floats || times) {
+        return ""
+    }
+    if k == K_FLOAT {
+        if floats {
+            return ""
+        }
+        if ints {
+            return "it is float and PostgreSQL would round it silently: use .round() or a numeric column"
+        }
+        return "it is float"
+    }
+    if k == K_BOOL {
+        if col_ty == "boolean" {
+            return ""
+        }
+        return "it is bool"
+    }
+    if k == K_STR || k == K_SUM {
+        if texty || times || col_ty == "numeric" {
+            return ""
+        }
+        if ints || floats {
+            return "it is " + ty_name(t) + ": parse it first, e.g. let n = s.to_int() else \{ return 400 }"
+        }
+        return "it is " + ty_name(t)
+    }
+    if k == K_INT {
+        return "it is int"
+    }
+    return ""
+}
+
+// Параметры против столбцов. → была ли ошибка.
+fn sq_check_params(at: Token, t: [SqTok], sc: SqScope, ps: [SqlParam]) -> bool {
+    for i in 0..t.len() {
+        if t[i].kind != SQ_PARAM {
+            continue
+        }
+        let no = (t[i].text[1..t[i].text.len()].to_int() ?? 0) - 1
+        if no < 0 || no >= ps.len() || (ps[no].kind != PK_VAL && ps[no].kind != PK_FIELD) {
+            continue
+        }
+        // $n::тип — значение явно приводится
+        if sq_is(t, i + 1, "::") {
+            continue
+        }
+        var col = ""
+        if i >= 2 && (sq_is(t, i - 1, "=") || sq_is(t, i - 1, "<>") || sq_is(t, i - 1, "!=") || sq_is(t, i - 1, "<") || sq_is(t, i - 1, ">") || sq_is(t, i - 1, "<=") || sq_is(t, i - 1, ">=")) {
+            col = sq_col_type(t, i - 2, sc)
+        } else if i + 2 < t.len() && (sq_is(t, i + 1, "=") || sq_is(t, i + 1, "<>") || sq_is(t, i + 1, "<") || sq_is(t, i + 1, ">") || sq_is(t, i + 1, "<=") || sq_is(t, i + 1, ">=")) && !sq_is(t, i + 3, "(") && !sq_is(t, i + 3, "::") {
+            col = sq_col_type(t, i + 2, sc)
+        }
+        if col.len() > 0 && !(i >= 3 && sq_is(t, i - 3, "::")) {
+            let why = sq_param_fits(ps[no].ty, col)
+            if why.len() > 0 {
+                error_tok(at, "a value is compared with or written to a " + col + " column, but " + why, "")
+                return true
+            }
+        }
+    }
+    // INSERT INTO t (a, b) VALUES ($1, $2): по позиции
+    if sq_is(t, 0, "insert") && sq_is(t, 1, "into") {
+        let k = sq_table_name(t, 2)
+        let ti = sq_table(sq_last_name)
+        if ti >= 0 && sq_is(t, k, "(") {
+            var cols: [str] = []
+            var j = k + 1
+            while j < t.len() && !sq_is(t, j, ")") {
+                if sq_name(t, j) {
+                    cols.push(t[j].text)
+                }
+                j += 1
+            }
+            j += 1
+            if sq_is(t, j, "values") && sq_is(t, j + 1, "(") {
+                var pos = 0
+                var p = j + 2
+                while p < t.len() && !sq_is(t, p, ")") {
+                    if t[p].kind == SQ_PARAM && (sq_is(t, p + 1, ",") || sq_is(t, p + 1, ")")) && pos < cols.len() {
+                        let no = (t[p].text[1..t[p].text.len()].to_int() ?? 0) - 1
+                        let ci = sq_find_col(ti, cols[pos])
+                        if no >= 0 && no < ps.len() && ci >= 0 && (ps[no].kind == PK_VAL || ps[no].kind == PK_FIELD) {
+                            let why = sq_param_fits(ps[no].ty, sq_tables[ti].cols[ci].ty)
+                            if why.len() > 0 {
+                                error_tok(at, "INSERT INTO " + sq_tables[ti].name + ": " + cols[pos] + " is " + sq_tables[ti].cols[ci].ty + ", but " + why, "")
+                                return true
+                            }
+                        }
+                    }
+                    if sq_is(t, p, "(") {
+                        p = sq_skip_parens(t, p)
+                        continue
+                    }
+                    if sq_is(t, p, ",") {
+                        pos += 1
+                    }
+                    p += 1
+                }
+            }
+        }
+    }
+    return false
+}
+
+// Имя без таблицы, которое не надо искать среди столбцов.
+fn sq_bare_skip(t: [SqTok], i: int, sc: SqScope) -> bool {
+    let tk = t[i]
+    let w = tk.text
+    if tk.kind == SQ_WORD && sq_keyword(w) {
+        return true
+    }
+    if sq_has(sc.defined, w) {
+        return true
+    }
+    // типизированный литерал date '...', interval '...'
+    if i + 1 < t.len() && t[i + 1].kind == SQ_STR {
+        return true
+    }
+    // функция, тип после ::, часть a.b, имя таблицы, именованный аргумент
+    if sq_is(t, i + 1, "(") || sq_is(t, i + 1, ".") || sq_is(t, i + 1, "=>") || (i > 0 && (sq_is(t, i - 1, "::") || sq_is(t, i - 1, "."))) {
+        return true
+    }
+    for ti in sc.tables {
+        if sq_tables[ti].name == w {
+            return true
+        }
+    }
+    if i > 0 {
+        let p = t[i - 1]
+        // имя таблицы после FROM/JOIN/INTO/UPDATE и псевдоним после неё
+        if p.kind == SQ_WORD && (p.text == "from" || p.text == "join" || p.text == "into" || p.text == "update" || p.text == "only" || p.text == "as" || p.text == "table") {
+            return true
+        }
+        // псевдоним без AS: два имени подряд или имя после «)»
+        if (p.kind == SQ_WORD && !sq_keyword(p.text)) || p.kind == SQ_QUOTED || sq_is(t, i - 1, ")") || p.kind == SQ_NUM || p.kind == SQ_STR {
+            return true
+        }
+        // тип в CAST(x AS type) и типы в списке столбцов уже учтены; тип после имени
+        // в определении: double precision, timestamp with time zone
+        if p.kind == SQ_WORD && (p.text == "double" || p.text == "with" || p.text == "without" || p.text == "time" || p.text == "varying") {
+            return true
+        }
+    }
+    // составные типы: double precision, character varying, ... with time zone
+    if w == "precision" || w == "varying" {
+        return true
+    }
+    return false
+}
+
+// Столбцы результата: SELECT список или RETURNING. "?" — столбец, имя которого
+// проверка не знает (тогда о недостающих полях молчит).
+fn sq_outputs(t: [SqTok], sc: SqScope) -> [SqOut] {
+    var out: [SqOut] = []
+    // начало списка: RETURNING (последний на верхнем уровне) или первый SELECT
+    var start = -1
+    var depth = 0
+    var i = 0
+    while i < t.len() {
+        if sq_is(t, i, "(") {
+            depth += 1
+        } else if sq_is(t, i, ")") {
+            depth -= 1
+        } else if depth == 0 && sq_is(t, i, "returning") {
+            start = i + 1
+        }
+        i += 1
+    }
+    if start < 0 {
+        depth = 0
+        i = 0
+        while i < t.len() && start < 0 {
+            if sq_is(t, i, "(") {
+                depth += 1
+            } else if sq_is(t, i, ")") {
+                depth -= 1
+            } else if depth == 0 && sq_is(t, i, "select") {
+                start = i + 1
+            } else if depth == 0 && i == 0 && sq_is(t, i, "with") {
+                // WITH ... SELECT: столбцы зависят от CTE — не проверять
+                return out
+            }
+            i += 1
+        }
+    }
+    if start < 0 {
+        return out
+    }
+    if sq_is(t, start, "distinct") {
+        start += 1
+    }
+    // элементы списка до FROM/INTO/WHERE верхнего уровня
+    var items: [[SqTok]] = []
+    var cur: [SqTok] = []
+    depth = 0
+    i = start
+    while i < t.len() {
+        let tk = t[i]
+        if sq_is(t, i, "(") || sq_is(t, i, "[") {
+            depth += 1
+        } else if sq_is(t, i, ")") || sq_is(t, i, "]") {
+            depth -= 1
+            if depth < 0 {
+                break
+            }
+        }
+        if depth == 0 && tk.kind == SQ_WORD && (tk.text == "from" || tk.text == "into" || tk.text == "where" || tk.text == "group" || tk.text == "order" || tk.text == "limit" || tk.text == "union" || tk.text == "on" || tk.text == "having" || tk.text == "window" || tk.text == "for") {
+            break
+        }
+        if depth == 0 && sq_is(t, i, ",") {
+            items.push(cur)
+            cur = []
+        } else {
+            cur.push(tk)
+        }
+        i += 1
+    }
+    items.push(cur)
+    for it in items {
+        if it.len() == 0 {
+            continue
+        }
+        // * и t.*: все столбцы таблиц запроса
+        if it.len() == 1 && sq_is(it, 0, "*") {
+            if sc.tables.len() != 1 {
+                out.push(SqOut { name: "?", ty: "", notnull: false })
+                continue
+            }
+            for c in sq_tables[sc.tables[0]].cols {
+                out.push(SqOut { name: c.name, ty: c.ty, notnull: c.notnull })
+            }
+            continue
+        }
+        if it.len() == 3 && sq_name(it, 0) && sq_is(it, 1, ".") && sq_is(it, 2, "*") {
+            var found = false
+            for x in 0..sc.aliases.len() {
+                if sc.aliases[x] == it[0].text && !found {
+                    found = true
+                    let lj = sq_left_joined(t)
+                    for c in sq_tables[sc.tables[x]].cols {
+                        out.push(SqOut { name: c.name, ty: c.ty, notnull: c.notnull && !lj })
+                    }
+                }
+            }
+            if !found {
+                out.push(SqOut { name: "?", ty: "", notnull: false })
+            }
+            continue
+        }
+        // ... AS имя
+        var name = ""
+        var expr_end = it.len()
+        if it.len() >= 2 && sq_name(it, it.len() - 1) && sq_is(it, it.len() - 2, "as") {
+            name = it[it.len() - 1].text
+            expr_end = it.len() - 2
+        }
+        // столбец: c или a.c
+        var col_ty = ""
+        var col_nn = false
+        var col_name = ""
+        if expr_end == 1 && sq_name(it, 0) {
+            col_name = it[0].text
+        } else if expr_end == 3 && sq_name(it, 0) && sq_is(it, 1, ".") && sq_name(it, 2) {
+            col_name = it[2].text
+        }
+        if col_name.len() > 0 {
+            var n_found = 0
+            for ti in sc.tables {
+                let ci = sq_find_col(ti, col_name)
+                if ci >= 0 {
+                    n_found += 1
+                    col_ty = sq_tables[ti].cols[ci].ty
+                    col_nn = sq_tables[ti].cols[ci].notnull
+                }
+            }
+            if n_found != 1 || sq_left_joined(t) {
+                // неоднозначно или внешнее соединение: тип и NULL не известны точно
+                col_ty = ""
+            }
+            if name.len() == 0 {
+                name = col_name
+            }
+        }
+        if name.len() == 0 {
+            // выражение без AS: имя даёт PostgreSQL (count, coalesce, ?column?)
+            name = "?"
+        }
+        out.push(SqOut { name: name, ty: col_ty, notnull: col_nn })
+    }
+    return out
+}
+
+// В запросе есть LEFT/RIGHT/FULL JOIN: столбцы могут быть NULL.
+fn sq_left_joined(t: [SqTok]) -> bool {
+    for i in 0..t.len() {
+        if sq_is(t, i, "left") || sq_is(t, i, "right") || sq_is(t, i, "full") {
+            return true
+        }
+    }
+    return false
+}

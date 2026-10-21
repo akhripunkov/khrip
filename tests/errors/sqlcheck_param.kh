@@ -1,0 +1,6 @@
+// expect: a value is compared with or written to a bigint column, but it is str: parse it first
+migration 1 `CREATE TABLE users (id bigserial PRIMARY KEY, name text NOT NULL);`
+type U { id: int, name: str }
+route GET "/u/{id}" (id: str) -> U | 404 {
+    return sql "SELECT * FROM users WHERE id = {id}"
+}
