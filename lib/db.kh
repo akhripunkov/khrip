@@ -1034,7 +1034,7 @@ fn __db_run(site: int, vals: int) -> int {
             }
             c = pc.c
         }
-        res = __pg_query(c, sql, params, types, [], deadline)
+        res = __pg_query_at(c, load64(site + SITE_INDEX), sql, params, types, [], deadline)
         if held == 0 {
             __pg_release(c)
         }
