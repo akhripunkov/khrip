@@ -1,0 +1,6 @@
+// expect: {category} may be none, and a comparison with NULL is never true
+// expect: write ({category} IS NULL OR column = {category})
+type P { id: int }
+route GET "/p" (category: str?) -> [P] {
+    return sql "SELECT id FROM products WHERE category = {category}"
+}

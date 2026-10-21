@@ -1,0 +1,11 @@
+// expect: notify() calls fetch, and the tx block may run again after a conflict
+fn notify() {
+    fetch POST "http://localhost/hook" "done"
+}
+route POST "/x" -> 204 {
+    tx {
+        sql "DELETE FROM t"
+        notify()
+    }
+    return 204
+}

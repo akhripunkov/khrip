@@ -1447,6 +1447,12 @@ fn parse_call(t: Token, w: int) -> int {
         return ty_err
     }
     let f = funcs[fi]
+    if tx_depth > 0 && !f.is_lib {
+        let why = fn_effect(fi)
+        if why != "" {
+            error_tok(t, name + "() " + why + ", and the tx block may run again after a conflict", "call it before or after the tx block")
+        }
+    }
     let n = compile_args(f.params, 0, ty_err, ty_err, ty_err, name, t)
     if n != f.params.len() {
         emit_alu_imm(0, RSP, n * 8)

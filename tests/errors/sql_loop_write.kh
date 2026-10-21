@@ -1,0 +1,7 @@
+// expect: this write runs outside tx and it runs in a loop
+route POST "/w" (body: [int]) -> 204 {
+    for id in body {
+        sql "DELETE FROM items WHERE id = {id}"
+    }
+    return 204
+}

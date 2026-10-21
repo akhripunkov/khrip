@@ -1717,6 +1717,7 @@ fn compile_fn(fi: int) {
     let f = funcs[fi]
     tx_depth = 0
     tx_locals = []
+    sql_outside = 0
     let frame_at = begin_fn(fi)
     plan_regs(fi)
     let n = f.params.len()

@@ -1140,6 +1140,11 @@ fn __db_run(site: int, vals: int) -> int {
         }
         return __cast(xs)
     }
+    if res.rows > 1 {
+        // T и T? — одна строка: несколько — ошибка программы, а не «первая попавшаяся»
+        let loc: str = __cast(load64(site + SITE_LOC))
+        __panic_msg("{loc}: the query returned {res.rows} rows, but one is expected: filter by a unique key, add LIMIT 1 with ORDER BY, or use a list [T]")
+    }
     if res.rows == 0 {
         if shape == SH_OPT {
             return 0

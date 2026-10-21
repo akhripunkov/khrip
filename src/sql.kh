@@ -43,6 +43,8 @@ type Migration {
     tok: int
 }
 
+// запросы маршрута вне tx: сколько уже было (запись после них — гонка)
+var sql_outside: int
 var sql_root_used: bool
 var sql_root_off: int
 var sql_sites: [int]
@@ -88,6 +90,62 @@ fn scan_uses_db() -> bool {
         }
     }
     return false
+}
+
+// ---- Действия, которые нельзя повторять (внутри tx) ----
+// Функция «с действием»: зовёт fetch или sleep, меняет store — сама или через
+// свои вызовы. Внутри tx такую функцию звать нельзя: блок может выполниться
+// ещё раз после конфликта.
+
+var fx_state: [int]
+var fx_why: [str]
+
+fn fn_effect(fi: int) -> str {
+    while fx_state.len() < funcs.len() {
+        fx_state.push(0)
+        fx_why.push("")
+    }
+    if fx_state[fi] >= 2 || fx_state[fi] == 1 {
+        return fx_why[fi]
+    }
+    fx_state[fi] = 1
+    let f = funcs[fi]
+    var why = ""
+    if f.body >= 0 && !f.is_lib {
+        var i = f.body
+        while i < f.body_end && why == "" {
+            let t = toks[i]
+            if t.kind == T_IDENT {
+                let nk = kind_at(i + 1)
+                if t.text == "fetch" || t.text == "sleep" {
+                    why = "calls " + t.text
+                } else if nk == '(' {
+                    let g = func_find(t.text)
+                    if g >= 0 && g != fi && !funcs[g].is_lib {
+                        let w = fn_effect(g)
+                        if w != "" {
+                            why = "calls " + t.text + "(), which " + w
+                        }
+                    }
+                } else {
+                    let s = sym_find(t.text)
+                    if s >= 0 && sym_kind(s) == SK_GLOBAL && globals[sym_idx(s)].is_store && (nk == '=' || is_assign_op(nk) || nk == '.' || nk == '[') && (i == 0 || toks[i - 1].kind != '.') {
+                        if nk != '.' || kind_at(i + 3) == '(' || is_assign_op(kind_at(i + 3)) {
+                            why = "changes store " + t.text
+                        }
+                    }
+                }
+            }
+            i += 1
+        }
+    }
+    fx_why[fi] = why
+    if why == "" {
+        fx_state[fi] = 2
+    } else {
+        fx_state[fi] = 3
+    }
+    return why
 }
 
 // ---- migration N `...` ----
@@ -520,8 +578,11 @@ fn parse_sql(w: int) -> int {
     var vals: [int] = []
     var vtypes: [int] = []
     var vkeys: [str] = []
+    var vtexts: [str] = []
+    var ptoks: [Token] = []
     for i in 0..n {
         let pt = tok()
+        ptoks.push(pt)
         if !expect_tok('(') {
             return ty_err
         }
@@ -551,6 +612,7 @@ fn parse_sql(w: int) -> int {
             vi = vtypes.len()
             vtypes.push(et)
             vkeys.push(key)
+            vtexts.push(sql_tok_text(from, to))
             emit_push(RAX)
         }
         vals.push(vi)
@@ -589,6 +651,9 @@ fn parse_sql(w: int) -> int {
     }
     var cur = segs[0]
     var ps: [SqlParam] = []
+    // сравнения с T? без проверки IS NULL: номер значения и место
+    var cmp_v: [int] = []
+    var cmp_at: [int] = []
     for i in 0..n {
         let vi = vals[i]
         let vt = vtypes[vi]
@@ -674,12 +739,40 @@ fn parse_sql(w: int) -> int {
             }
             cur = cur + " " + parts
         } else {
+            if vk == K_OPT && (sql_ends_cmp(cur) || sql_starts_cmp(next)) {
+                cmp_v.push(vi)
+                cmp_at.push(i)
+            }
             let no = sql_param_no(ps, PK_VAL, vt, vi, -1)
             cur = cur + "$" + no.to_str()
         }
         cur = cur + next
     }
+    for k in 0..cmp_v.len() {
+        var guarded = false
+        for p in ps {
+            if p.kind == PK_ISNULL && p.v == cmp_v[k] {
+                guarded = true
+            }
+        }
+        if !guarded {
+            let x = vtexts[cmp_v[k]]
+            error_tok(ptoks[cmp_at[k]], "\{" + x + "} may be none, and a comparison with NULL is never true: rows would silently not match", "write (\{" + x + "} IS NULL OR column = \{" + x + "}), or unwrap it first: let v = " + x + " else \{ return 400 }")
+        }
+    }
     sql_habits(at, cur)
+    // C: в маршруте запись после другого запроса вне tx — гонка «проверил, записал»
+    let writes = sql_target_table(cur).len() > 1 || sql_has_word(cur, "delete") || sql_has_word(cur, "merge")
+    if route_ctx >= 0 && tx_depth == 0 && inline_depth == 0 {
+        if writes && (sql_outside > 0 || loop_depth > 0) {
+            var why = "another statement runs before it"
+            if loop_depth > 0 {
+                why = "it runs in a loop"
+            }
+            error_tok(at, "this write runs outside tx and " + why + ": another request can change the data in between", "put the statements of this request in tx \{ ... }")
+        }
+        sql_outside += 1
+    }
     let first = sql_first_word(cur)
     let reads = first == "select" || first == "with" || first == "values" || first == "table"
     if shape == SH_COUNT && reads && !cur.lower().contains("returning") {
@@ -717,6 +810,78 @@ fn parse_sql(w: int) -> int {
     }
     last_was_call = true
     return rt
+}
+
+// Слово w (в нижнем регистре) в тексте запроса вне строк '...'.
+fn sql_has_word(s: str, w: str) -> bool {
+    var i = 0
+    let n = s.len()
+    while i < n {
+        if s[i] == '\'' {
+            i += 1
+            while i < n && s[i] != '\'' {
+                i += 1
+            }
+            i += 1
+            continue
+        }
+        if is_alpha(s[i]) && (i == 0 || !is_ident_char(s[i - 1])) {
+            let k = sql_starts_words(s[i..n], [w])
+            if k > 0 {
+                return true
+            }
+            while i < n && is_ident_char(s[i]) {
+                i += 1
+            }
+            continue
+        }
+        i += 1
+    }
+    return false
+}
+
+// Текст выражения параметра (для сообщений).
+fn sql_tok_text(from: int, to: int) -> str {
+    var s = ""
+    var i = from
+    while i < to {
+        let t = toks[i]
+        if i > from && t.kind != '.' && toks[i - 1].kind != '.' && t.kind != '(' && t.kind != ')' && t.kind != '[' && t.kind != ']' && toks[i - 1].kind != '(' && toks[i - 1].kind != '[' {
+            s = s + " "
+        }
+        s = s + t.text
+        i += 1
+    }
+    return s
+}
+
+// Сравнение перед параметром: = <> != < > <= >= LIKE ILIKE (но не IS DISTINCT FROM).
+fn sql_ends_cmp(cur: str) -> bool {
+    let e = sql_trim_end(cur)
+    if e == 0 {
+        return false
+    }
+    let c = cur[e - 1]
+    if c == '=' || c == '<' || c == '>' {
+        return true
+    }
+    return sql_ends_word(cur, e, "like") >= 0 || sql_ends_word(cur, e, "ilike") >= 0
+}
+
+// Сравнение после параметра: {x} = col.
+fn sql_starts_cmp(next: str) -> bool {
+    var p = 0
+    while p < next.len() && sql_space(next[p]) {
+        p += 1
+    }
+    if p >= next.len() {
+        return false
+    }
+    let c = next[p]
+    if c == '=' || c == '<' || c == '>' || (c == '!' && p + 1 < next.len() && next[p + 1] == '=') {
+        return true
+    }
+    return sql_starts_words(next, ["like"]) > 0 || sql_starts_words(next, ["ilike"]) > 0
 }
 
 // cur кончается на «IN (»? → позиция начала IN или -1.
