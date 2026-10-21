@@ -1024,6 +1024,7 @@ fn __save_store() {
 fn __run_task(w: __Worker, i: int) {
     let c = __ctx()
     __arena_begin()
+    store64(c + CTX_JNULLS, 0)
     if __setjmp(w.jb) == 0 {
         store64(c + CTX_CATCH, w.jb)
         __every_run(i)

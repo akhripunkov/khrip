@@ -40,6 +40,8 @@ fi
 start_solution "$lang" "$dir" "$tmp" "$port"
 wait_up "$port" || {
 	echo "сервер не запустился" >&2
+	# что сервер сказал при запуске (у Khrip — ошибки запросов к базе)
+	[[ -f "$tmp/log" ]] && tail -40 "$tmp/log" >&2
 	exit 2
 }
 if [[ $db == 1 ]]; then

@@ -1,0 +1,111 @@
+migration 1 `
+CREATE TABLE users (id bigserial PRIMARY KEY, email text NOT NULL UNIQUE, name text NOT NULL);
+CREATE TABLE projects (
+    key text PRIMARY KEY,
+    name text NOT NULL,
+    owner_id bigint NOT NULL REFERENCES users,
+    last_number bigint NOT NULL DEFAULT 0
+);
+CREATE TABLE issues (
+    project text NOT NULL REFERENCES projects,
+    number bigint NOT NULL,
+    key text GENERATED ALWAYS AS (project || '-' || number::text) STORED NOT NULL UNIQUE,
+    title text NOT NULL,
+    status text NOT NULL DEFAULT 'open',
+    priority text NOT NULL,
+    assignee_id bigint REFERENCES users,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (project, number)
+);
+`
+
+type NewUser { email: str, name: str }
+type User { id: int, email: str, name: str }
+type NewProject { key: str, name: str, owner_id: int }
+type Project { key: str, name: str, owner_id: int }
+type Status = open | in_progress | done
+type Priority = low | medium | high
+type NewIssue { title: str, priority: Priority = medium, assignee_id: int? }
+type Issue { key: str, project: str, number: int, title: str, status: Status, priority: Priority, assignee_id: int?, created_at: str, updated_at: str }
+type IssuePatch { title: str?, status: Status?, priority: Priority?, assignee_id: int? }
+type Active { id: int, name: str, active: int }
+type Summary { total: int, open: int, in_progress: int, done: int, assignees: [Active] }
+
+fn title_ok(t: str) -> bool {
+    return t.trim() != "" && t.len() <= 200
+}
+
+route POST "/users" (body: NewUser) -> 201 User | 400 str {
+    if !body.email.matches(`[^@\s]+@[^@\s]+`) || body.name.trim() == "" {
+        return 400 "invalid user"
+    }
+    return 201 sql "INSERT INTO users (email, name) VALUES ({body.email.lower()}, {body.name}) RETURNING *"
+}
+
+route POST "/projects" (body: NewProject) -> 201 Project | 400 str {
+    if !body.key.matches(`[A-Z]{2,5}`) || body.name.trim() == "" {
+        return 400 "invalid project"
+    }
+    return 201 sql "INSERT INTO projects {body} RETURNING key, name, owner_id"
+}
+
+route POST "/projects/{key}/issues" (key: str, body: NewIssue) -> 201 Issue | 400 str | 404 {
+    if !title_ok(body.title) {
+        return 400 "invalid issue"
+    }
+    return 201 sql `WITH n AS (UPDATE projects SET last_number = last_number + 1 WHERE key = {key} RETURNING last_number)
+        INSERT INTO issues (project, number, title, priority, assignee_id)
+        SELECT {key}, last_number, {body.title}, {body.priority}, {body.assignee_id} FROM n RETURNING *`
+}
+
+route GET "/issues/{key}" (key: str) -> Issue | 404 {
+    return sql "SELECT * FROM issues WHERE key = {key}"
+}
+
+route PATCH "/issues/{key}" (key: str, body: IssuePatch) -> Issue | 400 str | 404 {
+    if !title_ok(body.title ?? "x") {
+        return 400 "invalid change"
+    }
+    return sql "UPDATE issues SET {body}, updated_at = now() WHERE key = {key} RETURNING *"
+}
+
+route DELETE "/issues/{key}" (key: str) -> 204 | 404 {
+    if sql "DELETE FROM issues WHERE key = {key}" == 0 {
+        return 404
+    }
+    return 204
+}
+
+route GET "/projects/{key}/issues" (key: str, status: Status?, assignee_id: str?, q: str?) -> [Issue] | 400 str | 404 {
+    let unassigned = assignee_id == "none"
+    var assignee: int? = none
+    if let a = assignee_id {
+        if !unassigned {
+            let n = a.to_int() else {
+                return 400 "assignee_id is a user id or none"
+            }
+            assignee = n
+        }
+    }
+    let p: Project = sql "SELECT key, name, owner_id FROM projects WHERE key = {key}"
+    return sql `SELECT * FROM issues WHERE project = {p.key}
+        AND ({status} IS NULL OR status = {status})
+        AND ({assignee} IS NULL OR assignee_id = {assignee})
+        AND (NOT {unassigned} OR assignee_id IS NULL)
+        AND title ILIKE '%{q ?? ""}%'
+        ORDER BY number`
+}
+
+route GET "/projects/{key}/summary" (key: str) -> Summary | 404 {
+    let p: Project = sql "SELECT key, name, owner_id FROM projects WHERE key = {key}"
+    return sql `SELECT count(*) AS total,
+            count(*) FILTER (WHERE status = 'open') AS open,
+            count(*) FILTER (WHERE status = 'in_progress') AS in_progress,
+            count(*) FILTER (WHERE status = 'done') AS done,
+            coalesce((SELECT json_agg(a) FROM (
+                SELECT u.id, u.name, count(*) AS active FROM issues i JOIN users u ON u.id = i.assignee_id
+                WHERE i.project = {p.key} AND i.status <> 'done'
+                GROUP BY u.id, u.name ORDER BY active DESC, u.id) a), '[]') AS assignees
+        FROM issues WHERE project = {p.key}`
+}

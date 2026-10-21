@@ -23,6 +23,8 @@ const PK_LIKE = 3
 const PK_TEXT = 4
 const PK_FIELD = 5
 const PK_COLUMN = 6
+// поле T? задано: есть значение или в JSON пришёл явный null
+const PK_GIVEN = 7
 
 // Слова места запроса: см. lib/db.kh (SITE_*).
 const SITE_WORDS = 24
@@ -259,36 +261,56 @@ fn sql_first_word(s: str) -> str {
     return buf_str(b)
 }
 
+// Таблицы, в которые пишет запрос (INSERT INTO t, UPDATE t — и в WITH):
+// « t1 t2 ». Нарушение внешнего ключа в такой таблице — ссылка на то, чего нет
+// (404); в другой — удаляют то, на что ещё ссылаются (409).
 fn sql_target_table(s: str) -> str {
-    let w = sql_first_word(s)
-    var n = 0
-    if w == "insert" {
-        n = sql_starts_words(s, ["insert", "into"])
-    } else if w == "update" {
-        n = sql_starts_words(s, ["update"])
-        let only = sql_starts_words(s[n..s.len()], ["only"])
-        n += only
-    } else if w == "delete" {
-        n = sql_starts_words(s, ["delete", "from"])
-    } else {
-        return ""
-    }
-    if n == 0 {
-        return ""
-    }
-    while n < s.len() && sql_space(s[n]) {
-        n += 1
-    }
-    let b = buf_new(16)
-    while n < s.len() && (is_ident_char(s[n]) || s[n] == '.' || s[n] == '"') {
-        if s[n] == '.' {
-            buf_clear(b)
-        } else if s[n] != '"' {
-            buf_byte(b, sql_lower(s[n]))
+    var out = " "
+    var i = 0
+    let n = s.len()
+    while i < n {
+        if s[i] == '\'' {
+            i += 1
+            while i < n && s[i] != '\'' {
+                i += 1
+            }
+            i += 1
+            continue
         }
-        n += 1
+        if (i == 0 || !is_ident_char(s[i - 1])) && is_alpha(s[i]) {
+            var k = sql_starts_words(s[i..n], ["insert", "into"])
+            if k == 0 {
+                k = sql_starts_words(s[i..n], ["update"])
+                if k > 0 {
+                    k += sql_starts_words(s[i + k..n], ["only"])
+                }
+            }
+            if k > 0 {
+                var p = i + k
+                while p < n && sql_space(s[p]) {
+                    p += 1
+                }
+                let b = buf_new(16)
+                while p < n && (is_ident_char(s[p]) || s[p] == '.' || s[p] == '"') {
+                    if s[p] == '.' {
+                        buf_clear(b)
+                    } else if s[p] != '"' {
+                        buf_byte(b, sql_lower(s[p]))
+                    }
+                    p += 1
+                }
+                out = out + buf_str(b) + " "
+                i = p
+                continue
+            }
+            while i < n && is_ident_char(s[i]) {
+                i += 1
+            }
+            continue
+        }
+        i += 1
     }
-    return buf_str(b)
+    return out
 }
 
 // Ключ для слияния одинаковых параметров: только имена, поля, литералы и
@@ -555,7 +577,8 @@ fn parse_sql(w: int) -> int {
                 cur = cur + " (" + names + ") VALUES (" + values + ")"
             }
         } else if vk == K_STRUCT && sql_ends_word(cur, cur.len(), "set") >= 0 {
-            // SET {patch}: поле со значением none оставляет столбец как был
+            // SET {patch} — как JSON Merge Patch: поле T? без значения оставляет
+            // столбец как был, явный null из JSON записывает NULL
             let fs = structs[types[vt].a].fields
             var parts = ""
             for j in 0..fs.len() {
@@ -566,7 +589,8 @@ fn parse_sql(w: int) -> int {
                 let no = sql_param_no(ps, PK_FIELD, f.ty, vi, j)
                 let col = sql_ident(f.name)
                 if tkind(f.ty) == K_OPT {
-                    parts = parts + col + " = coalesce($" + no.to_str() + ", " + col + ")"
+                    let given = sql_param_no(ps, PK_GIVEN, ty_bool, vi, j)
+                    parts = parts + col + " = CASE WHEN $" + given.to_str() + " THEN $" + no.to_str() + " ELSE " + col + " END"
                 } else {
                     parts = parts + col + " = $" + no.to_str()
                 }

@@ -819,6 +819,9 @@ fn __jd(j: __Json, d: int, at: str) -> int {
                 if fi < 0 {
                     __jd_skip(j, __jd_join(at, key))
                 } else {
+                    if fi < 62 && __jd_peek(j) == 'n' && load64(__field_desc(d, fi)) == D_OPT {
+                        __json_null_mark(s, fi)
+                    }
                     store64(s + fi * 8, __jd(j, __field_desc(d, fi), __jd_join(at, key)))
                     if fi < 62 {
                         seen = seen | (1 << fi)
@@ -858,6 +861,28 @@ fn __jd(j: __Json, d: int, at: str) -> int {
         return s
     }
     return 0
+}
+
+// Явный null в JSON (а не отсутствующее поле): так SET \{patch} в sql отличает
+// «снять значение» от «не трогать» (JSON Merge Patch). Отметки живут до конца запроса.
+fn __json_null_mark(s: int, fi: int) {
+    let cx = __ctx()
+    var m = load64(cx + CTX_JNULLS)
+    if m == 0 {
+        m = __map_new(0)
+        store64(cx + CTX_JNULLS, m)
+    }
+    let mm: map[int, int] = __cast(m)
+    mm[s] = (mm[s] ?? 0) | (1 << fi)
+}
+
+fn __json_null_sent(s: int, fi: int) -> bool {
+    let m = load64(__ctx() + CTX_JNULLS)
+    if m == 0 || fi >= 62 {
+        return false
+    }
+    let mm: map[int, int] = __cast(m)
+    return ((mm[s] ?? 0) & (1 << fi)) != 0
 }
 
 fn __sum_names(d: int) -> str {
@@ -1257,6 +1282,7 @@ fn __serve_one(w: __Worker, req: __Req) {
     buf_clear(w.extra)
     w.cur = __cast(req)
     store64(c + CTX_STORE_MODE, 0)
+    store64(c + CTX_JNULLS, 0)
     if __setjmp(w.jb) == 0 {
         store64(c + CTX_CATCH, w.jb)
         __dispatch(req)
@@ -1304,6 +1330,7 @@ fn __tests_init() {
 }
 
 fn __test_begin(name: str, jb: int) {
+    store64(__ctx() + CTX_JNULLS, 0)
     __test_bad = false
     __test_log = ""
     __tests_run += 1

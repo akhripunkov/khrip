@@ -40,6 +40,7 @@ const PK_LIKE = 3
 const PK_TEXT = 4
 const PK_FIELD = 5
 const PK_COLUMN = 6
+const PK_GIVEN = 7
 
 // Типы PostgreSQL (pg_type.oid)
 const OID_BOOL = 16
@@ -462,6 +463,12 @@ fn __db_params(site: int, vals: int) -> [str?] {
             out.push(__db_encode(d, v, OID_TEXT))
         } else if kind == PK_FIELD {
             out.push(__db_encode(d, load64(v + f * 8), o))
+        } else if kind == PK_GIVEN {
+            if load64(v + f * 8) != 0 || __json_null_sent(v, f) {
+                out.push("t")
+            } else {
+                out.push("f")
+            }
         } else if kind == PK_COLUMN {
             // список структур: значения поля f всех элементов — массивом
             let xs: [int] = __cast(v)
@@ -726,7 +733,7 @@ fn __db_check(c: int, site: int, notnull: map[str, bool], deadline: int) -> str 
     for i in 0..np {
         let kind = load64(pt + i * 32)
         let d = load64(pt + i * 32 + 8)
-        if kind == PK_ISNULL {
+        if kind == PK_ISNULL || kind == PK_GIVEN {
             types.push(OID_BOOL)
         } else if kind == PK_LIKE || kind == PK_TEXT {
             types.push(OID_TEXT)
@@ -971,7 +978,7 @@ fn __db_fail(site: int, e: __PgErr) {
         }
     } else if code == "23503" {
         let target: str = __cast(load64(site + SITE_TARGET))
-        if e.table == target {
+        if target.contains(" " + e.table + " ") {
             status = 404
         } else {
             status = 409
