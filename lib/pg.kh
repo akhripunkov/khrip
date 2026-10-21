@@ -33,6 +33,10 @@ const PB_TXHDR = 136
 // номер блока tx и ключ сессионной advisory-блокировки очереди повторов (0 — нет)
 const PB_TXID = 144
 const PB_TXLOCK = 152
+// начало непрочитанного во входном буфере (сдвиг остатка — раз на чтение из сокета)
+const PB_ROFF = 160
+// место, чей подготовленный оператор устарел (номер + 1): перед новым Parse — Close
+const PB_STALE = 168
 // подготовленные запросы: SHA-256 текста (32 байта) и номер — по 40 байт
 const PB_STMT = 256
 const PG_STMTS = 200
@@ -216,20 +220,34 @@ type __PgMsg {
 fn __pg_read(c: int, deadline: int) -> __PgMsg? {
     var b = __pg_buf(c)
     while true {
-        if b.len >= 5 {
-            let len = __be32(b.data + 1)
+        let off = load64(c + PB_ROFF)
+        let avail = b.len - off
+        if avail >= 5 {
+            let at = b.data + off
+            let len = __be32(at + 1)
             if len < 4 || len > 1073741824 {
                 return none
             }
-            if b.len >= 1 + len {
+            if avail >= 1 + len {
                 let m = __alloc(len)
-                __memcpy(m, b.data + 5, len - 4)
-                let kind = load8(b.data)
-                __memcpy(b.data, b.data + 1 + len, b.len - 1 - len)
-                b.len -= 1 + len
-                __pg_save(c, b)
+                __memcpy(m, at + 5, len - 4)
+                let kind = load8(at)
+                if avail == 1 + len {
+                    b.len = 0
+                    store64(c + PB_ROFF, 0)
+                    __pg_save(c, b)
+                } else {
+                    store64(c + PB_ROFF, off + 1 + len)
+                }
                 return __PgMsg { kind, p: m, n: len - 4 }
             }
+        }
+        if off > 0 {
+            // неполное сообщение — в начало буфера, затем дочитать
+            __memcpy(b.data, b.data + off, avail)
+            b.len = avail
+            store64(c + PB_ROFF, 0)
+            __pg_save(c, b)
         }
         let t = load64(c + PB_TLS)
         if t != 0 {
@@ -901,6 +919,12 @@ fn __pg_query_at(c: int, site: int, sql: str, params: [str?], types: [int], fall
     if fresh {
         if by_site {
             name = "s{site}"
+            if load64(c + PB_STALE) == site + 1 {
+                let cat = __pg_begin(b, 'C')
+                buf_byte(b, 'S')
+                __wr_cstr(b, name)
+                __pg_end(b, cat)
+            }
         } else if load64(c + PB_NSTMT) < PG_STMTS {
             let n = load64(c + PB_NSTMT)
             idx = n
@@ -996,10 +1020,33 @@ fn __pg_query_at(c: int, site: int, sql: str, params: [str?], types: [int], fall
                 if by_site {
                     let a = c + PB_SITES + (site >> 3)
                     store8(a, load8(a) | (1 << (site & 7)))
+                    if load64(c + PB_STALE) == site + 1 {
+                        store64(c + PB_STALE, 0)
+                    }
                 } else if idx >= 0 {
                     __memcpy(c + PB_STMT + idx * 40, key, 32)
                     store64(c + PB_NSTMT, idx + 1)
                 }
+            }
+            // план оператора устарел (ALTER TABLE во время работы: «cached plan must
+            // not change result type») или оператора нет (26000): подготовить заново
+            if !fresh && by_site && __pg_stale(res.err) {
+                let a = c + PB_SITES + (site >> 3)
+                store8(a, load8(a) & (255 - (1 << (site & 7))))
+                if load64(c + PB_STALE) != 0 {
+                    // второй такой же — соединение закроется после запроса
+                    store64(c + PB_BROKEN, 1)
+                }
+                store64(c + PB_STALE, site + 1)
+                if load8(m.p) == 'I' || begin != 0 {
+                    if begin != 0 {
+                        __pg_simple(c, "rollback", deadline)
+                        store64(c + PB_BEGIN, begin)
+                    }
+                    return __pg_query_at(c, site, sql, params, types, fallback, deadline)
+                }
+                // в транзакции: она повторится целиком (__pg_retryable)
+                return res
             }
             // тип параметра не вывелся (42P08/42P18 — какой именно, сказано в
             // сообщении) или оператор неоднозначен с «unknown» (42725): взять
@@ -1226,7 +1273,12 @@ fn __pg_unlock_tx(c: int) {
 }
 
 fn __pg_retryable(e: __PgErr) -> bool {
-    return e.code == "40001" || e.code == "40P01"
+    return e.code == "40001" || e.code == "40P01" || __pg_stale(e)
+}
+
+// Подготовленный оператор устарел: после ALTER TABLE или его нет на сервере.
+fn __pg_stale(e: __PgErr) -> bool {
+    return e.code == "26000" || (e.code == "0A000" && e.message.contains("cached plan"))
 }
 
 // Пауза перед попыткой n (1, 2, …): случайная, до 2^n мс, не больше 200 мс.

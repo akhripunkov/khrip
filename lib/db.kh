@@ -488,14 +488,26 @@ fn __db_params(site: int, vals: int) -> [str?] {
 
 // ---- Строки результата ----
 
-fn __db_decode(r: __PgRes, i: int, d: int, cv: int, at: str) -> int {
+// Где значение: место запроса и поле (fi < 0 — единственный столбец). Строится
+// только для сообщения об ошибке.
+fn __db_at(site: int, fi: int) -> str {
+    let loc: str = __cast(load64(site + SITE_LOC))
+    if fi < 0 {
+        return loc + ": the column"
+    }
+    let d = load64(site + SITE_DESC)
+    let fname: str = __cast(load64(__field(d, fi)))
+    return loc + ": " + __desc_name(d) + "." + fname
+}
+
+fn __db_decode(r: __PgRes, i: int, d: int, cv: int, site: int, fi: int) -> int {
     let k = load64(d)
     if k == D_OPT {
         if __pg_null(r, i) {
             return 0
         }
         let inner = load64(d + 8)
-        let v = __db_decode(r, i, inner, cv, at)
+        let v = __db_decode(r, i, inner, cv, site, fi)
         if __is_scalar(inner) {
             let b = __alloc(8)
             store64(b, v)
@@ -504,7 +516,7 @@ fn __db_decode(r: __PgRes, i: int, d: int, cv: int, at: str) -> int {
         return v
     }
     if __pg_null(r, i) {
-        __panic_msg("{at} is NULL, but its type {__desc_name(d)} has no none: make it {__desc_name(d)}? or use coalesce(...) in the query")
+        __panic_msg("{__db_at(site, fi)} is NULL, but its type {__desc_name(d)} has no none: make it {__desc_name(d)}? or use coalesce(...) in the query")
     }
     if cv == CV_INT {
         return __pg_int(r, i)
@@ -535,7 +547,7 @@ fn __db_decode(r: __PgRes, i: int, d: int, cv: int, at: str) -> int {
     if cv == CV_JSON {
         let v = __json_decode(__pg_str(r, i), d)
         if v == 0 {
-            __panic_msg("{at}: the JSON from the database does not fit {__desc_name(d)}: {json_error()}")
+            __panic_msg("{__db_at(site, fi)}: the JSON from the database does not fit {__desc_name(d)}: {json_error()}")
         }
         if __is_scalar(d) {
             return load64(v)
@@ -552,7 +564,7 @@ fn __db_decode(r: __PgRes, i: int, d: int, cv: int, at: str) -> int {
                 return load64(e + 16)
             }
         }
-        __panic_msg("{at} is '{label}', which is not a value of {__desc_name(d)}")
+        __panic_msg("{__db_at(site, fi)} is '{label}', which is not a value of {__desc_name(d)}")
     }
     if cv == CV_ARRAY {
         let items = __pg_arr(r, i)
@@ -568,7 +580,7 @@ fn __db_decode(r: __PgRes, i: int, d: int, cv: int, at: str) -> int {
         var xs: [int] = []
         for x in items {
             let s = x else {
-                __panic_msg("{at} has a NULL element, but its type {__desc_name(d)} has no none")
+                __panic_msg("{__db_at(site, fi)} has a NULL element, but its type {__desc_name(d)} has no none")
                 return 0
             }
             if ek == D_INT {
@@ -590,9 +602,8 @@ fn __db_row(site: int, r: __PgRes, row: int) -> int {
     let d = load64(site + SITE_DESC)
     let plan: [int] = __cast(load64(site + SITE_PLAN))
     let base = row * r.cols
-    let loc: str = __cast(load64(site + SITE_LOC))
     if load64(site + SITE_SCALAR) != 0 {
-        return __db_decode(r, base, d, plan[1], loc + ": the column")
+        return __db_decode(r, base, d, plan[1], site, -1)
     }
     let s = __struct_alloc(d)
     let n = load64(d + 8)
@@ -614,8 +625,7 @@ fn __db_row(site: int, r: __PgRes, row: int) -> int {
             }
             continue
         }
-        let fname: str = __cast(load64(f))
-        store64(s + fi * 8, __db_decode(r, base + col, fd, plan[2 * fi + 1], loc + ": " + __desc_name(d) + "." + fname))
+        store64(s + fi * 8, __db_decode(r, base + col, fd, plan[2 * fi + 1], site, fi))
     }
     return s
 }

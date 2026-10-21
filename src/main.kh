@@ -149,7 +149,8 @@ fn print_sizes() {
                     end = x
                 }
             }
-            print((end - f.code).to_str() + " " + f.name)
+            // размер, имя и адрес (для профилировщика: valgrind, perf)
+            print((end - f.code).to_str() + " " + f.name + " @" + (CODE_BASE + HDR_SIZE + f.code).to_str())
             total += end - f.code
         }
     }
