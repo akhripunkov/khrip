@@ -607,6 +607,21 @@ fn __co_wait(fd: int, events: int, ms: int) -> int {
     return r
 }
 
+// Разбудить остановленную сопрограмму cv на следующем шаге планировщика (её
+// ожидание закончится так, будто вышел срок). Только для того же потока.
+fn __co_notify(cv: int) {
+    let co: __Co = __cast(cv)
+    if !co.parked {
+        return
+    }
+    let s = co.sch
+    if co.hidx >= 0 {
+        __heap_remove(s, co)
+    }
+    co.deadline = 0
+    __heap_push(s, co)
+}
+
 // Пауза на ms миллисекунд. В запросе сервера поток тем временем выполняет
 // другие запросы.
 fn sleep(ms: int) {

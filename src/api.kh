@@ -85,6 +85,7 @@ fn api_lib_files() -> [str] {
     names.push("fetch.kh")
     names.push("x509.kh")
     names.push("tls.kh")
+    names.push("pg.kh")
     return names
 }
 
@@ -94,7 +95,7 @@ fn uses_api() -> bool {
         if t.kind == T_ROUTE || t.kind == T_TEST || t.kind == T_STORE {
             return true
         }
-        if t.kind == T_IDENT && (t.text == "to_json" || t.text == "from_json" || t.text == "fetch" || t.text == "every") {
+        if t.kind == T_IDENT && (t.text == "to_json" || t.text == "from_json" || t.text == "fetch" || t.text == "every" || t.text.starts_with("__pg_")) {
             return true
         }
     }

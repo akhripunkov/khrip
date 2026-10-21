@@ -11,6 +11,7 @@
 #   tests/http.sh     — HTTP-сервер на Khrip отвечает правильно;
 #   tests/coro.sh     — запросы, которые ждут (sleep, fetch), не держат поток;
 #   tests/tls.sh      — свой TLS 1.3: криптография, сертификаты, рукопожатия;
+#   tests/pg.sh       — клиент PostgreSQL на временном сервере;
 #   tests/weather.sh  — погодный бэкенд: fetch, every, сохранение store;
 #   eval/solutions/*/khrip — решения задач проверки проходят eval/run.sh.
 # Компилятор берётся из $KHC (по умолчанию build/khc).
@@ -119,6 +120,11 @@ fi
 if [[ -f tests/tls.sh ]] && command -v curl >/dev/null; then
 	# shellcheck source=tests/tls.sh
 	source tests/tls.sh
+fi
+
+if [[ -f tests/pg.sh ]]; then
+	# shellcheck source=tests/pg.sh
+	source tests/pg.sh
 fi
 
 if [[ -f tests/weather.sh ]] && command -v curl >/dev/null; then

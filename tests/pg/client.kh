@@ -1,0 +1,188 @@
+// Клиент PostgreSQL на уровне рантайма: аутентификация, TLS, запросы, ошибки,
+// тайм-аут с отменой, транзакции, миграции. Запускается из tests/pg.sh:
+// аргументы — порт сервера и каталог с корневыми сертификатами.
+
+fn url(user: str, extra: str) -> __PgUrl {
+    let port = args()[1]
+    let s = "postgres://{user}:pw-{user}@127.0.0.1:{port}/khrip_test{extra}"
+    return __pg_parse_url(s) ?? __PgUrl { host: "", port: 0, user: "", password: "", db: "", ssl: "", root: "" }
+}
+
+fn connect(user: str, extra: str) -> int {
+    let pc = __pg_connect(url(user, extra), now_ms() + 5000)
+    if pc.c == 0 {
+        print("connect {user}{extra}: {pc.err}")
+    }
+    return pc.c
+}
+
+fn show(what: str, e: __PgErr) {
+    if e.code.len() == 0 {
+        print("{what}: ok")
+    } else {
+        print("{what}: [{e.code}] {e.message}")
+    }
+}
+
+fn main() -> int {
+    let pki = args()[2]
+    let d = now_ms() + 10000
+
+    // аутентификация: SCRAM-SHA-256, MD5, открытый пароль, неверный пароль
+    for user in ["u_scram", "u_md5", "u_plain"] {
+        let c = connect(user, "?sslmode=disable")
+        if c != 0 {
+            let r = __pg_exec(c, "select current_user", [], d)
+            print("{user}: {__pg_text(r, 0) ?? "?"}")
+            __pg_free(c)
+        }
+    }
+    let bad = __PgUrl { host: "127.0.0.1", port: url("u_scram", "").port, user: "u_scram", password: "wrong", db: "khrip_test", ssl: "disable", root: "" }
+    print("wrong password: {__pg_connect(bad, d).err}")
+    print("bad url: {__pg_parse_url("mysql://x@y/z") == none}")
+
+    // TLS как в libpq: prefer и require только шифруют, verify-ca проверяет
+    // цепочку, verify-full — и имя (в сертификате 127.0.0.1, но не localhost)
+    for t in ["127.0.0.1 ", "127.0.0.1 ?sslmode=require", "localhost ?sslmode=verify-ca&sslrootcert={pki}/root.pem", "localhost ?sslmode=verify-full&sslrootcert={pki}/root.pem", "127.0.0.1 ?sslmode=verify-full&sslrootcert={pki}/root.pem", "127.0.0.1 ?sslmode=require&sslrootcert={pki}/other.pem", "127.0.0.1 ?sslmode=verify-full&sslrootcert={pki}/other.pem"] {
+        let host = t.split(" ")[0]
+        let extra = t.split(" ")[1]
+        let u = __pg_parse_url("postgres://u_scram:pw-u_scram@{host}:{args()[1]}/khrip_test{extra}") ?? url("", "")
+        let label = "{host} {extra.replace(pki + "/", "")}"
+        let pc = __pg_connect(u, d)
+        if pc.c == 0 {
+            print("{label}: {pc.err}")
+            continue
+        }
+        let r = __pg_exec(pc.c, "select ssl from pg_stat_ssl where pid = pg_backend_pid()", [], d)
+        print("{label}: ssl {__pg_text(r, 0) ?? "?"}")
+        __pg_free(pc.c)
+    }
+
+    let c = connect("u_scram", "?sslmode=disable")
+    if c == 0 {
+        return 1
+    }
+    show("schema", __pg_simple(c, "drop table if exists t_users; create table t_users (id serial primary key, email text unique not null, age int)", d))
+
+    // параметры, NULL, число строк, кеш подготовленных запросов
+    for e in ["a@x", "b@x", "c@x"] {
+        let r = __pg_exec(c, "insert into t_users (email, age) values ($1, $2)", [e, none], d)
+        print("insert {e}: affected {r.affected}")
+    }
+    print("prepared: {load64(c + PB_NSTMT)}")
+    let up = __pg_exec(c, "update t_users set age = $1 where email <> $2", ["30", "c@x"], d)
+    print("update: affected {up.affected}")
+    let sel = __pg_exec(c, "select id, email, age from t_users order by id", [], d)
+    print("select: cols {sel.cols}, rows {sel.rows}, affected {sel.affected}")
+    for i in 0..sel.rows {
+        print("  {__pg_int(sel, 3 * i)} {__pg_str(sel, 3 * i + 1)} {__pg_text(sel, 3 * i + 2) ?? "NULL"}")
+    }
+    let quote = __pg_exec(c, "select $1::text", ["it's \"quoted\"; drop table t_users"], d)
+    print("injection-safe: {__pg_text(quote, 0) ?? "?"}")
+
+    // ошибки сервера с полями
+    let dup = __pg_exec(c, "insert into t_users (email) values ($1)", ["a@x"], d)
+    print("duplicate: [{dup.err.code}] constraint {dup.err.constraint} table {dup.err.table}")
+    let nn = __pg_exec(c, "insert into t_users (email) values ($1)", [none], d)
+    print("not null: [{nn.err.code}] column {nn.err.column}")
+    let col = __pg_exec(c, "select nope from t_users", [], d)
+    print("no column: [{col.err.code}] {col.err.message}")
+    let after = __pg_exec(c, "select count(*) from t_users", [], d)
+    print("after errors: {__pg_text(after, 0) ?? "?"} state {load8(c + PB_TX)}")
+
+    // тайм-аут: запрос отменён и на сервере
+    let t0 = now_ms()
+    let slow = __pg_exec(c, "select pg_sleep(5)", [], now_ms() + 300)
+    print("timeout: [{slow.err.code}] in time {now_ms() - t0 < 1500}")
+    __pg_free(c)
+    let c2 = connect("u_scram", "?sslmode=disable")
+    sleep(100)
+    let running = __pg_exec(c2, "select count(*) from pg_stat_activity where query = 'select pg_sleep(5)'", [], d)
+    print("still running on the server: {__pg_text(running, 0) ?? "?"}")
+
+    // транзакции: пустая не обращается к базе, конфликт сериализации
+    // повторяется, ошибка внутри — явный откат, BEGIN не прошёл — запрос не выполнен
+    show("accounts", __pg_simple(c2, "drop table if exists t_acc; create table t_acc (id int primary key, v int); insert into t_acc values (1, 0)", d))
+    let other = connect("u_scram", "?sslmode=disable")
+    __pg_tx_begin(c2, PG_SERIALIZABLE)
+    show("empty tx", __pg_tx_end(c2, true, d))
+    var attempt = 0
+    while attempt < 5 {
+        attempt += 1
+        __pg_tx_begin(c2, PG_SERIALIZABLE)
+        let r = __pg_exec(c2, "select v from t_acc where id = 1", [], d)
+        if attempt == 1 {
+            __pg_tx_begin(other, PG_SERIALIZABLE)
+            __pg_exec(other, "update t_acc set v = v + 10 where id = 1", [], d)
+            show("concurrent commit", __pg_tx_end(other, true, d))
+        }
+        let w = __pg_exec(c2, "update t_acc set v = $1 where id = 1", [(((__pg_text(r, 0) ?? "0").to_int() ?? 0) + 1).to_str()], d)
+        if __pg_retryable(w.err) {
+            print("attempt {attempt}: [{w.err.code}] retry")
+            __pg_tx_end(c2, false, d)
+            __pg_backoff(attempt)
+            continue
+        }
+        show("attempt {attempt} commit", __pg_tx_end(c2, true, d))
+        break
+    }
+    __pg_tx_begin(c2, PG_READ_COMMITTED)
+    __pg_exec(c2, "update t_acc set v = 1000", [], d)
+    let div = __pg_exec(c2, "select 1 / 0", [], d)
+    print("error in tx: [{div.err.code}] state {load8(c2 + PB_TX)}")
+    show("commit after error", __pg_tx_end(c2, true, d))
+    __pg_tx_begin(c2, PG_SERIALIZABLE | PG_READ_ONLY)
+    let ro = __pg_exec(c2, "update t_acc set v = 5", [], d)
+    print("write in read only: [{ro.err.code}]")
+    __pg_tx_end(c2, false, d)
+    let v = __pg_exec(c2, "select v from t_acc", [], d)
+    print("value: {__pg_text(v, 0) ?? "?"} state {load8(c2 + PB_TX)}")
+
+    // типы в текстовом виде
+    let ty = __pg_exec(c2, "select -9223372036854775807::int8, true, false, 2.5::float8, 1e-7::float8, '2026-10-21 19:37:54.5+03'::timestamptz, '2026-10-21 19:37:54'::timestamp, '\\x00ff41'::bytea, '\{\"a\": [1, 2]}'::jsonb, 'привет'::text, null::int", [], d)
+    print("int8 {__pg_int(ty, 0)} bool {__pg_bool(ty, 1)} {__pg_bool(ty, 2)} float {__pg_float(ty, 3)} {__pg_float(ty, 4)}")
+    print("timestamptz {time_iso(__pg_time(ty, 5))} timestamp {time_iso(__pg_time(ty, 6))}")
+    let raw = __pg_bytes(ty, 7)
+    print("bytea {raw.len()} {raw[0]} {raw[1]} {raw[2]} json {__pg_str(ty, 8)} text {__pg_str(ty, 9)} null {__pg_null(ty, 10)} {__pg_null(ty, 9)}")
+
+    // массивы и bytea: разбор ответа и параметры туда и обратно
+    let tricky: [str?] = ["a", "b c", none, "d\"e\\f", "", "NULL", "\{x,y}"]
+    let ar = __pg_exec(c2, "select array['a', 'b c', null, 'd\"e\\f', '', 'NULL', '\{x,y}']::text[], '\{1,2,3}'::int[], '\{}'::text[], $1::text[], $2::bytea", [__pg_arr_param(tricky), __pg_bytes_param("\0\"z")], d)
+    if ar.err.code.len() > 0 {
+        print("arrays: [{ar.err.code}] {ar.err.message}")
+    }
+    let back = __pg_arr(ar, 3)
+    var same = back.len() == tricky.len()
+    for k in 0..back.len().min(tricky.len()) {
+        same = same && (back[k] ?? "<null>") == (tricky[k] ?? "<null>") && (back[k] == none) == (tricky[k] == none)
+    }
+    print("text[] {__pg_arr(ar, 0).map(x => x ?? "<null>").join("|")}")
+    print("int[] {__pg_arr(ar, 1).map(x => x ?? "?").join("+")} empty {__pg_arr(ar, 2).len()} roundtrip {same} bytea {__pg_bytes(ar, 4).len()}")
+
+    // описание запроса без выполнения: типы параметров и столбцов, ошибки с местом
+    let ds = __pg_describe(c2, "select id, email, age, now() as at from t_users where id = $1 and email = $2", d)
+    print("describe params {ds.params.map(x => x.to_str()).join(",")} nodata {ds.nodata}")
+    for col in ds.cols {
+        print("  {col.name} type {col.ty} column {col.attnum} of table {col.table != 0}")
+    }
+    let dn = __pg_describe(c2, "insert into t_users (email) values ($1)", d)
+    print("describe insert: params {dn.params.map(x => x.to_str()).join(",")} nodata {dn.nodata} cols {dn.cols.len()}")
+    let de = __pg_describe(c2, "select emial from t_users", d)
+    print("describe typo: [{de.err.code}] {de.err.message} at {de.err.position} hint '{de.err.hint}'")
+
+    // миграции: применяются один раз, изменение старой — ошибка, сбой — откат
+    __pg_simple(c2, "drop table if exists khrip_migrations; drop table if exists t_m1; drop table if exists t_m2", d)
+    let names = ["001_init.sql", "002_more.sql"]
+    let sqls = ["create table t_m1 (id int);\ninsert into t_m1 values (1);", "create table t_m2 (id int)"]
+    let log1 = buf_new(64)
+    print("migrate: '{__pg_migrate(c2, names, sqls, log1)}' {buf_str(log1).replace("\n", ";")}")
+    let log2 = buf_new(64)
+    print("again: '{__pg_migrate(c2, names, sqls, log2)}' {buf_str(log2).replace("\n", ";")}")
+    let log3 = buf_new(64)
+    print("changed: {__pg_migrate(c2, names, ["create table t_m1 (id bigint);", sqls[1]], log3)}")
+    let log4 = buf_new(64)
+    print("failing: {__pg_migrate(c2, ["001_init.sql", "002_more.sql", "003_bad.sql"], [sqls[0], sqls[1], "create table t_m3 (id int); select 1/0"], log4)}")
+    let m3 = __pg_exec(c2, "select count(*) from pg_tables where tablename = 't_m3'", [], d)
+    print("t_m3 rolled back: {__pg_int(m3, 0) == 0}")
+    return 0
+}

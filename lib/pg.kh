@@ -1,0 +1,1282 @@
+// Клиент PostgreSQL (протокол 3.0): подключение, TLS (SSLRequest и свой TLS 1.3),
+// аутентификация SCRAM-SHA-256, MD5 и открытым паролем, расширенный протокол
+// (Parse/Bind/Execute/Sync одним пакетом) с кешем подготовленных запросов.
+//
+// Соединение живёт в блоке mmap, а не в арене запроса: оно переживает запрос и
+// возвращается в запас потока. Сокет неблокирующий: запрос, который ждёт базу,
+// ждёт в своей сопрограмме.
+
+const PG_BLOCK = 16384
+const PB_FD = 0
+const PB_TLS = 8
+// входящие байты: данные, длина, ёмкость (mmap)
+const PB_IN = 16
+const PB_NSTMT = 40
+// соединение нельзя возвращать в запас
+const PB_BROKEN = 48
+const PB_PID = 56
+const PB_SECRET = 64
+// состояние транзакции из ReadyForQuery: 'I', 'T' или 'E'
+const PB_TX = 72
+const PB_USED = 80
+// адрес сервера — для CancelRequest
+const PB_IP = 88
+const PB_PORT = 96
+// отложенный BEGIN (уровень изоляции | PG_READ_ONLY): уходит вместе с первым
+// запросом транзакции, а транзакция без запросов не стоит обращения к базе
+const PB_BEGIN = 104
+// подготовленные запросы: SHA-256 текста (32 байта) и номер — по 40 байт
+const PB_STMT = 256
+const PG_STMTS = 200
+
+// ---- Адрес базы ----
+
+type __PgUrl {
+    host: str
+    port: int
+    user: str
+    password: str
+    db: str
+    // disable, prefer, require, verify-full
+    ssl: str
+    // файл корневых сертификатов (sslrootcert) или ""
+    root: str
+}
+
+// Только %XX: «+» в пароле остаётся плюсом.
+fn __pct_decode(s: str) -> str {
+    if s.find("%") == none {
+        return s
+    }
+    let b = buf_new(s.len())
+    var i = 0
+    while i < s.len() {
+        if s[i] == '%' && i + 2 < s.len() && __hex_val(s[i + 1]) >= 0 && __hex_val(s[i + 2]) >= 0 {
+            buf_byte(b, __hex_val(s[i + 1]) * 16 + __hex_val(s[i + 2]))
+            i += 3
+        } else {
+            buf_byte(b, s[i])
+            i += 1
+        }
+    }
+    return __str_new(b.data, b.len)
+}
+
+// postgres://user:password@host:port/db?sslmode=...&sslrootcert=...
+fn __pg_parse_url(url: str) -> __PgUrl? {
+    var rest = ""
+    if url.starts_with("postgres://") {
+        rest = url[11..]
+    } else if url.starts_with("postgresql://") {
+        rest = url[13..]
+    } else {
+        return none
+    }
+    var query = ""
+    if let q = rest.find("?") {
+        query = rest[q + 1..]
+        rest = rest[..q]
+    }
+    var path = ""
+    if let s = rest.find("/") {
+        path = rest[s + 1..]
+        rest = rest[..s]
+    }
+    var user = "postgres"
+    var password = ""
+    var at = -1
+    for i in 0..rest.len() {
+        if rest[i] == '@' {
+            at = i
+        }
+    }
+    if at >= 0 {
+        let cred = rest[..at]
+        rest = rest[at + 1..]
+        if let c = cred.find(":") {
+            user = __pct_decode(cred[..c])
+            password = __pct_decode(cred[c + 1..])
+        } else {
+            user = __pct_decode(cred)
+        }
+    }
+    var host = rest
+    var port = 5432
+    if let c = rest.find(":") {
+        host = rest[..c]
+        port = rest[c + 1..].to_int() ?? -1
+    }
+    if host.len() == 0 {
+        host = "localhost"
+    }
+    if port <= 0 || port > 65535 {
+        return none
+    }
+    var db = __pct_decode(path)
+    if db.len() == 0 {
+        db = user
+    }
+    var ssl = "prefer"
+    var root = ""
+    for kv in query.split("&") {
+        if let e = kv.find("=") {
+            let k = kv[..e]
+            let v = __pct_decode(kv[e + 1..])
+            if k == "sslmode" {
+                ssl = v
+            } else if k == "sslrootcert" && v != "system" {
+                root = v
+            }
+        }
+    }
+    if ssl != "disable" && ssl != "prefer" && ssl != "require" && ssl != "verify-ca" && ssl != "verify-full" {
+        return none
+    }
+    return __PgUrl { host, port, user, password, db, ssl, root }
+}
+
+// ---- Сообщения ----
+
+fn __be32(p: int) -> int {
+    return ((load8(p) * 256 + load8(p + 1)) * 256 + load8(p + 2)) * 256 + load8(p + 3)
+}
+
+fn __be16(p: int) -> int {
+    return load8(p) * 256 + load8(p + 1)
+}
+
+fn __wr_u32(b: Buf, v: int) {
+    buf_byte(b, (v >> 24) & 255)
+    buf_byte(b, (v >> 16) & 255)
+    buf_byte(b, (v >> 8) & 255)
+    buf_byte(b, v & 255)
+}
+
+fn __wr_cstr(b: Buf, s: str) {
+    buf_add(b, s)
+    buf_byte(b, 0)
+}
+
+// Начать сообщение типа kind (0 — без типа, как StartupMessage) → где длина.
+fn __pg_begin(b: Buf, kind: int) -> int {
+    if kind != 0 {
+        buf_byte(b, kind)
+    }
+    let at = b.len
+    __wr_u32(b, 0)
+    return at
+}
+
+fn __pg_end(b: Buf, at: int) {
+    let n = b.len - at
+    store8(b.data + at, (n >> 24) & 255)
+    store8(b.data + at + 1, (n >> 16) & 255)
+    store8(b.data + at + 2, (n >> 8) & 255)
+    store8(b.data + at + 3, n & 255)
+}
+
+fn __pg_buf(c: int) -> Buf {
+    return Buf { data: load64(c + PB_IN), len: load64(c + PB_IN + 8), cap: load64(c + PB_IN + 16), mm: true }
+}
+
+fn __pg_save(c: int, b: Buf) {
+    store64(c + PB_IN, b.data)
+    store64(c + PB_IN + 8, b.len)
+    store64(c + PB_IN + 16, b.cap)
+}
+
+fn __pg_write(c: int, b: Buf, deadline: int) -> bool {
+    let t = load64(c + PB_TLS)
+    if t != 0 {
+        return __tls_write(t, b.data, b.len, deadline)
+    }
+    return __fd_write_all(load64(c + PB_FD), b.data, b.len, deadline)
+}
+
+// Сообщение сервера: тип и содержимое (копия в арене).
+type __PgMsg {
+    kind: int
+    p: int
+    n: int
+}
+
+fn __pg_read(c: int, deadline: int) -> __PgMsg? {
+    var b = __pg_buf(c)
+    while true {
+        if b.len >= 5 {
+            let len = __be32(b.data + 1)
+            if len < 4 || len > 1073741824 {
+                return none
+            }
+            if b.len >= 1 + len {
+                let m = __alloc(len)
+                __memcpy(m, b.data + 5, len - 4)
+                let kind = load8(b.data)
+                __memcpy(b.data, b.data + 1 + len, b.len - 1 - len)
+                b.len -= 1 + len
+                __pg_save(c, b)
+                return __PgMsg { kind, p: m, n: len - 4 }
+            }
+        }
+        let t = load64(c + PB_TLS)
+        if t != 0 {
+            let n = __tls_read(t, b, deadline)
+            __pg_save(c, b)
+            if n <= 0 {
+                return none
+            }
+            continue
+        }
+        buf_reserve(b, 16384)
+        __pg_save(c, b)
+        let fd = load64(c + PB_FD)
+        let n = syscall(SYS_READ, fd, b.data + b.len, b.cap - b.len)
+        if n == -EAGAIN && __wait_fd(fd, EPOLLIN, deadline) {
+            continue
+        }
+        if n <= 0 {
+            return none
+        }
+        b.len += n
+        __pg_save(c, b)
+    }
+    return none
+}
+
+// Ошибка сервера (ErrorResponse): код SQLSTATE, текст, подробности, ограничение.
+type __PgErr {
+    code: str = ""
+    message: str = ""
+    detail: str = ""
+    constraint: str = ""
+    column: str = ""
+    table: str = ""
+    hint: str = ""
+    // место ошибки в тексте запроса (с 1; 0 — неизвестно)
+    position: int = 0
+}
+
+fn __pg_error(m: __PgMsg) -> __PgErr {
+    let e = __PgErr {}
+    var i = 0
+    while i < m.n {
+        let f = load8(m.p + i)
+        if f == 0 {
+            break
+        }
+        var j = i + 1
+        while j < m.n && load8(m.p + j) != 0 {
+            j += 1
+        }
+        let v = __str_copy(m.p + i + 1, j - i - 1)
+        if f == 'C' {
+            e.code = v
+        } else if f == 'M' {
+            e.message = v
+        } else if f == 'D' {
+            e.detail = v
+        } else if f == 'n' {
+            e.constraint = v
+        } else if f == 'c' {
+            e.column = v
+        } else if f == 't' {
+            e.table = v
+        } else if f == 'H' {
+            e.hint = v
+        } else if f == 'P' {
+            e.position = v.to_int() ?? 0
+        }
+        i = j + 1
+    }
+    return e
+}
+
+// ---- MD5 (только для старой аутентификации md5) ----
+
+fn __md5_hex(s: str) -> str {
+    let k = [0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1, 0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391]
+    let r = [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21]
+    let n = s.len()
+    let total = (n + 8) / 64 * 64 + 64
+    let m = __alloc(total)
+    __memcpy(m, __str_ptr(s), n)
+    store8(m + n, 0x80)
+    let bits = n * 8
+    for i in 0..8 {
+        store8(m + total - 8 + i, (bits >> (i * 8)) & 255)
+    }
+    let mask = 0xFFFFFFFF
+    var a0 = 0x67452301
+    var b0 = 0xefcdab89
+    var c0 = 0x98badcfe
+    var d0 = 0x10325476
+    var off = 0
+    while off < total {
+        var a = a0
+        var b = b0
+        var c = c0
+        var d = d0
+        for i in 0..64 {
+            var f = 0
+            var g = 0
+            if i < 16 {
+                f = (b & c) | ((b ^ mask) & d)
+                g = i
+            } else if i < 32 {
+                f = (d & b) | ((d ^ mask) & c)
+                g = (5 * i + 1) % 16
+            } else if i < 48 {
+                f = b ^ c ^ d
+                g = (3 * i + 5) % 16
+            } else {
+                f = c ^ (b | (d ^ mask))
+                g = (7 * i) % 16
+            }
+            let x = (a + f + k[i] + load32(m + off + g * 4)) & mask
+            a = d
+            d = c
+            c = b
+            b = (b + (((x << r[i]) | (x >> (32 - r[i]))) & mask)) & mask
+        }
+        a0 = (a0 + a) & mask
+        b0 = (b0 + b) & mask
+        c0 = (c0 + c) & mask
+        d0 = (d0 + d) & mask
+        off += 64
+    }
+    let out = __alloc(16)
+    store32(out, a0)
+    store32(out + 4, b0)
+    store32(out + 8, c0)
+    store32(out + 12, d0)
+    return __hex_bytes(out, 16)
+}
+
+// ---- Подключение ----
+
+// Результат: блок соединения или текст ошибки.
+type __PgConn {
+    c: int
+    err: str
+}
+
+fn __pg_free(c: int) {
+    let t = load64(c + PB_TLS)
+    if t != 0 {
+        __tls_close(t)
+    } else {
+        syscall(SYS_CLOSE, load64(c + PB_FD))
+    }
+    let d = load64(c + PB_IN)
+    if d != 0 {
+        syscall(SYS_MUNMAP, d, load64(c + PB_IN + 16))
+    }
+    syscall(SYS_MUNMAP, c, PG_BLOCK)
+}
+
+fn __pg_fail(c: int, msg: str) -> __PgConn {
+    __pg_free(c)
+    return __PgConn { c: 0, err: msg }
+}
+
+// Аутентификация SCRAM-SHA-256 (RFC 5802, 7677) без привязки к каналу.
+fn __pg_scram(c: int, u: __PgUrl, deadline: int) -> str {
+    let raw = __alloc(18)
+    __random_bytes(raw, 18)
+    let cnonce = __b64_encode(__str_new(raw, 18))
+    let first_bare = "n=,r=" + cnonce
+    let b = buf_new(128)
+    let at = __pg_begin(b, 'p')
+    __wr_cstr(b, "SCRAM-SHA-256")
+    __wr_u32(b, first_bare.len() + 3)
+    buf_add(b, "n,," + first_bare)
+    __pg_end(b, at)
+    if !__pg_write(c, b, deadline) {
+        return "connection closed during authentication"
+    }
+    let m = __pg_read(c, deadline) else {
+        return "connection closed during authentication"
+    }
+    if m.kind == 'E' {
+        return __pg_error(m).message
+    }
+    if m.kind != 'R' || __be32(m.p) != 11 {
+        return "unexpected authentication message"
+    }
+    let server_first = __str_copy(m.p + 4, m.n - 4)
+    var nonce = ""
+    var salt = ""
+    var iter = 0
+    for part in server_first.split(",") {
+        if part.starts_with("r=") {
+            nonce = part[2..]
+        } else if part.starts_with("s=") {
+            salt = part[2..]
+        } else if part.starts_with("i=") {
+            iter = part[2..].to_int() ?? 0
+        }
+    }
+    if !nonce.starts_with(cnonce) || salt.len() == 0 || iter < 1 {
+        return "bad SCRAM server message"
+    }
+    let sb = buf_new(64)
+    __b64_decode(__str_ptr(salt), salt.len(), sb)
+    let salted = __alloc(32)
+    __pbkdf2(u.password, sb.data, sb.len, iter, salted)
+    let client_key = __alloc(32)
+    __hmac(32, salted, 32, __str_ptr("Client Key"), 10, client_key)
+    let stored = __alloc(32)
+    __hash(32, client_key, 32, stored)
+    let final_bare = "c=biws,r=" + nonce
+    let auth = first_bare + "," + server_first + "," + final_bare
+    let sig = __alloc(32)
+    __hmac(32, stored, 32, __str_ptr(auth), auth.len(), sig)
+    let proof = __alloc(32)
+    for i in 0..32 {
+        store8(proof + i, load8(client_key + i) ^ load8(sig + i))
+    }
+    let fin = final_bare + ",p=" + __b64_encode(__str_new(proof, 32))
+    let b2 = buf_new(128)
+    let at2 = __pg_begin(b2, 'p')
+    buf_add(b2, fin)
+    __pg_end(b2, at2)
+    if !__pg_write(c, b2, deadline) {
+        return "connection closed during authentication"
+    }
+    let m2 = __pg_read(c, deadline) else {
+        return "connection closed during authentication"
+    }
+    if m2.kind == 'E' {
+        return __pg_error(m2).message
+    }
+    if m2.kind != 'R' || __be32(m2.p) != 12 {
+        return "unexpected authentication message"
+    }
+    // подпись сервера: он тоже знает пароль
+    let server_key = __alloc(32)
+    __hmac(32, salted, 32, __str_ptr("Server Key"), 10, server_key)
+    let ssig = __alloc(32)
+    __hmac(32, server_key, 32, __str_ptr(auth), auth.len(), ssig)
+    let want = "v=" + __b64_encode(__str_new(ssig, 32))
+    if __str_copy(m2.p + 4, m2.n - 4) != want {
+        return "the server failed SCRAM authentication"
+    }
+    return ""
+}
+
+// Открыть соединение и пройти аутентификацию.
+fn __pg_connect(u: __PgUrl, deadline: int) -> __PgConn {
+    let ip = __resolve(u.host, deadline) else {
+        return __PgConn { c: 0, err: "cannot resolve host " + u.host }
+    }
+    let fd = __connect(ip, u.port, deadline)
+    if fd < 0 {
+        return __PgConn { c: 0, err: "cannot connect to {u.host}:{u.port}" }
+    }
+    let c = __mmap(PG_BLOCK)
+    store64(c + PB_FD, fd)
+    store64(c + PB_IP, ip)
+    store64(c + PB_PORT, u.port)
+    let ib = buf_mm(16384)
+    __pg_save(c, ib)
+    if u.ssl != "disable" {
+        // SSLRequest: сервер отвечает одним байтом S или N
+        let sr = buf_new(8)
+        __wr_u32(sr, 8)
+        __wr_u32(sr, 80877103)
+        if !__fd_write_all(fd, sr.data, 8, deadline) {
+            return __pg_fail(c, "cannot connect to {u.host}:{u.port}")
+        }
+        let one = __alloc(8)
+        var got = 0
+        while got == 0 {
+            let n = syscall(SYS_READ, fd, one, 1)
+            if n == -EAGAIN && __wait_fd(fd, EPOLLIN, deadline) {
+                continue
+            }
+            if n != 1 {
+                return __pg_fail(c, "connection closed during SSL negotiation")
+            }
+            got = 1
+        }
+        if load8(one) == 'S' {
+            // как в libpq: prefer и require только шифруют (с sslrootcert
+            // require проверяет цепочку), verify-ca — цепочку, verify-full — и имя
+            var verify = TLS_VERIFY_NONE
+            if u.ssl == "verify-full" {
+                verify = TLS_VERIFY_FULL
+            } else if u.ssl == "verify-ca" || (u.ssl == "require" && u.root.len() > 0) {
+                verify = TLS_VERIFY_CHAIN
+            }
+            let tc = __tls_connect_roots(fd, u.host, u.port, u.root, verify, deadline)
+            if tc.blk == 0 {
+                store64(c + PB_FD, -1)
+                syscall(SYS_CLOSE, fd)
+                return __pg_fail_free(c, tc.err)
+            }
+            store64(c + PB_TLS, tc.blk)
+        } else if u.ssl != "prefer" {
+            return __pg_fail(c, "the database server does not support TLS (sslmode={u.ssl})")
+        }
+    }
+    let b = buf_new(256)
+    let at = __pg_begin(b, 0)
+    __wr_u32(b, 196608)
+    __wr_cstr(b, "user")
+    __wr_cstr(b, u.user)
+    __wr_cstr(b, "database")
+    __wr_cstr(b, u.db)
+    __wr_cstr(b, "application_name")
+    __wr_cstr(b, "khrip")
+    __wr_cstr(b, "client_encoding")
+    __wr_cstr(b, "UTF8")
+    __wr_cstr(b, "DateStyle")
+    __wr_cstr(b, "ISO")
+    __wr_cstr(b, "TimeZone")
+    __wr_cstr(b, "UTC")
+    buf_byte(b, 0)
+    __pg_end(b, at)
+    if !__pg_write(c, b, deadline) {
+        return __pg_fail(c, "cannot send the startup message")
+    }
+    while true {
+        let m = __pg_read(c, deadline) else {
+            return __pg_fail(c, "connection closed during startup")
+        }
+        if m.kind == 'E' {
+            return __pg_fail(c, "database: " + __pg_error(m).message)
+        }
+        if m.kind == 'R' {
+            let code = __be32(m.p)
+            if code == 3 || code == 5 {
+                var pw = u.password
+                if code == 5 {
+                    pw = "md5" + __md5_hex(__md5_hex(u.password + u.user) + __str_new(m.p + 4, 4))
+                }
+                let pb = buf_new(64)
+                let pat = __pg_begin(pb, 'p')
+                __wr_cstr(pb, pw)
+                __pg_end(pb, pat)
+                if !__pg_write(c, pb, deadline) {
+                    return __pg_fail(c, "connection closed during authentication")
+                }
+            } else if code == 10 {
+                let mechs = __str_copy(m.p + 4, m.n - 4)
+                if mechs.find("SCRAM-SHA-256") == none {
+                    return __pg_fail(c, "the database wants an unsupported authentication method")
+                }
+                let e = __pg_scram(c, u, deadline)
+                if e.len() > 0 {
+                    return __pg_fail(c, "database: " + e)
+                }
+            } else if code != 0 {
+                return __pg_fail(c, "the database wants an unsupported authentication method ({code})")
+            }
+        } else if m.kind == 'K' {
+            store64(c + PB_PID, __be32(m.p))
+            store64(c + PB_SECRET, __be32(m.p + 4))
+        } else if m.kind == 'Z' {
+            store64(c + PB_TX, load8(m.p))
+            return __PgConn { c, err: "" }
+        }
+    }
+    return __pg_fail(c, "unexpected end of startup")
+}
+
+fn __pg_fail_free(c: int, msg: str) -> __PgConn {
+    let d = load64(c + PB_IN)
+    if d != 0 {
+        syscall(SYS_MUNMAP, d, load64(c + PB_IN + 16))
+    }
+    syscall(SYS_MUNMAP, c, PG_BLOCK)
+    return __PgConn { c: 0, err: msg }
+}
+
+// ---- Запросы ----
+
+const PG_SERIALIZABLE = 1
+const PG_REPEATABLE_READ = 2
+const PG_READ_COMMITTED = 3
+const PG_READ_ONLY = 8
+
+fn __pg_begin_sql(mode: int) -> str {
+    let lvl = mode & 7
+    var s = "begin isolation level serializable"
+    if lvl == PG_REPEATABLE_READ {
+        s = "begin isolation level repeatable read"
+    } else if lvl == PG_READ_COMMITTED {
+        s = "begin isolation level read committed"
+    }
+    if mode & PG_READ_ONLY != 0 {
+        s = s + " read only"
+    }
+    return s
+}
+
+fn __pg_lost(c: int, deadline: int) -> __PgErr {
+    store64(c + PB_BROKEN, 1)
+    if now_ms() >= deadline {
+        // сервер всё ещё считает: попросить его остановиться
+        __pg_cancel(c)
+        return __PgErr { code: "57014", message: "the query took too long and was cancelled" }
+    }
+    return __PgErr { code: "08006", message: "connection to the database lost" }
+}
+
+// Добавить в пакет Parse/Bind/Execute безымянного запроса без параметров.
+fn __pg_put_plain(b: Buf, sql: str) {
+    let at = __pg_begin(b, 'P')
+    __wr_cstr(b, "")
+    __wr_cstr(b, sql)
+    __wr_u16(b, 0)
+    __pg_end(b, at)
+    let bat = __pg_begin(b, 'B')
+    __wr_cstr(b, "")
+    __wr_cstr(b, "")
+    __wr_u16(b, 0)
+    __wr_u16(b, 0)
+    __wr_u16(b, 0)
+    __pg_end(b, bat)
+    let eat = __pg_begin(b, 'E')
+    __wr_cstr(b, "")
+    __wr_u32(b, 0)
+    __pg_end(b, eat)
+}
+
+// Ответ на запрос: значения в текстовом виде лежат подряд в data, значение
+// i (строка i / cols) — смещение at[2i] и длина at[2i + 1] (-1 — NULL);
+// разбираются на месте, без промежуточных строк. affected — число строк из
+// CommandComplete; err.code пустой — ошибки нет.
+type __PgRes {
+    cols: int
+    rows: int
+    data: Buf
+    at: [int]
+    affected: int
+    err: __PgErr
+}
+
+fn __pg_null(r: __PgRes, i: int) -> bool {
+    return r.at[2 * i + 1] < 0
+}
+
+fn __pg_text(r: __PgRes, i: int) -> str? {
+    let n = r.at[2 * i + 1]
+    if n < 0 {
+        return none
+    }
+    return __str_copy(r.data.data + r.at[2 * i], n)
+}
+
+fn __pg_str(r: __PgRes, i: int) -> str {
+    return __pg_text(r, i) ?? ""
+}
+
+fn __pg_int(r: __PgRes, i: int) -> int {
+    let n = r.at[2 * i + 1]
+    var p = r.data.data + r.at[2 * i]
+    let end = p + n.max(0)
+    var neg = false
+    if p < end && load8(p) == '-' {
+        neg = true
+        p += 1
+    }
+    var v = 0
+    while p < end {
+        v = v * 10 + load8(p) - '0'
+        p += 1
+    }
+    if neg {
+        return -v
+    }
+    return v
+}
+
+fn __pg_float(r: __PgRes, i: int) -> float {
+    let n = r.at[2 * i + 1]
+    if n < 0 {
+        return 0.0
+    }
+    return __float_parse(r.data.data + r.at[2 * i], n) ?? 0.0
+}
+
+fn __pg_bool(r: __PgRes, i: int) -> bool {
+    return r.at[2 * i + 1] > 0 && load8(r.data.data + r.at[2 * i]) == 't'
+}
+
+// timestamptz «2026-10-21 19:37:54.123456+00» (сессия в UTC) и timestamp без
+// пояса (считается UTC) — в секунды Unix, как now() и parse_time.
+fn __pg_time(r: __PgRes, i: int) -> int {
+    var s = __pg_str(r, i)
+    let n = s.len()
+    if n >= 3 && (s[n - 3] == '+' || s[n - 3] == '-') {
+        s = s + ":00"
+    } else if n >= 6 && (s[n - 6] == '+' || s[n - 6] == '-') && s[n - 3] == ':' {
+    } else {
+        s = s + "Z"
+    }
+    return parse_time(s) ?? parse_date(s[..10.min(s.len())]) ?? 0
+}
+
+// Одномерный массив «{a,"b c",NULL}» — элементы в текстовом виде (none — NULL).
+fn __pg_arr(r: __PgRes, i: int) -> [str?] {
+    var out: [str?] = []
+    let n = r.at[2 * i + 1]
+    if n < 2 {
+        return out
+    }
+    let p = r.data.data + r.at[2 * i]
+    var k = 1
+    let end = n - 1
+    if end == 1 {
+        return out
+    }
+    while k <= end {
+        let b = buf_new(16)
+        if load8(p + k) == '"' {
+            k += 1
+            while k < end && load8(p + k) != '"' {
+                if load8(p + k) == '\\' {
+                    k += 1
+                }
+                buf_byte(b, load8(p + k))
+                k += 1
+            }
+            k += 1
+            out.push(buf_str(b))
+        } else {
+            while k < end && load8(p + k) != ',' {
+                buf_byte(b, load8(p + k))
+                k += 1
+            }
+            let v = buf_str(b)
+            if v == "NULL" {
+                out.push(none)
+            } else {
+                out.push(v)
+            }
+        }
+        // запятая или закрывающая скобка
+        k += 1
+    }
+    return out
+}
+
+// Массив для параметра: каждый элемент в кавычках, «\» и «"» экранированы.
+fn __pg_arr_param(items: [str?]) -> str {
+    let b = buf_new(16)
+    buf_byte(b, '{')
+    for i, it in items {
+        if i > 0 {
+            buf_byte(b, ',')
+        }
+        if let v = it {
+            buf_byte(b, '"')
+            for k in 0..v.len() {
+                let ch = v[k]
+                if ch == '"' || ch == '\\' {
+                    buf_byte(b, '\\')
+                }
+                buf_byte(b, ch)
+            }
+            buf_byte(b, '"')
+        } else {
+            buf_add(b, "NULL")
+        }
+    }
+    buf_byte(b, '}')
+    return buf_str(b)
+}
+
+// Байты для параметра bytea: «\x» и шестнадцатеричные цифры.
+fn __pg_bytes_param(s: str) -> str {
+    let hex = "0123456789abcdef"
+    let b = buf_new(2 + s.len() * 2)
+    buf_add(b, "\\x")
+    for k in 0..s.len() {
+        buf_byte(b, hex[s[k] >> 4])
+        buf_byte(b, hex[s[k] & 15])
+    }
+    return buf_str(b)
+}
+
+// bytea в шестнадцатеричном виде «\x0a1b…» — в байты.
+fn __pg_bytes(r: __PgRes, i: int) -> str {
+    let n = r.at[2 * i + 1]
+    if n < 2 {
+        return ""
+    }
+    let p = r.data.data + r.at[2 * i] + 2
+    let b = buf_new(n / 2)
+    var k = 0
+    while k + 1 < n - 2 {
+        buf_byte(b, __hex_val(load8(p + k)) * 16 + __hex_val(load8(p + k + 1)))
+        k += 2
+    }
+    return buf_str(b)
+}
+
+// Номер подготовленного запроса для sql или -1; new_at — свободный номер.
+fn __pg_stmt(c: int, key: int) -> int {
+    let n = load64(c + PB_NSTMT)
+    for i in 0..n {
+        if __memeq(c + PB_STMT + i * 40, key, 32) {
+            return i
+        }
+    }
+    return -1
+}
+
+// Выполнить запрос с параметрами в текстовом виде (none — NULL). Parse (если
+// запроса ещё нет в кеше соединения), Bind, Execute и Sync уходят одним пакетом.
+fn __pg_exec(c: int, sql: str, params: [str?], deadline: int) -> __PgRes {
+    let key = __alloc(32)
+    __hash(32, __str_ptr(sql), sql.len(), key)
+    var idx = __pg_stmt(c, key)
+    let fresh = idx < 0
+    var name = ""
+    let b = buf_new(256 + sql.len())
+    // отложенный BEGIN — тем же пакетом и до Sync: если он не пройдёт, сервер
+    // пропустит и сам запрос, вне транзакции тот не выполнится
+    let begin = load64(c + PB_BEGIN)
+    if begin != 0 {
+        store64(c + PB_BEGIN, 0)
+        __pg_put_plain(b, __pg_begin_sql(begin))
+    }
+    if fresh {
+        let n = load64(c + PB_NSTMT)
+        if n < PG_STMTS {
+            idx = n
+            name = "k{n}"
+            let at = __pg_begin(b, 'P')
+            __wr_cstr(b, name)
+            __wr_cstr(b, sql)
+            __wr_u16(b, 0)
+            __pg_end(b, at)
+        } else {
+            // кеш полон: безымянный запрос, соединение потом закроется
+            store64(c + PB_BROKEN, 1)
+            let at = __pg_begin(b, 'P')
+            __wr_cstr(b, "")
+            __wr_cstr(b, sql)
+            __wr_u16(b, 0)
+            __pg_end(b, at)
+        }
+    } else {
+        name = "k{idx}"
+    }
+    let bat = __pg_begin(b, 'B')
+    __wr_cstr(b, "")
+    __wr_cstr(b, name)
+    __wr_u16(b, 0)
+    __wr_u16(b, params.len())
+    for p in params {
+        if let v = p {
+            __wr_u32(b, v.len())
+            buf_add(b, v)
+        } else {
+            __wr_u32(b, 0xFFFFFFFF)
+        }
+    }
+    __wr_u16(b, 0)
+    __pg_end(b, bat)
+    let eat = __pg_begin(b, 'E')
+    __wr_cstr(b, "")
+    __wr_u32(b, 0)
+    __pg_end(b, eat)
+    let sat = __pg_begin(b, 'S')
+    __pg_end(b, sat)
+    let res = __PgRes { cols: 0, rows: 0, data: buf_new(256), at: [], affected: 0, err: __PgErr {} }
+    if !__pg_write(c, b, deadline) {
+        store64(c + PB_BROKEN, 1)
+        res.err = __PgErr { code: "08006", message: "connection to the database lost" }
+        return res
+    }
+    // ParseComplete самого запроса — последний (первый — от BEGIN)
+    var ones = 0
+    var want = 1
+    if begin != 0 {
+        want = 2
+    }
+    while true {
+        let m = __pg_read(c, deadline) else {
+            res.err = __pg_lost(c, deadline)
+            return res
+        }
+        if m.kind == '1' {
+            ones += 1
+        } else if m.kind == 'D' {
+            let ncols = __be16(m.p)
+            res.cols = ncols
+            res.rows += 1
+            var at = 2
+            for i in 0..ncols {
+                let len = __be32(m.p + at)
+                at += 4
+                if len == 0xFFFFFFFF {
+                    res.at.push(0)
+                    res.at.push(-1)
+                } else {
+                    res.at.push(res.data.len)
+                    res.at.push(len)
+                    buf_add_raw(res.data, m.p + at, len)
+                    at += len
+                }
+            }
+        } else if m.kind == 'C' {
+            // «INSERT 0 3», «UPDATE 2», «SELECT 5»: число — последнее слово
+            let tag = __str_copy(m.p, (m.n - 1).max(0))
+            let words = tag.split(" ")
+            res.affected = words[words.len() - 1].to_int() ?? 0
+        } else if m.kind == 'E' {
+            res.err = __pg_error(m)
+        } else if m.kind == 'Z' {
+            store64(c + PB_TX, load8(m.p))
+            if fresh && ones == want && idx >= 0 && name.len() > 0 {
+                __memcpy(c + PB_STMT + idx * 40, key, 32)
+                store64(c + PB_NSTMT, idx + 1)
+            }
+            return res
+        }
+    }
+    return res
+}
+
+// Простой запрос без параметров (BEGIN, COMMIT, миграции): несколько команд подряд.
+fn __pg_simple(c: int, sql: str, deadline: int) -> __PgErr {
+    let b = buf_new(sql.len() + 8)
+    let at = __pg_begin(b, 'Q')
+    __wr_cstr(b, sql)
+    __pg_end(b, at)
+    var err = __PgErr {}
+    if !__pg_write(c, b, deadline) {
+        store64(c + PB_BROKEN, 1)
+        return __PgErr { code: "08006", message: "connection to the database lost" }
+    }
+    while true {
+        let m = __pg_read(c, deadline) else {
+            return __pg_lost(c, deadline)
+        }
+        if m.kind == 'E' {
+            err = __pg_error(m)
+        } else if m.kind == 'Z' {
+            store64(c + PB_TX, load8(m.p))
+            return err
+        }
+    }
+    return err
+}
+
+// ---- Описание запроса ----
+// Сервер сообщает типы параметров и столбцов запроса, не выполняя его (Parse +
+// Describe): так при запуске проверяются все запросы программы — опечатка в
+// имени столбца или несовпадение типа видны сразу, а не на первом запросе.
+
+type __PgCol {
+    name: str
+    // OID типа (pg_type), таблица и номер столбца в ней (0 — выражение)
+    ty: int
+    table: int
+    attnum: int
+}
+
+type __PgDesc {
+    params: [int]
+    cols: [__PgCol]
+    // запрос ничего не возвращает (INSERT без RETURNING и т. п.)
+    nodata: bool
+    err: __PgErr
+}
+
+fn __pg_describe(c: int, sql: str, deadline: int) -> __PgDesc {
+    let d = __PgDesc { params: [], cols: [], nodata: false, err: __PgErr {} }
+    let b = buf_new(64 + sql.len())
+    let at = __pg_begin(b, 'P')
+    __wr_cstr(b, "")
+    __wr_cstr(b, sql)
+    __wr_u16(b, 0)
+    __pg_end(b, at)
+    let dat = __pg_begin(b, 'D')
+    buf_byte(b, 'S')
+    __wr_cstr(b, "")
+    __pg_end(b, dat)
+    let sat = __pg_begin(b, 'S')
+    __pg_end(b, sat)
+    if !__pg_write(c, b, deadline) {
+        d.err = __pg_lost(c, deadline)
+        return d
+    }
+    while true {
+        let m = __pg_read(c, deadline) else {
+            d.err = __pg_lost(c, deadline)
+            return d
+        }
+        if m.kind == 't' {
+            let n = __be16(m.p)
+            for i in 0..n {
+                d.params.push(__be32(m.p + 2 + i * 4))
+            }
+        } else if m.kind == 'T' {
+            let n = __be16(m.p)
+            var q = m.p + 2
+            for i in 0..n {
+                var e = q
+                while load8(e) != 0 {
+                    e += 1
+                }
+                let name = __str_copy(q, e - q)
+                q = e + 1
+                d.cols.push(__PgCol { name, ty: __be32(q + 6), table: __be32(q), attnum: __be16(q + 4) })
+                q += 18
+            }
+        } else if m.kind == 'n' {
+            d.nodata = true
+        } else if m.kind == 'E' {
+            d.err = __pg_error(m)
+        } else if m.kind == 'Z' {
+            store64(c + PB_TX, load8(m.p))
+            return d
+        }
+    }
+    return d
+}
+
+// ---- Транзакции ----
+// BEGIN откладывается до первого запроса. Конфликт сериализации (40001) и
+// взаимоблокировка (40P01) — не ошибки программы: транзакцию повторяют целиком
+// с небольшой случайной паузой, пока не кончится время запроса.
+
+fn __pg_tx_begin(c: int, mode: int) {
+    store64(c + PB_BEGIN, mode)
+}
+
+// Завершить транзакцию: commit или rollback.
+fn __pg_tx_end(c: int, commit: bool, deadline: int) -> __PgErr {
+    if load64(c + PB_BEGIN) != 0 {
+        // ни одного запроса: на сервере транзакции нет
+        store64(c + PB_BEGIN, 0)
+        return __PgErr {}
+    }
+    if load64(c + PB_TX) == 'I' {
+        return __PgErr {}
+    }
+    if !commit {
+        return __pg_simple(c, "rollback", deadline)
+    }
+    let failed = load64(c + PB_TX) == 'E'
+    let e = __pg_simple(c, "commit", deadline)
+    if e.code.len() == 0 && failed {
+        // после ошибки COMMIT молча откатывает: сказать об этом явно
+        return __PgErr { code: "25P02", message: "the transaction was rolled back because a statement in it failed" }
+    }
+    return e
+}
+
+// Конец запроса или задачи every: соединение, которое держит незавершённая
+// транзакция (паника, ранний выход), закрывается — сервер откатит транзакцию.
+fn __pg_request_end() {
+    let cx = __ctx()
+    let c = load64(cx + CTX_PGHELD)
+    if c == 0 {
+        return
+    }
+    store64(cx + CTX_PGHELD, 0)
+    if load64(c + PB_BEGIN) != 0 || load64(c + PB_TX) != 'I' {
+        store64(c + PB_BROKEN, 1)
+    }
+    __pg_release(c)
+}
+
+fn __pg_retryable(e: __PgErr) -> bool {
+    return e.code == "40001" || e.code == "40P01"
+}
+
+// Пауза перед попыткой n (1, 2, …): случайная, до 2^n мс, не больше 200 мс.
+fn __pg_backoff(n: int) {
+    let r = __alloc(8)
+    __random_bytes(r, 8)
+    let cap = (1 << n.min(8)).min(200)
+    sleep(1 + (load64(r) & 0x7FFFFFFF) % cap)
+}
+
+// ---- Запас соединений потока ----
+// Блок mmap: [0] свободных, [8] открыто всего, [16] предел, [24] ждущих,
+// [32 + 8i] свободные соединения (до 64), [PGP_WAIT + 8i] ждущие сопрограммы.
+// Соединений на поток — DATABASE_POOL / число потоков (по умолчанию 4 на поток);
+// когда все заняты, запрос ждёт в своей сопрограмме, а освободившееся
+// соединение будит первого ждущего.
+
+const PGP_IDLE = 32
+const PGP_MAX_IDLE = 64
+const PGP_WAIT = 544
+const PGP_MAX_WAIT = 4096
+const PGP_SIZE = 33344
+
+fn __pg_pool() -> int {
+    let c = __ctx()
+    var p = load64(c + CTX_PGPOOL)
+    if p == 0 {
+        p = __mmap(PGP_SIZE)
+        var per = 4
+        if let total = env("DATABASE_POOL") {
+            let t = total.to_int() ?? 0
+            if t > 0 {
+                per = (t + __threads.max(1) - 1) / __threads.max(1)
+            }
+        }
+        store64(p + 16, per.max(1).min(PGP_MAX_IDLE))
+        store64(c + CTX_PGPOOL, p)
+    }
+    return p
+}
+
+// Живо ли свободное соединение: сервер мог закрыть его (перезапуск, тайм-аут
+// простоя) — тогда из сокета читается конец или сообщение об ошибке.
+fn __pg_alive(c: int) -> bool {
+    if load64(c + PB_BROKEN) != 0 || load64(c + PB_TX) != 'I' || load64(c + PB_IN + 8) != 0 {
+        return false
+    }
+    let fd = load64(c + PB_FD)
+    let peek = __ctx() + 232
+    return syscall(SYS_RECVFROM, fd, peek, 1, MSG_PEEK | MSG_DONTWAIT, 0, 0) == -EAGAIN
+}
+
+// Соединение из запаса или новое; если открыто уже предельное число — ждать.
+fn __pg_acquire(u: __PgUrl, deadline: int) -> __PgConn {
+    let p = __pg_pool()
+    while true {
+        var n = load64(p)
+        while n > 0 {
+            n -= 1
+            store64(p, n)
+            let c = load64(p + PGP_IDLE + n * 8)
+            if __pg_alive(c) {
+                return __PgConn { c, err: "" }
+            }
+            __pg_free(c)
+            store64(p + 8, load64(p + 8) - 1)
+        }
+        let cv = load64(__ctx() + CTX_CORO)
+        if load64(p + 8) < load64(p + 16) || cv == 0 {
+            store64(p + 8, load64(p + 8) + 1)
+            let pc = __pg_connect(u, deadline)
+            if pc.c == 0 {
+                store64(p + 8, load64(p + 8) - 1)
+            }
+            return pc
+        }
+        // все заняты: встать в очередь
+        let w = load64(p + 24)
+        if w >= PGP_MAX_WAIT {
+            return __PgConn { c: 0, err: "too many requests wait for a database connection" }
+        }
+        store64(p + PGP_WAIT + w * 8, cv)
+        store64(p + 24, w + 1)
+        let left = deadline - now_ms()
+        if left <= 0 {
+            __pg_unwait(p, cv)
+            return __PgConn { c: 0, err: "timeout waiting for a database connection" }
+        }
+        __co_wait(-1, 0, left)
+        __pg_unwait(p, cv)
+    }
+    return __PgConn { c: 0, err: "" }
+}
+
+fn __pg_unwait(p: int, cv: int) {
+    let w = load64(p + 24)
+    for i in 0..w {
+        if load64(p + PGP_WAIT + i * 8) == cv {
+            __memcpy(p + PGP_WAIT + i * 8, p + PGP_WAIT + (i + 1) * 8, (w - i - 1) * 8)
+            store64(p + 24, w - 1)
+            return
+        }
+    }
+}
+
+// Вернуть соединение: целое — в запас, сломанное или посреди транзакции — закрыть.
+fn __pg_release(c: int) {
+    let p = __pg_pool()
+    let n = load64(p)
+    if load64(c + PB_BROKEN) == 0 && load64(c + PB_TX) == 'I' && n < PGP_MAX_IDLE {
+        store64(c + PB_USED, now_ms())
+        store64(p + PGP_IDLE + n * 8, c)
+        store64(p, n + 1)
+    } else {
+        __pg_free(c)
+        store64(p + 8, load64(p + 8) - 1)
+    }
+    // разбудить первого ждущего
+    if load64(p + 24) > 0 {
+        __co_notify(load64(p + PGP_WAIT))
+    }
+}
+
+// Отменить запрос, который выполняется на соединении c (CancelRequest по
+// отдельному соединению): сервер не будет считать его после нашего тайм-аута.
+fn __pg_cancel(c: int) {
+    let deadline = now_ms() + 2000
+    let fd = __connect(load64(c + PB_IP), load64(c + PB_PORT), deadline)
+    if fd < 0 {
+        return
+    }
+    let b = buf_new(16)
+    __wr_u32(b, 16)
+    __wr_u32(b, 80877102)
+    __wr_u32(b, load64(c + PB_PID))
+    __wr_u32(b, load64(c + PB_SECRET))
+    __fd_write_all(fd, b.data, 16, deadline)
+    syscall(SYS_CLOSE, fd)
+}
+
+// ---- Миграции ----
+// Файлы SQL применяются по порядку, каждый — в своей транзакции вместе с
+// записью в таблицу khrip_migrations (имя, SHA-256 текста). Уже применённый
+// файл, чей текст изменился, — ошибка: историю базы не переписывают. Несколько
+// копий сервиса, стартующих одновременно, ждут друг друга на advisory lock.
+
+const PG_MIGRATE_LOCK = 4826197301
+
+// → "" или текст ошибки; log — что применено.
+fn __pg_migrate(c: int, names: [str], sqls: [str], log: Buf) -> str {
+    let deadline = now_ms() + 600000
+    let lock = __pg_simple(c, "select pg_advisory_lock({PG_MIGRATE_LOCK})", deadline)
+    if lock.code.len() > 0 {
+        return lock.message
+    }
+    let err = __pg_migrate_locked(c, names, sqls, log, deadline)
+    __pg_simple(c, "select pg_advisory_unlock({PG_MIGRATE_LOCK})", deadline)
+    return err
+}
+
+fn __pg_migrate_locked(c: int, names: [str], sqls: [str], log: Buf, deadline: int) -> str {
+    let t = __pg_simple(c, "create table if not exists khrip_migrations (name text primary key, sha256 text not null, applied_at timestamptz not null default now())", deadline)
+    if t.code.len() > 0 {
+        return t.message
+    }
+    let done = __pg_exec(c, "select name, sha256 from khrip_migrations", [], deadline)
+    if done.err.code.len() > 0 {
+        return done.err.message
+    }
+    var applied: map[str, str] = {}
+    for i in 0..done.rows {
+        applied[__pg_str(done, 2 * i)] = __pg_str(done, 2 * i + 1)
+    }
+    for k in 0..names.len() {
+        let name = names[k]
+        let sum = sha256(sqls[k])
+        if let old = applied[name] {
+            if old != sum {
+                return "migration {name} was changed after it was applied: add a new migration instead"
+            }
+            continue
+        }
+        let e = __pg_simple(c, "begin;\n" + sqls[k] + "\n;insert into khrip_migrations (name, sha256) values ('" + name.replace("'", "''") + "', '" + sum + "');\ncommit", deadline)
+        if e.code.len() > 0 {
+            __pg_simple(c, "rollback", deadline)
+            return "migration {name}: {e.message}"
+        }
+        buf_add(log, "applied {name}\n")
+    }
+    return ""
+}

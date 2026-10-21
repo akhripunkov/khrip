@@ -28,6 +28,17 @@ The task:
 | C# | `Program.cs` | .NET 10 minimal API, no extra packages; the project file is given. |
 | Python | `main.py` | Python 3.12, FastAPI and Pydantic 2; the app object is `app` (run by uvicorn). |
 
+Tasks with a database (`ledger`, `shop`, `tracker`; the task directory has a
+`db` file) keep their data in PostgreSQL, so the other languages get the usual
+driver:
+
+| Language | Rules for tasks with a database |
+|---|---|
+| Khrip | the text of `docs/KHRIP.md` |
+| Go | Go 1.25, standard library and `github.com/jackc/pgx/v5` (`pgxpool`); the `go.mod` is given. |
+| C# | .NET 10 minimal API with Npgsql and Dapper; the project file is given. |
+| Python | Python 3.12, FastAPI, Pydantic 2 and asyncpg; the app object is `app` (run by uvicorn). |
+
 After a failed attempt, the model gets a second message and answers with the
 whole file again:
 

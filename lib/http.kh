@@ -110,6 +110,8 @@ type __Job {
 }
 
 var __http_port: int
+// рабочих потоков сервера (для запаса соединений с базой)
+var __threads: int
 
 fn __srv() -> __Server {
     return __cast(load64(__ctx() + CTX_SERVER))
@@ -1113,6 +1115,7 @@ fn __serve() {
     if n < 1 {
         n = 1
     }
+    __threads = n
     let timers = __timers_wanted()
     if timers {
         __block_signals()

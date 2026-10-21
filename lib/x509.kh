@@ -549,6 +549,46 @@ fn __roots() -> [__Cert] {
     return roots
 }
 
+// Корни из своего файла (sslrootcert базы): последний прочитанный файл
+// помнится в постоянной памяти.
+var __rootfile_name: int
+var __rootfile_certs: int
+
+fn __roots_from(path: str) -> [__Cert] {
+    if path.len() == 0 {
+        return __roots()
+    }
+    __store_rw_init()
+    let lock = __store_rw + 40
+    __mutex_lock(lock)
+    if __rootfile_name != 0 {
+        let name: str = __cast(__rootfile_name)
+        if name == path {
+            __mutex_unlock(lock)
+            let r: [__Cert] = __cast(__rootfile_certs)
+            return r
+        }
+    }
+    let c = __ctx()
+    let sp = load64(c + CTX_PTR)
+    let se = load64(c + CTX_END)
+    store64(c + CTX_PTR, 0)
+    store64(c + CTX_END, 0)
+    let keep = path + ""
+    var certs: [__Cert] = []
+    if let text = read_file(keep) {
+        certs = __pem_certs(text)
+    }
+    let ch: int = __cast(certs)
+    let nh: int = __cast(keep)
+    store64(c + CTX_PTR, sp)
+    store64(c + CTX_END, se)
+    __rootfile_certs = ch
+    __rootfile_name = nh
+    __mutex_unlock(lock)
+    return certs
+}
+
 // ---- Проверка цепочки ----
 
 fn __name_eq(a: int, alen: int, b: int, blen: int) -> bool {
@@ -619,6 +659,11 @@ fn __cert_time_ok(c: __Cert, now: int) -> bool {
 // Цепочка: chain[0] — сертификат сервера, дальше — присланные промежуточные.
 // → none, если всё в порядке, иначе текст ошибки.
 fn __verify_chain(chain: [__Cert], host: str, now: int) -> str? {
+    return __verify_chain_with(chain, host, now, __roots())
+}
+
+// host "" — имя не проверяется (sslmode=verify-ca у баз).
+fn __verify_chain_with(chain: [__Cert], host: str, now: int, roots: [__Cert]) -> str? {
     if chain.len() == 0 {
         return "the server sent no certificate"
     }
@@ -626,13 +671,12 @@ fn __verify_chain(chain: [__Cert], host: str, now: int) -> str? {
     if leaf.unknown_critical || !leaf.server_auth {
         return "the server certificate is not for TLS servers"
     }
-    if !__host_ok(leaf, host) {
+    if host.len() > 0 && !__host_ok(leaf, host) {
         return "the certificate is for another name, not {host}"
     }
     if !__cert_time_ok(leaf, now) {
         return "the server certificate has expired or is not yet valid"
     }
-    let roots = __roots()
     if roots.len() == 0 {
         return "no root certificates: set SSL_CERT_FILE to a CA bundle"
     }
@@ -667,7 +711,7 @@ fn __verify_chain(chain: [__Cert], host: str, now: int) -> str? {
 
 // nameConstraints промежуточных сертификатов для имени сервера.
 fn __check_constraints(path: [__Cert], host: str) -> str? {
-    if __host_ip(host) != none {
+    if host.len() == 0 || __host_ip(host) != none {
         return none
     }
     for c in path {
@@ -708,20 +752,21 @@ fn __vcache_key(leaf: __Cert, host: str, out: int) {
     __hash_final(h, out)
 }
 
-fn __verify_chain_cached(chain: [__Cert], host: str, now: int) -> str? {
+fn __verify_chain_cached(chain: [__Cert], host: str, now: int, rootfile: str) -> str? {
+    let roots = __roots_from(rootfile)
     if chain.len() == 0 {
-        return __verify_chain(chain, host, now)
+        return __verify_chain_with(chain, host, now, roots)
     }
     let t = __vcache()
     let key = __alloc(32)
-    __vcache_key(chain[0], host, key)
+    __vcache_key(chain[0], host + "\n" + rootfile, key)
     for i in 0..VCACHE_N {
         let e = t + i * 40
         if load64(e + 32) > now && __memeq(e, key, 32) {
             return none
         }
     }
-    let err = __verify_chain(chain, host, now)
+    let err = __verify_chain_with(chain, host, now, roots)
     if err == none {
         let next = load64(t + VCACHE_N * 40)
         let e = t + next * 40

@@ -57,13 +57,17 @@ const CTX_SERVER = 104
 const CTX_STORE_MODE = 112
 // текущая сопрограмма (lib/rt.kh) или 0
 const CTX_CORO = 120
+// соединение с базой, которое держит транзакция запроса (lib/pg.kh), или 0
+const CTX_PGHELD = 128
 // слова [8, CTX_CO_END) — свои у каждой сопрограммы: при переключении они
 // сохраняются и загружаются (CTX_SELF и всё дальше — общие для потока)
-const CTX_CO_END = 128
+const CTX_CO_END = 136
 // свободные соединения fetch этого потока (lib/fetch.kh) или 0
 const CTX_POOL = 136
 // проверенные цепочки сертификатов этого потока (lib/x509.kh) или 0
 const CTX_VCACHE = 144
+// соединения с базой этого потока (lib/pg.kh) или 0
+const CTX_PGPOOL = 152
 const CTX_SIZE = 256
 
 const CHUNK = 1048576

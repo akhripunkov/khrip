@@ -553,6 +553,18 @@ fn __tls_free(blk: int) {
 
 // Рукопожатие по соединённому сокету fd с сервером host.
 fn __tls_connect(fd: int, host: str, port: int, deadline: int) -> __TlsConn {
+    return __tls_connect_roots(fd, host, port, "", TLS_VERIFY_FULL, deadline)
+}
+
+// Проверка сертификата сервера: цепочка и имя (как в браузерах), только
+// цепочка (sslmode=verify-ca у баз) или никакой — только шифрование
+// (sslmode=require: облачные базы с самоподписанными сертификатами).
+const TLS_VERIFY_NONE = 0
+const TLS_VERIFY_CHAIN = 1
+const TLS_VERIFY_FULL = 2
+
+// То же, но корневые сертификаты — из файла roots ("" — системные).
+fn __tls_connect_roots(fd: int, host: str, port: int, roots: str, verify: int, deadline: int) -> __TlsConn {
     let blk = __mmap(TLS_BLOCK)
     store64(blk + TB_FD, fd)
     store64(blk + TB_PORT, port)
@@ -676,8 +688,17 @@ fn __tls_connect(fd: int, host: str, port: int, deadline: int) -> __TlsConn {
     }
     __tr_add(h, cm)
     let chain = __tls_certs(cm)
-    if let e = __verify_chain_cached(chain, host.lower(), now()) {
-        return __tls_fail(blk, e)
+    if chain.len() == 0 {
+        return __tls_fail(blk, "the server sent no certificate")
+    }
+    if verify != TLS_VERIFY_NONE {
+        var name = ""
+        if verify == TLS_VERIFY_FULL {
+            name = host.lower()
+        }
+        if let e = __verify_chain_cached(chain, name, now(), roots) {
+            return __tls_fail(blk, e)
+        }
     }
     // CertificateVerify: подпись переписки ключом сертификата
     let cv = __hs_next(h) else {

@@ -63,6 +63,35 @@ sys.exit(0 if eval(sys.argv[2]) else 1)' "$LAST" "$2" 2>/dev/null || {
 	}
 }
 
+# jval <выражение Python над j> — значение из последнего ответа (например, id).
+jval() {
+	python3 -c 'import sys, json
+try:
+    print(eval(sys.argv[2], {"j": json.loads(sys.argv[1])}))
+except Exception:
+    print("?")' "$LAST" "$1"
+}
+
+# race <сколько> <параллельно> <путь> <аргументы curl...> — одновременные
+# запросы, поровну к обеим копиям сервера ($U и $U2, если она есть); печатает
+# коды ответов с числом: « 30 201; 30 409;».
+race() {
+	local n=$1 p=$2 path=$3
+	shift 3
+	seq "$n" | xargs -P "$p" -I{} bash -c 'if (( {} % 2 )); then u=$0; else u=$1; fi
+curl -s -o /dev/null --max-time 30 -w "%{http_code}\n" "${@:3}" "$u$2"' "$U" "${U2:-$U}" "$path" "$@" |
+		sort | uniq -c | tr -s ' ' | tr '\n' ';'
+}
+
+# same <название> <получено> <ожидалось>
+same() {
+	total=$((total + 1))
+	if [[ "$2" != "$3" ]]; then
+		echo "FAIL $1: «$2», ожидалось «$3»"
+		fails=$((fails + 1))
+	fi
+}
+
 # Итог: число проверок и проваленных; код возврата 1 при провалах.
 finish() {
 	echo "passed $((total - fails))/$total"

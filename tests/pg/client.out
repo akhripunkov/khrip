@@ -1,0 +1,55 @@
+u_scram: u_scram
+u_md5: u_md5
+u_plain: u_plain
+wrong password: database: password authentication failed for user "u_scram"
+bad url: true
+127.0.0.1 : ssl t
+127.0.0.1 ?sslmode=require: ssl t
+localhost ?sslmode=verify-ca&sslrootcert=root.pem: ssl t
+localhost ?sslmode=verify-full&sslrootcert=root.pem: tls: the certificate is for another name, not localhost
+127.0.0.1 ?sslmode=verify-full&sslrootcert=root.pem: ssl t
+127.0.0.1 ?sslmode=require&sslrootcert=other.pem: tls: the certificate is not signed by a trusted authority
+127.0.0.1 ?sslmode=verify-full&sslrootcert=other.pem: tls: the certificate is not signed by a trusted authority
+schema: ok
+insert a@x: affected 1
+insert b@x: affected 1
+insert c@x: affected 1
+prepared: 1
+update: affected 2
+select: cols 3, rows 3, affected 3
+  1 a@x 30
+  2 b@x 30
+  3 c@x NULL
+injection-safe: it's "quoted"; drop table t_users
+duplicate: [23505] constraint t_users_email_key table t_users
+not null: [23502] column email
+no column: [42703] column "nope" does not exist
+after errors: 3 state 73
+timeout: [57014] in time true
+still running on the server: 0
+accounts: ok
+empty tx: ok
+concurrent commit: ok
+attempt 1: [40001] retry
+attempt 2 commit: ok
+error in tx: [22012] state 69
+commit after error: [25P02] the transaction was rolled back because a statement in it failed
+write in read only: [25006]
+value: 11 state 73
+int8 -9223372036854775807 bool true false float 2.5 1e-7
+timestamptz 2026-10-21T16:37:54Z timestamp 2026-10-21T19:37:54Z
+bytea 3 0 255 65 json {"a": [1, 2]} text привет null true false
+text[] a|b c|<null>|d"e\f||NULL|{x,y}
+int[] 1+2+3 empty 0 roundtrip true bytea 3
+describe params 23,25 nodata false
+  id type 23 column 1 of table true
+  email type 25 column 2 of table true
+  age type 23 column 3 of table true
+  at type 1184 column 0 of table false
+describe insert: params 25 nodata true cols 0
+describe typo: [42703] column "emial" does not exist at 8 hint 'Perhaps you meant to reference the column "t_users.email".'
+migrate: '' applied 001_init.sql;applied 002_more.sql;
+again: '' 
+changed: migration 001_init.sql was changed after it was applied: add a new migration instead
+failing: migration 003_bad.sql: division by zero
+t_m3 rolled back: true
