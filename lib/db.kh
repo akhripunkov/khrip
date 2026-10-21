@@ -993,7 +993,7 @@ fn __db_testing() -> bool {
 }
 
 fn __db_start_here() {
-    var c = __pg_startup()
+    var c = __pg_startup(__db_testing())
     if __db_testing() {
         let name = "khrip_test_{syscall(39)}_{random_str(6).lower()}"
         let e = __pg_simple(c, "create schema {name}", now_ms() + 10000)

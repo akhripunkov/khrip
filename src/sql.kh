@@ -139,6 +139,102 @@ fn sql_root() -> int {
     return DATA_BASE + sql_root_off
 }
 
+// ---- Запросы вне tx через вызовы ----
+// Сколько запросов вне tx функция может выполнить (сама и через вызовы) и есть
+// ли среди них запись. По лексемам и без учёта ветвей: лучше лишний tx { },
+// чем пропущенная гонка «прочитал в помощнике — записал в маршруте».
+var fs_state: [int]
+var fs_count: [int]
+var fs_write: [bool]
+
+fn fn_sql_summary(fi: int) {
+    while fs_state.len() < funcs.len() {
+        fs_state.push(0)
+        fs_count.push(0)
+        fs_write.push(false)
+    }
+    if fs_state[fi] != 0 {
+        return
+    }
+    fs_state[fi] = 1
+    let f = funcs[fi]
+    var n = 0
+    var w = false
+    if f.body >= 0 && !f.is_lib {
+        var i = f.body
+        while i < f.body_end {
+            let t = toks[i]
+            if t.kind == T_IDENT && t.text == "tx" && kind_at(i + 1) == '\{' {
+                // запросы блока tx — одна транзакция
+                i = sql_skip_block(i + 1)
+                continue
+            }
+            if t.kind == T_SQL {
+                n += 1
+                if sql_lit_writes(sqllits[t.val]) {
+                    w = true
+                }
+            } else if t.kind == T_IDENT && kind_at(i + 1) == '(' && (i == 0 || toks[i - 1].kind != '.') {
+                let g = func_find(t.text)
+                if g >= 0 && g != fi && !funcs[g].is_lib {
+                    fn_sql_summary(g)
+                    n += fs_count[g]
+                    w = w || fs_write[g]
+                }
+            }
+            i += 1
+        }
+    }
+    fs_count[fi] = n
+    fs_write[fi] = w
+    fs_state[fi] = 2
+}
+
+// j — лексема «{» → лексема за парной «}».
+fn sql_skip_block(j: int) -> int {
+    var depth = 0
+    var i = j
+    while i < toks.len() && toks[i].kind != T_EOF {
+        if toks[i].kind == '\{' {
+            depth += 1
+        } else if toks[i].kind == '}' {
+            depth -= 1
+            if depth == 0 {
+                return i + 1
+            }
+        }
+        i += 1
+    }
+    return i
+}
+
+fn sql_lit_writes(lit: SqlLit) -> bool {
+    let text = lit.segs.join(" $0 ")
+    return sql_target_table(text).len() > 1 || sql_has_word(text, "delete") || sql_has_word(text, "merge")
+}
+
+// Вызов функции программы в маршруте вне tx: её запросы считаются, как свои.
+fn sql_call_check(t: Token, fi: int) {
+    if route_ctx < 0 || tx_depth > 0 || inline_depth > 0 || funcs[fi].is_lib {
+        return
+    }
+    fn_sql_summary(fi)
+    let n = fs_count[fi]
+    if n == 0 {
+        return
+    }
+    if fs_write[fi] && (sql_outside > 0 || n >= 2 || loop_depth > 0) {
+        var why = "another statement runs before it"
+        if loop_depth > 0 {
+            why = "it runs in a loop"
+        } else if sql_outside == 0 {
+            why = "it can run " + n.to_str() + " statements"
+        }
+        error_tok(t, t.text + "() writes to the database outside tx and " + why + ": another request can change the data in between", "put the statements of this request in tx \{ ... }")
+    }
+    sql_outside += n
+}
+
 // ---- Запрос T отвечает 404 ----
 // Запрос формы T (ровно одна строка) без гарантированной строки отвечает 404,
 // если строки нет. Маршрут, в котором (сам или через вызовы) есть такой

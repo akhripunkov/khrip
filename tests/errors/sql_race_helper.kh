@@ -1,0 +1,10 @@
+// expect: save() writes to the database outside tx and another statement runs before it
+type Account { id: int, balance: int }
+fn save(id: int, balance: int) {
+    sql "UPDATE accounts SET balance = {balance} WHERE id = {id}"
+}
+route POST "/accounts/{id}/bonus" (id: int) -> 204 | 404 {
+    let a: Account = sql "SELECT id, balance FROM accounts WHERE id = {id}"
+    save(a.id, a.balance + 10)
+    return 204
+}

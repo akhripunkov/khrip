@@ -1472,14 +1472,29 @@ fn __pg_default() -> __PgUrl {
 }
 
 // → соединение для миграций и проверки запросов; ошибка — выход с кодом 1.
-fn __pg_startup() -> int {
-    let raw = env("DATABASE_URL") ?? ""
+// testing: khc test берёт KHRIP_TEST_DATABASE_URL, иначе DATABASE_URL.
+fn __pg_startup(testing: bool) -> int {
+    var var_name = "DATABASE_URL"
+    var raw = ""
+    if testing {
+        raw = env("KHRIP_TEST_DATABASE_URL") ?? ""
+        if raw.len() > 0 {
+            var_name = "KHRIP_TEST_DATABASE_URL"
+        }
+    }
     if raw.len() == 0 {
-        eprint("khrip: DATABASE_URL is not set (postgres://user:password@host:5432/database)")
+        raw = env("DATABASE_URL") ?? ""
+    }
+    if raw.len() == 0 {
+        if testing {
+            eprint("khrip: tests use the database: set KHRIP_TEST_DATABASE_URL=postgres://user:password@host:5432/database (khc test works in its own temporary schema and drops it)")
+        } else {
+            eprint("khrip: DATABASE_URL is not set (postgres://user:password@host:5432/database)")
+        }
         exit(1)
     }
     let u = __pg_parse_url(raw) else {
-        eprint("khrip: DATABASE_URL is not a postgres:// URL")
+        eprint("khrip: {var_name} is not a postgres:// URL")
         exit(1)
         return 0
     }
