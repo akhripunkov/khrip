@@ -40,8 +40,8 @@ await using (var tx = await conn.BeginTransactionAsync())
             created_at timestamptz NOT NULL DEFAULT date_trunc('second', now()),
             idempotency_key text UNIQUE
         );
-        CREATE INDEX IF NOT EXISTS transfers_from_id ON transfers (from_id);
-        CREATE INDEX IF NOT EXISTS transfers_to_id ON transfers (to_id);
+        CREATE INDEX IF NOT EXISTS transfers_from_id ON transfers (from_id, id);
+        CREATE INDEX IF NOT EXISTS transfers_to_id ON transfers (to_id, id);
         """, transaction: tx);
     await tx.CommitAsync();
 }
@@ -85,7 +85,7 @@ app.MapPost("/transfers", async (NewTransfer req, [FromHeader(Name = "Idempotenc
     await using var tx = await conn.BeginTransactionAsync();
     if (key is not null)
     {
-        await conn.ExecuteAsync("SELECT pg_advisory_xact_lock(hashtext(@key))", new { key }, tx);
+        await conn.ExecuteAsync("SELECT pg_advisory_xact_lock(hashtextextended(@key, 0))", new { key }, tx);
         var done = await conn.QuerySingleOrDefaultAsync<Transfer>(
             $"SELECT {TransferColumns} FROM transfers WHERE idempotency_key = @key", new { key }, tx);
         if (done is not null)

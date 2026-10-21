@@ -47,7 +47,8 @@ app = FastAPI(lifespan=lifespan)
 
 
 @app.exception_handler(RequestValidationError)
-async def validation_error(request: Request, exc: RequestValidationError):
+@app.exception_handler(asyncpg.DataError)  # a number outside bigint: an id, amount or balance
+async def bad_request(request: Request, exc: Exception):
     return JSONResponse({"error": str(exc)}, status_code=400)
 
 

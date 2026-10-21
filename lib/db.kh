@@ -925,8 +925,29 @@ fn __db_start() {
     store64(cx + CTX_END, se)
 }
 
+// khc test: своя пустая схема на запуск, удаляется в конце (__db_test_done).
+fn __db_testing() -> bool {
+    return load64(__ctx() + CTX_WORKER) != 0 && __w().testing
+}
+
 fn __db_start_here() {
-    let c = __pg_startup()
+    var c = __pg_startup()
+    if __db_testing() {
+        let name = "khrip_test_{syscall(39)}_{random_str(6).lower()}"
+        let e = __pg_simple(c, "create schema {name}", now_ms() + 10000)
+        if e.code.len() > 0 {
+            eprint("khrip: cannot create the test schema: {e.message}")
+            exit(1)
+        }
+        __pg_free(c)
+        __pg_url.schema = name
+        let pc = __pg_connect(__pg_url, now_ms() + 10000)
+        if pc.c == 0 {
+            eprint("khrip: cannot connect to the database: {pc.err}")
+            exit(1)
+        }
+        c = pc.c
+    }
     let deadline = now_ms() + 600000
     let root = __db_root()
     let mt = load64(root + 8)
@@ -973,6 +994,20 @@ fn __db_start_here() {
         exit(1)
     }
     __pg_free(c)
+}
+
+// Конец khc test: удалить временную схему.
+fn __db_test_done() {
+    if __pg_url.schema.len() == 0 {
+        return
+    }
+    let schema = __pg_url.schema
+    __pg_url.schema = ""
+    let pc = __pg_connect(__pg_url, now_ms() + 10000)
+    if pc.c != 0 {
+        __pg_simple(pc.c, "drop schema {schema} cascade", now_ms() + 30000)
+        __pg_free(pc.c)
+    }
 }
 
 // ---- Выполнение ----

@@ -52,6 +52,8 @@ type __PgUrl {
     ssl: str
     // файл корневых сертификатов (sslrootcert) или ""
     root: str
+    // схема для search_path (khc test работает в своей временной) или ""
+    schema: str = ""
 }
 
 // Только %XX: «+» в пароле остаётся плюсом.
@@ -545,6 +547,10 @@ fn __pg_connect(u: __PgUrl, deadline: int) -> __PgConn {
     __wr_cstr(b, "ISO")
     __wr_cstr(b, "TimeZone")
     __wr_cstr(b, "UTC")
+    if u.schema.len() > 0 {
+        __wr_cstr(b, "search_path")
+        __wr_cstr(b, u.schema)
+    }
     buf_byte(b, 0)
     __pg_end(b, at)
     if !__pg_write(c, b, deadline) {

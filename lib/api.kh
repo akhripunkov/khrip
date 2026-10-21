@@ -1365,6 +1365,7 @@ fn __test_end(name: str) {
 }
 
 fn __tests_done() -> int {
+    __db_done()
     let passed = __tests_run - __tests_failed
     print("{__tests_run} tests: {passed} passed, {__tests_failed} failed")
     if __tests_failed > 0 {

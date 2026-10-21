@@ -1,4 +1,4 @@
-# Khrip language reference (v0.11)
+# Khrip language reference (v0.12)
 
 Khrip is a compiled, strictly typed language for HTTP APIs on Linux x86-64.
 One project = one namespace: no imports, declaration order does not matter.
@@ -218,11 +218,54 @@ every 10 min {
 headers }` (names lower case); `status` 0 means unreachable or a TLS error (`body`
 says why). A body value is sent as JSON, a str as text. https is built in (TLS
 1.3, system root certificates or `SSL_CERT_FILE`); `HTTPS_PROXY`, `HTTP_PROXY`,
-`NO_PROXY` are honored; connections are reused. `fetch` and
+`NO_PROXY` are honored; connections are reused. `fetch`, `sql` and
 `sleep` are plain calls (no async/await): while a request waits, the server runs
 other requests, and they may change store (so may password hashing). `every N
 ms|s|min|h|d` runs a block in a background thread. `KHRIP_DATA=file.json` keeps
 store across restarts.
+
+## PostgreSQL
+
+```khrip
+migration 1 `
+CREATE TABLE accounts (id bigserial PRIMARY KEY, owner text NOT NULL,
+    balance bigint NOT NULL DEFAULT 0, created_at timestamptz NOT NULL DEFAULT now());
+`
+route GET "/accounts/{id}" (id: int) -> Account | 404 {
+    return sql "SELECT * FROM accounts WHERE id = {id}"      // no row: 404
+}
+route POST "/accounts" (body: NewAccount) -> 201 Account {
+    return 201 sql "INSERT INTO accounts {body} RETURNING *"  // fields → columns
+}
+let a: Account? = sql "SELECT * FROM accounts WHERE owner = {name} LIMIT 1"
+let all: [Account] = sql `SELECT * FROM accounts
+    WHERE ({owner} IS NULL OR owner = {owner}) AND id IN ({ids}) ORDER BY id`
+let n: int = sql "SELECT count(*) FROM accounts"
+let changed = sql "DELETE FROM accounts WHERE balance = 0"   // rows changed
+sql "UPDATE accounts SET {patch} WHERE id = {id}"            // only fields sent
+tx {
+    let from: Account = sql "SELECT * FROM accounts WHERE id = {a}"
+    if from.balance < amount {
+        return 409 "insufficient funds"                      // rolls back
+    }
+    sql "UPDATE accounts SET balance = balance - {amount} WHERE id = {a}"
+}
+```
+
+- `sql "..."` (or `` `...` `` for several lines) runs one statement; `{expr}` is
+  sent as a parameter, never as SQL text (`none` is NULL); `name ILIKE '%{q}%'`
+  matches q literally. The expected type picks the result: `T` one row, `T?` the
+  first row or none (also with `else` / `??`), `[T]` all rows; `T` is a struct
+  (columns by name) or one column's type. timestamptz/date → `str` (as
+  `time_iso`) or `int`; jsonb → any type; a nullable column needs `T?`.
+- `migration N` runs once, in order, when the server starts (`DATABASE_URL`);
+  never edit one that ran: add the next number. At start the server checks every
+  `sql` against the database and refuses to run with precise errors.
+- A failed statement ends the request: duplicate 409, missing foreign key 404,
+  CHECK, NOT NULL or a bad value 400, database down 503.
+- Statements commit one by one. `tx { }` is SERIALIZABLE and re-runs on a
+  conflict, so inside it no `fetch`, `sleep`, store or outer-variable changes; a
+  status from 400, `fail` or a panic rolls it back.
 
 ## Tests
 
@@ -247,4 +290,4 @@ after it `r` is a value: `let u: User? = from_json(r.body)`, `expect u != none`,
 `x.length x.size() x.Count` → `x.len()`; `let mut` → `var`;
 `switch` → `match`; `enum` → `type Role = A | B`; `cond ? a : b` → `if`;
 `try/catch`, `raise HTTPException` → optionals, `else`, `fail(status)`;
-`import` → not needed.
+`import` → not needed; `$1`, `?` in SQL → `{value}`; `BEGIN`/`COMMIT` → `tx { }`.

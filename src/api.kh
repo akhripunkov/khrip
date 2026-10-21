@@ -1392,9 +1392,9 @@ fn gen_json_float(b: Buf) {
 // Хуки базы данных: в программе без sql они пустые (и lib/pg.kh не попадает в бинарник).
 fn gen_db(b: Buf) {
     if uses_db {
-        buf_add(b, "fn __db_init() \{\n    __db_start()\n}\n\nfn __db_end() \{\n    __pg_request_end()\n}\n\n")
+        buf_add(b, "fn __db_init() \{\n    __db_start()\n}\n\nfn __db_end() \{\n    __pg_request_end()\n}\n\nfn __db_done() \{\n    __db_test_done()\n}\n\n")
     } else {
-        buf_add(b, "fn __db_init() \{\n}\n\nfn __db_end() \{\n}\n\n")
+        buf_add(b, "fn __db_init() \{\n}\n\nfn __db_end() \{\n}\n\nfn __db_done() \{\n}\n\n")
     }
 }
 
