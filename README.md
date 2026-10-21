@@ -159,6 +159,7 @@ eval/perf.sh     # нагрузочный замер решений на Khrip, 
 
 ## Документы
 
+- [docs/TUTORIAL.md](docs/TUTORIAL.md) — мини-учебник: шесть уроков с заданиями и ответами, шпаргалка «C# → Khrip»
 - [docs/KHRIP.md](docs/KHRIP.md) — язык целиком, для промпта нейросети (англ.)
 - [docs/CRITERIA.md](docs/CRITERIA.md) — каким должен быть язык, чтобы ИИ писал на нём быстрее
 - [docs/DESIGN.md](docs/DESIGN.md) — цели, устройство, как проверяем

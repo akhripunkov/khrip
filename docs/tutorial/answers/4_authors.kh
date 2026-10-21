@@ -1,0 +1,101 @@
+// Ответ к заданию урока 4: урок 4 плюс маршрут GET /authors.
+// Запуск: khc run 04_api.kh (порт 8080), тесты: khc test 04_api.kh
+
+type NewBook { title: str, author: str, year: int, tags: [str] = [] }
+
+type Book { id: int, ...NewBook }
+
+type BookPatch { title: str?, author: str?, year: int?, tags: [str]? }
+
+// store — данные, которые живут между запросами
+store books: map[int, Book]
+store last_id: int
+
+// Тело запроса — JSON, разбирается в NewBook автоматически.
+// Если JSON неверный или нет обязательного поля — сразу 400.
+route POST "/books" (body: NewBook) -> 201 Book | 400 str {
+    if body.title.trim() == "" || body.year < 1450 {
+        return 400 "title is required, year must be 1450 or later"
+    }
+    last_id += 1
+    let book = Book { id: last_id, ...body }
+    books[book.id] = book
+    return 201 book
+}
+
+// {id} в пути — параметр; int проверяется сам: /books/abc → 400
+route GET "/books/{id}" (id: int) -> Book | 404 {
+    return books[id] ?? 404
+}
+
+// Параметры строки запроса: ?author=...&page=2
+route GET "/books" (author: str?, tag: str?, page: int = 1) -> [Book] {
+    let found = books.values()
+        .filter(b => author == none || b.author == author)
+        .filter(b => tag == none || b.tags.contains(tag))
+        .sort_by(b => b.title)
+    return found[(page - 1) * 20..page * 20]
+}
+
+// PATCH: пришедшие поля заменяют старые, остальные остаются
+route PATCH "/books/{id}" (id: int, body: BookPatch) -> Book | 404 {
+    let old = books[id] else {
+        return 404
+    }
+    let book = Book { ...old, ...body }
+    books[id] = book
+    return book
+}
+
+route DELETE "/books/{id}" (id: int) -> 204 | 404 {
+    books.remove(id) else {
+        return 404
+    }
+    return 204
+}
+
+test "create and read" {
+    let r = call POST "/books" NewBook { title: "Dune", author: "Herbert", year: 1965, tags: ["sf"] }
+    expect r.status == 201
+    expect r.body.contains(`"id":1`)
+    expect (call GET "/books/1").status == 200
+    expect (call GET "/books/99").status == 404
+}
+
+test "validation" {
+    expect (call POST "/books" NewBook { title: " ", author: "X", year: 2000 }).status == 400
+    expect (call POST "/books" `{"title": "No author"}`).status == 400
+    expect (call GET "/books/abc").status == 400
+}
+
+test "filter, patch, delete" {
+    call POST "/books" NewBook { title: "Solaris", author: "Lem", year: 1961, tags: ["sf"] }
+    call POST "/books" NewBook { title: "Ulysses", author: "Joyce", year: 1922 }
+    expect (call GET "/books?tag=sf").body.contains("Solaris")
+    expect !(call GET "/books?author=Lem").body.contains("Dune")
+    let p = call PATCH "/books/3" `{"year": 1920}`
+    expect p.body.contains(`"year":1920`)
+    expect p.body.contains(`"title":"Ulysses"`)
+    expect (call DELETE "/books/3").status == 204
+    expect (call DELETE "/books/3").status == 404
+}
+
+// --- ответ ---
+
+route GET "/authors" -> [str] {
+    var names: [str] = []
+    for b in books.values() {
+        if !names.contains(b.author) {
+            names.push(b.author)
+        }
+    }
+    return names.sort()
+}
+
+test "authors" {
+    call POST "/books" NewBook { title: "Emma", author: "Austen", year: 1815 }
+    call POST "/books" NewBook { title: "Persuasion", author: "Austen", year: 1817 }
+    call POST "/books" NewBook { title: "Ada", author: "Nabokov", year: 1969 }
+    let r = call GET "/authors"
+    expect r.body.contains(`"Austen","Herbert","Lem","Nabokov"`)
+}

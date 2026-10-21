@@ -7,6 +7,7 @@
 #                       компилятора — из «// flags: ...»;
 #   tests/api/*.kh    — блоки test (khc test); вывод сравнивается с .out;
 #   tests/locks/*.kh  — какие маршруты берут store на чтение (khc check --locks);
+#   docs/tutorial/    — примеры учебника выполняются, их тесты проходят;
 #   tests/http.sh     — HTTP-сервер на Khrip отвечает правильно;
 #   tests/weather.sh  — погодный бэкенд: fetch, every, сохранение store;
 #   eval/solutions/*/khrip — решения задач проверки проходят eval/run.sh.
@@ -74,6 +75,21 @@ for src in tests/api/*.kh; do
 		continue
 	fi
 	pass=$((pass + 1))
+done
+
+# Примеры учебника (docs/TUTORIAL.md) и ответы к заданиям: программы
+# выполняются, API проходят свои блоки test.
+for src in docs/tutorial/*.kh docs/tutorial/answers/*.kh; do
+	if grep -q '^route ' "$src"; then
+		cmd=(test "$src")
+	else
+		cmd=(run "$src")
+	fi
+	if "$KHC" "${cmd[@]}" >"$tmp/tutorial.out" 2>&1; then
+		pass=$((pass + 1))
+	else
+		failed "$src" "$(cat "$tmp/tutorial.out")"
+	fi
 done
 
 # Какие маршруты читают store параллельно: вывод khc check --locks.

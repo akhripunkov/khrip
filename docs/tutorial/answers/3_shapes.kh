@@ -1,0 +1,21 @@
+// Ответ к заданию урока 3.
+type Shape = Circle { r: int } | Rect { w: int, h: int } | Square { side: int }
+
+fn area(s: Shape) -> int {
+    return match s {
+        Circle c => 3 * c.r * c.r
+        Rect r => r.w * r.h
+        Square q => q.side * q.side
+    }
+}
+
+fn first_long(words: [str], min: int) -> str? {
+    return words.find(w => w.len() >= min)
+}
+
+fn main() {
+    let shapes: [Shape] = [Circle { r: 2 }, Rect { w: 3, h: 4 }, Square { side: 5 }]
+    print("Площади: {to_json(shapes.map(s => area(s)))}")
+    print("Длинное слово: {first_long(["cat", "horse", "elephant"], 5) ?? "нет"}")
+    print("Очень длинное: {first_long(["cat"], 10) ?? "нет"}")
+}

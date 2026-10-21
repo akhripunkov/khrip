@@ -1,0 +1,8 @@
+// Ответ к заданию урока 2.
+fn main() {
+    let grades = {"Анна": 5, "Борис": 3, "Вера": 5, "Глеб": 4}
+    let scores = grades.values()
+    let avg = scores.sum().to_float() / scores.len().to_float()
+    let best = grades.keys().filter(name => (grades[name] ?? 0) == 5)
+    print("Средний балл: {avg.round_to(2)}, отличники: {best.join(", ")}")
+}

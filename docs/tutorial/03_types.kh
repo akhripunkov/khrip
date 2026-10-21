@@ -1,0 +1,72 @@
+// Урок 3. Свои типы, варианты, match, необязательные значения.
+
+// Структура: короткая — в одну строку
+type Money { rubles: int, kopecks: int }
+
+type NewBook {
+    title: str
+    author: str
+    year: int
+    tags: [str] = []         // значение по умолчанию
+    note: str?               // необязательное поле, по умолчанию none
+}
+
+// ...NewBook — все поля NewBook плюс id
+type Book { id: int, ...NewBook }
+
+// Перечисление
+type Genre = Novel | Poetry | Science
+
+// Вариант с данными: каждый вариант со своими полями
+type Payment = Cash | Card { last4: str } | Transfer { bank: str, days: int }
+
+fn describe(p: Payment) -> str {
+    // match обязан покрыть все варианты — иначе ошибка компиляции
+    return match p {
+        Cash => "наличными"
+        Card c => "картой *{c.last4}"
+        Transfer t => "переводом через {t.bank}, {t.days} дн."
+    }
+}
+
+fn find_year(books: [Book], title: str) -> int? {
+    let b = books.find(b => b.title == title) else {
+        return none            // книги нет
+    }
+    return b.year
+}
+
+fn main() {
+    let draft = NewBook { title: "Мастер и Маргарита", author: "Булгаков", year: 1967 }
+    let book = Book { id: 1, ...draft, tags: ["роман"] }
+    print(to_json(book))
+
+    let genre = Novel
+    if genre == Novel {
+        print("Это роман")
+    }
+
+    for p in [Cash, Card { last4: "4242" }, Transfer { bank: "Сбер", days: 2 }] {
+        print("Оплата {describe(p)}")
+    }
+
+    // T? — значение может отсутствовать
+    let books = [book]
+    print("Год: {find_year(books, "Мастер и Маргарита") ?? 0}")
+    print("Нет книги: {find_year(books, "Идиот") ?? -1}")
+
+    // После проверки на none переменная — обычное значение
+    let note = book.note
+    if note == none {
+        print("Заметки нет")
+    } else {
+        print("Заметка: {note.upper()}")
+    }
+
+    // let ... else — достать значение или выйти
+    let first = books.find(b => b.year > 1900) else {
+        print("пусто")
+        return
+    }
+    print("Первая после 1900: {first.title}")
+}

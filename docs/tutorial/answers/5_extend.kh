@@ -1,0 +1,155 @@
+// Ответ к заданию урока 5: урок 5 плюс продление выдачи.
+// Ключ читателя — в заголовке X-API-Key; книги выдаются на 14 дней.
+
+const LOAN_DAYS = 14
+
+type NewMember { name: str, email: str }
+
+type Member { id: int, name: str, email: str }
+
+type Registered { member: Member, api_key: str }
+
+type Book { id: int, title: str }
+
+type LoanStatus = Active | Overdue | Returned
+
+type Loan { id: int, book_id: int, member_id: int, due: str, status: LoanStatus = Active, extended: bool = false }
+
+type NewLoan { book_id: int }
+
+store members: map[int, Member]
+store keys: map[str, int]
+store books: map[int, Book]
+store loans: map[int, Loan]
+
+// Читатель по ключу из заголовка; нет ключа или он неверный — 401.
+// fail завершает запрос из любой функции.
+fn current_member() -> Member {
+    let key = header("X-API-Key") else {
+        fail(401)
+    }
+    let id = keys[key] ?? fail(401, "unknown key")
+    return members[id] ?? fail(401)
+}
+
+route POST "/members" (body: NewMember) -> 201 Registered | 400 str {
+    if body.name.trim() == "" || !body.email.matches(`[^@\s]+@[^@\s]+\.[a-z]{2,}`) {
+        return 400 "name and a valid email are required"
+    }
+    let member = Member { id: members.len() + 1, ...body }
+    let key = random_str(24)
+    members[member.id] = member
+    keys[key] = member.id
+    return 201 Registered { member, api_key: key }
+}
+
+route POST "/books" (body: Book) -> 201 Book {
+    books[body.id] = body
+    return 201 body
+}
+
+route POST "/loans" (body: NewLoan) -> 201 Loan | 404 | 409 str {
+    let me = current_member()
+    if !books.has(body.book_id) {
+        return 404
+    }
+    if loans.values().any(l => l.book_id == body.book_id && l.status != Returned) {
+        return 409 "the book is already taken"
+    }
+    let loan = Loan { id: loans.len() + 1, book_id: body.book_id, member_id: me.id, due: time_iso(now() + LOAN_DAYS * 86400) }
+    loans[loan.id] = loan
+    return 201 loan
+}
+
+route POST "/loans/{id}/return" (id: int) -> Loan | 403 | 404 {
+    let me = current_member()
+    let loan = loans[id] else {
+        return 404
+    }
+    if loan.member_id != me.id {
+        return 403
+    }
+    loan.status = Returned
+    return loan
+}
+
+route GET "/me/loans" -> [Loan] {
+    let me = current_member()
+    return loans.values().filter(l => l.member_id == me.id)
+}
+
+// Просрочки: проверка раз в час (и из теста — тем же вызовом)
+fn mark_overdue() -> int {
+    var count = 0
+    let today = time_iso(now())
+    for l in loans.values() {
+        if l.status == Active && l.due < today {
+            l.status = Overdue
+            count += 1
+        }
+    }
+    return count
+}
+
+every 1 h {
+    mark_overdue()
+}
+
+test "member, loan, return" {
+    call POST "/books" Book { id: 7, title: "Dune" }
+    let reg = call POST "/members" NewMember { name: "Anna", email: "anna@example.com" }
+    expect reg.status == 201
+    let r: Registered? = from_json(reg.body)
+    let key = (r ?? Registered { member: Member { id: 0, name: "", email: "" }, api_key: "" }).api_key
+    expect key.len() == 24
+
+    let auth = {"X-API-Key": key}
+    expect (call POST "/loans" NewLoan { book_id: 7 }).status == 401
+    let loan = call POST "/loans" NewLoan { book_id: 7 } headers auth
+    expect loan.status == 201
+    expect (call POST "/loans" NewLoan { book_id: 7 } headers auth).status == 409
+    expect (call POST "/loans" NewLoan { book_id: 99 } headers auth).status == 404
+    expect (call GET "/me/loans" headers auth).body.contains(`"status":"Active"`)
+    expect (call POST "/loans/1/return" headers auth).body.contains(`"status":"Returned"`)
+}
+
+test "bad email" {
+    expect (call POST "/members" NewMember { name: "Bob", email: "bob@" }).status == 400
+}
+
+test "overdue" {
+    loans[50] = Loan { id: 50, book_id: 1, member_id: 1, due: "2020-01-01T00:00:00Z" }
+    expect mark_overdue() == 1
+    expect (loans[50] ?? Loan { id: 0, book_id: 0, member_id: 0, due: "" }).status == Overdue
+}
+
+// --- ответ ---
+
+route POST "/loans/{id}/extend" (id: int) -> Loan | 403 | 404 | 409 str {
+    let me = current_member()
+    let loan = loans[id] else {
+        return 404
+    }
+    if loan.member_id != me.id {
+        return 403
+    }
+    if loan.extended || loan.status != Active {
+        return 409 "only an active loan can be extended, once"
+    }
+    let due = parse_time(loan.due) ?? fail(500)
+    loan.due = time_iso(due + 7 * 86400)
+    loan.extended = true
+    return loan
+}
+
+test "extend once" {
+    call POST "/books" Book { id: 8, title: "Ulysses" }
+    let reg = call POST "/members" NewMember { name: "Vera", email: "vera@example.com" }
+    let r: Registered? = from_json(reg.body)
+    let auth = {"X-API-Key": (r ?? Registered { member: Member { id: 0, name: "", email: "" }, api_key: "" }).api_key}
+    let loan = call POST "/loans" NewLoan { book_id: 8 } headers auth
+    let l: Loan? = from_json(loan.body)
+    let id = (l ?? Loan { id: 0, book_id: 0, member_id: 0, due: "" }).id
+    expect (call POST "/loans/{id}/extend" headers auth).status == 200
+    expect (call POST "/loans/{id}/extend" headers auth).status == 409
+}

@@ -1,0 +1,41 @@
+// Урок 1. Переменные, функции, условия, циклы.
+
+const VAT_PERCENT = 20
+
+// Функция: параметры с типами, результат после ->.
+fn with_vat(price: int) -> int {
+    return price + price * VAT_PERCENT / 100
+}
+
+// Без результата -> не пишется.
+fn greet(name: str, greeting: str = "Привет") {
+    print("{greeting}, {name}!")
+}
+
+fn main() {
+    let name = "Анна"            // let — нельзя изменить, тип выводится: str
+    var visits = 0               // var — можно изменить
+    visits += 1
+
+    greet(name)
+    greet("Борис", "Здравствуйте")
+    print("Цена с НДС: {with_vat(1000)}")
+
+    // if — оператор и значение
+    let size = if visits > 10 { "постоянный" } else { "новый" }
+    print("Гость {name}: {size}, визитов {visits}")
+
+    // циклы
+    var total = 0
+    for i in 1..=5 {
+        total += i
+    }
+    print("Сумма 1..5 = {total}")
+
+    var n = 3
+    while n > 0 {
+        write("{n}… ")
+        n -= 1
+    }
+    print("старт!")
+}
