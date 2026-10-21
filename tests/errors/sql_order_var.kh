@@ -1,0 +1,9 @@
+// expect: ORDER BY {order}: a parameter here is a constant and sorts nothing
+type P { id: int }
+route GET "/p" (desc: bool) -> [P] {
+    var order = "id"
+    if desc {
+        order = "id DESC"
+    }
+    return sql "SELECT id FROM products ORDER BY {order}"
+}

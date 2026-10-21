@@ -119,7 +119,10 @@ test "create, read, 404" {
 test "errors become statuses" {
     expect (call POST "/teams" Team { id: 0, name: "red" }).status == 409
     expect (call POST "/people" NewPerson { name: "Bob", team_id: 42 }).status == 404
-    expect (call POST "/people" NewPerson { name: "" }).status == 400
+    let empty = call POST "/people" NewPerson { name: "" }
+    expect empty.status == 409 && empty.body.contains("people_name_check")
+    let dup = call POST "/teams" Team { id: 0, name: "red" }
+    expect dup.body.contains("already exists: teams_name_key") && !dup.body.contains("Key (")
     expect (call DELETE "/teams/1").status == 409
     expect (call DELETE "/teams/7").status == 404
 }

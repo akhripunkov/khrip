@@ -11,6 +11,8 @@ type Local {
     mutable: bool
     reg: int
     off: int
+    // let o = if/match со строками-литералами в ветках: какие строки бывают в o
+    lits: [str]
 }
 
 var locals: [Local]
@@ -45,7 +47,7 @@ fn new_slot() -> int {
 }
 
 fn add_local(name: str, t: int, mutable: bool, reg: int, off: int) -> int {
-    let l = Local { name: name, ty: t, mutable: mutable, reg: reg, off: off }
+    let l = Local { name: name, ty: t, mutable: mutable, reg: reg, off: off, lits: [] }
     if nlocals < locals.len() {
         locals[nlocals] = l
     } else {

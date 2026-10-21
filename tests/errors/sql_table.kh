@@ -1,0 +1,6 @@
+// expect: {table} cannot name a table: values are sent as parameters, never as SQL text
+// expect: choose between whole queries with if/match
+type P { id: int }
+route GET "/p" (table: str) -> [P] {
+    return sql "SELECT id FROM {table}"
+}

@@ -1,0 +1,6 @@
+// expect: SET would stay on the pooled connection and leak into other requests
+// expect: SET LOCAL inside tx { }
+route POST "/p" -> 204 {
+    sql "SET statement_timeout = 1000"
+    return 204
+}

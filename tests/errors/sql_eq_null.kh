@@ -1,0 +1,6 @@
+// expect: = NULL is never true in SQL
+// expect: IS NULL
+type P { id: int }
+route GET "/p" -> [P] {
+    return sql "SELECT id FROM products WHERE deleted_at = NULL ORDER BY id"
+}

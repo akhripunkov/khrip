@@ -1,0 +1,6 @@
+// expect: transactions are blocks: tx { ... }
+route POST "/p" -> 204 {
+    transaction {
+    }
+    return 204
+}

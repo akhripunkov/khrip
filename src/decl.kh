@@ -51,6 +51,8 @@ type Const {
     name: str
     ty: int
     val: int
+    // строка-литерал (номер в strlits) или -1
+    lit: int
 }
 
 var funcs: [Func]
@@ -663,6 +665,7 @@ fn prescan_const() {
     let v = tok()
     var t = ty_int
     var val = v.val
+    var lit = -1
     if v.kind == T_INT {
         if neg {
             val = -val
@@ -670,6 +673,7 @@ fn prescan_const() {
     } else if v.kind == T_STR && !neg {
         t = ty_str
         val = strlit(v.val)
+        lit = v.val
     } else if (v.kind == T_TRUE || v.kind == T_FALSE) && !neg {
         t = ty_bool
         val = 0
@@ -681,7 +685,7 @@ fn prescan_const() {
         return
     }
     advance()
-    consts.push(Const { name: name.text, ty: t, val: val })
+    consts.push(Const { name: name.text, ty: t, val: val, lit: lit })
     sym_add(name.text, SK_CONST, consts.len() - 1, name)
 }
 

@@ -1,0 +1,10 @@
+// expect: this query answers 404 when no row matches, but route POST "/login" does not list 404
+// expect: add | 404 to the route, or answer yourself: let row: T = sql ... else { return 401 }
+type User { id: int, name: str }
+type Login { name: str }
+fn find(name: str) -> User {
+    return sql "SELECT id, name FROM users WHERE name = {name}"
+}
+route POST "/login" (body: Login) -> User | 401 {
+    return find(body.name)
+}

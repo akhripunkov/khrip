@@ -28,6 +28,8 @@ const SITE_PLAN = 80
 const SITE_SCALAR = 88
 const SITE_COUNT = 96
 const SITE_FALLBACK = 104
+// таблица вариантов ORDER BY {o}: номер значения, число, пары (строка, место)
+const SITE_VARIANTS = 112
 
 const SH_COUNT = 0
 const SH_ONE = 1
@@ -1088,32 +1090,47 @@ fn __db_fail(site: int, e: __PgErr) {
     let code = e.code
     var status = 500
     var msg = "internal error"
+    // тело ответа — без значений из DETAIL (они только в журнале)
+    var name = e.constraint
+    if name.len() == 0 {
+        name = e.table
+    }
     if code == "23505" || code == "23P01" {
         status = 409
-        msg = e.detail
-        if msg.len() == 0 {
-            msg = e.message
-        }
+        msg = "already exists: " + name
+    } else if code == "23514" {
+        // CHECK — инвариант состояния (баланс, остаток): ввод проверяется в коде
+        status = 409
+        msg = "conflict: " + name
     } else if code == "23503" {
         let target: str = __cast(load64(site + SITE_TARGET))
         if target.contains(" " + e.table + " ") {
             status = 404
+            msg = "not found: " + name
         } else {
             status = 409
+            msg = "still referenced: " + name
         }
-        msg = e.detail
-        if msg.len() == 0 {
-            msg = e.message
-        }
-    } else if code == "23502" || code == "23514" || code.starts_with("22") {
+    } else if code == "23502" {
+        status = 400
+        msg = "missing value: " + e.table + "." + e.column
+    } else if code.starts_with("22") || code == "P0001" {
         status = 400
         msg = e.message
     } else if code == "57014" || code.starts_with("08") || code.starts_with("53") || code.starts_with("57P") || code == "40001" || code == "40P01" {
         status = 503
-        msg = "database unavailable: " + e.message
+        msg = "database unavailable, try again"
     }
     if status == 500 || status == 503 {
-        eprint("{loc}: sql failed [{code}] {e.message}")
+        var extra = ""
+        if e.detail.len() > 0 {
+            extra = " (" + e.detail + ")"
+        }
+        if status == 500 {
+            let sql: str = __cast(load64(site + SITE_SQL))
+            extra = extra + "\n    in: " + sql
+        }
+        eprint("{loc}: sql failed [{code}] {e.message}{extra}")
     }
     if load64(__ctx() + CTX_WORKER) != 0 {
         let w = __w()
@@ -1132,8 +1149,29 @@ fn __db_unavailable(site: int, why: str) {
     __db_fail(site, e)
 }
 
+// ORDER BY {o}: место, текст которого собран с этой строкой o.
+fn __db_variant(site: int, vt: int, vals: int) -> int {
+    let nv = load64(site + SITE_NVALS)
+    let o: str = __cast(load64(vals + (nv - 1 - load64(vt)) * 8))
+    let k = load64(vt + 8)
+    for j in 0..k {
+        let s: str = __cast(load64(vt + 16 + j * 16))
+        if s == o {
+            return load64(vt + 24 + j * 16)
+        }
+    }
+    let loc: str = __cast(load64(site + SITE_LOC))
+    __panic_msg("{loc}: ORDER BY got \"{o}\", which is none of the strings the compiler saw")
+    return site
+}
+
 // Выполнить место sql: значения параметров на стеке, результат — слово Khrip.
-fn __db_run(site: int, vals: int) -> int {
+fn __db_run(site0: int, vals: int) -> int {
+    var site = site0
+    let vt = load64(site0 + SITE_VARIANTS)
+    if vt != 0 {
+        site = __db_variant(site0, vt, vals)
+    }
     let cx = __ctx()
     let deadline = now_ms() + __db_timeout()
     let params = __db_params(site, vals)

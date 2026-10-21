@@ -169,6 +169,9 @@ fn name_hint(name: str) -> str {
     if name == "len" || name == "length" {
         return "use x.len()"
     }
+    if name == "transaction" || name == "transaction_do" || name == "atomic" || name == "with_transaction" {
+        return "transactions are blocks: tx \{ ... }"
+    }
     if name == "self" || name == "this" {
         return "methods take the receiver as the first parameter named self: fn name(self: Type)"
     }

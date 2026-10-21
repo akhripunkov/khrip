@@ -124,15 +124,25 @@ fn parse_value_block(w: int) -> int {
     while kind() != '}' && kind() != T_EOF {
         let before = pos
         panic_mode = false
+        let on = lit_on
         if value_stmt_here() {
             let vt = tok()
+            let vs = pos
+            // вложенные if/match значения отмечают свои ветви, если они и есть значение
+            lit_on = on && (kind() == T_IF || kind() == T_MATCH)
             t = parse_expr(w)
+            lit_on = on
+            lit_note(vs, pos)
             if t == ty_void {
                 error_tok(vt, "this block must end with a value, but this expression has none", "")
                 t = ty_err
             }
-        } else if parse_stmt() {
-            t = ty_never
+        } else {
+            lit_on = false
+            if parse_stmt() {
+                t = ty_never
+            }
+            lit_on = on
         }
         if panic_mode {
             sync_stmt()
@@ -160,7 +170,15 @@ fn parse_arm_value(w: int) -> int {
         parse_stmt()
         return ty_never
     }
-    return parse_expr(w)
+    let vs = pos
+    let on = lit_on
+    lit_on = on && (k == T_IF || k == T_MATCH)
+    let t = parse_expr(w)
+    lit_on = on
+    if t != ty_never {
+        lit_note(vs, pos)
+    }
+    return t
 }
 
 // ---- if как значение ----

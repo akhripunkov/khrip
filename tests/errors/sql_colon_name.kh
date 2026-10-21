@@ -1,0 +1,5 @@
+// expect: values go in place in sql: WHERE id = {id}, not :id
+type P { id: int }
+route GET "/p/{id}" (id: int) -> P | 404 {
+    return sql "SELECT id FROM products WHERE id = :id"
+}

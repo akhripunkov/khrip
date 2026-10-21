@@ -1,0 +1,5 @@
+// expect: CREATE belongs in a migration
+route POST "/p" -> 204 {
+    sql "CREATE TABLE t (id int)"
+    return 204
+}

@@ -1,0 +1,6 @@
+// expect: UPDATE without WHERE changes every row of accounts
+// expect: add WHERE ...; write WHERE true if you mean every row
+route POST "/p" -> 204 {
+    sql "UPDATE accounts SET balance = 0"
+    return 204
+}

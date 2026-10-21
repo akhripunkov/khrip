@@ -1362,7 +1362,7 @@ fn sq_bare_skip(t: [SqTok], i: int, sc: SqScope) -> bool {
     if i > 0 {
         let p = t[i - 1]
         // имя таблицы после FROM/JOIN/INTO/UPDATE и псевдоним после неё
-        if p.kind == SQ_WORD && (p.text == "from" || p.text == "join" || p.text == "into" || p.text == "update" || p.text == "only" || p.text == "as" || p.text == "table") {
+        if p.kind == SQ_WORD && (p.text == "from" || p.text == "join" || p.text == "into" || p.text == "update" || p.text == "only" || p.text == "as" || p.text == "table" || p.text == "collate") {
             return true
         }
         // псевдоним без AS: два имени подряд или имя после «)»

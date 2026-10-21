@@ -656,6 +656,10 @@ fn lex_sql(start: int, end: int) {
                 lx_p += 1
                 continue
             }
+            // ${x} (привычка шаблонов JS) — то же, что {x}
+            if b.len > 0 && load8(b.data + b.len - 1) == '$' {
+                b.len = b.len - 1
+            }
             lit.segs.push(buf_str(b))
             buf_clear(b)
             lit.quoted.push(st == 1)

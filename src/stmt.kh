@@ -323,7 +323,28 @@ fn parse_let() {
     if t >= 0 {
         w = t
     }
+    // набор строк-литералов, которые может принять неизменяемая локальная
+    let saved_on = lit_on
+    let saved_ok = lit_ok
+    let saved_vals = lit_vals
+    let from = pos
+    lit_on = !mutable && (kind() == T_IF || kind() == T_MATCH)
+    lit_ok = true
+    lit_vals = []
     var et = parse_expr(w)
+    var lits: [str] = []
+    if !mutable && kind() != T_ELSE {
+        if lit_on {
+            if lit_ok {
+                lits = lit_vals
+            }
+        } else {
+            lits = lit_set(from, pos)
+        }
+    }
+    lit_on = saved_on
+    lit_ok = saved_ok
+    lit_vals = saved_vals
     if kind() == T_ELSE {
         // let x = optional else { выход }
         let et_tok = tok()
@@ -359,6 +380,9 @@ fn parse_let() {
         final_t = ty_err
     }
     let li = declare_local(name.text, final_t, mutable)
+    if final_t == ty_str {
+        locals[li].lits = lits
+    }
     emit_store_local(li)
 }
 

@@ -1,0 +1,6 @@
+// expect: BEGIN inside sql: transactions are blocks
+// expect: tx { ... } runs its statements in one transaction
+route POST "/p" -> 204 {
+    sql "BEGIN"
+    return 204
+}

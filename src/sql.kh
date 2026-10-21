@@ -28,6 +28,10 @@ const PK_GIVEN = 7
 
 // Слова места запроса: см. lib/db.kh (SITE_*).
 const SITE_WORDS = 24
+// слово места: таблица вариантов ORDER BY {o}
+const SITE_W_VARIANTS = 14
+// сколько вариантов ORDER BY {o} у одного запроса
+const SQL_MAX_ORDERS = 16
 
 type SqlParam {
     kind: int
@@ -46,6 +50,65 @@ type Migration {
 // запросы маршрута вне tx: сколько уже было (запись после них — гонка);
 // по веткам — наибольшее из путей, которые доходят до следующего оператора
 var sql_outside: int
+
+// let o = if/match ...: строки-литералы из ветвей-значений (для ORDER BY {o}).
+var lit_on: bool
+var lit_ok: bool
+var lit_vals: [str]
+
+// Строки, которые даёт выражение toks[s..e]: строка-литерал, const или локальная
+// с известным набором; [] — неизвестно.
+fn lit_set(s: int, e: int) -> [str] {
+    if e != s + 1 {
+        return []
+    }
+    let t = toks[s]
+    if t.kind == T_STR {
+        return [strlits[t.val]]
+    }
+    if t.kind == T_IDENT {
+        let li = find_local(t.text)
+        if li >= 0 {
+            return locals[li].lits
+        }
+        let si = sym_find(t.text)
+        if si >= 0 && sym_kinds[si] == SK_CONST {
+            let c = consts[sym_idxs[si]]
+            if c.lit >= 0 {
+                return [strlits[c.lit]]
+            }
+        }
+    }
+    return []
+}
+
+// Значение ветви toks[s..e] внутри let o = if/match: литерал — в набор; вложенный
+// if/match отметил свои ветви сам; иное — набор неизвестен.
+fn lit_note(s: int, e: int) {
+    if !lit_on || s >= toks.len() {
+        return
+    }
+    let k = toks[s].kind
+    if k == T_IF || k == T_MATCH {
+        return
+    }
+    let xs = lit_set(s, e)
+    if xs.len() == 0 {
+        lit_ok = false
+        return
+    }
+    for x in xs {
+        var seen = false
+        for y in lit_vals {
+            if y == x {
+                seen = true
+            }
+        }
+        if !seen {
+            lit_vals.push(x)
+        }
+    }
+}
 
 // После ветки: если она ушла (return, break…), её запросы дальше не предшествуют.
 fn sql_branch(before: int, div: bool) -> int {
@@ -76,8 +139,132 @@ fn sql_root() -> int {
     return DATA_BASE + sql_root_off
 }
 
+// ---- Запрос T отвечает 404 ----
+// Запрос формы T (ровно одна строка) без гарантированной строки отвечает 404,
+// если строки нет. Маршрут, в котором (сам или через вызовы) есть такой
+// запрос, обязан объявить 404: иначе тихий 404 там, где задача ждёт 401 или 422.
+
+// по функциям: первый такой запрос (лексема) и есть ли он
+var fn_404_tok: [Token]
+var fn_404_has: [bool]
+// 0 — не смотрели, 1 — смотрим, 2 — готово
+var fn_404_state: [int]
+
+fn sql_grow_404() {
+    while fn_404_has.len() < funcs.len() {
+        fn_404_tok.push(Token { kind: 0, val: 0, text: "", line: 0, col: 0, file: 0 })
+        fn_404_has.push(false)
+        fn_404_state.push(0)
+    }
+}
+
+fn sql_note_404(at: Token) {
+    if cur_fn < 0 {
+        return
+    }
+    sql_grow_404()
+    if !fn_404_has[cur_fn] {
+        fn_404_has[cur_fn] = true
+        fn_404_tok[cur_fn] = at
+    }
+}
+
+// Есть ли в функции (сама или через вызовы функций программы) такой запрос.
+fn fn_may_404(fi: int) -> bool {
+    sql_grow_404()
+    if fn_404_state[fi] != 0 {
+        return fn_404_has[fi]
+    }
+    fn_404_state[fi] = 1
+    let f = funcs[fi]
+    if !fn_404_has[fi] && f.body >= 0 && !f.is_lib {
+        var i = f.body
+        while i < f.body_end && !fn_404_has[fi] {
+            let t = toks[i]
+            if t.kind == T_IDENT && kind_at(i + 1) == '(' && (i == 0 || toks[i - 1].kind != '.') {
+                let g = func_find(t.text)
+                if g >= 0 && g != fi && !funcs[g].is_lib && fn_may_404(g) {
+                    fn_404_has[fi] = true
+                    fn_404_tok[fi] = fn_404_tok[g]
+                }
+            }
+            i += 1
+        }
+    }
+    fn_404_state[fi] = 2
+    return fn_404_has[fi]
+}
+
+fn sql_check_404() {
+    for r in routes {
+        var lists = false
+        for v in r.variants {
+            if v.status == 404 {
+                lists = true
+            }
+        }
+        if !lists && r.fi >= 0 && fn_may_404(r.fi) {
+            error_tok(fn_404_tok[r.fi], "this query answers 404 when no row matches, but route " + r.method + " \"" + r.path + "\" does not list 404", "add | 404 to the route, or answer yourself: let row: T = sql ... else \{ return 401 }")
+        }
+    }
+}
+
+// Строка гарантирована самим запросом: INSERT ... VALUES/{v} с RETURNING без
+// ON CONFLICT ... DO NOTHING; SELECT без FROM; SELECT с агрегатом без GROUP BY,
+// HAVING, LIMIT, OFFSET и UNION.
+fn sql_one_row(s: str) -> bool {
+    let ws = sql_code_words(s)
+    if ws.len() == 0 {
+        return false
+    }
+    let first = ws[0].w
+    if first == "insert" {
+        var values = false
+        for i in 0..ws.len() {
+            let x = ws[i]
+            if x.depth == 0 {
+                if x.w == "values" {
+                    values = true
+                }
+                if x.w == "select" || (x.w == "do" && i + 1 < ws.len() && ws[i + 1].w == "nothing") {
+                    return false
+                }
+            }
+        }
+        return values && sql_top_returning(s)
+    }
+    if first != "select" {
+        return false
+    }
+    var from = false
+    var agg = false
+    var sub = -1
+    for i in 1..ws.len() {
+        let x = ws[i]
+        if sub >= 0 && x.depth < sub {
+            sub = -1
+        }
+        if x.depth == 0 {
+            if x.w == "group" || x.w == "having" || x.w == "limit" || x.w == "offset" || x.w == "union" || x.w == "intersect" || x.w == "except" || x.w == "fetch" || x.w == "window" {
+                return false
+            }
+            if x.w == "from" {
+                from = true
+            }
+        }
+        if x.w == "select" && x.depth > 0 && sub < 0 {
+            sub = x.depth
+        }
+        if !from && sub < 0 && (x.w == "count" || x.w == "sum" || x.w == "avg" || x.w == "min" || x.w == "max" || x.w == "bool_and" || x.w == "bool_or" || x.w == "array_agg" || x.w == "string_agg" || x.w == "json_agg" || x.w == "jsonb_agg" || x.w == "json_object_agg" || x.w == "jsonb_object_agg" || x.w == "exists") {
+            agg = true
+        }
+    }
+    return !from || agg
+}
+
 // После компиляции всех функций: таблицы мест и миграций.
 fn sql_finish() {
+    sql_check_404()
     if !sql_root_used {
         return
     }
@@ -672,6 +859,157 @@ fn sql_habits(at: Token, text: str) {
     }
 }
 
+fn sql_upper(s: str) -> str {
+    let b = buf_new(s.len())
+    for i in 0..s.len() {
+        let c = s[i]
+        if c >= 'a' && c <= 'z' {
+            buf_byte(b, c - 32)
+        } else {
+            buf_byte(b, c)
+        }
+    }
+    return buf_str(b)
+}
+
+// Последний значащий символ кода перед i (пропуская пробелы) или -1.
+fn sql_prev_code(s: str, st: [int], i: int) -> int {
+    var j = i - 1
+    while j >= 0 && (sql_space(s[j]) || st[j] != 0) {
+        j -= 1
+    }
+    return j
+}
+
+// Правила текста запроса: привычки других баз и ошибки, которые PostgreSQL
+// пропустит молча (всё — ошибки с исправлением: предупреждений модель не видит).
+fn sql_rules(at: Token, s: str, shape: int) {
+    let ws = sql_code_words(s)
+    if ws.len() == 0 {
+        return
+    }
+    let first = ws[0].w
+    var second = ""
+    if ws.len() > 1 {
+        second = ws[1].w
+    }
+    if first == "begin" || first == "commit" || first == "rollback" || first == "savepoint" || first == "release" || first == "start" || first == "abort" || (first == "set" && second == "transaction") {
+        error_tok(at, sql_upper(first) + " inside sql: transactions are blocks", "tx \{ ... } runs its statements in one transaction and commits at the end")
+        return
+    }
+    if (first == "set" && second != "local") || first == "reset" || first == "listen" || first == "unlisten" || first == "prepare" || first == "deallocate" || first == "discard" {
+        error_tok(at, sql_upper(first) + " would stay on the pooled connection and leak into other requests", "SET LOCAL inside tx \{ }")
+        return
+    }
+    if first == "create" || first == "alter" || first == "drop" || first == "grant" || first == "revoke" || first == "comment" {
+        error_tok(at, sql_upper(first) + " belongs in a migration: the schema changes only through migrations", "migration N `...` with the next number")
+        return
+    }
+    for x in ws {
+        if x.w == "pg_advisory_lock" || x.w == "pg_try_advisory_lock" || x.w == "pg_advisory_unlock" {
+            error_tok(at, x.w + " takes a session lock that stays on the pooled connection", "pg_advisory_xact_lock inside tx \{ }: it is released at commit")
+            return
+        }
+    }
+    // UPDATE/DELETE без WHERE
+    let main = sql_main_word(s)
+    if main == "update" || main == "delete" {
+        var seen = false
+        var has_where = false
+        for x in ws {
+            if x.depth == 0 {
+                if x.w == main {
+                    seen = true
+                } else if seen && x.w == "where" {
+                    has_where = true
+                }
+            }
+        }
+        if seen && !has_where {
+            error_tok(at, sql_upper(main) + " without WHERE changes every row of " + sql_target_table(s).trim(), "add WHERE ...; write WHERE true if you mean every row")
+            return
+        }
+    }
+    // список со страницами без порядка
+    if shape == SH_LIST {
+        var lim = false
+        var ord = false
+        for i in 0..ws.len() {
+            let x = ws[i]
+            if x.depth == 0 {
+                if x.w == "limit" || x.w == "offset" {
+                    lim = true
+                }
+                if x.w == "order" && i + 1 < ws.len() && ws[i + 1].w == "by" {
+                    ord = true
+                }
+            }
+        }
+        if lim && !ord {
+            error_tok(at, "LIMIT without ORDER BY returns rows in no fixed order: pages repeat or skip rows", "ORDER BY id (or another unique key last)")
+            return
+        }
+    }
+    let st = sql_states(s)
+    let n = s.len()
+    // = NULL, <> NULL: сравнение с NULL никогда не истинно
+    for x in ws {
+        if x.w == "null" {
+            let q = sql_prev_code(s, st, x.at)
+            if q >= 0 {
+                let c = s[q]
+                var p = ' '
+                if q > 0 {
+                    p = s[q - 1]
+                }
+                if (c == '>' && p == '<') || (c == '=' && p == '!') {
+                    error_tok(at, "<> NULL is never true in SQL", "IS NOT NULL")
+                    return
+                }
+                if c == '=' && p != '<' && p != '>' && p != '!' && p != ':' && !sql_in_set(s[0..q]) {
+                    error_tok(at, "= NULL is never true in SQL", "IS NULL")
+                    return
+                }
+            }
+        }
+    }
+    // заполнители других драйверов: ?, :name, @name на месте значения
+    for i in 0..n {
+        if st[i] != 0 {
+            continue
+        }
+        let c = s[i]
+        if c != '?' && c != ':' && c != '@' {
+            continue
+        }
+        let q = sql_prev_code(s, st, i)
+        let after_op = q >= 0 && (s[q] == '=' || s[q] == '<' || s[q] == '>' || s[q] == '(' || s[q] == ',')
+        if !after_op || (q == i - 1 && c == ':' && s[q] == ':') {
+            continue
+        }
+        var mark = ""
+        if c == '?' {
+            var j = i + 1
+            while j < n && sql_space(s[j]) {
+                j += 1
+            }
+            if j >= n || s[j] == ')' || s[j] == ',' || s[j] == ';' {
+                mark = "?"
+            }
+        } else if i + 1 < n && is_alpha(s[i + 1]) && (i == 0 || s[i - 1] != ':') {
+            var j = i + 1
+            while j < n && is_ident_char(s[j]) {
+                j += 1
+            }
+            mark = s[i..j]
+        }
+        if mark.len() > 0 {
+            error_tok(at, "values go in place in sql: WHERE id = \{id}, not " + mark, "every \{expression} is sent as a parameter, never as SQL text")
+            return
+        }
+    }
+}
+
 // Заполнители других драйверов ($1, %s) в исходном тексте (параметры — \0).
 fn sql_habit_placeholder(at: Token, text: str) {
     let st = sql_states(text)
@@ -704,6 +1042,8 @@ fn parse_sql(w: int) -> int {
     var vkeys: [str] = []
     var vtexts: [str] = []
     var ptoks: [Token] = []
+    var pfrom: [int] = []
+    var pto: [int] = []
     for i in 0..n {
         let pt = tok()
         ptoks.push(pt)
@@ -716,6 +1056,8 @@ fn parse_sql(w: int) -> int {
         let et = parse_expr(ty_err)
         no_struct = saved
         let to = pos
+        pfrom.push(from)
+        pto.push(to)
         expect_tok(')')
         if et == ty_void || et == ty_never {
             error_tok(pt, "this expression has no value to send to the database", "")
@@ -785,6 +1127,9 @@ fn parse_sql(w: int) -> int {
     // строка '...' с параметрами внутри: она открыта (ещё не закрыта) и шаблон ли это LIKE
     var in_lit = false
     var lit_like = false
+    // ORDER BY {o}: o — из строк-литералов, каждая даёт свой вариант запроса
+    var order_vi = -1
+    var order_lits: [str] = []
     for i in 0..n {
         let vi = vals[i]
         let vt = vtypes[vi]
@@ -792,6 +1137,26 @@ fn parse_sql(w: int) -> int {
         let vk = tkind(vt)
         let isnull = sql_starts_words(next, ["is", "null"])
         let notnull = sql_starts_words(next, ["is", "not", "null"])
+        let by = sql_ends_word(cur, cur.len(), "by")
+        if !lit.quoted[i] && by >= 0 && sql_ends_word(cur, by, "order") >= 0 {
+            let x = vtexts[vi]
+            let lits = lit_set(pfrom[i], pto[i])
+            if lits.len() == 0 {
+                error_tok(ptoks[i], "ORDER BY \{" + x + "}: a parameter here is a constant and sorts nothing", "let order = match " + x + " \{ \"price\" => \"price, id\", ... _ => return 400 \"bad sort\" }, then ORDER BY \{order}")
+            } else if order_vi >= 0 {
+                error_tok(ptoks[i], "one ORDER BY \{...} per query", "put the whole ORDER BY list in one string")
+            } else if lits.len() > SQL_MAX_ORDERS {
+                error_tok(ptoks[i], "ORDER BY \{" + x + "} has " + lits.len().to_str() + " variants, at most " + SQL_MAX_ORDERS.to_str(), "")
+            } else {
+                order_vi = vi
+                order_lits = lits
+            }
+            cur = cur + "%%O%%" + next
+            continue
+        }
+        if !lit.quoted[i] && sql_names_slot(cur, vk) {
+            error_tok(ptoks[i], "\{" + vtexts[vi] + "} cannot name a table: values are sent as parameters, never as SQL text", "choose between whole queries with if/match")
+        }
         if lit.quoted[i] {
             // '...{x}...' → ('...' || $n || '...'): скобки сохраняют приоритет
             // ('{d}'::date); в шаблоне LIKE % и _ значения — буквы
@@ -935,7 +1300,21 @@ fn parse_sql(w: int) -> int {
             error_tok(ptoks[cmp_at[k]], "\{" + x + "} may be none, and a comparison with NULL is never true: rows would silently not match", "write (\{" + x + "} IS NULL OR column = \{" + x + "}), or unwrap it first: let v = " + x + " else \{ return 400 }")
         }
     }
+    // варианты текста: по одному на строку ORDER BY {o}
+    var texts: [str] = [cur]
+    if order_lits.len() > 0 {
+        texts = []
+        for o in order_lits {
+            let at_o = cur.find("%%O%%") ?? 0
+            texts.push(cur[0..at_o] + o + cur[at_o + 5..cur.len()])
+        }
+        cur = texts[0]
+    }
     sql_habits(at, cur)
+    sql_rules(at, cur, shape)
+    if shape == SH_ONE && !sql_one_row(cur) {
+        sql_note_404(at)
+    }
     // C: в маршруте запись после другого запроса вне tx — гонка «проверил, записал»
     let writes = sql_target_table(cur).len() > 1 || sql_has_word(cur, "delete") || sql_has_word(cur, "merge")
     if route_ctx >= 0 && tx_depth == 0 && inline_depth == 0 {
@@ -953,9 +1332,61 @@ fn parse_sql(w: int) -> int {
     if shape == SH_COUNT && (reads || sql_top_returning(cur)) {
         error_tok(at, "sql needs to know the result type of this query", "let row: Row? = sql ... (one row or none), [Row] (all rows), Row (one row, 404 if none); Row is a type with the selected columns as fields")
     }
-    // проверка против схемы из миграций (без базы)
-    sq_check(at, lit, sql_unmark(cur), shape, inner, ps)
-    // место запроса в данных программы
+    // проверка против схемы из миграций (без базы) и места запроса в данных программы
+    var sites: [int] = []
+    var offs: [int] = []
+    for text in texts {
+        sq_check(at, lit, sql_unmark(text), shape, inner, ps)
+        let off = sql_site(at, text, vtypes.len(), ps, shape, inner)
+        offs.push(off)
+        sites.push(DATA_BASE + off)
+    }
+    if order_lits.len() > 0 {
+        // таблица вариантов: номер значения, число, затем пары (строка, место)
+        let vt = desc_reserve(2 + 2 * order_lits.len())
+        desc_put(vt, 0, order_vi)
+        desc_put(vt, 1, order_lits.len())
+        for j in 0..order_lits.len() {
+            desc_put(vt, 2 + 2 * j, const_str(order_lits[j]))
+            desc_put(vt, 3 + 2 * j, sites[j])
+        }
+        desc_put(offs[0], SITE_W_VARIANTS, DATA_BASE + vt)
+    }
+    let site = sites[0]
+    sql_root()
+    emit_mov_imm(RDI, site)
+    emit_mov_rr(RSI, RSP)
+    emit_call(rt_func("__db_run"))
+    if vtypes.len() > 0 {
+        emit_alu_imm(0, RSP, vtypes.len() * 8)
+    }
+    last_was_call = true
+    return rt
+}
+
+// Параметр стоит на месте имени таблицы: FROM (верхнего уровня, не IS DISTINCT
+// FROM), JOIN, UPDATE, INTO (кроме INSERT INTO t {структура}).
+fn sql_names_slot(cur: str, vk: int) -> bool {
+    let ws = sql_code_words(cur)
+    let n = ws.len()
+    if n == 0 {
+        return false
+    }
+    let w = ws[n - 1].w
+    if sql_ends_word(cur, cur.len(), w) < 0 {
+        return false
+    }
+    if w == "join" || w == "update" {
+        return true
+    }
+    if w == "into" {
+        return vk != K_STRUCT && vk != K_LIST
+    }
+    return w == "from" && ws[n - 1].depth == 0 && !(n > 1 && ws[n - 2].w == "distinct")
+}
+
+// Место запроса в данных программы (слова SITE_* из lib/db.kh) → смещение.
+fn sql_site(at: Token, cur: str, nv: int, ps: [SqlParam], shape: int, inner: int) -> int {
     let off = desc_reserve(SITE_WORDS)
     let pt = desc_reserve(4 * ps.len() + 1)
     for i in 0..ps.len() {
@@ -966,7 +1397,7 @@ fn parse_sql(w: int) -> int {
         desc_put(pt, 4 * i + 3, p.f)
     }
     desc_put(off, 0, const_str(cur))
-    desc_put(off, 1, vtypes.len())
+    desc_put(off, 1, nv)
     desc_put(off, 2, ps.len())
     desc_put(off, 3, DATA_BASE + pt)
     desc_put(off, 4, shape)
@@ -976,17 +1407,8 @@ fn parse_sql(w: int) -> int {
     desc_put(off, 6, const_str(files[at.file].path + ":" + at.line.to_str() + ":" + at.col.to_str()))
     desc_put(off, 7, const_str(sql_target_table(cur)))
     desc_put(off, 8, sql_sites.len())
-    let site = DATA_BASE + off
-    sql_sites.push(site)
-    sql_root()
-    emit_mov_imm(RDI, site)
-    emit_mov_rr(RSI, RSP)
-    emit_call(rt_func("__db_run"))
-    if vtypes.len() > 0 {
-        emit_alu_imm(0, RSP, vtypes.len() * 8)
-    }
-    last_was_call = true
-    return rt
+    sql_sites.push(DATA_BASE + off)
+    return off
 }
 
 // Слово w в коде запроса (вне строк, имён в кавычках и комментариев).

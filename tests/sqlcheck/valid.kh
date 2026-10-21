@@ -41,7 +41,16 @@ type Count { user_id: int, n: int }
 type Stat { name: str, posts: int, last: str?, avg_likes: float? }
 type Pair { a: str, b: str }
 
-fn queries(id: int, q: str, ids: [int], since: int, tag: str?, limit: int) {
+const NEWEST = "created_at DESC, id"
+
+fn queries(id: int, q: str, ids: [int], since: int, tag: str?, limit: int, sort: str) {
+    let order = match sort {
+        "name" => `name COLLATE "C", id`
+        "-score" => "score DESC, id"
+        _ => NEWEST
+    }
+    let sorted: [User] = sql "SELECT * FROM users ORDER BY {order} LIMIT {limit}"
+    let by_name: [str] = sql `SELECT name FROM users ORDER BY name COLLATE "C"`
     let u: User? = sql "SELECT * FROM users WHERE id = {id}"
     let us: [User] = sql `SELECT u.* FROM users u WHERE u.email ILIKE '%{q}%' ORDER BY u."order" DESC NULLS LAST, u.id LIMIT {limit} OFFSET 0`
     let ps: [Post] = sql "SELECT * FROM posts WHERE user_id = ANY({ids}) AND created_at > to_timestamp({since}) ORDER BY id"
@@ -94,6 +103,7 @@ fn main() {
 
 test "every query is valid PostgreSQL" {
     writes(1, "a@x.io", "Ann", "Hello")
-    queries(1, "a", [1, 2], 0, none, 10)
-    queries(1, "a", [], 0, "x", 1)
+    queries(1, "a", [1, 2], 0, none, 10, "name")
+    queries(1, "a", [], 0, "x", 1, "-score")
+    queries(1, "a", [], 0, "x", 1, "")
 }
