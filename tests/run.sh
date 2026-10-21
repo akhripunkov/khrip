@@ -134,8 +134,13 @@ fi
 
 # Решения задач проверки (eval/) на Khrip проходят свои сценарии запросов.
 if command -v curl >/dev/null && command -v python3 >/dev/null; then
+	. eval/server.sh
 	for dir in eval/solutions/*/khrip; do
 		task=$(basename "$(dirname "$dir")")
+		if [[ -f "eval/tasks/$task/db" ]] && ! "$PSQL" -q "$EVAL_PG" -c "select 1" >/dev/null 2>&1; then
+			echo "пропуск eval/$task: нет PostgreSQL ($EVAL_PG)"
+			continue
+		fi
 		if eval/run.sh "$task" khrip >"$tmp/eval.txt" 2>&1; then
 			pass=$((pass + 1))
 		else

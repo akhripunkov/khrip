@@ -1,0 +1,98 @@
+migration 1 `
+CREATE TABLE accounts (
+    id bigserial PRIMARY KEY,
+    owner text NOT NULL,
+    currency text NOT NULL,
+    balance bigint NOT NULL DEFAULT 0
+);
+CREATE TABLE transfers (
+    id bigserial PRIMARY KEY,
+    "from" bigint NOT NULL REFERENCES accounts,
+    "to" bigint NOT NULL REFERENCES accounts,
+    amount bigint NOT NULL,
+    idem_key text UNIQUE,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX ON transfers ("from");
+CREATE INDEX ON transfers ("to");
+`
+
+type NewAccount { owner: str, currency: str }
+type Account { id: int, owner: str, currency: str, balance: int }
+type Amount { amount: int }
+type NewTransfer { from: int, to: int, amount: int }
+type Transfer { id: int, from: int, to: int, amount: int, created_at: str }
+type Keyed { from: int, to: int, amount: int, idem_key: str? }
+type Balances { USD: int, EUR: int, GBP: int }
+type Stats { accounts: int, transfers: int, balances: Balances }
+
+route POST "/accounts" (body: NewAccount) -> 201 Account | 400 str {
+    if body.owner.trim() == "" || !["USD", "EUR", "GBP"].contains(body.currency) {
+        return 400 "owner is required, currency is USD, EUR or GBP"
+    }
+    return 201 sql "INSERT INTO accounts {body} RETURNING *"
+}
+
+route GET "/accounts/{id}" (id: int) -> Account | 404 {
+    return sql "SELECT * FROM accounts WHERE id = {id}"
+}
+
+route POST "/accounts/{id}/deposit" (id: int, body: Amount) -> Account | 400 str | 404 {
+    if body.amount <= 0 {
+        return 400 "amount must be positive"
+    }
+    return sql "UPDATE accounts SET balance = balance + {body.amount} WHERE id = {id} RETURNING *"
+}
+
+route POST "/transfers" (body: NewTransfer) -> 201 Transfer | 400 str | 404 | 409 str | 422 str {
+    let key = header("Idempotency-Key")
+    if key != none && (key ?? "").len() > 64 {
+        return 400 "Idempotency-Key is 1-64 characters"
+    }
+    if body.amount <= 0 || body.from == body.to {
+        return 400 "amount must be positive and accounts different"
+    }
+    tx {
+        if let k = key {
+            let old: Keyed? = sql `SELECT "from", "to", amount, idem_key FROM transfers WHERE idem_key = {k}`
+            if let o = old {
+                if o.from != body.from || o.to != body.to || o.amount != body.amount {
+                    return 422 "Idempotency-Key was used with another body"
+                }
+                return 201 sql "SELECT * FROM transfers WHERE idem_key = {k}"
+            }
+        }
+        let from: Account = sql "SELECT * FROM accounts WHERE id = {body.from}"
+        let to: Account = sql "SELECT * FROM accounts WHERE id = {body.to}"
+        if from.currency != to.currency {
+            return 422 "accounts have different currencies"
+        }
+        if from.balance < body.amount {
+            return 409 "insufficient funds"
+        }
+        sql "UPDATE accounts SET balance = balance - {body.amount} WHERE id = {from.id}"
+        sql "UPDATE accounts SET balance = balance + {body.amount} WHERE id = {to.id}"
+        return 201 sql `INSERT INTO transfers {Keyed { ...body, idem_key: key }} RETURNING *`
+    }
+}
+
+route GET "/accounts/{id}/transfers" (id: int, limit: int = 20, before: int?) -> [Transfer] | 400 str | 404 {
+    if limit < 1 || limit > 100 {
+        return 400 "limit is 1-100"
+    }
+    let acc: Account = sql "SELECT * FROM accounts WHERE id = {id}"
+    return sql `SELECT * FROM transfers WHERE {acc.id} IN ("from", "to")
+        AND ({before} IS NULL OR id < {before}) ORDER BY id DESC LIMIT {limit}`
+}
+
+route GET "/stats" -> Stats {
+    return Stats {
+        accounts: sql "SELECT count(*) FROM accounts",
+        transfers: sql "SELECT count(*) FROM transfers",
+        balances: sql `SELECT
+            coalesce(sum(balance) FILTER (WHERE currency = 'USD'), 0) AS "USD",
+            coalesce(sum(balance) FILTER (WHERE currency = 'EUR'), 0) AS "EUR",
+            coalesce(sum(balance) FILTER (WHERE currency = 'GBP'), 0) AS "GBP"
+            FROM accounts`
+    }
+}

@@ -5,6 +5,13 @@
 
 var fn_ret_ty: int
 var loop_depth: int
+// tx { }: глубина вложенности, первая локальная блока, глубина циклов на входе,
+// скрытые локальные с буфером повтора (по одной на блок этой функции)
+var tx_depth: int
+var tx_local_base: int
+var tx_loop_base: int
+var tx_locals: [int]
+var tx_count: int
 var brks: [int]
 var conts: [int]
 var ret_holes: [int]
@@ -120,6 +127,9 @@ fn parse_stmt() -> bool {
             error_tok(t, t.text + " outside of a loop", "")
             return true
         }
+        if tx_depth > 0 && loop_depth <= tx_loop_base {
+            error_tok(t, t.text + " cannot leave a tx block", "end the block normally or return from it")
+        }
         if k == T_BREAK {
             brks.push(emit_jmp())
         } else {
@@ -134,6 +144,9 @@ fn parse_stmt() -> bool {
     if k == '\{' {
         return parse_block()
     }
+    if k == T_IDENT && t.text == "tx" && kind_at(pos + 1) == '\{' {
+        return parse_tx()
+    }
     if k == T_FN || k == T_TYPE {
         syntax_error(t, "declarations are only allowed at the top level", "move it outside the function")
         return false
@@ -145,6 +158,16 @@ fn parse_stmt() -> bool {
     if k == T_IDENT && stmt_has_assign() {
         parse_assign()
         return false
+    }
+    if tx_depth > 0 && k == T_IDENT && kind_at(pos + 1) == '.' && kind_at(pos + 2) == T_IDENT && kind_at(pos + 3) == '(' {
+        // xs.push(...) над списком снаружи блока
+        let m = toks[pos + 2].text
+        if m == "push" || m == "pop" || m == "insert" || m == "remove" || m == "clear" || m == "sort" || m == "sort_by" || m == "reverse" || m == "extend" || m == "set" || m == "delete" {
+            let li = find_local(t.text)
+            if li >= 0 {
+                tx_outer_check(t, li)
+            }
+        }
     }
     let ty = parse_expr(ty_err)
     if kind() == T_ELSE && tkind(ty) == K_OPT {
@@ -167,6 +190,70 @@ fn parse_stmt() -> bool {
         error_tok(t, "this expression is not used", hint)
     }
     return false
+}
+
+// ---- tx { } ----
+
+// Транзакция SERIALIZABLE. Блок выполняется в одном соединении; конфликт с
+// другим запросом (40001, 40P01) откатывает его, и блок выполняется снова с
+// начала — поэтому внутри нельзя менять то, что откат не вернёт. Вложенный
+// блок (и блок в вызванной функции) присоединяется к внешнему.
+fn parse_tx() -> bool {
+    let at = tok()
+    advance()
+    if !uses_db {
+        error_tok(at, "tx needs a database: the program has no sql", "")
+    }
+    emit_mov_imm(RDI, tx_count)
+    emit_call(rt_func("__db_tx_begin"))
+    let li = declare_local("__tx" + tx_count.to_str(), ty_int, false)
+    tx_count += 1
+    emit_store_local(li)
+    emit_test_rax()
+    let skip = emit_jcc(CC_E)
+    // точка повтора: сюда возвращается блок после конфликта
+    emit_setjmp_rax()
+    patch_here(skip)
+    let saved_base = tx_local_base
+    let saved_loop = tx_loop_base
+    tx_local_base = nlocals
+    tx_loop_base = loop_depth
+    tx_depth += 1
+    tx_locals.push(li)
+    let div = parse_block()
+    tx_locals = tx_locals[0..tx_locals.len() - 1]
+    tx_depth -= 1
+    tx_local_base = saved_base
+    tx_loop_base = saved_loop
+    if !div {
+        emit_load_local(li)
+        emit_mov_rr(RDI, RAX)
+        emit_call(rt_func("__db_tx_commit"))
+    }
+    return div
+}
+
+// return внутри tx в обычной функции: зафиксировать блоки этой функции.
+fn tx_commit_all() {
+    if tx_locals.len() == 0 {
+        return
+    }
+    emit_push(RAX)
+    var i = tx_locals.len() - 1
+    while i >= 0 {
+        emit_load_local(tx_locals[i])
+        emit_mov_rr(RDI, RAX)
+        emit_call(rt_func("__db_tx_commit"))
+        i -= 1
+    }
+    emit_pop(RAX)
+}
+
+// Изменение внешней переменной внутри tx: блок может выполниться дважды.
+fn tx_outer_check(t: Token, li: int) {
+    if tx_depth > 0 && li < tx_local_base {
+        error_tok(t, "'" + t.text + "' is declared outside tx, and the block may run again after a conflict", "compute the value inside: let " + t.text + "2 = tx \{ ... } — or change it after the block")
+    }
 }
 
 // ---- let и var ----
@@ -323,6 +410,12 @@ fn parse_assign() {
         advance()
         assign_name(t, op, at)
         return
+    }
+    if tx_depth > 0 {
+        let li = find_local(t.text)
+        if li >= 0 {
+            tx_outer_check(t, li)
+        }
     }
     advance()
     var ty = load_name_value(t)
@@ -496,6 +589,7 @@ fn assign_name(t: Token, op: int, at: Token) {
     let name = t.text
     let li = find_local(name)
     if li >= 0 {
+        tx_outer_check(t, li)
         let l = locals[li]
         if !l.mutable {
             var hint = "declare it with var to make it mutable"
@@ -541,6 +635,9 @@ fn assign_name(t: Token, op: int, at: Token) {
     }
     let g = globals[sym_idx(s)]
     if g.is_store {
+        if tx_depth > 0 {
+            error_tok(t, "store is not rolled back with the tx block", "change it after the block, from the block's result")
+        }
         store_touch()
     }
     if op == '=' {
@@ -1423,6 +1520,9 @@ fn parse_return() {
     } else if fn_ret_ty != ty_void {
         error_tok(at, "return needs a value of type " + ty_name(fn_ret_ty), "")
     }
+    if tx_depth > 0 && inline_depth == 0 {
+        tx_commit_all()
+    }
     if inline_depth > 0 {
         inline_rets.push(emit_jmp())
     } else {
@@ -1615,6 +1715,8 @@ fn end_fn(frame_at: int, diverged: bool) {
 
 fn compile_fn(fi: int) {
     let f = funcs[fi]
+    tx_depth = 0
+    tx_locals = []
     let frame_at = begin_fn(fi)
     plan_regs(fi)
     let n = f.params.len()
@@ -1716,6 +1818,9 @@ fn compile_main_wrapper(fi: int, test_mode: bool) {
         }
         if f.ret != ty_void && f.ret != ty_int {
             error_tok(toks[f.tok], "main may return nothing or int (the exit code)", "")
+        }
+        if uses_db {
+            emit_call(rt_func("__db_init"))
         }
         emit_call(m)
         if f.ret == ty_void {

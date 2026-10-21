@@ -250,12 +250,14 @@ fn main() -> int {
             lex_file(files.len() - 1)
         }
     }
+    uses_db = scan_uses_db()
     lx_file = files.len() - 1
     add_tok_text(T_EOF, 0, "", lx_p)
     let init_fn = gen_func("__init_globals", ty_void)
     let main_fn = gen_func("__main", ty_int)
     prescan(1)
     prescan(2)
+    sort_migrations()
     api_mode = routes.len() > 0 || tests.len() > 0 || everies.len() > 0 || test_mode
     check_api()
     if locks {
@@ -298,6 +300,7 @@ fn main() -> int {
         }
         w += 1
     }
+    sql_finish()
     resolve_fixups()
     if diags.len() > 0 {
         print_diags()

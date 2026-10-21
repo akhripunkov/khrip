@@ -593,7 +593,7 @@ fn can_inline(fi: int) -> bool {
         if k == T_WHILE || k == T_FOR {
             return false
         }
-        if k == T_IDENT && (toks[i].text == f.name || toks[i].text.starts_with("__simd_")) {
+        if k == T_IDENT && (toks[i].text == f.name || toks[i].text.starts_with("__simd_") || toks[i].text == "tx") {
             return false
         }
         i += 1
@@ -721,6 +721,10 @@ fn prescan_from(pass: int, from: int) {
                     prescan_api(k)
                 } else if k == T_IDENT && toks[i].text == "every" && kind_at(i + 1) == T_INT {
                     prescan_every()
+                } else if k == T_IDENT && toks[i].text == "migration" && kind_at(i + 1) == T_INT {
+                    prescan_migration()
+                    i += 3
+                    continue
                 } else if k != T_TYPE && starts_decl_error(i) {
                     error_tok(toks[i], "expected a declaration (fn, type, var, const, store, route, every or test), found " + tok_show(toks[i]), decl_hint(toks[i]))
                 }

@@ -1,0 +1,167 @@
+migration 1 `
+CREATE TABLE categories (id bigserial PRIMARY KEY, name text NOT NULL);
+CREATE UNIQUE INDEX ON categories (lower(name));
+CREATE TABLE products (
+    id bigserial PRIMARY KEY,
+    name text NOT NULL,
+    category_id bigint NOT NULL REFERENCES categories,
+    price bigint NOT NULL,
+    stock bigint NOT NULL,
+    tags text[] NOT NULL DEFAULT '{}'
+);
+CREATE TABLE orders (
+    id bigserial PRIMARY KEY,
+    customer text NOT NULL,
+    status text NOT NULL DEFAULT 'placed',
+    total bigint NOT NULL,
+    lines jsonb NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX ON orders (customer);
+`
+
+type NewCategory { name: str }
+type Category { id: int, name: str }
+type NewProduct { name: str, category_id: int, price: int, stock: int, tags: [str] = [] }
+type Product { id: int, ...NewProduct }
+type ProductPatch { name: str?, price: int?, stock: int?, tags: [str]? }
+type Page { items: [Product], total: int }
+type Line { product_id: int, qty: int }
+type PricedLine { product_id: int, qty: int, price: int }
+type NewOrder { customer: str, lines: [Line] }
+type Order { id: int, customer: str, status: str, total: int, created_at: str, lines: [PricedLine] }
+type OrderRow { customer: str, total: int, lines: [PricedLine] }
+type CategoryStats { category: str, products: int, units_sold: int, revenue: int }
+
+fn tags_ok(tags: [str]) -> bool {
+    return tags.len() <= 5 && tags.all(t => t.matches(`[a-z0-9]{1,20}`))
+}
+
+fn dedup(tags: [str]) -> [str] {
+    var out: [str] = []
+    for t in tags {
+        if !out.contains(t) {
+            out.push(t)
+        }
+    }
+    return out
+}
+
+fn email_ok(s: str) -> bool {
+    let parts = s.split("@")
+    return parts.len() == 2 && parts[0] != "" && parts[1] != "" && !s.contains(" ")
+}
+
+route POST "/categories" (body: NewCategory) -> 201 Category | 400 str {
+    let name = body.name.trim()
+    if name.len() < 1 || name.len() > 50 {
+        return 400 "name must be 1-50 characters"
+    }
+    return 201 sql "INSERT INTO categories (name) VALUES ({name}) RETURNING *"
+}
+
+route GET "/categories" -> [Category] {
+    return sql "SELECT * FROM categories ORDER BY name"
+}
+
+route POST "/products" (body: NewProduct) -> 201 Product | 400 str {
+    let p = NewProduct { ...body, tags: dedup(body.tags) }
+    if p.name.trim() == "" || p.price <= 0 || p.stock < 0 || !tags_ok(p.tags) {
+        return 400 "invalid product"
+    }
+    return 201 sql "INSERT INTO products {p} RETURNING *"
+}
+
+route GET "/products/{id}" (id: int) -> Product | 404 {
+    return sql "SELECT * FROM products WHERE id = {id}"
+}
+
+route PATCH "/products/{id}" (id: int, body: ProductPatch) -> Product | 400 str | 404 {
+    var patch = body
+    if let t = body.tags {
+        patch.tags = dedup(t)
+    }
+    if (body.name ?? "x").trim() == "" || (body.price ?? 1) <= 0 || (body.stock ?? 0) < 0 || !tags_ok(patch.tags ?? []) {
+        return 400 "invalid product"
+    }
+    return sql "UPDATE products SET {patch} WHERE id = {id} RETURNING *"
+}
+
+route GET "/products" (category_id: int?, tag: str?, q: str?, min_price: int?, max_price: int?, in_stock: bool = false, sort: str = "", page: int = 1, per_page: int = 10) -> Page | 400 str {
+    if !["", "price", "-price", "name"].contains(sort) || page < 1 || per_page < 1 || per_page > 50 {
+        return 400 "bad query"
+    }
+    var items: [Product] = sql `SELECT * FROM products
+        WHERE ({category_id} IS NULL OR category_id = {category_id})
+          AND ({tag} IS NULL OR {tag} = ANY(tags))
+          AND ({q} IS NULL OR name ILIKE '%{q ?? ""}%')
+          AND ({min_price} IS NULL OR price >= {min_price})
+          AND ({max_price} IS NULL OR price <= {max_price})
+          AND (NOT {in_stock} OR stock > 0)
+        ORDER BY id`
+    if sort == "price" {
+        items = items.sort_by(p => p.price)
+    } else if sort == "-price" {
+        items = items.sort_by(p => -p.price)
+    } else if sort == "name" {
+        items = items.sort_by(p => p.name)
+    }
+    let start = (page - 1) * per_page
+    return Page { items: items[start.min(items.len())..(start + per_page).min(items.len())], total: items.len() }
+}
+
+route POST "/orders" (body: NewOrder) -> 201 Order | 400 str | 404 | 409 str {
+    if !email_ok(body.customer) || body.lines.len() == 0 || body.lines.any(l => l.qty <= 0) {
+        return 400 "invalid order"
+    }
+    var lines: [Line] = []
+    for l in body.lines {
+        if let m = lines.find(x => x.product_id == l.product_id) {
+            m.qty += l.qty
+        } else {
+            lines.push(Line { ...l })
+        }
+    }
+    tx {
+        var priced: [PricedLine] = []
+        for l in lines {
+            let p: Product = sql "SELECT * FROM products WHERE id = {l.product_id}"
+            if p.stock < l.qty {
+                return 409 "not enough stock for product {p.id}"
+            }
+            priced.push(PricedLine { ...l, price: p.price })
+        }
+        for l in lines {
+            sql "UPDATE products SET stock = stock - {l.qty} WHERE id = {l.product_id}"
+        }
+        let total = priced.map(l => l.qty * l.price).sum()
+        return 201 sql "INSERT INTO orders {OrderRow { customer: body.customer.lower(), total, lines: priced }} RETURNING *"
+    }
+}
+
+route POST "/orders/{id}/cancel" (id: int) -> Order | 404 | 409 str {
+    tx {
+        let o: Order = sql "SELECT * FROM orders WHERE id = {id}"
+        if o.status == "cancelled" {
+            return 409 "already cancelled"
+        }
+        for l in o.lines {
+            sql "UPDATE products SET stock = stock + {l.qty} WHERE id = {l.product_id}"
+        }
+        return sql "UPDATE orders SET status = 'cancelled' WHERE id = {id} RETURNING *"
+    }
+}
+
+route GET "/customers/{email}/orders" (email: str) -> [Order] {
+    return sql "SELECT * FROM orders WHERE customer = {email.lower()} ORDER BY id DESC"
+}
+
+route GET "/stats/categories" -> [CategoryStats] {
+    return sql `SELECT c.name AS category, count(DISTINCT p.id) AS products,
+            coalesce(sum(l.qty), 0) AS units_sold, coalesce(sum(l.qty * l.price), 0) AS revenue
+        FROM categories c
+        LEFT JOIN products p ON p.category_id = c.id
+        LEFT JOIN (SELECT l.* FROM orders o, jsonb_to_recordset(o.lines) AS l(product_id bigint, qty bigint, price bigint)
+            WHERE o.status = 'placed') l ON l.product_id = p.id
+        GROUP BY c.name ORDER BY revenue DESC, c.name`
+}

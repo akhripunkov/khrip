@@ -1,0 +1,1223 @@
+// Язык и база: места запросов sql "...", которые собрал компилятор (src/sql.kh).
+//
+// При запуске (__db_start): подключение, миграции, затем каждое место
+// проверяется самим PostgreSQL (Parse + Describe): типы параметров, столбцы
+// и их типы против ожидаемого типа Khrip, NOT NULL — по каталогу. Ошибка —
+// выход с кодом 1 и местом в исходнике: запрос с опечаткой не доживает до
+// первого запроса клиента. Проверка строит план раскладки строк для каждого
+// места; рабочие потоки только читают его.
+//
+// Запрос (__db_run): соединение из запаса потока (или соединение транзакции),
+// параметры по виду Khrip и типу столбца, результат — по форме места.
+// Ошибка базы завершает запрос статусом: дубликат 409, нет ссылки 404, плохое
+// значение 400, база недоступна 503, остальное 500.
+
+// Слова места запроса (их пишет компилятор, src/sql.kh)
+const SITE_SQL = 0
+const SITE_NVALS = 8
+const SITE_NPARAMS = 16
+const SITE_PARAMS = 24
+const SITE_SHAPE = 32
+const SITE_DESC = 40
+const SITE_LOC = 48
+const SITE_TARGET = 56
+const SITE_INDEX = 64
+// заполняет рантайм при запуске
+const SITE_OIDS = 72
+const SITE_PLAN = 80
+const SITE_SCALAR = 88
+const SITE_COUNT = 96
+const SITE_FALLBACK = 104
+
+const SH_COUNT = 0
+const SH_ONE = 1
+const SH_OPT = 2
+const SH_LIST = 3
+
+const PK_VAL = 1
+const PK_ISNULL = 2
+const PK_LIKE = 3
+const PK_TEXT = 4
+const PK_FIELD = 5
+const PK_COLUMN = 6
+
+// Типы PostgreSQL (pg_type.oid)
+const OID_BOOL = 16
+const OID_BYTEA = 17
+const OID_CHAR = 18
+const OID_NAME = 19
+const OID_INT8 = 20
+const OID_INT2 = 21
+const OID_INT4 = 23
+const OID_TEXT = 25
+const OID_OID = 26
+const OID_JSON = 114
+const OID_FLOAT4 = 700
+const OID_FLOAT8 = 701
+const OID_UNKNOWN = 705
+const OID_BPCHAR = 1042
+const OID_VARCHAR = 1043
+const OID_DATE = 1082
+const OID_TIME = 1083
+const OID_TIMESTAMP = 1114
+const OID_TIMESTAMPTZ = 1184
+const OID_INTERVAL = 1186
+const OID_NUMERIC = 1700
+const OID_UUID = 2950
+const OID_JSONB = 3802
+
+// Как значение столбца становится значением Khrip
+const CV_INT = 1
+const CV_FLOAT = 2
+const CV_BOOL = 3
+const CV_STR = 4
+const CV_TIME_INT = 5
+const CV_TIME_STR = 6
+const CV_BYTES = 7
+const CV_JSON = 8
+const CV_ARRAY = 9
+const CV_ENUM = 10
+
+// Время на запрос к базе (мс): ожидание соединения, сам запрос и повторы.
+fn __db_timeout() -> int {
+    return __env_int("DATABASE_TIMEOUT", 10000)
+}
+
+// ---- Типы PostgreSQL ----
+
+fn __oid_int(o: int) -> bool {
+    return o == OID_INT2 || o == OID_INT4 || o == OID_INT8 || o == OID_OID
+}
+
+fn __oid_float(o: int) -> bool {
+    return o == OID_FLOAT4 || o == OID_FLOAT8 || o == OID_NUMERIC
+}
+
+fn __oid_time(o: int) -> bool {
+    return o == OID_TIMESTAMPTZ || o == OID_TIMESTAMP || o == OID_DATE
+}
+
+fn __oid_json(o: int) -> bool {
+    return o == OID_JSON || o == OID_JSONB
+}
+
+// Тип, который PostgreSQL читает из текста: строка Khrip подходит к нему.
+fn __oid_texty(o: int) -> bool {
+    return o == OID_TEXT || o == OID_VARCHAR || o == OID_BPCHAR || o == OID_NAME || o == OID_CHAR || o == OID_UUID || o == OID_DATE || o == OID_TIME || o == OID_TIMESTAMP || o == OID_TIMESTAMPTZ || o == OID_INTERVAL || o == OID_JSON || o == OID_JSONB || o == OID_BYTEA || o == OID_NUMERIC || o == OID_UNKNOWN || o == 869 || o == 650 || o == 829 || o == 142 || o >= 16384
+}
+
+// Элемент массива: OID массива → OID элемента (0 — не массив).
+fn __oid_elem(o: int) -> int {
+    if o == 1000 {
+        return OID_BOOL
+    }
+    if o == 1005 {
+        return OID_INT2
+    }
+    if o == 1007 {
+        return OID_INT4
+    }
+    if o == 1016 {
+        return OID_INT8
+    }
+    if o == 1009 {
+        return OID_TEXT
+    }
+    if o == 1015 {
+        return OID_VARCHAR
+    }
+    if o == 1014 {
+        return OID_BPCHAR
+    }
+    if o == 1021 {
+        return OID_FLOAT4
+    }
+    if o == 1022 {
+        return OID_FLOAT8
+    }
+    if o == 1231 {
+        return OID_NUMERIC
+    }
+    if o == 2951 {
+        return OID_UUID
+    }
+    if o == 1115 {
+        return OID_TIMESTAMP
+    }
+    if o == 1185 {
+        return OID_TIMESTAMPTZ
+    }
+    if o == 1182 {
+        return OID_DATE
+    }
+    if o == 199 {
+        return OID_JSON
+    }
+    if o == 3807 {
+        return OID_JSONB
+    }
+    if o == 1001 {
+        return OID_BYTEA
+    }
+    return 0
+}
+
+fn __oid_name(o: int) -> str {
+    if o == OID_BOOL {
+        return "boolean"
+    }
+    if o == OID_INT2 {
+        return "smallint"
+    }
+    if o == OID_INT4 {
+        return "integer"
+    }
+    if o == OID_INT8 {
+        return "bigint"
+    }
+    if o == OID_TEXT {
+        return "text"
+    }
+    if o == OID_VARCHAR {
+        return "varchar"
+    }
+    if o == OID_FLOAT4 {
+        return "real"
+    }
+    if o == OID_FLOAT8 {
+        return "double precision"
+    }
+    if o == OID_NUMERIC {
+        return "numeric"
+    }
+    if o == OID_TIMESTAMPTZ {
+        return "timestamptz"
+    }
+    if o == OID_TIMESTAMP {
+        return "timestamp"
+    }
+    if o == OID_DATE {
+        return "date"
+    }
+    if o == OID_UUID {
+        return "uuid"
+    }
+    if o == OID_JSON {
+        return "json"
+    }
+    if o == OID_JSONB {
+        return "jsonb"
+    }
+    if o == OID_BYTEA {
+        return "bytea"
+    }
+    if o == OID_INTERVAL {
+        return "interval"
+    }
+    let e = __oid_elem(o)
+    if e != 0 {
+        return __oid_name(e) + "[]"
+    }
+    return "type {o}"
+}
+
+// Название типа Khrip по описанию (для сообщений).
+fn __desc_name(d: int) -> str {
+    let k = load64(d)
+    if k == D_INT {
+        return "int"
+    }
+    if k == D_FLOAT {
+        return "float"
+    }
+    if k == D_BOOL {
+        return "bool"
+    }
+    if k == D_STR {
+        return "str"
+    }
+    if k == D_OPT {
+        return __desc_name(load64(d + 8)) + "?"
+    }
+    if k == D_LIST {
+        return "[" + __desc_name(load64(d + 8)) + "]"
+    }
+    if k == D_MAP {
+        return "map"
+    }
+    let name: str = __cast(load64(d + 16))
+    return name
+}
+
+// Перечисление: вариант без полей у каждого значения.
+fn __desc_enum(d: int) -> bool {
+    if load64(d) != D_SUM {
+        return false
+    }
+    let n = load64(d + 8)
+    for i in 0..n {
+        if load64(d + 32 + i * 24 + 16) == 0 {
+            return false
+        }
+    }
+    return true
+}
+
+// Тип параметра, если сервер не вывел его сам.
+fn __desc_oid(d: int) -> int {
+    let k = load64(d)
+    if k == D_OPT {
+        return __desc_oid(load64(d + 8))
+    }
+    if k == D_INT {
+        return OID_INT8
+    }
+    if k == D_FLOAT {
+        return OID_FLOAT8
+    }
+    if k == D_BOOL {
+        return OID_BOOL
+    }
+    if k == D_STR || __desc_enum(d) {
+        return OID_TEXT
+    }
+    if k == D_LIST {
+        let e = load64(load64(d + 8))
+        if e == D_INT {
+            return 1016
+        }
+        if e == D_FLOAT {
+            return 1022
+        }
+        if e == D_BOOL {
+            return 1000
+        }
+        if e == D_STR {
+            return 1009
+        }
+    }
+    return OID_JSONB
+}
+
+// Подходит ли значение Khrip (описание d) к параметру типа o → "" или почему нет.
+fn __param_fits(d: int, o: int) -> str {
+    var k = load64(d)
+    var dd = d
+    if k == D_OPT {
+        dd = load64(d + 8)
+        k = load64(dd)
+    }
+    if o == 0 || o == OID_UNKNOWN {
+        return ""
+    }
+    if k == D_INT {
+        if __oid_int(o) || __oid_float(o) || __oid_time(o) {
+            return ""
+        }
+        return "it is int"
+    }
+    if k == D_FLOAT {
+        if o == OID_FLOAT4 || o == OID_FLOAT8 || o == OID_NUMERIC {
+            return ""
+        }
+        if __oid_int(o) {
+            return "it is float and PostgreSQL would round it silently: use .round() or a numeric column"
+        }
+        return "it is float"
+    }
+    if k == D_BOOL {
+        if o == OID_BOOL {
+            return ""
+        }
+        return "it is bool"
+    }
+    if k == D_STR || __desc_enum(dd) {
+        if __oid_texty(o) {
+            return ""
+        }
+        if __oid_int(o) || __oid_float(o) {
+            return "it is str: parse it first, e.g. let n = s.to_int() else \{ return 400 }"
+        }
+        return "it is str"
+    }
+    if k == D_LIST {
+        if __oid_elem(o) != 0 || __oid_json(o) {
+            return ""
+        }
+        return "it is a list: compare with = ANY(\{list}) or store it in an array or jsonb column"
+    }
+    if __oid_json(o) {
+        return ""
+    }
+    return "it is " + __desc_name(dd) + ": store it in a jsonb column or pass its fields"
+}
+
+// ---- Параметры ----
+
+fn __db_scalar_text(d: int, v: int, o: int) -> str {
+    let k = load64(d)
+    if k == D_INT {
+        if o == OID_TIMESTAMPTZ || o == OID_TIMESTAMP {
+            return time_iso(v)
+        }
+        if o == OID_DATE {
+            return time_iso(v)[..10]
+        }
+        return v.to_str()
+    }
+    if k == D_FLOAT {
+        let f: float = __cast(v)
+        return f.to_str()
+    }
+    if k == D_BOOL {
+        if v != 0 {
+            return "t"
+        }
+        return "f"
+    }
+    if k == D_STR {
+        let s: str = __cast(v)
+        if o == OID_BYTEA {
+            return __pg_bytes_param(s)
+        }
+        return s
+    }
+    let j = __json_encode(v, d)
+    if __desc_enum(d) && !__oid_json(o) && j.len() >= 2 {
+        return j[1..j.len() - 1]
+    }
+    return j
+}
+
+// Значение параметра: текст для Bind или none (NULL).
+fn __db_encode(d: int, v: int, o: int) -> str? {
+    let k = load64(d)
+    if k == D_OPT {
+        if v == 0 {
+            return none
+        }
+        let inner = load64(d + 8)
+        if __is_scalar(inner) {
+            return __db_encode(inner, load64(v), o)
+        }
+        return __db_encode(inner, v, o)
+    }
+    if k == D_LIST && !__oid_json(o) {
+        let ed = load64(d + 8)
+        var items: [str?] = []
+        let eo = __oid_elem(o)
+        if load64(ed) == D_BOOL {
+            let xs: [bool] = __cast(v)
+            for x in xs {
+                if x {
+                    items.push("t")
+                } else {
+                    items.push("f")
+                }
+            }
+        } else {
+            let xs: [int] = __cast(v)
+            for x in xs {
+                items.push(__db_encode(ed, x, eo))
+            }
+        }
+        return __pg_arr_param(items)
+    }
+    return __db_scalar_text(d, v, o)
+}
+
+fn __like_escape(s: str) -> str {
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+}
+
+// Параметры места из значений на стеке (значение i — по адресу vals + (n-1-i)*8).
+fn __db_params(site: int, vals: int) -> [str?] {
+    let nv = load64(site + SITE_NVALS)
+    let np = load64(site + SITE_NPARAMS)
+    let pt = load64(site + SITE_PARAMS)
+    let oids: [int] = __cast(load64(site + SITE_OIDS))
+    var out: [str?] = []
+    for i in 0..np {
+        let kind = load64(pt + i * 32)
+        let d = load64(pt + i * 32 + 8)
+        let v = load64(vals + (nv - 1 - load64(pt + i * 32 + 16)) * 8)
+        let f = load64(pt + i * 32 + 24)
+        var o = 0
+        if oids.len() > i {
+            o = oids[i]
+        }
+        if kind == PK_ISNULL {
+            if v == 0 {
+                out.push("t")
+            } else {
+                out.push("f")
+            }
+        } else if kind == PK_LIKE {
+            if let s = __db_encode(d, v, OID_TEXT) {
+                out.push(__like_escape(s))
+            } else {
+                out.push(none)
+            }
+        } else if kind == PK_TEXT {
+            out.push(__db_encode(d, v, OID_TEXT))
+        } else if kind == PK_FIELD {
+            out.push(__db_encode(d, load64(v + f * 8), o))
+        } else if kind == PK_COLUMN {
+            // список структур: значения поля f всех элементов — массивом
+            let xs: [int] = __cast(v)
+            var col: [int] = []
+            for x in xs {
+                col.push(load64(x + f * 8))
+            }
+            out.push(__db_encode(d, __cast(col), o))
+        } else {
+            out.push(__db_encode(d, v, o))
+        }
+    }
+    return out
+}
+
+// ---- Строки результата ----
+
+fn __db_decode(r: __PgRes, i: int, d: int, cv: int, at: str) -> int {
+    let k = load64(d)
+    if k == D_OPT {
+        if __pg_null(r, i) {
+            return 0
+        }
+        let inner = load64(d + 8)
+        let v = __db_decode(r, i, inner, cv, at)
+        if __is_scalar(inner) {
+            let b = __alloc(8)
+            store64(b, v)
+            return b
+        }
+        return v
+    }
+    if __pg_null(r, i) {
+        __panic_msg("{at} is NULL, but its type {__desc_name(d)} has no none: make it {__desc_name(d)}? or use coalesce(...) in the query")
+    }
+    if cv == CV_INT {
+        return __pg_int(r, i)
+    }
+    if cv == CV_FLOAT {
+        let f = __pg_float(r, i)
+        return __cast(f)
+    }
+    if cv == CV_BOOL {
+        if __pg_bool(r, i) {
+            return 1
+        }
+        return 0
+    }
+    if cv == CV_TIME_INT {
+        return __pg_time(r, i)
+    }
+    if cv == CV_TIME_STR {
+        let s = __pg_str(r, i)
+        if s.len() == 10 {
+            return __cast(s)
+        }
+        return __cast(time_iso(__pg_time(r, i)))
+    }
+    if cv == CV_BYTES {
+        return __cast(__pg_bytes(r, i))
+    }
+    if cv == CV_JSON {
+        let v = __json_decode(__pg_str(r, i), d)
+        if v == 0 {
+            __panic_msg("{at}: the JSON from the database does not fit {__desc_name(d)}: {json_error()}")
+        }
+        if __is_scalar(d) {
+            return load64(v)
+        }
+        return v
+    }
+    if cv == CV_ENUM {
+        let label = __pg_str(r, i)
+        let n = load64(d + 8)
+        for j in 0..n {
+            let e = d + 32 + j * 24
+            let vn: str = __cast(load64(e))
+            if vn == label {
+                return load64(e + 16)
+            }
+        }
+        __panic_msg("{at} is '{label}', which is not a value of {__desc_name(d)}")
+    }
+    if cv == CV_ARRAY {
+        let items = __pg_arr(r, i)
+        let ed = load64(d + 8)
+        let ek = load64(ed)
+        if ek == D_BOOL {
+            var xs: [bool] = []
+            for x in items {
+                xs.push((x ?? "") == "t")
+            }
+            return __cast(xs)
+        }
+        var xs: [int] = []
+        for x in items {
+            let s = x else {
+                __panic_msg("{at} has a NULL element, but its type {__desc_name(d)} has no none")
+                return 0
+            }
+            if ek == D_INT {
+                xs.push(s.to_int() ?? 0)
+            } else if ek == D_FLOAT {
+                let f = s.to_float() ?? 0.0
+                xs.push(__cast(f))
+            } else {
+                xs.push(__cast(s))
+            }
+        }
+        return __cast(xs)
+    }
+    return __cast(__pg_str(r, i))
+}
+
+// Строка row → значение по плану места (структура или одно значение).
+fn __db_row(site: int, r: __PgRes, row: int) -> int {
+    let d = load64(site + SITE_DESC)
+    let plan: [int] = __cast(load64(site + SITE_PLAN))
+    let base = row * r.cols
+    let loc: str = __cast(load64(site + SITE_LOC))
+    if load64(site + SITE_SCALAR) != 0 {
+        return __db_decode(r, base, d, plan[1], loc + ": the column")
+    }
+    let s = __struct_alloc(d)
+    let n = load64(d + 8)
+    for fi in 0..n {
+        let col = plan[2 * fi]
+        let fd = __field_desc(d, fi)
+        let f = __field(d, fi)
+        if col < 0 {
+            // столбца нет: значение по умолчанию поля
+            let dk = load64(f + 24)
+            if dk == 1 {
+                store64(s + fi * 8, load64(f + 32))
+            } else if dk == 2 {
+                store64(s + fi * 8, __list_new(4, load64(f + 32)))
+            } else if dk == 3 {
+                store64(s + fi * 8, __map_new(load64(f + 32)))
+            } else {
+                store64(s + fi * 8, 0)
+            }
+            continue
+        }
+        let fname: str = __cast(load64(f))
+        store64(s + fi * 8, __db_decode(r, base + col, fd, plan[2 * fi + 1], loc + ": " + __desc_name(d) + "." + fname))
+    }
+    return s
+}
+
+// ---- Проверка места при запуске ----
+
+// Как столбец типа o становится значением с описанием d (0 — никак).
+fn __db_conv(d: int, o: int) -> int {
+    var k = load64(d)
+    var dd = d
+    if k == D_OPT {
+        dd = load64(d + 8)
+        k = load64(dd)
+    }
+    if k == D_INT {
+        if __oid_int(o) || o == OID_NUMERIC {
+            return CV_INT
+        }
+        if __oid_time(o) {
+            return CV_TIME_INT
+        }
+        return 0
+    }
+    if k == D_FLOAT {
+        if __oid_float(o) || __oid_int(o) {
+            return CV_FLOAT
+        }
+        return 0
+    }
+    if k == D_BOOL {
+        if o == OID_BOOL {
+            return CV_BOOL
+        }
+        return 0
+    }
+    if k == D_STR {
+        if o == OID_TIMESTAMPTZ || o == OID_TIMESTAMP || o == OID_DATE {
+            return CV_TIME_STR
+        }
+        if o == OID_BYTEA {
+            return CV_BYTES
+        }
+        if o == OID_BOOL || __oid_int(o) || o == OID_FLOAT4 || o == OID_FLOAT8 || __oid_elem(o) != 0 {
+            return 0
+        }
+        return CV_STR
+    }
+    if __oid_json(o) {
+        return CV_JSON
+    }
+    if __desc_enum(dd) && (o == OID_TEXT || o == OID_VARCHAR || o >= 16384) {
+        return CV_ENUM
+    }
+    if k == D_LIST {
+        let eo = __oid_elem(o)
+        if eo == 0 {
+            return 0
+        }
+        let ek = load64(load64(dd + 8))
+        if (ek == D_INT && __oid_int(eo)) || (ek == D_FLOAT && (__oid_float(eo) || __oid_int(eo))) || (ek == D_BOOL && eo == OID_BOOL) || (ek == D_STR && eo != OID_BOOL && !__oid_int(eo) && !__oid_float(eo) && !__oid_time(eo)) {
+            return CV_ARRAY
+        }
+    }
+    return 0
+}
+
+fn __db_conv_hint(d: int, o: int) -> str {
+    var dd = d
+    if load64(d) == D_OPT {
+        dd = load64(d + 8)
+    }
+    let k = load64(dd)
+    if k == D_INT && o == OID_NUMERIC {
+        return ""
+    }
+    if k == D_INT && (o == OID_FLOAT8 || o == OID_FLOAT4) {
+        return "make it float, or cast in SQL: round(x)::bigint"
+    }
+    if k == D_STR && (__oid_int(o) || __oid_float(o) || o == OID_BOOL) {
+        return "make it " + __kh_for_oid(o) + ", or cast in SQL: x::text"
+    }
+    if (k == D_INT || k == D_FLOAT || k == D_BOOL) && __oid_texty(o) {
+        return "make it str, or cast in SQL: x::bigint"
+    }
+    return "make it " + __kh_for_oid(o)
+}
+
+// Тип Khrip для столбца типа o (для подсказок).
+fn __kh_for_oid(o: int) -> str {
+    if __oid_int(o) {
+        return "int"
+    }
+    if __oid_float(o) {
+        return "float"
+    }
+    if o == OID_BOOL {
+        return "bool"
+    }
+    if __oid_json(o) {
+        return "a type that matches the JSON"
+    }
+    let e = __oid_elem(o)
+    if e != 0 {
+        return "[" + __kh_for_oid(e) + "]"
+    }
+    return "str"
+}
+
+// Подготовка места: Parse + Describe, типы параметров (с повтором, если сервер
+// не вывел тип), план раскладки строк. → описание ошибки или "".
+fn __db_check(c: int, site: int, notnull: map[str, bool], deadline: int) -> str {
+    let sql: str = __cast(load64(site + SITE_SQL))
+    let np = load64(site + SITE_NPARAMS)
+    let pt = load64(site + SITE_PARAMS)
+    var types: [int] = []
+    var fallback: [int] = []
+    for i in 0..np {
+        let kind = load64(pt + i * 32)
+        let d = load64(pt + i * 32 + 8)
+        if kind == PK_ISNULL {
+            types.push(OID_BOOL)
+        } else if kind == PK_LIKE || kind == PK_TEXT {
+            types.push(OID_TEXT)
+        } else {
+            types.push(0)
+        }
+        fallback.push(__desc_oid(d))
+    }
+    var desc = __pg_describe_typed(c, sql, types, deadline)
+    var tries = 0
+    while desc.err.code.len() > 0 && tries <= np {
+        tries += 1
+        var changed = false
+        if desc.err.code == "42P18" || desc.err.code == "42P08" {
+            if let k = __pg_param_no(desc.err.message) {
+                if k >= 0 && k < np && types[k] == 0 {
+                    types[k] = fallback[k]
+                    changed = true
+                }
+            }
+        } else if desc.err.code == "42725" && desc.err.message.contains("unknown") {
+            for j in 0..np {
+                if types[j] == 0 {
+                    types[j] = fallback[j]
+                    changed = true
+                }
+            }
+        }
+        if !changed {
+            break
+        }
+        desc = __pg_describe_typed(c, sql, types, deadline)
+    }
+    if desc.err.code.len() > 0 {
+        return __db_sql_error(sql, desc.err)
+    }
+    // типы параметров, которые вывел сервер
+    var oids: [int] = []
+    for i in 0..np {
+        var o = types[i]
+        if i < desc.params.len() {
+            o = desc.params[i]
+        }
+        oids.push(o)
+        let kind = load64(pt + i * 32)
+        let d = load64(pt + i * 32 + 8)
+        if kind == PK_VAL || kind == PK_FIELD {
+            let why = __param_fits(d, o)
+            if why.len() > 0 {
+                return "parameter ${i + 1} is sent to a {__oid_name(o)} place, but {why}\n    in: {sql}"
+            }
+        }
+    }
+    let persist_oids: [int] = oids
+    store64(site + SITE_OIDS, __cast(persist_oids))
+    store64(site + SITE_FALLBACK, __cast(types))
+    let shape = load64(site + SITE_SHAPE)
+    let d = load64(site + SITE_DESC)
+    var names: [str] = []
+    for col in desc.cols {
+        names.push(col.name)
+    }
+    if shape == SH_COUNT {
+        if desc.cols.len() > 0 {
+            return "sql needs to know the result type: the query returns {names.join(", ")}\n    fix: let row: Row = sql ... (one row), Row? (maybe none) or [Row] (all rows), with type Row \{ {__db_suggest(desc)} }"
+        }
+        return ""
+    }
+    if desc.cols.len() == 0 {
+        // let n: int = sql "UPDATE ..." — число строк
+        if load64(d) == D_INT && shape == SH_ONE {
+            store64(site + SITE_COUNT, 1)
+            return ""
+        }
+        return "the query returns no rows, but a {__desc_name(d)} is expected: add RETURNING ..., or drop the type to get the number of changed rows"
+    }
+    var dd = d
+    if load64(d) == D_OPT {
+        dd = load64(d + 8)
+    }
+    let is_struct = load64(dd) == D_STRUCT && !(desc.cols.len() == 1 && __oid_json(desc.cols[0].ty))
+    var plan: [int] = []
+    if !is_struct {
+        if desc.cols.len() != 1 {
+            return "{__desc_name(d)} takes one column, but the query returns {desc.cols.len()}: {names.join(", ")}"
+        }
+        let col = desc.cols[0]
+        let cv = __db_conv(d, col.ty)
+        if cv == 0 {
+            return "column {col.name} is {__oid_name(col.ty)}, but {__desc_name(d)} is expected; {__db_conv_hint(d, col.ty)}"
+        }
+        plan.push(0)
+        plan.push(cv)
+        store64(site + SITE_SCALAR, 1)
+    } else {
+        let n = load64(dd + 8)
+        let tname: str = __cast(load64(dd + 16))
+        for fi in 0..n {
+            let f = __field(dd, fi)
+            let fname: str = __cast(load64(f))
+            let fd = __field_desc(dd, fi)
+            var ci = -1
+            for j, col in desc.cols {
+                if ci < 0 && col.name == fname {
+                    ci = j
+                }
+            }
+            if ci < 0 {
+                for j, col in desc.cols {
+                    if ci < 0 && col.name.lower() == fname.lower() {
+                        ci = j
+                    }
+                }
+            }
+            if ci < 0 {
+                if load64(f + 24) == 0 && load64(fd) != D_OPT {
+                    return "{tname}.{fname} has no column: the query returns {names.join(", ")}\n    fix: select it (or rename a column with AS {fname}), or give the field a default"
+                }
+                plan.push(-1)
+                plan.push(0)
+                continue
+            }
+            let col = desc.cols[ci]
+            let cv = __db_conv(fd, col.ty)
+            if cv == 0 {
+                return "{tname}.{fname} is {__desc_name(fd)}, but column {col.name} is {__oid_name(col.ty)}; {__db_conv_hint(fd, col.ty)}"
+            }
+            if col.table != 0 && load64(fd) != D_OPT {
+                if !(notnull["{col.table}:{col.attnum}"] ?? true) {
+                    return "{tname}.{fname} is {__desc_name(fd)}, but column {col.name} can be NULL\n    fix: make the field {__desc_name(fd)}?, add NOT NULL to the column, or select coalesce({col.name}, ...) AS {fname}"
+                }
+            }
+            plan.push(ci)
+            plan.push(cv)
+        }
+    }
+    store64(site + SITE_PLAN, __cast(plan))
+    return ""
+}
+
+// Поля типа для подсказки: «id: int, owner: str».
+fn __db_suggest(desc: __PgDesc) -> str {
+    var parts: [str] = []
+    for col in desc.cols {
+        parts.push(col.name + ": " + __kh_for_oid(col.ty))
+    }
+    return parts.join(", ")
+}
+
+// Ошибка PostgreSQL с подсказкой и местом в тексте запроса.
+fn __db_sql_error(sql: str, e: __PgErr) -> str {
+    var msg = "{e.message} [{e.code}]"
+    if e.hint.len() > 0 {
+        msg = msg + "\n    hint: " + e.hint
+    }
+    msg = msg + "\n    in: " + sql.replace("\n", " ")
+    if e.position > 0 && e.position <= sql.len() {
+        let pad = buf_new(e.position + 8)
+        for i in 0..e.position + 7 {
+            buf_byte(pad, ' ')
+        }
+        msg = msg + "\n" + buf_str(pad) + "^"
+    }
+    return msg
+}
+
+// NOT NULL столбцов, которые возвращают запросы: «таблица:номер» → attnotnull.
+fn __db_notnull(c: int, deadline: int) -> map[str, bool] {
+    var m: map[str, bool] = {}
+    let r = __pg_exec(c, "select attrelid::bigint, attnum::bigint, attnotnull from pg_attribute where attnum > 0 and attrelid in (select oid from pg_class where relnamespace not in (select oid from pg_namespace where nspname in ('pg_catalog', 'information_schema')))", [], deadline)
+    for i in 0..r.rows {
+        m["{__pg_int(r, 3 * i)}:{__pg_int(r, 3 * i + 1)}"] = __pg_bool(r, 3 * i + 2)
+    }
+    return m
+}
+
+// ---- Запуск ----
+
+fn __db_start() {
+    let c = __pg_startup()
+    let deadline = now_ms() + 600000
+    let root = __db_root()
+    let mt = load64(root + 8)
+    var names: [str] = []
+    var sqls: [str] = []
+    if mt != 0 {
+        for i in 0..load64(mt) {
+            let nm: str = __cast(load64(mt + 8 + 16 * i))
+            let sq: str = __cast(load64(mt + 16 + 16 * i))
+            names.push(nm)
+            sqls.push(sq)
+        }
+    }
+    if names.len() > 0 && (env("DATABASE_MIGRATE") ?? "1") != "0" {
+        let log = buf_new(64)
+        let err = __pg_migrate(c, names, sqls, log)
+        for line in buf_str(log).split("\n") {
+            if line.len() > 0 {
+                eprint("khrip: " + line.replace("applied ", "applied migration "))
+            }
+        }
+        if err.len() > 0 {
+            eprint("khrip: migration failed: " + err)
+            exit(1)
+        }
+    }
+    // каждое место sql — против настоящей базы
+    let st = load64(root)
+    var bad = 0
+    if st != 0 {
+        let notnull = __db_notnull(c, deadline)
+        for i in 0..load64(st) {
+            let site = load64(st + 8 + 8 * i)
+            let err = __db_check(c, site, notnull, deadline)
+            if err.len() > 0 {
+                let loc: str = __cast(load64(site + SITE_LOC))
+                eprint("{loc}: error: {err}")
+                bad += 1
+            }
+        }
+    }
+    if bad > 0 {
+        eprint("khrip: {bad} sql statement(s) do not match the database")
+        exit(1)
+    }
+    __pg_free(c)
+}
+
+// ---- Выполнение ----
+
+// Ошибка базы → завершить запрос статусом (или паника вне запроса).
+fn __db_fail(site: int, e: __PgErr) {
+    let loc: str = __cast(load64(site + SITE_LOC))
+    let code = e.code
+    var status = 500
+    var msg = "internal error"
+    if code == "23505" || code == "23P01" {
+        status = 409
+        msg = e.detail
+        if msg.len() == 0 {
+            msg = e.message
+        }
+    } else if code == "23503" {
+        let target: str = __cast(load64(site + SITE_TARGET))
+        if e.table == target {
+            status = 404
+        } else {
+            status = 409
+        }
+        msg = e.detail
+        if msg.len() == 0 {
+            msg = e.message
+        }
+    } else if code == "23502" || code == "23514" || code.starts_with("22") {
+        status = 400
+        msg = e.message
+    } else if code == "57014" || code.starts_with("08") || code.starts_with("53") || code.starts_with("57P") || code == "40001" || code == "40P01" {
+        status = 503
+        msg = "database unavailable: " + e.message
+    }
+    if status == 500 || status == 503 {
+        eprint("{loc}: sql failed [{code}] {e.message}")
+    }
+    if load64(__ctx() + CTX_WORKER) != 0 {
+        let w = __w()
+        if w.cur != 0 {
+            if status == 503 {
+                set_header("Retry-After", "1")
+            }
+            fail(status, msg)
+        }
+    }
+    __panic_msg("{loc}: sql failed [{code}] {e.message}")
+}
+
+fn __db_unavailable(site: int, why: str) {
+    let e = __PgErr { code: "08006", message: why }
+    __db_fail(site, e)
+}
+
+// Выполнить место sql: значения параметров на стеке, результат — слово Khrip.
+fn __db_run(site: int, vals: int) -> int {
+    let cx = __ctx()
+    let deadline = now_ms() + __db_timeout()
+    let params = __db_params(site, vals)
+    let sql: str = __cast(load64(site + SITE_SQL))
+    let types: [int] = __cast(load64(site + SITE_FALLBACK))
+    var attempt = 0
+    var res = __PgRes { cols: 0, rows: 0, data: buf_new(16), at: [], affected: 0, err: __PgErr {} }
+    while true {
+        attempt += 1
+        let held = load64(cx + CTX_PGHELD)
+        var c = held
+        if c == 0 {
+            let pc = __pg_acquire(__pg_url, deadline)
+            if pc.c == 0 {
+                __db_unavailable(site, pc.err)
+            }
+            c = pc.c
+        }
+        res = __pg_query(c, sql, params, types, [], deadline)
+        if held == 0 {
+            __pg_release(c)
+        }
+        if res.err.code.len() == 0 {
+            break
+        }
+        if __pg_retryable(res.err) || (held != 0 && res.err.code == "55P03") {
+            if held != 0 {
+                // конфликт в транзакции: она повторяется целиком
+                __db_tx_retry(res.err)
+            } else if now_ms() < deadline {
+                // одиночный запрос (взаимоблокировка) — повторить его
+                __pg_backoff(attempt)
+                continue
+            }
+        }
+        __db_fail(site, res.err)
+    }
+    let shape = load64(site + SITE_SHAPE)
+    if shape == SH_COUNT || load64(site + SITE_COUNT) != 0 {
+        return res.affected
+    }
+    if shape == SH_LIST {
+        let d = load64(site + SITE_DESC)
+        if load64(d) == D_BOOL {
+            var bs: [bool] = []
+            for i in 0..res.rows {
+                bs.push(__db_row(site, res, i) != 0)
+            }
+            return __cast(bs)
+        }
+        var xs: [int] = []
+        for i in 0..res.rows {
+            xs.push(__db_row(site, res, i))
+        }
+        return __cast(xs)
+    }
+    if res.rows == 0 {
+        if shape == SH_OPT {
+            return 0
+        }
+        // T без строки: 404, как fail(404)
+        if load64(cx + CTX_WORKER) != 0 && __w().cur != 0 {
+            fail(404, "not found")
+        }
+        let loc: str = __cast(load64(site + SITE_LOC))
+        __panic_msg("{loc}: the query returned no row")
+    }
+    let v = __db_row(site, res, 0)
+    if shape == SH_OPT {
+        let d = load64(site + SITE_DESC)
+        if __is_scalar(d) {
+            let b = __alloc(8)
+            store64(b, v)
+            return b
+        }
+    }
+    return v
+}
+
+// ---- tx { } ----
+// Блок держит одно соединение (CTX_PGHELD) от начала до конца. BEGIN уходит с
+// первым запросом. Конфликт (40001, 40P01) в любом запросе или в COMMIT:
+// откат, случайная пауза, и блок выполняется снова с начала (longjmp в точку,
+// которую запомнил компилятор), пока не выйдет DATABASE_TIMEOUT — тогда 503.
+
+// Начало блока id → буфер повтора (0 — блок вложен и присоединяется к внешнему).
+fn __db_tx_begin(id: int) -> int {
+    let cx = __ctx()
+    if load64(cx + CTX_PGHELD) != 0 {
+        return 0
+    }
+    let deadline = now_ms() + __db_timeout()
+    let pc = __pg_acquire(__pg_url, deadline)
+    if pc.c == 0 {
+        __db_tx_unavailable(pc.err)
+    }
+    let c = pc.c
+    store64(cx + CTX_PGHELD, c)
+    __pg_tx_begin(c, PG_SERIALIZABLE | PG_SHORT_LOCKS)
+    let jb = __alloc(64)
+    store64(c + PB_TXJB, jb)
+    store64(c + PB_TXTRY, 0)
+    store64(c + PB_TXDL, deadline)
+    var hl = 0
+    if load64(cx + CTX_WORKER) != 0 && __w().cur != 0 {
+        hl = __w().extra.len
+    }
+    store64(c + PB_TXHDR, hl)
+    store64(c + PB_TXID, id)
+    return jb
+}
+
+fn __db_tx_unavailable(why: str) {
+    if load64(__ctx() + CTX_WORKER) != 0 && __w().cur != 0 {
+        set_header("Retry-After", "1")
+        fail(503, "database unavailable: " + why)
+    }
+    __panic_msg("database unavailable: " + why)
+}
+
+// Освободить соединение блока (и очередь повторов, если блок в ней стоял).
+fn __db_tx_release(c: int) {
+    store64(__ctx() + CTX_PGHELD, 0)
+    store64(c + PB_TXJB, 0)
+    if load64(c + PB_BROKEN) == 0 {
+        __pg_unlock_tx(c)
+    }
+    __pg_release(c)
+}
+
+// Конец блока: COMMIT (jb == 0 — блок вложен, фиксирует внешний).
+fn __db_tx_commit(jb: int) {
+    if jb == 0 {
+        return
+    }
+    let c = load64(__ctx() + CTX_PGHELD)
+    if c == 0 {
+        return
+    }
+    let e = __pg_tx_end(c, true, load64(c + PB_TXDL))
+    if e.code.len() > 0 {
+        if __pg_retryable(e) || e.code == "55P03" {
+            __db_tx_retry(e)
+        }
+        __db_tx_release(c)
+        __db_tx_error(e)
+    }
+    __db_tx_release(c)
+}
+
+// Ответ из блока: статус меньше 400 — COMMIT, иначе ROLLBACK.
+fn __db_tx_status(status: int) {
+    let c = load64(__ctx() + CTX_PGHELD)
+    if c == 0 {
+        return
+    }
+    if status < 400 {
+        __db_tx_commit(load64(c + PB_TXJB))
+        return
+    }
+    __pg_tx_end(c, false, load64(c + PB_TXDL))
+    __db_tx_release(c)
+}
+
+fn __db_tx_error(e: __PgErr) {
+    eprint("tx failed [{e.code}] {e.message}")
+    if load64(__ctx() + CTX_WORKER) != 0 && __w().cur != 0 {
+        if e.code.starts_with("40") || e.code.starts_with("08") || e.code == "57014" {
+            set_header("Retry-After", "1")
+            fail(503, "database busy, try again")
+        }
+        fail(500, "internal error")
+    }
+    __panic_msg("tx failed [{e.code}] {e.message}")
+}
+
+// Конфликт внутри блока: откатить и выполнить блок снова.
+fn __db_tx_retry(e: __PgErr) {
+    let cx = __ctx()
+    let c = load64(cx + CTX_PGHELD)
+    let jb = load64(c + PB_TXJB)
+    let n = load64(c + PB_TXTRY) + 1
+    store64(c + PB_TXTRY, n)
+    if load64(c + PB_TX) != 'I' && load64(c + PB_BROKEN) == 0 {
+        __pg_simple(c, "rollback", load64(c + PB_TXDL))
+    }
+    if jb == 0 || now_ms() >= load64(c + PB_TXDL) || load64(c + PB_BROKEN) != 0 {
+        __db_tx_release(c)
+        __db_tx_error(e)
+    }
+    // Очередь повторов: проигравший конфликт блок ждёт своей очереди на
+    // сессионной advisory-блокировке своего места (во всех копиях сервера), а не
+    // бьётся снова вслепую. BEGIN — после блокировки: снимок уже свежий.
+    if load64(c + PB_TXLOCK) == 0 {
+        let key = 0x4B48520000000000 + load64(c + PB_TXID)
+        let le = __pg_simple(c, "select pg_advisory_lock({key})", load64(c + PB_TXDL))
+        if le.code.len() > 0 {
+            __db_tx_release(c)
+            __db_tx_error(le)
+        }
+        store64(c + PB_TXLOCK, key)
+    } else {
+        __pg_backoff(n)
+    }
+    // заголовки неудачной попытки не уходят в ответ
+    if load64(cx + CTX_WORKER) != 0 && __w().cur != 0 {
+        let w = __w()
+        w.extra.len = load64(c + PB_TXHDR)
+    }
+    __pg_tx_begin(c, PG_SERIALIZABLE)
+    __longjmp(jb)
+}

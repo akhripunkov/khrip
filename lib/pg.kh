@@ -25,6 +25,14 @@ const PB_PORT = 96
 // отложенный BEGIN (уровень изоляции | PG_READ_ONLY): уходит вместе с первым
 // запросом транзакции, а транзакция без запросов не стоит обращения к базе
 const PB_BEGIN = 104
+// блок tx { } (lib/db.kh): буфер повтора, номер попытки, срок, длина заголовков
+const PB_TXJB = 112
+const PB_TXTRY = 120
+const PB_TXDL = 128
+const PB_TXHDR = 136
+// номер блока tx и ключ сессионной advisory-блокировки очереди повторов (0 — нет)
+const PB_TXID = 144
+const PB_TXLOCK = 152
 // подготовленные запросы: SHA-256 текста (32 байта) и номер — по 40 байт
 const PB_STMT = 256
 const PG_STMTS = 200
@@ -598,6 +606,9 @@ const PG_SERIALIZABLE = 1
 const PG_REPEATABLE_READ = 2
 const PG_READ_COMMITTED = 3
 const PG_READ_ONLY = 8
+// первая попытка блока tx: чужую блокировку строки ждать не дольше 100 мс
+// (взаимоблокировку PostgreSQL замечает только через секунду), дальше — очередь
+const PG_SHORT_LOCKS = 16
 
 fn __pg_begin_sql(mode: int) -> str {
     let lvl = mode & 7
@@ -860,6 +871,9 @@ fn __pg_query(c: int, sql: str, params: [str?], types: [int], fallback: [int], d
     if begin != 0 {
         store64(c + PB_BEGIN, 0)
         __pg_put_plain(b, __pg_begin_sql(begin))
+        if begin & PG_SHORT_LOCKS != 0 {
+            __pg_put_plain(b, "set local lock_timeout = 100")
+        }
     }
     if fresh {
         let n = load64(c + PB_NSTMT)
@@ -913,6 +927,9 @@ fn __pg_query(c: int, sql: str, params: [str?], types: [int], fallback: [int], d
     var want = 1
     if begin != 0 {
         want = 2
+        if begin & PG_SHORT_LOCKS != 0 {
+            want = 3
+        }
     }
     while true {
         let m = __pg_read(c, deadline) else {
@@ -1052,12 +1069,20 @@ type __PgDesc {
 }
 
 fn __pg_describe(c: int, sql: str, deadline: int) -> __PgDesc {
+    return __pg_describe_typed(c, sql, [], deadline)
+}
+
+// То же с типами параметров (OID; 0 — выводит сервер).
+fn __pg_describe_typed(c: int, sql: str, types: [int], deadline: int) -> __PgDesc {
     let d = __PgDesc { params: [], cols: [], nodata: false, err: __PgErr {} }
     let b = buf_new(64 + sql.len())
     let at = __pg_begin(b, 'P')
     __wr_cstr(b, "")
     __wr_cstr(b, sql)
-    __wr_u16(b, 0)
+    __wr_u16(b, types.len())
+    for t in types {
+        __wr_u32(b, t)
+    }
     __pg_end(b, at)
     let dat = __pg_begin(b, 'D')
     buf_byte(b, 'S')
@@ -1147,11 +1172,25 @@ fn __pg_request_end() {
     store64(cx + CTX_PGHELD, 0)
     if load64(c + PB_BROKEN) == 0 && load64(c + PB_IN + 8) == 0 {
         __pg_tx_end(c, false, now_ms() + 5000)
+        __pg_unlock_tx(c)
     }
     if load64(c + PB_TX) != 'I' {
         store64(c + PB_BROKEN, 1)
     }
     __pg_release(c)
+}
+
+// Снять advisory-блокировку очереди повторов, если соединение её держит.
+fn __pg_unlock_tx(c: int) {
+    let key = load64(c + PB_TXLOCK)
+    if key == 0 {
+        return
+    }
+    store64(c + PB_TXLOCK, 0)
+    let e = __pg_simple(c, "select pg_advisory_unlock({key})", now_ms() + 5000)
+    if e.code.len() > 0 {
+        store64(c + PB_BROKEN, 1)
+    }
 }
 
 fn __pg_retryable(e: __PgErr) -> bool {

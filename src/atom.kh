@@ -75,6 +75,9 @@ fn parse_atom() -> int {
     if k == T_IF {
         return parse_if_expr(w)
     }
+    if k == T_SQL {
+        return parse_sql(w)
+    }
     var hint = ""
     if k == T_FN {
         hint = "lambdas are written x => expression and work in map, filter, find, any, all, count, sort_by; otherwise declare a named fn"
@@ -925,6 +928,30 @@ fn builtin_args(n: int, at: Token, name: str) -> int {
 }
 
 // Встроенные функции. → тип или -1, если это не встроенная.
+// setjmp по буферу в rax: rip, rsp, rbp, rbx, r12–r15; повторный возврат — с 1.
+fn emit_setjmp_rax() {
+    emit8(0x48)
+    emit8(0x8D)
+    emit8(0x0D)
+    let lea = emit_hole()
+    emit_store(RAX, 0, RCX)
+    emit_store(RAX, 8, RSP)
+    emit_store(RAX, 16, RBP)
+    emit_store(RAX, 24, RBX)
+    emit_store(RAX, 32, R12)
+    emit_store(RAX, 40, R13)
+    emit_store(RAX, 48, R14)
+    emit_store(RAX, 56, R15)
+    emit8(0x31)
+    emit8(0xC0)
+    emit8(0xEB)
+    emit8(0x05)
+    patch_rel(lea, code_len)
+    emit8(0xB8)
+    emit32(1)
+    barrier = code_len
+}
+
 fn parse_builtin(t: Token, w: int) -> int {
     let name = t.text
     if name == "load8" || name == "load32" || name == "load64" {
@@ -1005,6 +1032,13 @@ fn parse_builtin(t: Token, w: int) -> int {
         }
         return w
     }
+    if name == "__db_root" && files[t.file].is_lib {
+        // корень таблиц мест sql и миграций (src/sql.kh)
+        advance()
+        expect_tok(')')
+        emit_mov_imm(RAX, sql_root())
+        return ty_int
+    }
     if name == "__to_str" {
         advance()
         let a = tok()
@@ -1055,30 +1089,10 @@ fn parse_builtin(t: Token, w: int) -> int {
         return -1
     }
     if name == "__setjmp" {
-        // буфер: rip, rsp, rbp, rbx, r12–r15; повторный возврат — с 1
         advance()
         builtin_args(1, t, name)
         emit_pop(RAX)
-        emit8(0x48)
-        emit8(0x8D)
-        emit8(0x0D)
-        let lea = emit_hole()
-        emit_store(RAX, 0, RCX)
-        emit_store(RAX, 8, RSP)
-        emit_store(RAX, 16, RBP)
-        emit_store(RAX, 24, RBX)
-        emit_store(RAX, 32, R12)
-        emit_store(RAX, 40, R13)
-        emit_store(RAX, 48, R14)
-        emit_store(RAX, 56, R15)
-        emit8(0x31)
-        emit8(0xC0)
-        emit8(0xEB)
-        emit8(0x05)
-        patch_rel(lea, code_len)
-        emit8(0xB8)
-        emit32(1)
-        barrier = code_len
+        emit_setjmp_rax()
         return ty_int
     }
     if name == "__longjmp" {
@@ -1400,6 +1414,9 @@ fn parse_builtin(t: Token, w: int) -> int {
 }
 
 fn parse_call(t: Token, w: int) -> int {
+    if tx_depth > 0 && (t.text == "fetch" || t.text == "sleep") && !files[t.file].is_lib {
+        error_tok(t, t.text + " inside tx runs again on every retry and holds a database connection", "call it before or after the tx block")
+    }
     let bt = parse_builtin(t, w)
     if bt >= 0 {
         last_was_call = true

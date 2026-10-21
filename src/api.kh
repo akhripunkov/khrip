@@ -86,16 +86,17 @@ fn api_lib_files() -> [str] {
     names.push("x509.kh")
     names.push("tls.kh")
     names.push("pg.kh")
+    names.push("db.kh")
     return names
 }
 
 // Нужна ли программе библиотека API: есть route, test, store или JSON.
 fn uses_api() -> bool {
     for t in toks {
-        if t.kind == T_ROUTE || t.kind == T_TEST || t.kind == T_STORE {
+        if t.kind == T_ROUTE || t.kind == T_TEST || t.kind == T_STORE || t.kind == T_SQL {
             return true
         }
-        if t.kind == T_IDENT && (t.text == "to_json" || t.text == "from_json" || t.text == "fetch" || t.text == "every" || t.text.starts_with("__pg_")) {
+        if t.kind == T_IDENT && (t.text == "to_json" || t.text == "from_json" || t.text == "fetch" || t.text == "every" || t.text == "migration" || t.text.starts_with("__pg_")) {
             return true
         }
     }
@@ -658,6 +659,7 @@ fn find_variant(r: Route, status: int) -> int {
 
 // Значение типа t в rax → ответ со статусом и выход из маршрута.
 fn emit_reply(status: int, t: int) {
+    tx_reply(status)
     emit_mov_rr(RSI, RAX)
     emit_mov_imm(RDI, status)
     emit_mov_imm(RDX, type_desc(t))
@@ -665,7 +667,19 @@ fn emit_reply(status: int, t: int) {
     ret_holes.push(emit_jmp())
 }
 
+// Ответ из блока tx: статус до 400 фиксирует транзакцию, от 400 — откатывает.
+fn tx_reply(status: int) {
+    if tx_depth == 0 {
+        return
+    }
+    emit_push(RAX)
+    emit_mov_imm(RDI, status)
+    emit_call(rt_func("__db_tx_status"))
+    emit_pop(RAX)
+}
+
 fn emit_reply_status(status: int) {
+    tx_reply(status)
     emit_mov_imm(RDI, status)
     emit_call(rt_func("__reply_status"))
     ret_holes.push(emit_jmp())
@@ -689,7 +703,7 @@ fn starts_value(i: int) -> bool {
         return false
     }
     let k = kind_at(i)
-    return k == T_IDENT || k == T_STR || k == T_INT || k == '[' || k == '(' || k == T_TRUE || k == T_FALSE || k == T_NONE || k == '!'
+    return k == T_IDENT || k == T_STR || k == T_INT || k == '[' || k == '(' || k == T_TRUE || k == T_FALSE || k == T_NONE || k == '!' || k == T_SQL
 }
 
 fn route_return(at: Token, has_value: bool) {
@@ -746,6 +760,22 @@ fn route_return(at: Token, has_value: bool) {
     var w = ty_err
     if ntyped == 1 {
         w = r.variants[only].ty
+    } else {
+        // несколько типов: ожидается тип единственного успешного (2xx) варианта
+        var ok = -1
+        var nok = 0
+        i = 0
+        while i < r.variants.len() {
+            let v = r.variants[i]
+            if v.ty >= 0 && v.status >= 200 && v.status < 300 {
+                ok = i
+                nok += 1
+            }
+            i += 1
+        }
+        if nok == 1 {
+            w = r.variants[ok].ty
+        }
     }
     let vtok = tok()
     route_qq = true
@@ -1359,8 +1389,18 @@ fn gen_json_float(b: Buf) {
     }
 }
 
+// Хуки базы данных: в программе без sql они пустые (и lib/pg.kh не попадает в бинарник).
+fn gen_db(b: Buf) {
+    if uses_db {
+        buf_add(b, "fn __db_init() \{\n    __db_start()\n}\n\nfn __db_end() \{\n    __pg_request_end()\n}\n\n")
+    } else {
+        buf_add(b, "fn __db_init() \{\n}\n\nfn __db_end() \{\n}\n\n")
+    }
+}
+
 fn gen_api_source() -> str {
     let b = buf_new(4096)
+    gen_db(b)
     gen_json_float(b)
     gen_dispatch(b)
     gen_tests(b)

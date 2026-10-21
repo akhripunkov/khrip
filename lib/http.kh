@@ -1033,6 +1033,7 @@ fn __run_task(w: __Worker, i: int) {
         eprint(msg)
     }
     store64(c + CTX_CATCH, 0)
+    __db_end()
     __store_unlock()
     __arena_end()
 }
@@ -1094,6 +1095,7 @@ fn __run_timers() {
     __store_unlock()
     __load_store()
     __store_saved = __store_touches
+    __db_init()
     __block_signals()
     eprint("khrip: running {__every_count()} background task(s)")
     __timer_loop()
@@ -1110,6 +1112,7 @@ fn __serve() {
     __store_unlock()
     __load_store()
     __store_saved = __store_touches
+    __db_init()
     __read_cpus()
     var n = __env_int("THREADS", __cpus.len())
     if n < 1 {

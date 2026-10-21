@@ -1281,6 +1281,7 @@ fn __serve_one(w: __Worker, req: __Req) {
         }
     }
     store64(c + CTX_CATCH, prev)
+    __db_end()
     __store_unlock()
     store64(c + CTX_STORE_MODE, 0)
     w.cur = 0
@@ -1299,6 +1300,7 @@ fn __tests_init() {
     __arena_init()
     let w = __worker_init()
     w.testing = true
+    __db_init()
 }
 
 fn __test_begin(name: str, jb: int) {
@@ -1323,6 +1325,7 @@ fn __test_end(name: str) {
         __test_fail(msg)
     }
     store64(c + CTX_CATCH, 0)
+    __db_end()
     __store_unlock()
     if __test_bad {
         __tests_failed += 1
