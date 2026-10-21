@@ -606,8 +606,10 @@ fn lex_sql(start: int, end: int) {
     lx_p += 1
     let lit = SqlLit { segs: [], quoted: [], lines: [lx_line], cols: [lx_p - lx_line_start + 1] }
     let b = buf_new(64)
-    // состояние SQL: 0 — код, 1 — '...', 2 — "имя", 3 — -- комментарий, 4 — /* */
+    // состояние SQL: 0 — код, 1 — '...', 2 — "имя", 3 — -- комментарий, 4 — /* */,
+    // 5 — E'...' (с \-экранированием), 6 — $тег$...$тег$; параметры — только в 0 и 1
     var st = 0
+    var dtag = ""
     // номер занят сразу: в параметре может встретиться свой sql "..."
     let li = sqllits.len()
     sqllits.push(lit)
@@ -632,9 +634,15 @@ fn lex_sql(start: int, end: int) {
             }
             continue
         }
+        if c == '\{' && (st == 5 || st == 6) {
+            let close = interp_end(lx_p + 1, end)
+            if close > lx_p + 1 && !is_quantifier(lx_p + 1, close) && !sql_array_literal(lx_p + 1, close) {
+                lex_error("\{...} inside E'...' or $$...$$ is plain text, not a parameter", lx_p)
+            }
+        }
         if c == '\{' && (st == 0 || st == 1) {
             let close = interp_end(lx_p + 1, end)
-            if close == lx_p + 1 || (close > 0 && is_quantifier(lx_p + 1, close)) {
+            if close == lx_p + 1 || (close > 0 && is_quantifier(lx_p + 1, close)) || (close > 0 && st == 1 && sql_array_literal(lx_p + 1, close)) {
                 // {} и {3,5} — текст
                 while lx_p <= close {
                     buf_byte(b, lx_text[lx_p])
@@ -670,8 +678,29 @@ fn lex_sql(start: int, end: int) {
         let nx = lx_p < end && lx_text[lx_p] == '-'
         // состояние SQL по символу
         if st == 0 {
+            let prev = b.len
             if ch == '\'' {
                 st = 1
+                // E'...': обратная косая черта экранирует кавычку
+                if prev > 0 && (load8(b.data + prev - 1) == 'e' || load8(b.data + prev - 1) == 'E') && (prev == 1 || !is_ident_char(load8(b.data + prev - 2))) {
+                    st = 5
+                }
+            } else if ch == '$' && (prev == 0 || !is_ident_char(load8(b.data + prev - 1))) && lx_p < end && !is_digit(lx_text[lx_p]) {
+                // $тег$ ... $тег$
+                var j = lx_p
+                while j < end && is_ident_char(lx_text[j]) {
+                    j += 1
+                }
+                if j < end && lx_text[j] == '$' {
+                    dtag = "$" + lx_text[lx_p..j + 1]
+                    st = 6
+                    buf_byte(b, ch)
+                    while lx_p <= j {
+                        buf_byte(b, lx_text[lx_p])
+                        lx_p += 1
+                    }
+                    continue
+                }
             } else if ch == '"' {
                 st = 2
             } else if ch == '-' && nx {
@@ -682,6 +711,26 @@ fn lex_sql(start: int, end: int) {
         } else if st == 1 {
             if ch == '\'' {
                 st = 0
+            }
+        } else if st == 5 {
+            if ch == '\\' && lx_p < end {
+                buf_byte(b, ch)
+                ch = lx_text[lx_p]
+                lx_p += 1
+            } else if ch == '\'' {
+                st = 0
+            }
+        } else if st == 6 {
+            if ch == '$' && lx_p + dtag.len() - 1 <= end && "$" + lx_text[lx_p..lx_p + dtag.len() - 1] == dtag {
+                buf_byte(b, ch)
+                var k = 1
+                while k < dtag.len() {
+                    buf_byte(b, lx_text[lx_p])
+                    lx_p += 1
+                    k += 1
+                }
+                st = 0
+                continue
             }
         } else if st == 2 {
             if ch == '"' {
@@ -696,6 +745,30 @@ fn lex_sql(start: int, end: int) {
     }
     lit.segs.push(buf_str(b))
     sqllits[li] = lit
+}
+
+// {...} в строке '...' SQL с запятой на верхнем уровне — литерал массива или
+// пути jsonb ('{a,b}', '{1,2,3}'), а не выражение.
+fn sql_array_literal(from: int, to: int) -> bool {
+    var depth = 0
+    var i = from
+    while i < to {
+        let c = lx_text[i]
+        if c == '(' || c == '[' || c == '\{' {
+            depth += 1
+        } else if c == ')' || c == ']' || c == '}' {
+            depth -= 1
+        } else if c == ',' && depth == 0 {
+            return true
+        } else if c == '"' {
+            i += 1
+            while i < to && lx_text[i] != '"' {
+                i += 1
+            }
+        }
+        i += 1
+    }
+    return false
 }
 
 fn lex_range(end: int) {

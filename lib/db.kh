@@ -722,10 +722,59 @@ fn __kh_for_oid(o: int) -> str {
     return "str"
 }
 
+// Метки компилятора в тексте запроса: %%T:таблица.столбец%% — тип столбца,
+// %%D:таблица.столбец%% — его DEFAULT, для identity — nextval, иначе NULL.
+// → готовый текст или "" (тогда в __db_mark_err — почему).
+var __db_mark_err: str = ""
+
+fn __db_markers(c: int, sql: str, deadline: int) -> str {
+    if !sql.contains("%%") {
+        return sql
+    }
+    let b = buf_new(sql.len() + 64)
+    var i = 0
+    let n = sql.len()
+    while i < n {
+        if i + 3 < n && sql[i] == '%' && sql[i + 1] == '%' && (sql[i + 2] == 'T' || sql[i + 2] == 'D') && sql[i + 3] == ':' {
+            var j = i + 4
+            while j + 1 < n && !(sql[j] == '%' && sql[j + 1] == '%') {
+                j += 1
+            }
+            // имя таблицы может быть со схемой: столбец — после последней точки
+            var dot = j - 1
+            while dot > i + 4 && sql[dot] != '.' {
+                dot -= 1
+            }
+            let table = sql[i + 4..dot]
+            let col = sql[dot + 1..j]
+            let r = __pg_exec(c, "select format_type(a.atttypid, a.atttypmod), case when a.attidentity <> '' then 'nextval(' || quote_literal(pg_get_serial_sequence($1, a.attname)) || ')' else '(' || pg_get_expr(d.adbin, d.adrelid) || ')' end from pg_attribute a left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum where a.attrelid = to_regclass($1) and a.attname::text in ($2::text, lower($2::text)) and a.attnum > 0 and not a.attisdropped order by a.attname::text = $2::text desc limit 1", [table, col], deadline)
+            if r.err.code.len() > 0 || r.rows == 0 {
+                __db_mark_err = "table {table} has no column {col}"
+                return ""
+            }
+            if sql[i + 2] == 'T' {
+                buf_add(b, __pg_str(r, 0))
+            } else {
+                buf_add(b, __pg_text(r, 1) ?? "NULL")
+            }
+            i = j + 2
+            continue
+        }
+        buf_byte(b, sql[i])
+        i += 1
+    }
+    return buf_str(b)
+}
+
 // Подготовка места: Parse + Describe, типы параметров (с повтором, если сервер
 // не вывел тип), план раскладки строк. → описание ошибки или "".
 fn __db_check(c: int, site: int, notnull: map[str, bool], deadline: int) -> str {
-    let sql: str = __cast(load64(site + SITE_SQL))
+    let marked: str = __cast(load64(site + SITE_SQL))
+    let sql = __db_markers(c, marked, deadline)
+    if sql.len() == 0 {
+        return __db_mark_err + "\n    in: " + marked
+    }
+    store64(site + SITE_SQL, __cast(sql))
     let np = load64(site + SITE_NPARAMS)
     let pt = load64(site + SITE_PARAMS)
     var types: [int] = []
@@ -735,6 +784,7 @@ fn __db_check(c: int, site: int, notnull: map[str, bool], deadline: int) -> str 
         let d = load64(pt + i * 32 + 8)
         if kind == PK_ISNULL || kind == PK_GIVEN {
             types.push(OID_BOOL)
+
         } else if kind == PK_LIKE || kind == PK_TEXT {
             types.push(OID_TEXT)
         } else {

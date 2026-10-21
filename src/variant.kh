@@ -248,8 +248,11 @@ fn parse_match(as_value: bool, w: int) -> int {
     var end_holes: [int] = []
     var result = ty_never
     var all_div = true
+    let so = sql_outside
+    var s_after = so
     while kind() != '}' && kind() != T_EOF {
         panic_mode = false
+        sql_outside = so
         let arm_at = tok()
         var body_holes: [int] = []
         var wild = false
@@ -369,6 +372,7 @@ fn parse_match(as_value: bool, w: int) -> int {
                 }
                 end_holes.push(emit_jmp())
                 all_div = false
+                s_after = sql_join(s_after, sql_outside)
             }
         } else {
             var div = false
@@ -380,6 +384,7 @@ fn parse_match(as_value: bool, w: int) -> int {
             if !div {
                 end_holes.push(emit_jmp())
                 all_div = false
+                s_after = sql_join(s_after, sql_outside)
             }
         }
         nlocals = saved_n
@@ -394,6 +399,7 @@ fn parse_match(as_value: bool, w: int) -> int {
         }
     }
     expect_tok('}')
+    sql_outside = s_after
     // полнота: каждый вариант или _
     var complete = has_wild
     if !has_wild {

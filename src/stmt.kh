@@ -335,7 +335,9 @@ fn parse_let() {
         } else {
             emit_test_rax()
             let has = emit_jcc(CC_NE)
+            let so = sql_outside
             let div = parse_block()
+            sql_outside = so
             if !div {
                 error_tok(et_tok, "the else block must leave the scope", "end it with return, break or continue")
             }
@@ -1095,11 +1097,14 @@ fn parse_if() -> bool {
     for li in none_tests(cs, ce, T_ANDAND, T_NE) {
         narrowed.push(li)
     }
+    let so = sql_outside
     let d1 = parse_block()
+    let s1 = sql_branch(so, d1)
     narrow_to(nn)
     // ветка «иначе» знает, что все x == none из цепочки || ложны
     let else_narrow = none_tests(cs, ce, T_OROR, T_EQ)
     if kind() != T_ELSE {
+        sql_outside = s1
         patch_all(fl, here())
         if d1 {
             // if x == none { return }: дальше в блоке x — не none
@@ -1118,12 +1123,14 @@ fn parse_if() -> bool {
     for li in else_narrow {
         narrowed.push(li)
     }
+    sql_outside = so
     var d2 = false
     if kind() == T_IF {
         d2 = parse_if()
     } else {
         d2 = parse_block()
     }
+    sql_outside = sql_join(s1, sql_branch(so, d2))
     narrow_to(nn)
     if end >= 0 {
         patch_here(end)
@@ -1159,12 +1166,16 @@ fn parse_if_let() -> bool {
     let saved_n = nlocals
     let li = declare_local(name.text, inner, false)
     emit_store_local(li)
+    let so = sql_outside
     let d1 = parse_block()
+    let s1 = sql_branch(so, d1)
     nlocals = saved_n
+    sql_outside = s1
     if kind() != T_ELSE {
         patch_here(none_at)
         return false
     }
+    sql_outside = so
     advance()
     var end = -1
     if !d1 {
@@ -1177,6 +1188,7 @@ fn parse_if_let() -> bool {
     } else {
         d2 = parse_block()
     }
+    sql_outside = sql_join(s1, sql_branch(so, d2))
     if end >= 0 {
         patch_here(end)
     }

@@ -1,9 +1,11 @@
 khrip: applied migration 1
 khrip: applied migration 2
+khrip: applied migration 3
 ok    create, read, 404
 ok    errors become statuses
 ok    merge patch
 ok    filters
 ok    tx rolls back on 409
 ok    scalars
-6 tests: 6 passed, 0 failed
+ok    insert takes column types and defaults
+7 tests: 7 passed, 0 failed

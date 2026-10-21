@@ -43,8 +43,24 @@ type Migration {
     tok: int
 }
 
-// запросы маршрута вне tx: сколько уже было (запись после них — гонка)
+// запросы маршрута вне tx: сколько уже было (запись после них — гонка);
+// по веткам — наибольшее из путей, которые доходят до следующего оператора
 var sql_outside: int
+
+// После ветки: если она ушла (return, break…), её запросы дальше не предшествуют.
+fn sql_branch(before: int, div: bool) -> int {
+    if div {
+        return before
+    }
+    return sql_outside
+}
+
+fn sql_join(a: int, b: int) -> int {
+    if a > b {
+        return a
+    }
+    return b
+}
 var sql_root_used: bool
 var sql_root_off: int
 var sql_sites: [int]
@@ -340,57 +356,203 @@ fn sql_starts_words(s: str, ws: [str]) -> int {
     return p
 }
 
-// Начало открытой строки '...' в конце s (s кончается внутри неё) или -1.
-fn sql_open_quote(s: str) -> int {
-    var open = -1
+// ---- Сканер текста SQL ----
+// Состояние каждого символа: 0 — код, 1 — '...', 2 — "имя", 3 — -- комментарий,
+// 4 — /* */, 5 — E'...' (с \-экранированием), 6 — $тег$...$тег$. Последний
+// элемент — состояние после текста. Один сканер на всё: поиск слов, кавычек,
+// таблиц и ошибок привычек видит одно и то же.
+fn sql_states(s: str) -> [int] {
+    var out: [int] = []
     var st = 0
+    var tag = ""
     var i = 0
-    while i < s.len() {
+    let n = s.len()
+    while i < n {
         let c = s[i]
         if st == 0 {
             if c == '\'' {
                 st = 1
-                open = i
-            } else if c == '"' {
-                st = 2
-            } else if c == '-' && i + 1 < s.len() && s[i + 1] == '-' {
-                st = 3
-            } else if c == '/' && i + 1 < s.len() && s[i + 1] == '*' {
-                st = 4
+                if i > 0 && (s[i - 1] == 'e' || s[i - 1] == 'E') && (i == 1 || !is_ident_char(s[i - 2])) {
+                    st = 5
+                }
+                out.push(st)
+                i += 1
+                continue
             }
-        } else if st == 1 {
+            if c == '"' {
+                st = 2
+            } else if c == '-' && i + 1 < n && s[i + 1] == '-' {
+                st = 3
+            } else if c == '/' && i + 1 < n && s[i + 1] == '*' {
+                st = 4
+                out.push(4)
+                out.push(4)
+                i += 2
+                continue
+            } else if c == '$' && (i == 0 || !is_ident_char(s[i - 1])) && i + 1 < n && !is_digit(s[i + 1]) {
+                var j = i + 1
+                while j < n && is_ident_char(s[j]) {
+                    j += 1
+                }
+                if j < n && s[j] == '$' {
+                    tag = s[i..j + 1]
+                    while i <= j {
+                        out.push(6)
+                        i += 1
+                    }
+                    st = 6
+                    continue
+                }
+            }
+            out.push(st)
+            i += 1
+            continue
+        }
+        if st == 1 || st == 5 {
+            out.push(st)
+            if c == '\\' && st == 5 && i + 1 < n {
+                out.push(st)
+                i += 2
+                continue
+            }
             if c == '\'' {
+                if i + 1 < n && s[i + 1] == '\'' {
+                    out.push(st)
+                    i += 2
+                    continue
+                }
                 st = 0
             }
-        } else if st == 2 {
+            i += 1
+            continue
+        }
+        if st == 2 {
+            out.push(2)
             if c == '"' {
                 st = 0
             }
-        } else if st == 3 {
+            i += 1
+            continue
+        }
+        if st == 3 {
+            out.push(3)
             if c == '\n' {
                 st = 0
             }
-        } else if c == '*' && i + 1 < s.len() && s[i + 1] == '/' {
-            st = 0
             i += 1
+            continue
+        }
+        if st == 4 {
+            out.push(4)
+            if c == '*' && i + 1 < n && s[i + 1] == '/' {
+                out.push(4)
+                i += 2
+                st = 0
+                continue
+            }
+            i += 1
+            continue
+        }
+        // $тег$ ... $тег$
+        if c == '$' && i + tag.len() <= n && s[i..i + tag.len()] == tag {
+            for k in 0..tag.len() {
+                out.push(6)
+            }
+            i += tag.len()
+            st = 0
+            continue
+        }
+        out.push(6)
+        i += 1
+    }
+    out.push(st)
+    return out
+}
+
+type SqlWord {
+    w: str
+    at: int
+    depth: int
+}
+
+// Слова кода (в нижнем регистре) с глубиной скобок — без строк, имён в кавычках и комментариев.
+fn sql_code_words(s: str) -> [SqlWord] {
+    let st = sql_states(s)
+    var out: [SqlWord] = []
+    var depth = 0
+    var i = 0
+    let n = s.len()
+    while i < n {
+        if st[i] != 0 {
+            i += 1
+            continue
+        }
+        let c = s[i]
+        if c == '(' {
+            depth += 1
+        } else if c == ')' {
+            depth -= 1
+        } else if is_alpha(c) && (i == 0 || !is_ident_char(s[i - 1])) {
+            let b = buf_new(8)
+            let at = i
+            while i < n && is_ident_char(s[i]) {
+                buf_byte(b, sql_lower(s[i]))
+                i += 1
+            }
+            out.push(SqlWord { w: buf_str(b), at: at, depth: depth })
+            continue
         }
         i += 1
     }
-    if st == 1 {
-        return open
-    }
-    return -1
+    return out
 }
 
-// Первое слово запроса (в нижнем регистре) и, для INSERT/UPDATE/DELETE, таблица.
+// Начало открытой строки '...' в конце s (s кончается внутри неё) или -1.
+fn sql_open_quote(s: str) -> int {
+    let st = sql_states(s)
+    let n = s.len()
+    if st[n] != 1 {
+        return -1
+    }
+    var i = n - 1
+    while i > 0 && st[i - 1] == 1 {
+        i -= 1
+    }
+    return i
+}
+
+// Первое слово запроса (в нижнем регистре).
 fn sql_first_word(s: str) -> str {
-    var p = 0
-    while p < s.len() && (sql_space(s[p]) || s[p] == '(') {
+    let ws = sql_code_words(s)
+    if ws.len() == 0 {
+        return ""
+    }
+    return ws[0].w
+}
+
+
+
+
+// Имя таблицы в s с позиции p (необязательная схема, "кавычки"): без схемы.
+fn sql_name_at(s: str, p0: int) -> str {
+    var p = p0
+    let n = s.len()
+    while p < n && sql_space(s[p]) {
         p += 1
     }
-    let b = buf_new(8)
-    while p < s.len() && is_ident_char(s[p]) {
-        buf_byte(b, sql_lower(s[p]))
+    let b = buf_new(16)
+    while p < n && (is_ident_char(s[p]) || s[p] == '.' || s[p] == '"') {
+        if s[p] == '.' {
+            buf_clear(b)
+        } else if s[p] == '"' {
+            p += 1
+            while p < n && s[p] != '"' {
+                buf_byte(b, s[p])
+                p += 1
+            }
+        } else {
+            buf_byte(b, sql_lower(s[p]))
+        }
         p += 1
     }
     return buf_str(b)
@@ -400,50 +562,31 @@ fn sql_first_word(s: str) -> str {
 // « t1 t2 ». Нарушение внешнего ключа в такой таблице — ссылка на то, чего нет
 // (404); в другой — удаляют то, на что ещё ссылаются (409).
 fn sql_target_table(s: str) -> str {
+    let ws = sql_code_words(s)
     var out = " "
-    var i = 0
-    let n = s.len()
-    while i < n {
-        if s[i] == '\'' {
-            i += 1
-            while i < n && s[i] != '\'' {
-                i += 1
+    for i in 0..ws.len() {
+        let w = ws[i].w
+        var after = -1
+        if w == "insert" && i + 1 < ws.len() && ws[i + 1].w == "into" {
+            after = ws[i + 1].at + 4
+        } else if w == "update" {
+            var prev = ""
+            if i > 0 {
+                prev = ws[i - 1].w
             }
-            i += 1
-            continue
+            if prev != "for" && prev != "do" && prev != "on" && prev != "key" && prev != "no" {
+                after = ws[i].at + 6
+                if i + 1 < ws.len() && ws[i + 1].w == "only" {
+                    after = ws[i + 1].at + 4
+                }
+            }
         }
-        if (i == 0 || !is_ident_char(s[i - 1])) && is_alpha(s[i]) {
-            var k = sql_starts_words(s[i..n], ["insert", "into"])
-            if k == 0 {
-                k = sql_starts_words(s[i..n], ["update"])
-                if k > 0 {
-                    k += sql_starts_words(s[i + k..n], ["only"])
-                }
+        if after >= 0 {
+            let name = sql_name_at(s, after)
+            if name.len() > 0 {
+                out = out + name + " "
             }
-            if k > 0 {
-                var p = i + k
-                while p < n && sql_space(s[p]) {
-                    p += 1
-                }
-                let b = buf_new(16)
-                while p < n && (is_ident_char(s[p]) || s[p] == '.' || s[p] == '"') {
-                    if s[p] == '.' {
-                        buf_clear(b)
-                    } else if s[p] != '"' {
-                        buf_byte(b, sql_lower(s[p]))
-                    }
-                    p += 1
-                }
-                out = out + buf_str(b) + " "
-                i = p
-                continue
-            }
-            while i < n && is_ident_char(s[i]) {
-                i += 1
-            }
-            continue
         }
-        i += 1
     }
     return out
 }
@@ -462,7 +605,12 @@ fn sql_pure_key(from: int, to: int) -> str {
         if k == T_IDENT && i + 1 < to && toks[i + 1].kind == '(' {
             return ""
         }
-        buf_add(b, toks[i].text)
+        if k == T_STR {
+            // у сырых строк текст токена одинаковый («`...`»): ключ — само значение
+            buf_add(b, "\"" + strlits[toks[i].val] + "\"")
+        } else {
+            buf_add(b, toks[i].text)
+        }
         buf_byte(b, ' ')
         i += 1
     }
@@ -507,64 +655,40 @@ fn sql_param_no(ps: [SqlParam], kind: int, ty: int, v: int, f: int) -> int {
     return ps.len()
 }
 
-// Ошибки привычек вне кавычек: $1 из других драйверов, несколько команд.
+// Ошибки привычек вне строк и комментариев: несколько команд через ;.
 fn sql_habits(at: Token, text: str) {
-    var st = 0
-    var i = 0
-    let n = text.len()
-    while i < n {
-        let c = text[i]
-        if st == 0 {
-            if c == '\'' {
-                st = 1
-            } else if c == '"' {
-                st = 2
-            } else if c == '-' && i + 1 < n && text[i + 1] == '-' {
-                st = 3
-            } else if c == ';' {
-                var j = i + 1
-                while j < n && sql_space(text[j]) {
-                    j += 1
-                }
-                if j < n {
-                    error_tok(at, "sql runs one statement; this one has several separated by ;", "write one sql per statement (inside tx \{ } if they belong together)")
-                    return
-                }
+    let st = sql_states(text)
+    var semi = false
+    for i in 0..text.len() {
+        if st[i] == 0 {
+            let c = text[i]
+            if c == ';' {
+                semi = true
+            } else if semi && !sql_space(c) {
+                error_tok(at, "sql runs one statement; this one has several separated by ;", "write one sql per statement (inside tx \{ } if they belong together)")
+                return
             }
-        } else if st == 1 {
-            if c == '\'' {
-                st = 0
-            }
-        } else if st == 2 {
-            if c == '"' {
-                st = 0
-            }
-        } else if st == 3 && c == '\n' {
-            st = 0
         }
-        i += 1
     }
 }
 
-fn sql_habit_placeholder(at: Token, seg: str) {
-    var st = 0
-    var i = 0
-    while i < seg.len() {
-        let c = seg[i]
-        if st == 0 {
-            if c == '\'' {
-                st = 1
-            } else if c == '$' && i + 1 < seg.len() && is_digit(seg[i + 1]) && (i == 0 || !is_ident_char(seg[i - 1])) {
-                error_tok(at, "values go in place in sql: WHERE id = \{id}, not $" + seg[i + 1..i + 2], "every \{expression} is sent as a parameter, never as SQL text")
-                return
-            } else if c == '%' && i + 1 < seg.len() && seg[i + 1] == 's' && (i + 2 >= seg.len() || !is_ident_char(seg[i + 2])) {
-                error_tok(at, "values go in place in sql: WHERE id = \{id}, not %s", "every \{expression} is sent as a parameter, never as SQL text")
-                return
-            }
-        } else if c == '\'' {
-            st = 0
+// Заполнители других драйверов ($1, %s) в исходном тексте (параметры — \0).
+fn sql_habit_placeholder(at: Token, text: str) {
+    let st = sql_states(text)
+    let n = text.len()
+    for i in 0..n {
+        if st[i] != 0 {
+            continue
         }
-        i += 1
+        let c = text[i]
+        if c == '$' && i + 1 < n && is_digit(text[i + 1]) && (i == 0 || !is_ident_char(text[i - 1])) {
+            error_tok(at, "values go in place in sql: WHERE id = \{id}, not $" + text[i + 1..i + 2], "every \{expression} is sent as a parameter, never as SQL text")
+            return
+        }
+        if c == '%' && i + 1 < n && text[i + 1] == 's' && (i + 2 >= n || !is_ident_char(text[i + 2])) {
+            error_tok(at, "values go in place in sql: WHERE id = \{id}, not %s", "every \{expression} is sent as a parameter, never as SQL text")
+            return
+        }
     }
 }
 
@@ -599,6 +723,12 @@ fn parse_sql(w: int) -> int {
             error_tok(pt, "none needs a type here", "write NULL in the SQL text instead")
         }
         let key = sql_pure_key(from, to)
+        if key.len() == 0 {
+            // вызов мог изменить то, что вычислили раньше: дальше не сливать с прежними
+            for j in 0..vkeys.len() {
+                vkeys[j] = ""
+            }
+        }
         var vi = -1
         if key.len() > 0 {
             for j in 0..vkeys.len() {
@@ -617,9 +747,7 @@ fn parse_sql(w: int) -> int {
         }
         vals.push(vi)
     }
-    for seg in lit.segs {
-        sql_habit_placeholder(at, seg)
-    }
+    sql_habit_placeholder(at, lit.segs.join("\0"))
     // форма результата — из ожидаемого типа
     var shape = SH_COUNT
     var rt = ty_int
@@ -654,28 +782,53 @@ fn parse_sql(w: int) -> int {
     // сравнения с T? без проверки IS NULL: номер значения и место
     var cmp_v: [int] = []
     var cmp_at: [int] = []
+    // строка '...' с параметрами внутри: она открыта (ещё не закрыта) и шаблон ли это LIKE
+    var in_lit = false
+    var lit_like = false
     for i in 0..n {
         let vi = vals[i]
         let vt = vtypes[vi]
         var next = segs[i + 1]
         let vk = tkind(vt)
+        let isnull = sql_starts_words(next, ["is", "null"])
+        let notnull = sql_starts_words(next, ["is", "not", "null"])
         if lit.quoted[i] {
-            // '...{x}...' → '...' || $n || '...'; в шаблоне LIKE % и _ значения — буквы
-            let q = sql_open_quote(cur)
+            // '...{x}...' → ('...' || $n || '...'): скобки сохраняют приоритет
+            // ('{d}'::date); в шаблоне LIKE % и _ значения — буквы
+            if !in_lit {
+                let q = sql_open_quote(cur)
+                lit_like = q >= 0 && (sql_ends_word(cur, q, "like") >= 0 || sql_ends_word(cur, q, "ilike") >= 0)
+                if q >= 0 {
+                    cur = cur[0..q] + "(" + cur[q..cur.len()]
+                    in_lit = true
+                }
+            }
             var pk = PK_TEXT
-            if q >= 0 && (sql_ends_word(cur, q, "like") >= 0 || sql_ends_word(cur, q, "ilike") >= 0) {
+            if lit_like {
                 pk = PK_LIKE
             }
             let no = sql_param_no(ps, pk, vt, vi, -1)
             cur = cur + "' || $" + no.to_str() + " || '"
-        } else if sql_starts_words(next, ["is", "null"]) > 0 {
+            if in_lit {
+                // закрывающая кавычка строки — в следующем куске (если там нет нового параметра)
+                let close = sql_close_quote(next)
+                if close >= 0 {
+                    next = next[0..close + 1] + ")" + next[close + 1..next.len()]
+                    in_lit = false
+                }
+            }
+        } else if isnull > 0 || notnull > 0 {
+            if vk != K_OPT {
+                error_tok(ptoks[i], "\{" + vtexts[vi] + "} is " + ty_name(vt) + " and is never none, so IS NULL is always false here", "drop the IS NULL check, or make the value optional (" + ty_name(vt) + "?)")
+            }
             let no = sql_param_no(ps, PK_ISNULL, ty_bool, vi, -1)
-            cur = cur + "$" + no.to_str()
-            next = next[sql_starts_words(next, ["is", "null"])..next.len()]
-        } else if sql_starts_words(next, ["is", "not", "null"]) > 0 {
-            let no = sql_param_no(ps, PK_ISNULL, ty_bool, vi, -1)
-            cur = cur + "(NOT $" + no.to_str() + ")"
-            next = next[sql_starts_words(next, ["is", "not", "null"])..next.len()]
+            if isnull > 0 {
+                cur = cur + "$" + no.to_str()
+                next = next[isnull..next.len()]
+            } else {
+                cur = cur + "(NOT $" + no.to_str() + ")"
+                next = next[notnull..next.len()]
+            }
         } else if vk == K_LIST && tkind(ty_elem(vt)) != K_STRUCT && sql_ends_in_open(cur) >= 0 && sql_starts_close(next) > 0 {
             // x IN ({xs}) → x = ANY($n); пустой список ничему не равен
             var head = cur[0..sql_ends_in_open(cur)]
@@ -696,25 +849,47 @@ fn parse_sql(w: int) -> int {
                 si = types[ty_elem(vt)].a
             }
             let fs = structs[si].fields
+            // таблица — для меток %%T (тип столбца) и %%D (DEFAULT столбца), которые
+            // рантайм заменяет при запуске по каталогу базы (lib/db.kh)
+            let table = sql_name_at(cur, sql_insert_name_at(cur))
             var names = ""
             var values = ""
+            // для списка: столбцы unnest и что из них выбрать
+            var cols = ""
+            var picks = ""
             for j in 0..fs.len() {
                 let f = fs[j]
                 if j > 0 {
                     names = names + ", "
                     values = values + ", "
+                    cols = cols + ", "
+                    picks = picks + ", "
                 }
                 names = names + sql_ident(f.name)
+                let mark = table + "." + f.name + "%%"
+                // поле T? со значением none — DEFAULT столбца (без DEFAULT — NULL)
+                let opt = tkind(f.ty) == K_OPT
                 if vk == K_LIST {
+                    // unnest($n::<тип столбца>[]): дата, uuid, перечисление — как в таблице
                     let no = sql_param_no(ps, PK_COLUMN, ty_list(f.ty), vi, j)
-                    values = values + "$" + no.to_str() + "::" + sql_array_type(f.ty)
+                    values = values + "$" + no.to_str() + "::%%T:" + mark + "[]"
+                    let k = "k" + j.to_str()
+                    cols = cols + k
+                    if opt {
+                        picks = picks + "COALESCE(" + k + ", %%D:" + mark + ")"
+                    } else {
+                        picks = picks + k
+                    }
+                } else if opt {
+                    let no = sql_param_no(ps, PK_FIELD, f.ty, vi, j)
+                    values = values + "COALESCE($" + no.to_str() + "::%%T:" + mark + ", %%D:" + mark + ")"
                 } else {
                     let no = sql_param_no(ps, PK_FIELD, f.ty, vi, j)
                     values = values + "$" + no.to_str()
                 }
             }
             if vk == K_LIST {
-                cur = cur + " (" + names + ") SELECT * FROM unnest(" + values + ")"
+                cur = cur + " (" + names + ") SELECT " + picks + " FROM unnest(" + values + ") AS u(" + cols + ")"
             } else {
                 cur = cur + " (" + names + ") VALUES (" + values + ")"
             }
@@ -739,7 +914,7 @@ fn parse_sql(w: int) -> int {
             }
             cur = cur + " " + parts
         } else {
-            if vk == K_OPT && (sql_ends_cmp(cur) || sql_starts_cmp(next)) {
+            if vk == K_OPT && (sql_ends_cmp(cur) || sql_starts_cmp(next)) && !sql_in_set(cur) {
                 cmp_v.push(vi)
                 cmp_at.push(i)
             }
@@ -779,7 +954,7 @@ fn parse_sql(w: int) -> int {
         error_tok(at, "sql needs to know the result type of this query", "let row: Row? = sql ... (one row or none), [Row] (all rows), Row (one row, 404 if none); Row is a type with the selected columns as fields")
     }
     // проверка против схемы из миграций (без базы)
-    sq_check(at, lit, cur, shape, inner, ps)
+    sq_check(at, lit, sql_unmark(cur), shape, inner, ps)
     // место запроса в данных программы
     let off = desc_reserve(SITE_WORDS)
     let pt = desc_reserve(4 * ps.len() + 1)
@@ -814,100 +989,41 @@ fn parse_sql(w: int) -> int {
     return rt
 }
 
-// Слово w (в нижнем регистре) в тексте запроса вне строк '...'.
+// Слово w в коде запроса (вне строк, имён в кавычках и комментариев).
 fn sql_has_word(s: str, w: str) -> bool {
-    var i = 0
-    let n = s.len()
-    while i < n {
-        if s[i] == '\'' {
-            i += 1
-            while i < n && s[i] != '\'' {
-                i += 1
-            }
-            i += 1
-            continue
+    for x in sql_code_words(s) {
+        if x.w == w {
+            return true
         }
-        if is_alpha(s[i]) && (i == 0 || !is_ident_char(s[i - 1])) {
-            let k = sql_starts_words(s[i..n], [w])
-            if k > 0 {
-                return true
-            }
-            while i < n && is_ident_char(s[i]) {
-                i += 1
-            }
-            continue
-        }
-        i += 1
     }
     return false
-}
-
-// Главная команда запроса: для WITH ... — первая SELECT/INSERT/UPDATE/DELETE вне скобок.
-fn sql_main_word(s: str) -> str {
-    let first = sql_first_word(s)
-    if first != "with" {
-        return first
-    }
-    var depth = 0
-    var i = 0
-    let n = s.len()
-    while i < n {
-        let c = s[i]
-        if c == '\'' {
-            i += 1
-            while i < n && s[i] != '\'' {
-                i += 1
-            }
-        } else if c == '(' {
-            depth += 1
-        } else if c == ')' {
-            depth -= 1
-        } else if depth == 0 && is_alpha(c) && (i == 0 || !is_ident_char(s[i - 1])) {
-            let rest = s[i..n]
-            if sql_starts_words(rest, ["select"]) > 0 {
-                return "select"
-            }
-            if sql_starts_words(rest, ["insert"]) > 0 || sql_starts_words(rest, ["update"]) > 0 || sql_starts_words(rest, ["delete"]) > 0 || sql_starts_words(rest, ["merge"]) > 0 {
-                return sql_first_word(rest)
-            }
-            while i < n && is_ident_char(s[i]) {
-                i += 1
-            }
-            continue
-        }
-        i += 1
-    }
-    return first
 }
 
 // RETURNING на верхнем уровне (не внутри WITH (...)).
 fn sql_top_returning(s: str) -> bool {
-    var depth = 0
-    var i = 0
-    let n = s.len()
-    while i < n {
-        let c = s[i]
-        if c == '\'' {
-            i += 1
-            while i < n && s[i] != '\'' {
-                i += 1
-            }
-        } else if c == '(' {
-            depth += 1
-        } else if c == ')' {
-            depth -= 1
-        } else if depth == 0 && is_alpha(c) && (i == 0 || !is_ident_char(s[i - 1])) {
-            if sql_starts_words(s[i..n], ["returning"]) > 0 {
-                return true
-            }
-            while i < n && is_ident_char(s[i]) {
-                i += 1
-            }
-            continue
+    for x in sql_code_words(s) {
+        if x.w == "returning" && x.depth == 0 {
+            return true
         }
-        i += 1
     }
     return false
+}
+
+// Главная команда: для WITH ... — первая SELECT/INSERT/UPDATE/DELETE/MERGE вне скобок.
+fn sql_main_word(s: str) -> str {
+    let ws = sql_code_words(s)
+    if ws.len() == 0 {
+        return ""
+    }
+    if ws[0].w != "with" {
+        return ws[0].w
+    }
+    for x in ws {
+        if x.depth == 0 && (x.w == "select" || x.w == "insert" || x.w == "update" || x.w == "delete" || x.w == "merge" || x.w == "values") {
+            return x.w
+        }
+    }
+    return "with"
 }
 
 // Текст выражения параметра (для сообщений).
@@ -925,10 +1041,50 @@ fn sql_tok_text(from: int, to: int) -> str {
     return s
 }
 
-// Сравнение перед параметром: = <> != < > <= >= LIKE ILIKE (но не IS DISTINCT FROM).
+// Закрывающая кавычка строки '...', которая открыта в начале s (s начинается
+// внутри неё), или -1. '' внутри — экранированная кавычка.
+fn sql_close_quote(s: str) -> int {
+    var i = 0
+    let n = s.len()
+    while i < n {
+        if s[i] == '\'' {
+            if i + 1 < n && s[i + 1] == '\'' {
+                i += 2
+                continue
+            }
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+// Параметр — значение присваивания SET col = {x} (а не сравнение): ближайшее
+// слово-раздел перед ним — SET.
+fn sql_in_set(cur: str) -> bool {
+    let ws = sql_code_words(cur)
+    var i = ws.len() - 1
+    while i >= 0 {
+        let w = ws[i].w
+        if w == "set" {
+            return true
+        }
+        if w == "where" || w == "on" || w == "having" || w == "when" || w == "then" || w == "else" || w == "and" || w == "or" || w == "not" || w == "select" || w == "returning" || w == "values" || w == "case" || w == "join" || w == "using" || w == "from" || w == "limit" || w == "offset" || w == "by" || w == "filter" {
+            return false
+        }
+        i -= 1
+    }
+    return false
+}
+
+// Сравнение перед параметром: = <> != < > <= >= LIKE ILIKE (но не IS DISTINCT FROM,
+// не => и ->).
 fn sql_ends_cmp(cur: str) -> bool {
     let e = sql_trim_end(cur)
     if e == 0 {
+        return false
+    }
+    if e >= 2 && (cur[e - 2..e] == "=>" || cur[e - 2..e] == "->") {
         return false
     }
     let c = cur[e - 1]
@@ -973,6 +1129,45 @@ fn sql_starts_close(next: str) -> int {
         return p + 1
     }
     return 0
+}
+
+// Текст без меток (для проверки без базы): «::%%T:...%%» и «[]» после неё
+// убираются, %%D:...%% — NULL.
+fn sql_unmark(s: str) -> str {
+    if !s.contains("%%") {
+        return s
+    }
+    let b = buf_new(s.len())
+    var i = 0
+    let n = s.len()
+    while i < n {
+        let cast = i + 5 < n && s[i] == ':' && s[i + 1] == ':' && s[i + 2] == '%' && s[i + 3] == '%' && s[i + 4] == 'T'
+        if cast || (i + 3 < n && s[i] == '%' && s[i + 1] == '%' && s[i + 2] == 'D' && s[i + 3] == ':') {
+            var j = i + 4
+            while j + 1 < n && !(s[j] == '%' && s[j + 1] == '%') {
+                j += 1
+            }
+            i = j + 2
+            if !cast {
+                buf_add(b, "NULL")
+            } else if i + 1 < n && s[i] == '[' && s[i + 1] == ']' {
+                i += 2
+            }
+            continue
+        }
+        buf_byte(b, s[i])
+        i += 1
+    }
+    return buf_str(b)
+}
+
+// Начало имени таблицы в конце cur («INSERT INTO имя»).
+fn sql_insert_name_at(cur: str) -> int {
+    var s = sql_trim_end(cur)
+    while s > 0 && sql_word_char(cur[s - 1]) {
+        s -= 1
+    }
+    return s
 }
 
 // cur кончается на «INSERT INTO имя»?

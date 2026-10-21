@@ -1037,7 +1037,13 @@ fn parse_call_expr() -> int {
     let saved = no_struct
     no_struct = false
     let pt = tok()
-    let ptype = parse_add()
+    var ptype = ty_err
+    if pt.kind == T_STR && kind_at(pos + 1) == '[' {
+        // call POST "/x" [..]: список — это тело, а не индекс строки
+        ptype = parse_atom()
+    } else {
+        ptype = parse_add()
+    }
     coerce(ptype, ty_str, pt)
     emit_push(RAX)
     var has_body = starts_value(pos) && tok().line == pt.line
