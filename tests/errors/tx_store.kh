@@ -1,0 +1,9 @@
+// expect: store is not rolled back with the tx block
+store hits: int = 0
+route POST "/x" -> 204 {
+    tx {
+        sql "DELETE FROM t"
+        hits = hits + 1
+    }
+    return 204
+}

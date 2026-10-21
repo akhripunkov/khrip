@@ -134,6 +134,9 @@ fn parse_ident(w: int) -> int {
         return parse_call(t, w)
     }
     if name == "fetch" && kind() == T_IDENT && is_http_method(tok().text) && find_local(name) < 0 {
+        if tx_depth > 0 {
+            error_tok(t, "fetch inside tx runs again on every retry and holds a database connection", "call it before or after the tx block")
+        }
         return parse_fetch(t)
     }
     if kind() == '\{' && !no_struct {

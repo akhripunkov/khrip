@@ -1,0 +1,4 @@
+// expect: sql runs one statement; this one has several separated by ;
+fn main() {
+    sql "DELETE FROM a; DELETE FROM b"
+}

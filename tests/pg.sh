@@ -62,6 +62,18 @@ X
 
 for src in tests/pg/*.kh; do
 	name=$(basename "$src" .kh)
+	if grep -q '^test "' "$src"; then
+		# программа с блоками test: khc test на своей пустой базе
+		"${as_pg[@]}" "$pg_bin/psql" -q -h "$pg_dir" -p "$PG_PORT" -U postgres -d postgres -c "create database t_$name" >/dev/null 2>&1
+		DATABASE_URL="postgres://u_scram:pw-u_scram@127.0.0.1:$PG_PORT/t_$name?sslmode=disable" "$KHC" test "$src" >"$tmp/pg/$name.out" 2>&1
+		if ! diff -u "tests/pg/$name.out" "$tmp/pg/$name.out" >"$tmp/pg/$name.diff"; then
+			failed "$src" "вывод тестов отличается от ожидаемого"
+			cat "$tmp/pg/$name.diff"
+			continue
+		fi
+		pass=$((pass + 1))
+		continue
+	fi
 	if ! "$KHC" -o "$tmp/pg/$name" "$src" >"$tmp/pg/$name.err" 2>&1; then
 		failed "$src" "не скомпилировалось:"$'\n'"$(cat "$tmp/pg/$name.err")"
 		continue

@@ -1,0 +1,6 @@
+// expect: sql needs to know the result type of this query
+// expect: let row: Row? = sql
+fn main() {
+    let x = sql "SELECT 1"
+    print(x)
+}

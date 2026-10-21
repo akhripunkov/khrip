@@ -913,6 +913,19 @@ fn __db_notnull(c: int, deadline: int) -> map[str, bool] {
 // ---- Запуск ----
 
 fn __db_start() {
+    // всё, что строит запуск (планы мест, типы параметров), живёт до конца
+    // процесса: выделять из свежего куска mmap, а не из арены запроса
+    let cx = __ctx()
+    let sp = load64(cx + CTX_PTR)
+    let se = load64(cx + CTX_END)
+    store64(cx + CTX_PTR, 0)
+    store64(cx + CTX_END, 0)
+    __db_start_here()
+    store64(cx + CTX_PTR, sp)
+    store64(cx + CTX_END, se)
+}
+
+fn __db_start_here() {
     let c = __pg_startup()
     let deadline = now_ms() + 600000
     let root = __db_root()
@@ -1082,6 +1095,10 @@ fn __db_run(site: int, vals: int) -> int {
         }
         let loc: str = __cast(load64(site + SITE_LOC))
         __panic_msg("{loc}: the query returned no row")
+    }
+    if shape == SH_OPT && load64(site + SITE_SCALAR) != 0 && __pg_null(res, 0) {
+        // T? из одного столбца: и «нет строки», и NULL — none
+        return 0
     }
     let v = __db_row(site, res, 0)
     if shape == SH_OPT {

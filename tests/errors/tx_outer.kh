@@ -1,0 +1,8 @@
+// expect: 'n' is declared outside tx, and the block may run again after a conflict
+fn main() {
+    var n = 0
+    tx {
+        n = sql "DELETE FROM t"
+    }
+    print(n)
+}

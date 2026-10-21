@@ -1,0 +1,151 @@
+// sql и tx в маршрутах: формы результата, переписывания параметров, ошибки
+// базы → статусы, JSON Merge Patch, откат tx. Запускается khc test на пустой базе.
+
+migration 1 `
+CREATE TABLE teams (id bigserial PRIMARY KEY, name text NOT NULL UNIQUE);
+CREATE TABLE people (
+    id bigserial PRIMARY KEY,
+    name text NOT NULL CHECK (name <> ''),
+    team_id bigint REFERENCES teams,
+    role text NOT NULL DEFAULT 'member',
+    nick text,
+    score bigint NOT NULL DEFAULT 0,
+    tags text[] NOT NULL DEFAULT '{}',
+    extra jsonb,
+    born date,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+`
+
+migration 2 `
+ALTER TABLE people ADD COLUMN rating float8 NOT NULL DEFAULT 0;
+`
+
+type Role = member | lead
+type Extra { city: str, langs: [str] }
+type NewPerson { name: str, team_id: int?, role: Role = member, nick: str?, tags: [str] = [], extra: Extra? }
+type Person { id: int, name: str, team_id: int?, role: Role, nick: str?, score: int, tags: [str], extra: Extra?, born: str?, created_at: str, rating: float }
+type PersonPatch { name: str?, team_id: int?, nick: str?, role: Role? }
+type Move { from: int, to: int, points: int }
+type Team { id: int, name: str }
+
+route POST "/teams" (body: Team) -> 201 Team {
+    return 201 sql "INSERT INTO teams (name) VALUES ({body.name}) RETURNING *"
+}
+
+route POST "/people" (body: NewPerson) -> 201 Person {
+    return 201 sql "INSERT INTO people {body} RETURNING *"
+}
+
+route GET "/people/{id}" (id: int) -> Person | 404 {
+    return sql "SELECT * FROM people WHERE id = {id}"
+}
+
+route PATCH "/people/{id}" (id: int, body: PersonPatch) -> Person | 404 {
+    return sql "UPDATE people SET {body} WHERE id = {id} RETURNING *"
+}
+
+route DELETE "/teams/{id}" (id: int) -> 204 | 404 {
+    if sql "DELETE FROM teams WHERE id = {id}" == 0 {
+        return 404
+    }
+    return 204
+}
+
+route GET "/people" (team: int?, q: str?, ids: str?) -> [str] {
+    var idl: [int] = []
+    if let s = ids {
+        idl = s.split(",").map(x => x.to_int() ?? 0)
+    }
+    let all = ids == none
+    return sql `SELECT name FROM people
+        WHERE ({team} IS NULL OR team_id = {team})
+          AND name ILIKE '%{q ?? ""}%'
+          AND ({all} OR id IN ({idl}))
+        ORDER BY id`
+}
+
+route POST "/moves" (body: Move) -> 201 Person | 404 | 409 str {
+    tx {
+        let a: Person = sql "SELECT * FROM people WHERE id = {body.from}"
+        sql "UPDATE people SET score = score - {body.points} WHERE id = {a.id}"
+        let b: Person = sql "UPDATE people SET score = score + {body.points} WHERE id = {body.to} RETURNING *"
+        if a.score < body.points {
+            return 409 "not enough points"
+        }
+        return 201 b
+    }
+}
+
+route GET "/stats" -> map[str, int] {
+    let n: int = sql "SELECT count(*) FROM people"
+    let top: int? = sql "SELECT max(score) FROM people"
+    let none_yet: int? = sql "SELECT max(score) FROM people WHERE id < 0"
+    let born: int? = sql "SELECT born FROM people WHERE born IS NOT NULL LIMIT 1"
+    return {"people": n, "top": top ?? -1, "none": none_yet ?? -1, "born": born ?? 0}
+}
+
+test "create, read, 404" {
+    expect (call POST "/teams" Team { id: 0, name: "red" }).status == 201
+    let r = call POST "/people" NewPerson { name: "Ann", team_id: 1, tags: ["a", "b c"], extra: Extra { city: "Oslo", langs: ["kh"] } }
+    expect r.status == 201
+    let v: Person? = from_json(r.body)
+    expect v != none
+    expect v.id == 1 && v.role == member && v.score == 0 && v.tags.len() == 2 && v.nick == none
+    expect (v.extra ?? Extra { city: "", langs: [] }).city == "Oslo"
+    expect v.created_at.ends_with("Z") && v.rating == 0.0
+    expect (call GET "/people/1").status == 200
+    expect (call GET "/people/99").status == 404
+}
+
+test "errors become statuses" {
+    expect (call POST "/teams" Team { id: 0, name: "red" }).status == 409
+    expect (call POST "/people" NewPerson { name: "Bob", team_id: 42 }).status == 404
+    expect (call POST "/people" NewPerson { name: "" }).status == 400
+    expect (call DELETE "/teams/1").status == 409
+    expect (call DELETE "/teams/7").status == 404
+}
+
+test "merge patch" {
+    let r0 = call POST "/people" NewPerson { name: "Bob", team_id: 1, nick: "bobby", role: lead }
+    let bob: Person? = from_json(r0.body)
+    expect bob != none
+    let r = call PATCH "/people/{bob.id}" "\{\"nick\": null}"
+    expect r.status == 200
+    let v: Person? = from_json(r.body)
+    expect v != none
+    expect v.nick == none && v.team_id == 1 && v.role == lead && v.name == "Bob"
+    let r2 = call PATCH "/people/{bob.id}" "\{\"name\": \"Robert\"}"
+    let v2: Person? = from_json(r2.body)
+    expect v2 != none
+    expect v2.name == "Robert" && v2.team_id == 1
+    expect (call PATCH "/people/{bob.id}" "\{\"name\": null}").status == 400
+    expect (call PATCH "/people/999" "\{}").status == 404
+}
+
+test "filters" {
+    let off: Person? = from_json((call POST "/people" NewPerson { name: "50% Off" }).body)
+    expect off != none
+    expect (call GET "/people?team=1").body == "[\"Ann\",\"Robert\"]"
+    expect (call GET "/people?q=b").body == "[\"Robert\"]"
+    expect (call GET "/people?q=50%25").body == "[\"50% Off\"]"
+    expect (call GET "/people?q=_").body == "[]"
+    expect (call GET "/people?ids=1,{off.id}").body == "[\"Ann\",\"50% Off\"]"
+    expect (call GET "/people?ids=").body == "[]"
+}
+
+test "tx rolls back on 409" {
+    let ids: [int] = sql "SELECT id FROM people ORDER BY id"
+    let ann = ids[0]
+    let rob = ids[1]
+    expect (call POST "/moves" Move { from: ann, to: rob, points: 5 }).status == 409
+    expect (call GET "/people/{rob}").body.contains("\"score\":0")
+    expect (call POST "/moves" Move { from: 999, to: rob, points: 0 }).status == 404
+    expect (call POST "/moves" Move { from: ann, to: rob, points: 0 }).status == 201
+}
+
+test "scalars" {
+    expect (call GET "/stats").body == "\{\"people\":3,\"top\":0,\"none\":-1,\"born\":0}"
+    let names: [str] = sql "SELECT name FROM people ORDER BY id"
+    expect names.join(",") == "Ann,Robert,50% Off"
+}

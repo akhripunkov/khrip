@@ -1,0 +1,9 @@
+khrip: applied migration 1
+khrip: applied migration 2
+ok    create, read, 404
+ok    errors become statuses
+ok    merge patch
+ok    filters
+ok    tx rolls back on 409
+ok    scalars
+6 tests: 6 passed, 0 failed

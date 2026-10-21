@@ -1,0 +1,6 @@
+// expect: values go in place in sql: WHERE id = {id}, not $1
+// expect: every {expression} is sent as a parameter, never as SQL text
+fn main() {
+    let id = 1
+    sql "DELETE FROM t WHERE id = $1 AND x = {id}"
+}

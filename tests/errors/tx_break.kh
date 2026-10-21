@@ -1,0 +1,9 @@
+// expect: break cannot leave a tx block
+fn main() {
+    while true {
+        tx {
+            sql "DELETE FROM t"
+            break
+        }
+    }
+}

@@ -1307,6 +1307,7 @@ fn __serve_one(w: __Worker, req: __Req) {
         }
     }
     store64(c + CTX_CATCH, prev)
+    store64(c + CTX_JNULLS, 0)
     __db_end()
     __store_unlock()
     store64(c + CTX_STORE_MODE, 0)

@@ -1,0 +1,8 @@
+// expect: 'xs' is declared outside tx, and the block may run again after a conflict
+fn main() {
+    var xs: [int] = []
+    tx {
+        xs.push(sql "DELETE FROM t")
+    }
+    print(xs.len())
+}

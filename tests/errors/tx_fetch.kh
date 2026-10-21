@@ -1,0 +1,9 @@
+// expect: fetch inside tx runs again on every retry and holds a database connection
+// expect: call it before or after the tx block
+route POST "/x" -> 204 {
+    tx {
+        sql "DELETE FROM t"
+        fetch GET "http://localhost/"
+    }
+    return 204
+}
