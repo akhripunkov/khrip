@@ -240,8 +240,10 @@ fn main() -> int {
         lex_file(fi)
         fi += 1
     }
-    // библиотека API — только программам с route, test, store или JSON
-    if test_mode || uses_api() {
+    uses_db = scan_uses_db()
+    load_migration_files(inputs[0])
+    // библиотека API — только программам с route, test, store, JSON или базой
+    if test_mode || uses_api() || uses_db {
         api_libs = true
         for name in api_lib_files() {
             if !load_file(lib + "/" + name, true) {
@@ -250,7 +252,6 @@ fn main() -> int {
             lex_file(files.len() - 1)
         }
     }
-    uses_db = scan_uses_db()
     lx_file = files.len() - 1
     add_tok_text(T_EOF, 0, "", lx_p)
     let init_fn = gen_func("__init_globals", ty_void)

@@ -120,6 +120,83 @@ fn prescan_migration() {
     sql_migs.push(Migration { n: nt.val, name: nt.val.to_str(), sql: strlits[st.val], tok: pos - 3 })
 }
 
+// Имена в каталоге (getdents64); none — каталога нет.
+fn dir_names(path: str) -> [str]? {
+    let fd = syscall(2, __cstr(path), 0x10000, 0)
+    if fd < 0 {
+        return none
+    }
+    var out: [str] = []
+    let buf = __alloc(8192)
+    while true {
+        let n = syscall(217, fd, buf, 8192)
+        if n <= 0 {
+            break
+        }
+        var off = 0
+        while off < n {
+            let reclen = load8(buf + off + 16) + load8(buf + off + 17) * 256
+            var e = buf + off + 19
+            var len = 0
+            while load8(e + len) != 0 {
+                len += 1
+            }
+            out.push(__str_copy(e, len))
+            off += reclen
+        }
+    }
+    syscall(3, fd)
+    return out
+}
+
+// Файлы migrations/N_имя.sql рядом с главным файлом программы.
+fn load_migration_files(main_path: str) {
+    var dir = "migrations"
+    var slash = main_path.len() - 1
+    while slash >= 0 && main_path[slash] != '/' {
+        slash -= 1
+    }
+    if slash >= 0 {
+        dir = main_path[0..slash] + "/migrations"
+    }
+    let found = dir_names(dir)
+    if found == none {
+        return
+    }
+    let names = found ?? []
+    for name in names {
+        if !name.ends_with(".sql") {
+            continue
+        }
+        var i = 0
+        while i < name.len() && is_digit(name[i]) {
+            i += 1
+        }
+        let n = name[0..i].to_int() ?? 0
+        if i == 0 || n < 1 || (i < name.len() - 4 && name[i] != '_') {
+            report_at(files.len() - 1, 1, 1, "migration file " + dir + "/" + name + " must be named N_name.sql (N = 1, 2, 3, ...)", "rename it, e.g. 1_init.sql")
+            continue
+        }
+        let read = read_file(dir + "/" + name)
+        if read == none {
+            continue
+        }
+        let text = read ?? ""
+        var dup = false
+        for m in sql_migs {
+            if m.n == n {
+                dup = true
+            }
+        }
+        if dup {
+            report_at(files.len() - 1, 1, 1, "two migrations numbered " + n.to_str() + " (" + dir + "/" + name + ")", "give the newer one the next number")
+            continue
+        }
+        sql_migs.push(Migration { n: n, name: n.to_str(), sql: text.replace("\r\n", "\n"), tok: -1 })
+        uses_db = true
+    }
+}
+
 // Миграции по возрастанию номера.
 fn sort_migrations() {
     var i = 1
