@@ -199,6 +199,34 @@ fn parse_stmt() -> bool {
 // начала — поэтому внутри нельзя менять то, что откат не вернёт. Вложенный
 // блок (и блок в вызванной функции) присоединяется к внешнему.
 fn parse_tx() -> bool {
+    let li = tx_open()
+    let div = parse_block()
+    tx_close()
+    if !div {
+        emit_load_local(li)
+        emit_mov_rr(RDI, RAX)
+        emit_call(rt_func("__db_tx_commit"))
+    }
+    return div
+}
+
+// let t: T = tx { ...; значение }: фиксация — после значения.
+fn parse_tx_value(w: int) -> int {
+    let li = tx_open()
+    let t = parse_value_block(w)
+    tx_close()
+    if t != ty_never {
+        emit_push(RAX)
+        emit_load_local(li)
+        emit_mov_rr(RDI, RAX)
+        emit_call(rt_func("__db_tx_commit"))
+        emit_pop(RAX)
+    }
+    return t
+}
+
+// Начало блока tx: соединение, точка повтора; → локальная с буфером повтора.
+fn tx_open() -> int {
     let at = tok()
     advance()
     if !uses_db {
@@ -214,26 +242,26 @@ fn parse_tx() -> bool {
     // точка повтора: сюда возвращается блок после конфликта
     emit_setjmp_rax()
     patch_here(skip)
-    let saved_base = tx_local_base
-    let saved_loop = tx_loop_base
+    tx_saved_base.push(tx_local_base)
+    tx_saved_loop.push(tx_loop_base)
     tx_local_base = nlocals
     tx_loop_base = loop_depth
     tx_depth += 1
     tx_locals.push(li)
-    let div = parse_block()
+    return li
+}
+
+fn tx_close() {
     tx_locals = tx_locals[0..tx_locals.len() - 1]
     tx_depth -= 1
-    tx_local_base = saved_base
-    tx_loop_base = saved_loop
-    if !div {
-        emit_load_local(li)
-        emit_mov_rr(RDI, RAX)
-        emit_call(rt_func("__db_tx_commit"))
-    }
-    return div
+    tx_local_base = tx_saved_base.pop()
+    tx_loop_base = tx_saved_loop.pop()
 }
 
 // return внутри tx в обычной функции: зафиксировать блоки этой функции.
+var tx_saved_base: [int]
+var tx_saved_loop: [int]
+
 fn tx_commit_all() {
     if tx_locals.len() == 0 {
         return

@@ -1,0 +1,5 @@
+// expect: migration 2 uses CONCURRENTLY, so it runs outside a transaction: it must be one statement with IF NOT EXISTS
+migration 1 `CREATE TABLE t (id bigserial PRIMARY KEY, name text NOT NULL)`
+migration 2 `CREATE INDEX CONCURRENTLY t_name ON t (name)`
+fn main() {
+}

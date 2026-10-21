@@ -50,6 +50,6 @@ describe insert: params 25 nodata true cols 0
 describe typo: [42703] column "emial" does not exist at 8 hint 'Perhaps you meant to reference the column "t_users.email".'
 migrate: '' applied 001_init.sql;applied 002_more.sql;
 again: '' 
-changed: migration 001_init.sql was changed after it was applied: add a new migration instead
+changed: migration 001_init.sql was changed after it was applied: restore it and put the change into migration 3
 failing: migration 003_bad.sql: division by zero
 t_m3 rolled back: true

@@ -63,6 +63,9 @@ fn parse_atom() -> int {
     if k == '\{' {
         return parse_map_lit(w)
     }
+    if k == T_IDENT && tok().text == "tx" && kind_at(pos + 1) == '\{' {
+        return parse_tx_value(w)
+    }
     if k == T_IDENT {
         return parse_ident(w)
     }

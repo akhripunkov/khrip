@@ -7,6 +7,11 @@
 // ждёт в своей сопрограмме.
 
 const PG_BLOCK = 16384
+const PG_SO_KEEPALIVE = 9
+const PG_TCP_KEEPIDLE = 4
+const PG_TCP_KEEPINTVL = 5
+const PG_TCP_KEEPCNT = 6
+const PG_TCP_USER_TIMEOUT = 18
 const PB_FD = 0
 const PB_TLS = 8
 // входящие байты: данные, длина, ёмкость (mmap)
@@ -504,6 +509,14 @@ fn __pg_connect(u: __PgUrl, deadline: int) -> __PgConn {
     if fd < 0 {
         return __PgConn { c: 0, err: "cannot connect to {u.host}:{u.port}" }
     }
+    // обрыв связи с базой виден за минуту, а не за часы: keepalive и предел
+    // неподтверждённой отправки
+    let tmp = __ctx() + 232
+    __setsockopt(tmp, fd, SOL_SOCKET, PG_SO_KEEPALIVE, 1)
+    __setsockopt(tmp, fd, IPPROTO_TCP, PG_TCP_KEEPIDLE, 30)
+    __setsockopt(tmp, fd, IPPROTO_TCP, PG_TCP_KEEPINTVL, 10)
+    __setsockopt(tmp, fd, IPPROTO_TCP, PG_TCP_KEEPCNT, 3)
+    __setsockopt(tmp, fd, IPPROTO_TCP, PG_TCP_USER_TIMEOUT, 15000)
     let c = __mmap(PG_BLOCK)
     store64(c + PB_FD, fd)
     store64(c + PB_IP, ip)
@@ -584,6 +597,10 @@ fn __pg_connect(u: __PgUrl, deadline: int) -> __PgConn {
         if m.kind == 'R' {
             let code = __be32(m.p)
             if code == 3 || code == 5 {
+                // открытый пароль — только по TLS или внутри машины (127.x)
+                if code == 3 && load64(c + PB_TLS) == 0 && (load64(c + PB_IP) >> 24) != 127 {
+                    return __pg_fail(c, "the database asked for a cleartext password over an unencrypted connection: use sslmode=require")
+                }
                 var pw = u.password
                 if code == 5 {
                     pw = "md5" + __md5_hex(__md5_hex(u.password + u.user) + __str_new(m.p + 4, 4))
@@ -1493,23 +1510,36 @@ fn __pg_startup() -> int {
 }
 
 // ---- Миграции ----
-// Файлы SQL применяются по порядку, каждый — в своей транзакции вместе с
-// записью в таблицу khrip_migrations (имя, SHA-256 текста). Уже применённый
-// файл, чей текст изменился, — ошибка: историю базы не переписывают. Несколько
-// копий сервиса, стартующих одновременно, ждут друг друга на advisory lock.
+// Миграции применяются по номерам, каждая — в своей транзакции вместе с записью
+// в khrip_migrations (номер, SHA-256 текста) и с lock_timeout 5 с: долгий запрос,
+// держащий таблицу, не останавливает базу, а миграция повторяется. Уже
+// применённая миграция, чей текст изменился, и новая миграция с номером ниже
+// применённого — отказ: историю базы не переписывают. Миграция с CONCURRENTLY
+// идёт вне транзакции. Копии сервиса, стартующие одновременно, ждут друг друга
+// на advisory lock (ключ — от схемы: тесты в своих схемах не ждут).
 
-const PG_MIGRATE_LOCK = 4826197301
+const PG_MIGRATE_LOCK = "select pg_advisory_lock(hashtext('khrip:migrate:' || current_schema()))"
+const PG_MIGRATE_UNLOCK = "select pg_advisory_unlock(hashtext('khrip:migrate:' || current_schema()))"
 
 // → "" или текст ошибки; log — что применено.
 fn __pg_migrate(c: int, names: [str], sqls: [str], log: Buf) -> str {
     let deadline = now_ms() + 600000
-    let lock = __pg_simple(c, "select pg_advisory_lock({PG_MIGRATE_LOCK})", deadline)
+    let lock = __pg_simple(c, PG_MIGRATE_LOCK, deadline)
     if lock.code.len() > 0 {
         return lock.message
     }
     let err = __pg_migrate_locked(c, names, sqls, log, deadline)
-    __pg_simple(c, "select pg_advisory_unlock({PG_MIGRATE_LOCK})", deadline)
+    __pg_simple(c, PG_MIGRATE_UNLOCK, deadline)
     return err
+}
+
+// Номер миграции — число в начале имени («3», «003_tags.sql»).
+fn __pg_mig_no(name: str) -> int {
+    var i = 0
+    while i < name.len() && name[i] >= '0' && name[i] <= '9' {
+        i += 1
+    }
+    return name[0..i].to_int() ?? 0
 }
 
 fn __pg_migrate_locked(c: int, names: [str], sqls: [str], log: Buf, deadline: int) -> str {
@@ -1522,21 +1552,61 @@ fn __pg_migrate_locked(c: int, names: [str], sqls: [str], log: Buf, deadline: in
         return done.err.message
     }
     var applied: map[str, str] = {}
+    var top = 0
     for i in 0..done.rows {
-        applied[__pg_str(done, 2 * i)] = __pg_str(done, 2 * i + 1)
+        let nm = __pg_str(done, 2 * i)
+        applied[nm] = __pg_str(done, 2 * i + 1)
+        top = top.max(__pg_mig_no(nm))
+    }
+    var next = top
+    for name in names {
+        next = next.max(__pg_mig_no(name))
+    }
+    next += 1
+    // сначала весь список: отказ — до того, как что-то применено
+    for k in 0..names.len() {
+        let name = names[k]
+        if let old = applied[name] {
+            if old != sha256(sqls[k]) {
+                return "migration {name} was changed after it was applied: restore it and put the change into migration {next}"
+            }
+        } else if __pg_mig_no(name) < top {
+            return "migration {name} is older than the applied migration {top}: renumber it to {next}"
+        }
     }
     for k in 0..names.len() {
         let name = names[k]
-        let sum = sha256(sqls[k])
-        if let old = applied[name] {
-            if old != sum {
-                return "migration {name} was changed after it was applied: add a new migration instead"
-            }
+        if applied.has(name) {
             continue
         }
-        let e = __pg_simple(c, "begin;\n" + sqls[k] + "\n;insert into khrip_migrations (name, sha256) values ('" + name.replace("'", "''") + "', '" + sum + "');\ncommit", deadline)
-        if e.code.len() > 0 {
+        let sum = sha256(sqls[k])
+        let record = "insert into khrip_migrations (name, sha256) values ('" + name.replace("'", "''") + "', '" + sum + "')"
+        let conc = sqls[k].lower().contains("concurrently")
+        var tries = 0
+        while true {
+            var e = __PgErr {}
+            if conc {
+                // CREATE INDEX CONCURRENTLY не идёт в транзакции; IF NOT EXISTS
+                // (проверено при компиляции) переживает сбой до записи
+                e = __pg_simple(c, sqls[k], deadline)
+                if e.code.len() == 0 {
+                    e = __pg_simple(c, record, deadline)
+                }
+            } else {
+                e = __pg_simple(c, "begin;\nset local lock_timeout = '5s';\n" + sqls[k] + "\n;" + record + ";\ncommit", deadline)
+            }
+            if e.code.len() == 0 {
+                break
+            }
             __pg_simple(c, "rollback", deadline)
+            if e.code == "55P03" && tries < 5 {
+                tries += 1
+                sleep(1000 * tries)
+                continue
+            }
+            if e.code == "55P03" {
+                return "migration {name} waited for a lock 5 times: a long query holds the table; retry the deploy"
+            }
             return "migration {name}: {e.message}"
         }
         buf_add(log, "applied {name}\n")

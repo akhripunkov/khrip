@@ -1,0 +1,35 @@
+// tx как значение: let t = tx { ...; v } фиксирует после значения, 409 откатывает.
+
+migration 1 `
+CREATE TABLE accounts (id bigserial PRIMARY KEY, owner text NOT NULL, balance bigint NOT NULL DEFAULT 0 CHECK (balance >= 0));
+CREATE TABLE transfers (id bigserial PRIMARY KEY, from_id bigint NOT NULL REFERENCES accounts, to_id bigint NOT NULL REFERENCES accounts, amount bigint NOT NULL);
+`
+type Account { id: int, owner: str, balance: int }
+type NewTransfer { from_id: int, to_id: int, amount: int }
+type Transfer { id: int, ...NewTransfer }
+route POST "/transfers" (body: NewTransfer) -> 201 Transfer | 404 | 409 str {
+    let t: Transfer = tx {
+        let from: Account = sql "SELECT * FROM accounts WHERE id = {body.from_id}"
+        if from.balance < body.amount {
+            return 409 "insufficient funds"
+        }
+        sql "UPDATE accounts SET balance = balance - {body.amount} WHERE id = {from.id}"
+        sql "UPDATE accounts SET balance = balance + {body.amount} WHERE id = {body.to_id}"
+        sql "INSERT INTO transfers {body} RETURNING *"
+    }
+    return 201 t
+}
+test "tx value" {
+    sql "INSERT INTO accounts (owner, balance) VALUES ('a', 100), ('b', 0)"
+    let r = call POST "/transfers" NewTransfer { from_id: 1, to_id: 2, amount: 60 }
+    expect r.status == 201 && r.body.contains("\"amount\":60")
+    expect (call POST "/transfers" NewTransfer { from_id: 1, to_id: 2, amount: 60 }).status == 409
+    let total: int = sql "SELECT sum(balance)::bigint FROM accounts"
+    let b: int = sql "SELECT balance FROM accounts WHERE id = 2"
+    expect total == 100 && b == 60
+    let n = tx {
+        sql "UPDATE accounts SET balance = balance + 1 WHERE id = 1"
+        5
+    }
+    expect n == 5
+}

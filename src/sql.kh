@@ -471,6 +471,52 @@ fn sort_migrations() {
         }
         i += 1
     }
+    for m in sql_migs {
+        sql_check_migration(m)
+    }
+}
+
+// Миграция с CONCURRENTLY идёт вне транзакции: если сервер упадёт до записи о
+// ней, следующий старт выполнит её снова — поэтому один оператор и IF NOT EXISTS.
+fn sql_check_migration(m: Migration) {
+    var conc = false
+    var guarded = false
+    var stmts = 0
+    let ws = sql_code_words(m.sql)
+    for i in 0..ws.len() {
+        if ws[i].w == "concurrently" {
+            conc = true
+        }
+        if ws[i].w == "if" && i + 2 < ws.len() && ws[i + 1].w == "not" && ws[i + 2].w == "exists" {
+            guarded = true
+        }
+    }
+    if !conc {
+        return
+    }
+    let st = sql_states(m.sql)
+    var tail = false
+    for i in 0..m.sql.len() {
+        if st[i] == 0 {
+            let c = m.sql[i]
+            if c == ';' {
+                tail = true
+            } else if tail && !sql_space(c) {
+                stmts += 1
+                tail = false
+            }
+        }
+    }
+    if stmts == 0 && guarded {
+        return
+    }
+    let msg = "migration " + m.n.to_str() + " uses CONCURRENTLY, so it runs outside a transaction: it must be one statement with IF NOT EXISTS, or a crash before it is recorded blocks the next start"
+    let fix = "migration " + m.n.to_str() + " `CREATE INDEX CONCURRENTLY IF NOT EXISTS ...` alone; other statements in the next migration"
+    if m.tok >= 0 {
+        error_tok(toks[m.tok], msg, fix)
+    } else {
+        report_at(files.len() - 1, 1, 1, msg, fix)
+    }
 }
 
 // ---- Разбор текста SQL ----

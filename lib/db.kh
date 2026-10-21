@@ -1023,7 +1023,14 @@ fn __db_start_here() {
             sqls.push(sq)
         }
     }
-    let migrate = (env("DATABASE_MIGRATE") ?? "1") != "0" || (args().len() > 1 && args()[1] == "migrate")
+    // DATABASE_MIGRATE: apply (по умолчанию) — применить при старте; check — схему
+    // меняет отдельный шаг ./app migrate, сервер только проверяет
+    let mode = env("DATABASE_MIGRATE") ?? "apply"
+    if mode != "apply" && mode != "check" && mode != "1" && mode != "0" {
+        eprint("khrip: DATABASE_MIGRATE must be apply or check, not {mode}")
+        exit(1)
+    }
+    let migrate = mode == "apply" || mode == "1" || (args().len() > 1 && args()[1] == "migrate")
     if names.len() > 0 && migrate {
         let log = buf_new(64)
         let err = __pg_migrate(c, names, sqls, log)
@@ -1037,7 +1044,7 @@ fn __db_start_here() {
             exit(1)
         }
     } else if names.len() > 0 {
-        // DATABASE_MIGRATE=0: схему меняет отдельный шаг (./app migrate)
+        // DATABASE_MIGRATE=check: схему меняет отдельный шаг (./app migrate)
         let done = __pg_exec(c, "select name from khrip_migrations", [], deadline)
         var applied: [str] = []
         for i in 0..done.rows {
@@ -1045,7 +1052,7 @@ fn __db_start_here() {
         }
         for nm in names {
             if !applied.contains(nm) {
-                eprint("khrip: migration {nm} is not applied and DATABASE_MIGRATE=0: run ./app migrate")
+                eprint("khrip: migration {nm} is not applied (DATABASE_MIGRATE={mode}): run ./app migrate")
                 exit(1)
             }
         }
