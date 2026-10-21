@@ -215,7 +215,8 @@ fn parse_list_lit(want_ty: int) -> int {
     no_struct = false
     var et = ty_err
     var known = false
-    if tkind(w) == K_LIST {
+    let want_known = tkind(w) == K_LIST
+    if want_known {
         et = ty_elem(w)
         known = true
         emit_list_new(et)
@@ -244,6 +245,10 @@ fn parse_list_lit(want_ty: int) -> int {
             emit_pop(RAX)
             emit_store(RSP, 0, RAX)
         } else {
+            // [Circle { .. }, Rect { .. }] — список общего типа Shape
+            if !want_known && t != et && !assignable(t, et) && variant_sum(t) >= 0 && variant_sum(t) == variant_sum(et) {
+                et = variant_sum(t)
+            }
             coerce(t, et, vt)
             emit_mov_rr(RSI, RAX)
             emit_load(RDI, RSP, 0)

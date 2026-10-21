@@ -1342,6 +1342,13 @@ fn __expect(ok: bool, at: str, text: str) {
     }
 }
 
+// expect x != none: значения нет — тест останавливается.
+fn __expect_some(ok: bool, at: str, text: str) {
+    if !ok {
+        __panic_msg(at + ": expect " + text + " — the test stops here")
+    }
+}
+
 fn __expect_eq(l: str, r: str, want_eq: bool, at: str, text: str) {
     if (l == r) != want_eq {
         __test_fail(at + ": expect " + text + "\n      left:  " + l + "\n      right: " + r)

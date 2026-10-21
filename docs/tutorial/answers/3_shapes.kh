@@ -14,7 +14,7 @@ fn first_long(words: [str], min: int) -> str? {
 }
 
 fn main() {
-    let shapes: [Shape] = [Circle { r: 2 }, Rect { w: 3, h: 4 }, Square { side: 5 }]
+    let shapes = [Circle { r: 2 }, Rect { w: 3, h: 4 }, Square { side: 5 }]
     print("Площади: {to_json(shapes.map(s => area(s)))}")
     print("Длинное слово: {first_long(["cat", "horse", "elephant"], 5) ?? "нет"}")
     print("Очень длинное: {first_long(["cat"], 10) ?? "нет"}")

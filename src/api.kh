@@ -891,6 +891,18 @@ fn parse_expect() {
     }
     let where = files[at.file].path + ":" + at.line.to_str()
     let text = expect_text(at)
+    // expect x != none: без значения тест дальше не имеет смысла — он
+    // прерывается, а после проверки x читается как значение
+    let li = none_test_at(pos, T_NE)
+    if li >= 0 && ends_stmt(pos + 3) {
+        parse_expr(ty_bool)
+        emit_mov_rr(RDI, RAX)
+        emit_mov_imm(RSI, const_str(where))
+        emit_mov_imm(RDX, const_str(text))
+        emit_call(rt_func("__expect_some"))
+        narrowed.push(li)
+        return
+    }
     // a == b и a != b: при ошибке показать обе стороны
     var simple_eq = false
     var depth = 0

@@ -100,7 +100,8 @@ test "member, loan, return" {
     let reg = call POST "/members" NewMember { name: "Anna", email: "anna@example.com" }
     expect reg.status == 201
     let r: Registered? = from_json(reg.body)
-    let key = (r ?? Registered { member: Member { id: 0, name: "", email: "" }, api_key: "" }).api_key
+    expect r != none
+    let key = r.api_key
     expect key.len() == 24
 
     let auth = {"X-API-Key": key}
@@ -120,5 +121,7 @@ test "bad email" {
 test "overdue" {
     loans[50] = Loan { id: 50, book_id: 1, member_id: 1, due: "2020-01-01T00:00:00Z" }
     expect mark_overdue() == 1
-    expect (loans[50] ?? Loan { id: 0, book_id: 0, member_id: 0, due: "" }).status == Overdue
+    let loan = loans[50]
+    expect loan != none
+    expect loan.status == Overdue
 }

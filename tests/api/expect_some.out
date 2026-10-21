@@ -1,0 +1,5 @@
+ok    variants list
+ok    expect some
+FAIL  expect some stops
+    panic: tests/api/expect_some.kh:34: expect p != none — the test stops here
+3 tests: 2 passed, 1 failed

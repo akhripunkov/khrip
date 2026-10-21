@@ -353,7 +353,7 @@ fn first_long(words: [str], min: int) -> str? {
 }
 
 fn main() {
-    let shapes: [Shape] = [Circle { r: 2 }, Rect { w: 3, h: 4 }, Square { side: 5 }]
+    let shapes = [Circle { r: 2 }, Rect { w: 3, h: 4 }, Square { side: 5 }]
     print("Площади: {to_json(shapes.map(s => area(s)))}")
     print("Длинное слово: {first_long(["cat", "horse", "elephant"], 5) ?? "нет"}")
     print("Очень длинное: {first_long(["cat"], 10) ?? "нет"}")
@@ -366,9 +366,8 @@ fn main() {
 Очень длинное: нет
 ```
 
-Тип списка `[Shape]` пришлось указать явно: без него компилятор берёт тип по
-первому элементу (`Circle`) и не принимает `Rect`. Это известная шероховатость
-языка.
+Список `[Circle { .. }, Rect { .. }, Square { .. }]` получает общий тип `[Shape]`
+сам: разные варианты одного типа складываются в список этого типа.
 
 </details>
 
@@ -641,7 +640,8 @@ test "member, loan, return" {
     let reg = call POST "/members" NewMember { name: "Anna", email: "anna@example.com" }
     expect reg.status == 201
     let r: Registered? = from_json(reg.body)
-    let key = (r ?? Registered { member: Member { id: 0, name: "", email: "" }, api_key: "" }).api_key
+    expect r != none
+    let key = r.api_key
     expect key.len() == 24
 
     let auth = {"X-API-Key": key}
@@ -661,7 +661,9 @@ test "bad email" {
 test "overdue" {
     loans[50] = Loan { id: 50, book_id: 1, member_id: 1, due: "2020-01-01T00:00:00Z" }
     expect mark_overdue() == 1
-    expect (loans[50] ?? Loan { id: 0, book_id: 0, member_id: 0, due: "" }).status == Overdue
+    let loan = loans[50]
+    expect loan != none
+    expect loan.status == Overdue
 }
 ```
 
@@ -680,12 +682,14 @@ ok    overdue
   в `current_member()`, а не в каждом маршруте.
 - `random_str`, `time_iso`, `parse_time`, `hash_password`, `check_password`, `sha256` —
   встроенные функции для типичных задач бэкенда.
-- `` s.matches(`...`) `` проверяет строку регулярным выражением целиком. Время проверки
+- `s.matches(`...`)` проверяет строку регулярным выражением целиком. Время проверки
   линейное, поэтому злой шаблон или ввод не подвесят сервер.
 - `every 1 h { ... }` — фоновая задача. Её тело лучше вынести в функцию, чтобы
   проверить тестом без ожидания.
 - В тестах можно менять `store` напрямую (`loans[50] = ...`): так готовятся данные
   для проверки.
+- `expect r != none` в тесте: если значения нет, тест останавливается с сообщением,
+  а дальше `r` читается как обычное значение (`r.api_key`).
 
 **Задание.** Добавьте `POST /loans/{id}/extend`: продлить свою активную выдачу на 7
 дней, но только один раз (повторно — 409). Подсказка: `parse_time(loan.due)` даёт
@@ -718,10 +722,11 @@ test "extend once" {
     call POST "/books" Book { id: 8, title: "Ulysses" }
     let reg = call POST "/members" NewMember { name: "Vera", email: "vera@example.com" }
     let r: Registered? = from_json(reg.body)
-    let auth = {"X-API-Key": (r ?? Registered { member: Member { id: 0, name: "", email: "" }, api_key: "" }).api_key}
-    let loan = call POST "/loans" NewLoan { book_id: 8 } headers auth
-    let l: Loan? = from_json(loan.body)
-    let id = (l ?? Loan { id: 0, book_id: 0, member_id: 0, due: "" }).id
+    expect r != none
+    let auth = {"X-API-Key": r.api_key}
+    let loan: Loan? = from_json((call POST "/loans" NewLoan { book_id: 8 } headers auth).body)
+    expect loan != none
+    let id = loan.id
     expect (call POST "/loans/{id}/extend" headers auth).status == 200
     expect (call POST "/loans/{id}/extend" headers auth).status == 409
 }

@@ -1,0 +1,10 @@
+$ curl -s -X POST localhost:8080/books -d '{"title":"Dune","author":"Herbert","year":1965}'
+{"id":1,"title":"Dune","author":"Herbert","year":1965,"tags":[]}
+$ curl -s localhost:8080/books/1
+{"id":1,"title":"Dune","author":"Herbert","year":1965,"tags":[]}
+$ curl -s -X POST localhost:8080/books -d '{"title":"Dune"}'
+invalid JSON body: missing field 'author'
+$ curl -s -X PATCH localhost:8080/books/1 -d '{"year":1966}'
+{"id":1,"title":"Dune","author":"Herbert","year":1966,"tags":[]}
+$ curl -si localhost:8080/books/7 | head -1
+HTTP/1.1 404 Not Found

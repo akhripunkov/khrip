@@ -232,7 +232,9 @@ test "create user" {
 
 `call METHOD "path?query" [body] [headers map]` runs a request in-process and
 returns a `Response`. `expect cond` records a failure and continues; `a == b`
-failures show both sides. Tests run in order and share store.
+failures show both sides; `expect r != none` stops the test when `r` is none, and
+after it `r` is a value: `let u: User? = from_json(r.body)`, `expect u != none`,
+`expect u.name == "Ann"`. Tests run in order and share store.
 
 ## Habits from other languages
 

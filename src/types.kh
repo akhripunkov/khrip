@@ -143,6 +143,17 @@ fn is_variant_of(t: int, to: int) -> bool {
     return tkind(t) == K_STRUCT && tkind(to) == K_SUM && structs[types[t].a].sum == types[to].a
 }
 
+// Общий тип варианта: для варианта — его тип A | B, для самого типа — он же, иначе -1.
+fn variant_sum(t: int) -> int {
+    if tkind(t) == K_SUM {
+        return t
+    }
+    if tkind(t) == K_STRUCT && structs[types[t].a].sum >= 0 {
+        return ty_sum(structs[types[t].a].sum)
+    }
+    return -1
+}
+
 fn ty_elem(t: int) -> int {
     return types[t].a
 }

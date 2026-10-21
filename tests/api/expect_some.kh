@@ -1,0 +1,36 @@
+// expect x != none останавливает тест и сужает x; список вариантов — общего типа.
+
+type Shape = Circle { r: int } | Rect { w: int, h: int } | Empty
+
+type Pt { x: int, y: int }
+
+route GET "/pt" -> Pt {
+    return Pt { x: 1, y: 2 }
+}
+
+fn area(s: Shape) -> int {
+    return match s {
+        Circle c => 3 * c.r * c.r
+        Rect r => r.w * r.h
+        Empty => 0
+    }
+}
+
+test "variants list" {
+    let shapes = [Circle { r: 2 }, Rect { w: 3, h: 4 }, Empty]
+    expect shapes.map(s => area(s)).sum() == 24
+    let circles = [Circle { r: 1 }, Circle { r: 2 }]
+    expect circles[1].r == 2
+}
+
+test "expect some" {
+    let p: Pt? = from_json((call GET "/pt").body)
+    expect p != none
+    expect p.x + p.y == 3
+}
+
+test "expect some stops" {
+    let p: Pt? = from_json("garbage")
+    expect p != none
+    expect p.x == 100
+}

@@ -1,0 +1,22 @@
+type Genre = Novel | Poetry | Science
+
+type Book { id: int, title: str, genre: Genre }
+
+store books: map[int, Book]
+
+fn label(g: Genre) -> str {
+    return match g {
+        Novel => "роман"
+        Poetry => "стихи"
+    }
+}
+
+route GET "/books/{id}" (id: int) -> Book | 404 {
+    let book = books[id]
+    if book == null {
+        return 404
+    }
+    var count: string = "1"
+    count++
+    return book
+}
