@@ -421,3 +421,163 @@ fn emit_sha256_ni() {
     sse_store(7, 0, 1)
     sse_store(7, 16, 2)
 }
+
+// ---- SHA-256 без SHA-NI: свой машинный код ----
+// 32-битные операции «r/m, r»: 0x89 mov, 0x01 add, 0x31 xor, 0x21 and, 0x09 or.
+
+fn x_rr(op: int, dst: int, src: int) {
+    let rex = ((src >> 3) << 2) | (dst >> 3)
+    if rex != 0 {
+        emit8(0x40 | rex)
+    }
+    emit8(op)
+    emit8(0xC0 | ((src & 7) << 3) | (dst & 7))
+}
+
+// ror/shr r32, n (ext: 1 — ror, 5 — shr)
+fn x_shift(ext: int, reg: int, n: int) {
+    if reg >= 8 {
+        emit8(0x41)
+    }
+    emit8(0xC1)
+    emit8(0xC0 | (ext << 3) | (reg & 7))
+    emit8(n)
+}
+
+// op reg, [rsp + disp] (op: 0x8B mov в регистр, 0x03 add) или 0x89 — в память.
+fn x_rsp(op: int, reg: int, disp: int) {
+    if reg >= 8 {
+        emit8(0x44)
+    }
+    emit8(op)
+    if disp < 128 {
+        emit8(0x44 | ((reg & 7) << 3))
+        emit8(0x24)
+        emit8(disp)
+    } else {
+        emit8(0x84 | ((reg & 7) << 3))
+        emit8(0x24)
+        emit32(disp)
+    }
+}
+
+// add reg, [base + rsi + disp8] (sib: 0x34 — rsp, 0x32 — rdx)
+fn x_add_idx(reg: int, sib: int, disp: int) {
+    if reg >= 8 {
+        emit8(0x44)
+    }
+    emit8(0x03)
+    emit8(0x44 | ((reg & 7) << 3))
+    emit8(sib)
+    emit8(disp)
+}
+
+// Один 64-байтовый блок: rdi — состояние (8 слов по 32 бита), rsi — блок,
+// rdx — константы K. Состояние a..h — в r8d..r15d, расписание W[64] — на стеке;
+// раунды развёрнуты по 8: роли регистров сдвигаются, а не переписываются.
+fn emit_sha256_x64() {
+    let eax = 0
+    let ecx = 1
+    let ebx = 3
+    let ebp = 5
+    // push rbx, rbp, r12–r15, rdi; sub rsp, 256
+    emit_hex("53 55 41 54 41 55 41 56 41 57 57 48 81 EC 00 01 00 00")
+    for i in 0..16 {
+        // mov eax, [rsi + 4i]; bswap eax; mov [rsp + 4i], eax
+        emit8(0x8B)
+        emit8(0x46)
+        emit8(i * 4)
+        emit_hex("0F C8")
+        x_rsp(0x89, eax, i * 4)
+    }
+    for i in 16..64 {
+        // s0 = ror(x, 7) ^ ror(x, 18) ^ (x >> 3), x = W[i - 15]
+        x_rsp(0x8B, eax, (i - 15) * 4)
+        x_rr(0x89, ecx, eax)
+        x_rr(0x89, ebx, eax)
+        x_shift(1, eax, 7)
+        x_shift(1, ecx, 18)
+        x_rr(0x31, eax, ecx)
+        x_shift(5, ebx, 3)
+        x_rr(0x31, eax, ebx)
+        // s1 = ror(y, 17) ^ ror(y, 19) ^ (y >> 10), y = W[i - 2]
+        x_rsp(0x8B, ecx, (i - 2) * 4)
+        x_rr(0x89, ebx, ecx)
+        x_rr(0x89, ebp, ecx)
+        x_shift(1, ecx, 17)
+        x_shift(1, ebx, 19)
+        x_rr(0x31, ecx, ebx)
+        x_shift(5, ebp, 10)
+        x_rr(0x31, ecx, ebp)
+        x_rr(0x01, eax, ecx)
+        x_rsp(0x03, eax, (i - 16) * 4)
+        x_rsp(0x03, eax, (i - 7) * 4)
+        x_rsp(0x89, eax, i * 4)
+    }
+    // mov r8d..r15d, [rdi + 4r]
+    for r in 0..8 {
+        emit8(0x44)
+        emit8(0x8B)
+        emit8(0x47 | (r << 3))
+        emit8(r * 4)
+    }
+    // xor esi, esi: смещение раунда в W и K
+    emit_hex("31 F6")
+    let top = code_len
+    for j in 0..8 {
+        let a = 8 + (8 - j) % 8
+        let b = 8 + (9 - j) % 8
+        let c = 8 + (10 - j) % 8
+        let d = 8 + (11 - j) % 8
+        let e = 8 + (12 - j) % 8
+        let f = 8 + (13 - j) % 8
+        let g = 8 + (14 - j) % 8
+        let h = 8 + (15 - j) % 8
+        // h += S1(e) + ch(e, f, g) + K[i] + W[i]
+        x_rr(0x89, eax, e)
+        x_rr(0x89, ecx, e)
+        x_shift(1, eax, 6)
+        x_shift(1, ecx, 11)
+        x_rr(0x31, eax, ecx)
+        x_shift(1, ecx, 14)
+        x_rr(0x31, eax, ecx)
+        x_rr(0x89, ecx, f)
+        x_rr(0x31, ecx, g)
+        x_rr(0x21, ecx, e)
+        x_rr(0x31, ecx, g)
+        x_rr(0x01, h, eax)
+        x_rr(0x01, h, ecx)
+        x_add_idx(h, 0x32, j * 4)
+        x_add_idx(h, 0x34, j * 4)
+        x_rr(0x01, d, h)
+        // h += S0(a) + maj(a, b, c)
+        x_rr(0x89, eax, a)
+        x_rr(0x89, ecx, a)
+        x_shift(1, eax, 2)
+        x_shift(1, ecx, 13)
+        x_rr(0x31, eax, ecx)
+        x_shift(1, ecx, 9)
+        x_rr(0x31, eax, ecx)
+        x_rr(0x89, ecx, a)
+        x_rr(0x09, ecx, b)
+        x_rr(0x21, ecx, c)
+        x_rr(0x89, ebx, a)
+        x_rr(0x21, ebx, b)
+        x_rr(0x09, ecx, ebx)
+        x_rr(0x01, h, eax)
+        x_rr(0x01, h, ecx)
+    }
+    // add rsi, 32; cmp rsi, 256; jne top
+    emit_hex("48 83 C6 20 48 81 FE 00 01 00 00")
+    emit_jcc_to(CC_NE, top)
+    // mov rdi, [rsp + 256]; add [rdi + 4r], r8d..r15d
+    emit_hex("48 8B BC 24 00 01 00 00")
+    for r in 0..8 {
+        emit8(0x44)
+        emit8(0x01)
+        emit8(0x47 | (r << 3))
+        emit8(r * 4)
+    }
+    // add rsp, 264; pop r15–r12, rbp, rbx
+    emit_hex("48 81 C4 08 01 00 00 41 5F 41 5E 41 5D 41 5C 5D 5B")
+}

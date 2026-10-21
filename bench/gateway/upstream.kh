@@ -1,0 +1,15 @@
+// Медленный сервис для стенда шлюза: отвечает через DELAY мс (по умолчанию 0).
+
+type Item {
+    id: int
+    name: str
+    price: int
+}
+
+route GET "/item" (id: int) -> Item {
+    let delay = (env("DELAY") ?? "0").to_int() ?? 0
+    if delay > 0 {
+        sleep(delay)
+    }
+    return Item { id, name: "item {id}", price: 1000 + id }
+}

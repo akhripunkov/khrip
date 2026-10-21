@@ -1,0 +1,62 @@
+// Сервер для tests/coro.sh: запросы, которые ждут (sleep, fetch), не держат поток.
+
+store log: [str]
+
+fn deep(n: int, ms: int) -> int {
+    if n == 0 {
+        sleep(ms)
+        return 0
+    }
+    return deep(n - 1, ms) + 1
+}
+
+route GET "/sleep" (ms: int, tag: str = "") -> str {
+    sleep(ms)
+    return "slept {tag}"
+}
+
+route GET "/deep" (n: int) -> int {
+    return deep(n, 20)
+}
+
+// запрос к самому себе: с одним потоком без сопрограмм он ждал бы себя вечно
+route GET "/self" (port: int) -> str {
+    let r = fetch GET "http://127.0.0.1:{port}/sleep?ms=20&tag=inner"
+    return "{r.status} {r.body}"
+}
+
+route GET "/boom" () -> str {
+    sleep(5)
+    let xs = [1, 2]
+    return "{xs[5]}"
+}
+
+route GET "/deny" () -> str {
+    sleep(5)
+    fail(403, "denied")
+    return ""
+}
+
+route POST "/log" (text: str) -> int {
+    log.push(text + "-a")
+    sleep(10)
+    log.push(text + "-b")
+    return log.len()
+}
+
+route GET "/log" () -> int {
+    return log.len()
+}
+
+// fetch к сервису tests/coro/upstream.py дважды: второй раз — по тому же
+// соединению, если ответ это позволяет
+route GET "/twice" (port: int, path: str) -> str {
+    let a = fetch GET "http://127.0.0.1:{port}/{path}"
+    let b = fetch GET "http://127.0.0.1:{port}/{path}"
+    return "{a.status}:{a.body}|{b.status}:{b.body}"
+}
+
+route POST "/post" (port: int) -> str {
+    let r = fetch POST "http://127.0.0.1:{port}/len" "x"
+    return "{r.status}:{r.body}"
+}

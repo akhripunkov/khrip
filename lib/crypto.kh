@@ -50,58 +50,15 @@ fn __sha_init(st: int) {
     store32(st + 28, 0x5be0cd19)
 }
 
-fn __rotr(x: int, n: int) -> int {
-    return ((x >> n) | (x << (32 - n))) & 0xFFFFFFFF
-}
-
-// Один 64-байтовый блок p в состояние st; k — константы, w — 64 слова.
+// Один 64-байтовый блок p в состояние st; k — константы. Оба пути —
+// машинный код компилятора: инструкции SHA-NI, если процессор их знает, иначе
+// обычные 32-битные (src/simd.kh). w не нужен: расписание — на стеке.
 fn __sha_block(st: int, p: int, k: int, w: int) {
     if __simd_sha {
         __simd_sha256(st, p, k)
         return
     }
-    for t in 0..16 {
-        let q = p + t * 4
-        store64(w + t * 8, (load8(q) << 24) | (load8(q + 1) << 16) | (load8(q + 2) << 8) | load8(q + 3))
-    }
-    for t in 16..64 {
-        let x = load64(w + (t - 15) * 8)
-        let y = load64(w + (t - 2) * 8)
-        let s0 = __rotr(x, 7) ^ __rotr(x, 18) ^ (x >> 3)
-        let s1 = __rotr(y, 17) ^ __rotr(y, 19) ^ (y >> 10)
-        store64(w + t * 8, (load64(w + (t - 16) * 8) + s0 + load64(w + (t - 7) * 8) + s1) & 0xFFFFFFFF)
-    }
-    var a = load32(st)
-    var b = load32(st + 4)
-    var c = load32(st + 8)
-    var d = load32(st + 12)
-    var e = load32(st + 16)
-    var f = load32(st + 20)
-    var g = load32(st + 24)
-    var h = load32(st + 28)
-    for t in 0..64 {
-        let s1 = __rotr(e, 6) ^ __rotr(e, 11) ^ __rotr(e, 25)
-        let ch = (e & f) ^ ((e ^ 0xFFFFFFFF) & g)
-        let t1 = (h + s1 + ch + load32(k + t * 4) + load64(w + t * 8)) & 0xFFFFFFFF
-        let s0 = __rotr(a, 2) ^ __rotr(a, 13) ^ __rotr(a, 22)
-        let mj = (a & b) ^ (a & c) ^ (b & c)
-        h = g
-        g = f
-        f = e
-        e = (d + t1) & 0xFFFFFFFF
-        d = c
-        c = b
-        b = a
-        a = (t1 + s0 + mj) & 0xFFFFFFFF
-    }
-    store32(st, load32(st) + a)
-    store32(st + 4, load32(st + 4) + b)
-    store32(st + 8, load32(st + 8) + c)
-    store32(st + 12, load32(st + 12) + d)
-    store32(st + 16, load32(st + 16) + e)
-    store32(st + 20, load32(st + 20) + f)
-    store32(st + 24, load32(st + 24) + g)
-    store32(st + 28, load32(st + 28) + h)
+    __sha256_x64(st, p, k)
 }
 
 // Состояние → 32 байта (старшими вперёд).
@@ -230,7 +187,11 @@ fn __pbkdf2(pw: str, salt: int, slen: int, iter: int, out: int) {
     let ob = __hmac32_block()
     __hmac_short(ist, ost, msg, slen + 4, ib, k, w, st)
     __memcpy(out, ib, 32)
-    for _ in 1..iter {
+    for i in 1..iter {
+        if (i & 1023) == 0 {
+            // 16 мс вычислений не держат весь поток: другие запросы идут между частями
+            __co_yield()
+        }
         __memcpy(st, ist, 32)
         __sha_block(st, ib, k, w)
         __sha_put(st, ob)

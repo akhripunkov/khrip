@@ -1,7 +1,9 @@
 // HTTP/1.1-сервер на epoll: неблокирующие сокеты, keep-alive, конвейерные
 // запросы, тело по Content-Length. Каждый рабочий поток — свой epoll, свой
-// слушающий сокет (SO_REUSEPORT), свои соединения и своя арена запроса.
-// Маршрутизатор __dispatch генерирует компилятор из объявлений route.
+// слушающий сокет (SO_REUSEPORT) и свои соединения. Каждый запрос выполняется
+// в сопрограмме (lib/rt.kh) со своей ареной: если он ждёт (fetch, sleep), поток
+// выполняет другие. Маршрутизатор __dispatch генерирует компилятор из
+// объявлений route.
 
 const SYS_RT_SIGACTION = 13
 const SYS_SOCKET = 41
@@ -13,12 +15,14 @@ const SYS_SHUTDOWN = 48
 const SHUT_WR = 1
 const SYS_TIME = 201
 const SYS_EPOLL_WAIT = 232
-const SYS_EPOLL_CTL = 233
 const SYS_EPOLL_CREATE1 = 291
+const SYS_MPROTECT = 10
+const SYS_MADVISE = 28
 
 const AF_INET = 2
 const SOCK_STREAM = 1
 const SOCK_NONBLOCK = 0x800
+const SOCK_CLOEXEC = 0x80000
 const SOL_SOCKET = 1
 const SO_REUSEADDR = 2
 const SO_REUSEPORT = 15
@@ -27,12 +31,6 @@ const TCP_NODELAY = 1
 const SIGPIPE = 13
 const EAGAIN = 11
 
-const EPOLL_CTL_ADD = 1
-const EPOLL_CTL_MOD = 3
-const EPOLLIN = 1
-const EPOLLOUT = 4
-const EPOLLERR = 8
-const EPOLLHUP = 16
 const EPOLL_EVENT_SIZE = 12
 
 const HTTP_IN_SIZE = 65536
@@ -40,6 +38,13 @@ const HTTP_OUT_SIZE = 65536
 const HTTP_MAX_FD = 65536
 const HTTP_MAX_EVENTS = 512
 const HTTP_DATE_LEN = 29
+
+// Сопрограммы потока: не больше CO_MAX или KHRIP_COROUTINES (дальше запросы
+// ждут в очереди), из свободных CO_KEEP держат память арены; стек запросов —
+// CO_STACK байт.
+const CO_MAX = 4096
+const CO_KEEP = 64
+const CO_STACK = 8388608
 
 type __Conn {
     inp: int
@@ -54,6 +59,17 @@ type __Conn {
     // выбрасываем его данные — иначе close() с непрочитанным вводом шлёт RST,
     // и клиент может не успеть прочитать ответ (431, 400)
     linger: bool
+    // сколько байтов входа уже разобрано; размер запроса, который выполняется
+    off: int
+    pend: int
+    // запрос соединения выполняется (ждёт) или ждёт свободную сопрограмму:
+    // вход не читается и не сдвигается — строки запроса указывают в него
+    busy: bool
+    // клиент ушёл, пока запрос выполнялся: закрыть, когда запрос закончится
+    dead: bool
+    open: bool
+    // события, на которые соединение подписано в epoll
+    armed: int
 }
 
 // Состояние сервера в потоке.
@@ -65,7 +81,32 @@ type __Server {
     date: int
     date_sec: int
     tmp: int
+    // ответы на ошибки протокола (400, 413, 431, 501)
     w: __Worker
+    sch: __Sched
+    // свободные сопрограммы; сколько создано и сколько можно
+    free: [int]
+    co_count: int
+    co_max: int
+    // соединения, чьим запросам не хватило сопрограммы, по очереди
+    starved: [int]
+    starved_head: int
+    // сопрограммы, чей срок вышел
+    due: [int]
+}
+
+// Задание сопрограммы: запрос в буфере соединения conn (адреса и длины).
+type __Job {
+    conn: int = 0
+    fd: int = 0
+    p: int = 0
+    mlen: int = 0
+    target: int = 0
+    plen: int = 0
+    qlen: int = 0
+    lend: int = 0
+    hend: int = 0
+    blen: int = 0
 }
 
 var __http_port: int
@@ -89,7 +130,7 @@ fn __ignore_sigpipe() {
 
 // Неблокирующий слушающий сокет на 0.0.0.0:port → дескриптор или код ошибки.
 fn __tcp_listen(tmp: int, port: int) -> int {
-    let fd = syscall(SYS_SOCKET, AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)
+    let fd = syscall(SYS_SOCKET, AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)
     if fd < 0 {
         return fd
     }
@@ -221,9 +262,8 @@ fn __out_int(c: __Conn, x: int) {
     c.out_len += n
 }
 
-// Заголовки и тело ответа из состояния потока.
-fn __write_response(s: __Server, c: __Conn) {
-    let w = s.w
+// Заголовки и тело ответа из состояния запроса w.
+fn __write_response(s: __Server, c: __Conn, w: __Worker) {
     let n = w.body.len
     __out_reserve(c, n + 256)
     __out_str(c, "HTTP/1.1 ")
@@ -256,7 +296,7 @@ fn __write_response(s: __Server, c: __Conn) {
 fn __http_error(s: __Server, c: __Conn, status: int) {
     c.close = true
     __reply_status(status)
-    __write_response(s, c)
+    __write_response(s, c, s.w)
 }
 
 // ---- Разбор запросов ----
@@ -306,9 +346,11 @@ fn __parse_len(p: int, n: int) -> int {
     return v
 }
 
-// Разбирает один запрос с начала p, вызывает маршрутизатор и дописывает ответ.
-// → сколько байтов занял запрос, или 0, если он ещё не пришёл целиком.
-fn __http_request(s: __Server, c: __Conn, p: int, n: int) -> int {
+// Разбирает один запрос с начала p и выполняет его в сопрограмме: она вызывает
+// маршрутизатор и дописывает ответ. → сколько байтов занял запрос; 0 — он ещё
+// не пришёл целиком; -1 — он ждёт (fetch, sleep), его размер — в c.pend; -2 —
+// свободной сопрограммы нет.
+fn __http_request(s: __Server, c: __Conn, fd: int, p: int, n: int) -> int {
     let hend = __header_end(p, n)
     if hend == 0 {
         return 0
@@ -385,21 +427,228 @@ fn __http_request(s: __Server, c: __Conn, p: int, n: int) -> int {
     if query_len < 0 {
         query_len = 0
     }
+    let co = __co_get(s) else {
+        return -2
+    }
     if !keep_alive {
         c.close = true
     }
+    let j: __Job = __cast(co.job)
+    j.conn = __cast(c)
+    j.fd = fd
+    j.p = p
+    j.mlen = method_len
+    j.target = target
+    j.plen = path_len
+    j.qlen = query_len
+    j.lend = line_end
+    j.hend = hend
+    j.blen = body_len
+    __co_enter(s.sch, co)
+    if co.done {
+        __co_put(s, co)
+        return hend + body_len
+    }
+    c.pend = hend + body_len
+    return -1
+}
+
+// ---- Сопрограммы запросов ----
+
+fn __co_new(s: __Server) -> __Co? {
+    let base = __arena_take()
+    if base == 0 {
+        return none
+    }
+    let w = __worker_new()
+    let job = __Job {}
+    let co = __Co { sch: s.sch, jb: __alloc(64), ctx: __alloc(CTX_CO_END), stk: 0, stk_len: 0, stk_cap: 0, started: false, parked: false, done: false, deadline: 0, hidx: -1, revents: 0, w: __cast(w), job: __cast(job) }
+    let x = co.ctx
+    store64(x + CTX_WORKER, co.w)
+    store64(x + CTX_SERVER, __cast(s))
+    store64(x + CTX_CORO, __cast(co))
+    __arena_attach(x, base)
+    return co
+}
+
+fn __co_get(s: __Server) -> __Co? {
+    if s.free.len() > 0 {
+        let co: __Co = __cast(s.free.pop())
+        return co
+    }
+    if s.co_count >= s.co_max {
+        return none
+    }
+    let co = __co_new(s) else {
+        // адреса арен кончились: больше сопрограмм не будет
+        s.co_max = s.co_count
+        return none
+    }
+    s.co_count += 1
+    return co
+}
+
+fn __co_put(s: __Server, co: __Co) {
+    co.started = false
+    co.parked = false
+    co.done = false
+    let w: __Worker = __cast(co.w)
+    buf_shrink(w.body, 1048576)
+    buf_shrink(w.extra, 65536)
+    if s.free.len() >= CO_KEEP {
+        // лишняя свободная сопрограмма: страницы арены — системе
+        let base = load64(co.ctx + CTX_ARENA)
+        syscall(SYS_MADVISE, base, load64(co.ctx + CTX_ARENA_END) - base, 4)
+    }
+    s.free.push(__cast(co))
+}
+
+// Кадры сопрограммы, которая ждёт, — со стека запросов в кучу.
+fn __co_evict(sch: __Sched, occ: int) {
+    sch.on_stack = 0
+    let o: __Co = __cast(occ)
+    if !o.parked {
+        return
+    }
+    let sp = load64(o.jb + 8)
+    let n = sch.top - sp
+    if n > o.stk_cap {
+        var cap = 4096
+        while cap < n {
+            cap *= 2
+        }
+        o.stk = __alloc(cap)
+        o.stk_cap = cap
+    }
+    __memcpy(o.stk, sp, n)
+    o.stk_len = n
+}
+
+// Выполнять сопрограмму co, пока она не остановится или не закончит задание.
+fn __co_enter(sch: __Sched, co: __Co) {
+    let c = __ctx()
+    let cv: int = __cast(co)
+    let occ = sch.on_stack
+    if occ != 0 && occ != cv {
+        __co_evict(sch, occ)
+    }
+    __memcpy(sch.ctx + 8, c + 8, CTX_CO_END - 8)
+    __memcpy(c + 8, co.ctx + 8, CTX_CO_END - 8)
+    if __setjmp(sch.jb) == 0 {
+        sch.on_stack = cv
+        if co.started {
+            if occ != cv {
+                __memcpy(sch.top - co.stk_len, co.stk, co.stk_len)
+            }
+            co.parked = false
+            __longjmp(co.jb)
+        }
+        co.started = true
+        __co_call(sch.top, cv)
+    }
+    __memcpy(co.ctx + 8, c + 8, CTX_CO_END - 8)
+    __memcpy(c + 8, sch.ctx + 8, CTX_CO_END - 8)
+}
+
+// Начало сопрограммы на стеке запросов (встроенная __co_call). Из функции нет
+// возврата: планировщик продолжает с __setjmp в __co_enter.
+fn __co_main(co: __Co) {
+    __co_job(co)
+    co.done = true
+    __longjmp(co.sch.jb)
+}
+
+fn __co_job(co: __Co) {
+    let j: __Job = __cast(co.job)
+    let w: __Worker = __cast(co.w)
+    let c: __Conn = __cast(j.conn)
+    let p = j.p
     __arena_begin()
     let req = __Req {
-        method: __str_new(p, method_len),
-        path: __str_new(target, path_len),
-        query: __str_new(target + path_len + 1, query_len),
-        body: __str_new(p + hend, body_len),
-        headers: __str_new(p + line_end + 2, hend - line_end - 4)
+        method: __str_new(p, j.mlen),
+        path: __str_new(j.target, j.plen),
+        query: __str_new(j.target + j.plen + 1, j.qlen),
+        body: __str_new(p + j.hend, j.blen),
+        headers: __str_new(p + j.lend + 2, j.hend - j.lend - 4)
     }
-    __serve_one(s.w, req)
-    __write_response(s, c)
+    __serve_one(w, req)
+    __write_response(__srv(), c, w)
     __arena_end()
-    return hend + body_len
+}
+
+fn __co_run(s: __Server, co: __Co) {
+    __co_enter(s.sch, co)
+    if co.done {
+        let j: __Job = __cast(co.job)
+        let c: __Conn = __cast(j.conn)
+        let fd = j.fd
+        __co_put(s, co)
+        __conn_resume(s, fd, c, c.pend)
+        __feed_starved(s)
+    }
+}
+
+// Событие для сопрограммы, которая ждёт fd.
+fn __co_wake(s: __Server, cv: int, flags: int) {
+    let co: __Co = __cast(cv)
+    if !co.parked {
+        return
+    }
+    if co.hidx >= 0 {
+        __heap_remove(s.sch, co)
+    }
+    co.revents = flags
+    __co_run(s, co)
+}
+
+// Разбудить сопрограммы, чей срок вышел.
+fn __co_expire(s: __Server) {
+    let sch = s.sch
+    if sch.heap_len == 0 {
+        return
+    }
+    let now = now_ms()
+    while sch.heap_len > 0 {
+        let co = __heap_at(sch, 0)
+        if co.deadline > now {
+            break
+        }
+        __heap_remove(sch, co)
+        s.due.push(__cast(co))
+    }
+    for cv in s.due {
+        let co: __Co = __cast(cv)
+        if co.parked {
+            co.revents = 0
+            __co_run(s, co)
+        }
+    }
+    s.due.clear()
+}
+
+// Сколько мс epoll может ждать: до ближайшего срока или без предела (-1).
+fn __co_timeout(sch: __Sched) -> int {
+    if sch.heap_len == 0 {
+        return -1
+    }
+    let d = __heap_at(sch, 0).deadline - now_ms()
+    if d < 0 {
+        return 0
+    }
+    return d
+}
+
+// Запросы, которым не хватило сопрограммы, — по мере того как они освобождаются.
+fn __feed_starved(s: __Server) {
+    while s.starved_head < s.starved.len() && (s.free.len() > 0 || s.co_count < s.co_max) {
+        let fd = s.starved[s.starved_head]
+        s.starved_head += 1
+        __conn_resume(s, fd, __conn(s, fd), 0)
+    }
+    if s.starved_head == s.starved.len() {
+        s.starved.clear()
+        s.starved_head = 0
+    }
 }
 
 // ---- Соединения ----
@@ -408,60 +657,108 @@ fn __conn(s: __Server, fd: int) -> __Conn {
     return __cast(load64(s.conns + fd * 8))
 }
 
-// Отправляет накопленные ответы. → true, если всё отправлено и соединение живо.
+// Подписать соединение на события ev, если оно подписано на другие.
+fn __conn_arm(s: __Server, fd: int, c: __Conn, ev: int) {
+    if c.armed != ev {
+        __epoll_ctl(s, EPOLL_CTL_MOD, fd, ev)
+        c.armed = ev
+    }
+}
+
+// Закрыть соединение; если его запрос ещё выполняется — когда закончится.
+fn __conn_drop(s: __Server, fd: int, c: __Conn) {
+    if c.busy {
+        if !c.dead {
+            c.dead = true
+            __epoll_ctl(s, EPOLL_CTL_DEL, fd, 0)
+            c.armed = 0
+        }
+        return
+    }
+    if c.open {
+        c.open = false
+        syscall(SYS_CLOSE, fd)
+    }
+}
+
+// Запрос соединения закончился (used — его размер) или получил сопрограмму
+// (used = 0): разобрать остальной вход и снова ждать ввода.
+fn __conn_resume(s: __Server, fd: int, c: __Conn, used: int) {
+    c.busy = false
+    c.off += used
+    c.pend = 0
+    if c.dead {
+        c.dead = false
+        __conn_drop(s, fd, c)
+        return
+    }
+    __process(s, fd, c)
+    if c.open && !c.busy && !c.dead {
+        if c.wait_out {
+            __conn_arm(s, fd, c, EPOLLOUT)
+        } else {
+            __conn_arm(s, fd, c, EPOLLIN)
+        }
+    }
+}
+
+// Отправляет накопленные ответы. → true, если всё отправлено, соединение живо
+// и можно разбирать следующие запросы.
 fn __flush(s: __Server, fd: int, c: __Conn) -> bool {
     while c.sent < c.out_len {
         let w = syscall(SYS_WRITE, fd, c.out + c.sent, c.out_len - c.sent)
         if w == -EAGAIN {
-            if !c.wait_out {
-                c.wait_out = true
-                __epoll_ctl(s, EPOLL_CTL_MOD, fd, EPOLLOUT)
-            }
+            c.wait_out = true
+            __conn_arm(s, fd, c, EPOLLOUT)
             return false
         }
         if w <= 0 {
-            syscall(SYS_CLOSE, fd)
+            __conn_drop(s, fd, c)
             return false
         }
         c.sent += w
     }
     c.out_len = 0
     c.sent = 0
-    if c.close {
+    c.wait_out = false
+    if c.close && !c.busy {
         syscall(SYS_SHUTDOWN, fd, SHUT_WR)
         c.linger = true
-        if c.wait_out {
-            c.wait_out = false
-            __epoll_ctl(s, EPOLL_CTL_MOD, fd, EPOLLIN)
-        }
+        __conn_arm(s, fd, c, EPOLLIN)
         return false
     }
-    if c.wait_out {
-        c.wait_out = false
-        __epoll_ctl(s, EPOLL_CTL_MOD, fd, EPOLLIN)
-    }
-    return true
+    __conn_arm(s, fd, c, EPOLLIN)
+    return !c.busy
 }
 
 // Все полные запросы из входного буфера, затем отправка ответов.
 fn __process(s: __Server, fd: int, c: __Conn) {
     while true {
-        var off = 0
         var more = false
-        while off < c.in_len && !c.close {
+        while c.off < c.in_len && !c.close {
             if c.out_len >= HTTP_OUT_SIZE {
                 more = true
                 break
             }
-            let used = __http_request(s, c, c.inp + off, c.in_len - off)
+            let used = __http_request(s, c, fd, c.inp + c.off, c.in_len - c.off)
             if used == 0 {
                 break
             }
-            off += used
+            if used < 0 {
+                // запрос ждёт: следующие — когда он закончится (ответы по порядку)
+                c.busy = true
+                if used == -2 {
+                    s.starved.push(fd)
+                }
+                __flush(s, fd, c)
+                return
+            }
+            c.off += used
         }
-        if off > 0 {
-            __memcpy(c.inp, c.inp + off, c.in_len - off)
-            c.in_len -= off
+        if c.off > 0 {
+            __memcpy(c.inp, c.inp + c.off, c.in_len - c.off)
+            c.in_len -= c.off
+            c.off = 0
         }
         if !c.close && c.in_len == HTTP_IN_SIZE {
             __http_error(s, c, 431)
@@ -481,7 +778,7 @@ fn __read(s: __Server, fd: int, c: __Conn) {
                 return
             }
             if d <= 0 {
-                syscall(SYS_CLOSE, fd)
+                __conn_drop(s, fd, c)
                 return
             }
         }
@@ -491,7 +788,7 @@ fn __read(s: __Server, fd: int, c: __Conn) {
         return
     }
     if n <= 0 {
-        syscall(SYS_CLOSE, fd)
+        __conn_drop(s, fd, c)
         return
     }
     c.in_len += n
@@ -500,7 +797,7 @@ fn __read(s: __Server, fd: int, c: __Conn) {
 
 fn __accept(s: __Server) {
     while true {
-        let fd = syscall(SYS_ACCEPT4, s.lfd, 0, 0, SOCK_NONBLOCK)
+        let fd = syscall(SYS_ACCEPT4, s.lfd, 0, 0, SOCK_NONBLOCK | SOCK_CLOEXEC)
         if fd < 0 {
             return
         }
@@ -511,7 +808,7 @@ fn __accept(s: __Server) {
         __setsockopt(s.tmp, fd, IPPROTO_TCP, TCP_NODELAY, 1)
         var a = load64(s.conns + fd * 8)
         if a == 0 {
-            let c = __Conn { inp: __mmap(HTTP_IN_SIZE), in_len: 0, out: __mmap(HTTP_OUT_SIZE * 2), out_len: 0, out_cap: HTTP_OUT_SIZE * 2, sent: 0, close: false, wait_out: false, linger: false }
+            let c = __Conn { inp: __mmap(HTTP_IN_SIZE), in_len: 0, out: __mmap(HTTP_OUT_SIZE * 2), out_len: 0, out_cap: HTTP_OUT_SIZE * 2, sent: 0, close: false, wait_out: false, linger: false, off: 0, pend: 0, busy: false, dead: false, open: true, armed: 0 }
             a = __cast(c)
             store64(s.conns + fd * 8, a)
         }
@@ -522,14 +819,23 @@ fn __accept(s: __Server) {
         c.close = false
         c.wait_out = false
         c.linger = false
+        c.off = 0
+        c.pend = 0
+        c.busy = false
+        c.dead = false
+        c.open = true
+        c.armed = EPOLLIN
         __epoll_ctl(s, EPOLL_CTL_ADD, fd, EPOLLIN)
     }
 }
 
 fn __event(s: __Server, fd: int, flags: int) {
     let c = __conn(s, fd)
+    if !c.open {
+        return
+    }
     if (flags & (EPOLLERR | EPOLLHUP)) != 0 {
-        syscall(SYS_CLOSE, fd)
+        __conn_drop(s, fd, c)
         return
     }
     if c.wait_out {
@@ -538,46 +844,68 @@ fn __event(s: __Server, fd: int, flags: int) {
         }
         return
     }
+    if c.busy {
+        // новый ввод подождёт, пока выполняется запрос
+        __conn_arm(s, fd, c, 0)
+        return
+    }
     __read(s, fd, c)
 }
 
 // Рабочий цикл потока id.
 fn __http_worker(id: int) {
     let w = __worker_init()
-    __arena_init(id)
     let tmp = __alloc(64)
     let lfd = __tcp_listen(tmp, __http_port)
     if lfd < 0 {
         eprint("khrip: cannot listen on port {__http_port}")
         exit(1)
     }
+    let ep = syscall(SYS_EPOLL_CREATE1, SOCK_CLOEXEC)
+    // стек запросов и страница-охранник под ним
+    let stack = __mmap(CO_STACK + 4096)
+    syscall(SYS_MPROTECT, stack, 4096, 0)
+    let co_max = __env_int("KHRIP_COROUTINES", CO_MAX).max(1)
+    let sch = __Sched { ep, jb: __alloc(64), ctx: __alloc(CTX_CO_END), top: stack + 4096 + CO_STACK, on_stack: 0, heap: __mmap(co_max * 8), heap_len: 0, ev: __alloc(16) }
     let s = __Server {
-        ep: syscall(SYS_EPOLL_CREATE1, 0),
+        ep: ep,
         lfd: lfd,
         conns: __mmap(HTTP_MAX_FD * 8),
         events: __alloc(HTTP_MAX_EVENTS * EPOLL_EVENT_SIZE),
         date: __alloc(32),
         date_sec: 0,
         tmp: tmp,
-        w: w
+        w: w,
+        sch: sch,
+        free: [],
+        co_count: 0,
+        co_max: co_max,
+        starved: [],
+        starved_head: 0,
+        due: []
     }
     store64(__ctx() + CTX_SERVER, __cast(s))
     __update_date(s)
     __epoll_ctl(s, EPOLL_CTL_ADD, lfd, EPOLLIN)
     while true {
-        let n = syscall(SYS_EPOLL_WAIT, s.ep, s.events, HTTP_MAX_EVENTS, -1)
+        let n = syscall(SYS_EPOLL_WAIT, s.ep, s.events, HTTP_MAX_EVENTS, __co_timeout(sch))
         __update_date(s)
         var i = 0
         while i < n {
             let e = s.events + i * EPOLL_EVENT_SIZE
-            let fd = load64(e + 4) & 0xFFFFFFFF
-            if fd == lfd {
+            // данные события: дескриптор соединения или сопрограмма, которая ждёт
+            let d = load64(e + 4)
+            let flags = load64(e) & 0xFFFFFFFF
+            if d == lfd {
                 __accept(s)
+            } else if d < HTTP_MAX_FD {
+                __event(s, d, flags)
             } else {
-                __event(s, fd, load64(e) & 0xFFFFFFFF)
+                __co_wake(s, d, flags)
             }
             i += 1
         }
+        __co_expire(s)
     }
 }
 
@@ -638,7 +966,6 @@ const SYS_RENAME_STORE = 82
 const SIGINT = 2
 const SIGTERM = 15
 
-var __timer_arena: int
 var __store_saved: int
 
 fn __data_path() -> str {
@@ -710,7 +1037,7 @@ fn __run_task(w: __Worker, i: int) {
 
 fn __timer_loop() {
     let w = __worker_init()
-    __arena_init(__timer_arena)
+    __arena_init()
     let n = __every_count()
     var t = now_ms()
     var next: [int] = []
@@ -766,7 +1093,6 @@ fn __run_timers() {
     __load_store()
     __store_saved = __store_touches
     __block_signals()
-    __timer_arena = 0
     eprint("khrip: running {__every_count()} background task(s)")
     __timer_loop()
 }
@@ -797,7 +1123,6 @@ fn __serve() {
         __spawn(stack + THREAD_STACK, id)
     }
     if timers {
-        __timer_arena = n
         let stack = syscall(SYS_MMAP, 0, THREAD_STACK, 3, 0x22 | 0x4000, -1, 0)
         __spawn(stack + THREAD_STACK, -1)
     }

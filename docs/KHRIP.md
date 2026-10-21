@@ -1,4 +1,4 @@
-# Khrip language reference (v0.9)
+# Khrip language reference (v0.10)
 
 Khrip is a compiled, strictly typed language for HTTP APIs on Linux x86-64.
 One project = one namespace: no imports, declaration order does not matter.
@@ -136,7 +136,7 @@ Any function is also a method of its first argument: `p.describe()`.
 
 Functions: `print(s)`, `eprint(s)`, `write(s)`, `args()`, `env(name) -> str?`,
 `read_file(path) -> str?`, `write_file(path, text, executable) -> bool`,
-`exit(code)`, `now()` (unix seconds), `now_ms()`, `time_iso(t)` →
+`exit(code)`, `sleep(ms)`, `now()` (unix seconds), `now_ms()`, `time_iso(t)` →
 `"2026-10-19T15:04:05Z"`, `parse_time(s) -> int?` (ISO 8601, offsets allowed),
 `parse_date("2026-10-19") -> int?`, `random_str(n)` (A-Za-z0-9), `sha256(s)`
 (hex), `hash_password(p)`, `check_password(p, hash) -> bool`, `url_encode(s)`,
@@ -216,9 +216,11 @@ every 10 min {
 
 `fetch METHOD url [body] [headers map]` returns `Response { status, body,
 headers }` (names lower case); `status` 0 means unreachable (`body` says why). A
-body value is sent as JSON, a str as text; https uses `curl`. During `fetch`
-and password hashing other requests may change store. `every N ms|s|min|h|d` runs a block in a
-background thread. `KHRIP_DATA=file.json` keeps store across restarts.
+body value is sent as JSON, a str as text; https uses `curl`. `fetch` and
+`sleep` are plain calls (no async/await): while a request waits, the server runs
+other requests, and they may change store (so may password hashing). `every N
+ms|s|min|h|d` runs a block in a background thread. `KHRIP_DATA=file.json` keeps
+store across restarts.
 
 ## Tests
 

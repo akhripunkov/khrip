@@ -248,7 +248,7 @@ MISTAKES_OUTPUT
 | `throw new HttpException(401)` | `fail(401)` |
 | `lock (gate) { ... }` | не нужен: `store` защищён автоматически |
 | xUnit + WebApplicationFactory | `test "..." { let r = call GET "/x"; expect r.status == 200 }` |
-| `async`/`await` | не нужны (ожидание без блокировки потоков — в планах runtime) |
+| `async`/`await`, `Task.Delay` | не нужны: `fetch` и `sleep(ms)` — обычные вызовы, пока запрос ждёт, поток выполняет другие |
 | `using`, `namespace`, NuGet | не нужны: один проект — одно пространство имён |
 
 ## Чего пока нет
@@ -256,7 +256,6 @@ MISTAKES_OUTPUT
 - **Баз данных** (Postgres, Kafka, Redis): данные живут в `store` и могут сохраняться в
   файл (`KHRIP_DATA=file.json`). План работы с базами и миграциями — в
   [ROADMAP.md](ROADMAP.md).
-- **Ожидания без блокировки:** `fetch` занимает рабочий поток, пока ждёт ответ.
 - **Освобождения старых значений в `store`:** при постоянных обновлениях память растёт.
 - **Строк с учётом Юникода:** длина и срезы — в байтах.
 - **https без `curl`** — свой TLS в планах.

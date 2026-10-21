@@ -9,6 +9,7 @@
 #   tests/locks/*.kh  — какие маршруты берут store на чтение (khc check --locks);
 #   docs/tutorial/    — примеры учебника выполняются, их тесты проходят;
 #   tests/http.sh     — HTTP-сервер на Khrip отвечает правильно;
+#   tests/coro.sh     — запросы, которые ждут (sleep, fetch), не держат поток;
 #   tests/weather.sh  — погодный бэкенд: fetch, every, сохранение store;
 #   eval/solutions/*/khrip — решения задач проверки проходят eval/run.sh.
 # Компилятор берётся из $KHC (по умолчанию build/khc).
@@ -107,6 +108,11 @@ done
 if [[ -f tests/http.sh ]]; then
 	# shellcheck source=tests/http.sh
 	source tests/http.sh
+fi
+
+if [[ -f tests/coro.sh ]] && command -v curl >/dev/null; then
+	# shellcheck source=tests/coro.sh
+	source tests/coro.sh
 fi
 
 if [[ -f tests/weather.sh ]] && command -v curl >/dev/null; then

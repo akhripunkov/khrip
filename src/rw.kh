@@ -34,7 +34,7 @@ fn rw_same_method(name: str) -> bool {
 
 // Функции библиотеки, которые не трогают store.
 fn rw_safe_lib(name: str) -> bool {
-    return name == "__to_str" || name == "print" || name == "eprint" || name == "write" || name == "args" || name == "env" || name == "read_file" || name == "write_file" || name == "exit" || name == "now" || name == "now_ms" || name == "time_iso" || name == "parse_time" || name == "parse_date" || name == "random_str" || name == "sha256" || name == "hash_password" || name == "check_password" || name == "url_encode" || name == "to_json" || name == "from_json" || name == "json_error" || name == "header" || name == "set_header" || name == "fail"
+    return name == "__to_str" || name == "print" || name == "eprint" || name == "write" || name == "args" || name == "env" || name == "read_file" || name == "write_file" || name == "exit" || name == "now" || name == "now_ms" || name == "sleep" || name == "time_iso" || name == "parse_time" || name == "parse_date" || name == "random_str" || name == "sha256" || name == "hash_password" || name == "check_password" || name == "url_encode" || name == "to_json" || name == "from_json" || name == "json_error" || name == "header" || name == "set_header" || name == "fail"
 }
 
 // Встроенные функции, которые пишут в память напрямую.

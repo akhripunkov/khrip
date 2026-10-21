@@ -64,8 +64,14 @@ fn __w() -> __Worker {
     return __cast(load64(__ctx() + CTX_WORKER))
 }
 
+// Буферы ответа живут дольше запроса и растут через mmap (buf_mm): не за счёт
+// арены запроса и не в store.
+fn __worker_new() -> __Worker {
+    return __Worker { status: 0, ctype: 0, body: buf_mm(4096), jb: __alloc(64), json_err: "", testing: false, cur: 0, extra: buf_mm(4096), failed: 0 }
+}
+
 fn __worker_init() -> __Worker {
-    let w = __Worker { status: 0, ctype: 0, body: buf_new(4096), jb: __alloc(64), json_err: "", testing: false, cur: 0, extra: buf_new(256), failed: 0 }
+    let w = __worker_new()
     store64(__ctx() + CTX_WORKER, __cast(w))
     return w
 }
@@ -1290,7 +1296,7 @@ var __test_log: str
 fn __tests_init() {
     __store_init()
     __store_rw_init()
-    __arena_init(0)
+    __arena_init()
     let w = __worker_init()
     w.testing = true
 }

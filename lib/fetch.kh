@@ -2,8 +2,11 @@
 // http:// — свой клиент: DNS (/etc/resolv.conf), /etc/hosts, HTTP_PROXY, ответы
 // с Content-Length и по частям (chunked). https:// — пока через curl: своего TLS
 // у Khrip ещё нет. Ошибка соединения — Response со status 0 и текстом в body.
-// Пока запрос ждёт сеть, блокировка store отпущена: другие запросы идут дальше,
-// поэтому данные store между вызовами fetch могут измениться.
+// Сокеты и каналы неблокирующие: запрос сервера, который ждёт сеть, ждёт в своей
+// сопрограмме (__co_wait), а поток выполняет другие запросы. Соединения http
+// переиспользуются (keep-alive): у потока свой запас свободных соединений по
+// адресам. Блокировка store на время fetch отпущена, поэтому данные store между
+// вызовами fetch могут измениться.
 
 const SYS_CONNECT = 42
 const SYS_SENDTO = 44
@@ -15,10 +18,27 @@ const SYS_DUP2 = 33
 const SYS_EXECVE = 59
 const SYS_WAIT4 = 61
 const SYS_RENAME = 82
-const SO_RCVTIMEO = 20
-const SO_SNDTIMEO = 21
+const SYS_GETSOCKOPT = 55
+const SYS_FCNTL = 72
+const SYS_KILL = 62
+const SYS_PIDFD_OPEN = 434
+const SO_ERROR = 4
 const SOCK_DGRAM = 2
+const EINPROGRESS = 115
+const F_SETFL = 4
+const O_NONBLOCK = 0x800
+const O_CLOEXEC = 0x80000
+const SIGKILL = 9
+const MSG_PEEK = 2
+const MSG_DONTWAIT = 0x40
+const ECONNRESET = 104
 const FETCH_TIMEOUT = 30
+// запас соединений потока: до POOL_HOSTS адресов, по POOL_CONNS свободных на
+// адрес; соединение, которое пролежало POOL_IDLE_MS, закрывается
+const POOL_HOSTS = 16
+const POOL_CONNS = 128
+const POOL_HOST_SIZE = 2072
+const POOL_IDLE_MS = 30000
 
 type __Url {
     https: bool
@@ -137,17 +157,19 @@ fn __sockaddr(ip: int, port: int) -> int {
     return a
 }
 
-fn __set_timeouts(fd: int, sec: int) {
-    let tv = __alloc(16)
-    store64(tv, sec)
-    syscall(SYS_SETSOCKOPT, fd, SOL_SOCKET, SO_RCVTIMEO, tv, 16)
-    syscall(SYS_SETSOCKOPT, fd, SOL_SOCKET, SO_SNDTIMEO, tv, 16)
+// Ждать, пока fd будет готов к events, но не дольше срока deadline (now_ms).
+// → false: срок вышел.
+fn __wait_fd(fd: int, events: int, deadline: int) -> bool {
+    let left = deadline - now_ms()
+    return left > 0 && __co_wait(fd, events, left) != 0
 }
 
 // Запрос A-записи у DNS-сервера по UDP.
-fn __dns_query(host: str) -> int? {
+fn __dns_query(host: str, deadline: int) -> int? {
     let q = buf_new(64)
-    let id = syscall(SYS_TIME, 0) & 0xFFFF
+    let rnd = __alloc(8)
+    __random_bytes(rnd, 2)
+    let id = load64(rnd) & 0xFFFF
     buf_byte(q, id >> 8)
     buf_byte(q, id & 255)
     // флаги: рекурсия; один вопрос
@@ -167,16 +189,23 @@ fn __dns_query(host: str) -> int? {
     let resp = __alloc(1500)
     for ns in __nameservers() {
         for attempt in 0..2 {
-            let fd = syscall(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0)
+            let fd = syscall(SYS_SOCKET, AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)
             if fd < 0 {
                 return none
             }
-            __set_timeouts(fd, 2)
             syscall(SYS_SENDTO, fd, q.data, q.len, 0, __sockaddr(ns, 53), 16)
-            let n = syscall(SYS_RECVFROM, fd, resp, 1500, 0, 0, 0)
+            // ответ — не дольше 2 с на попытку
+            let until = (now_ms() + 2000).min(deadline)
+            var n = syscall(SYS_RECVFROM, fd, resp, 1500, 0, 0, 0)
+            while n == -EAGAIN && __wait_fd(fd, EPOLLIN, until) {
+                n = syscall(SYS_RECVFROM, fd, resp, 1500, 0, 0, 0)
+            }
             syscall(SYS_CLOSE, fd)
             if n >= 12 && load8(resp) == (id >> 8) && load8(resp + 1) == (id & 255) {
                 return __dns_answer(resp, n)
+            }
+            if now_ms() >= deadline {
+                return none
             }
         }
     }
@@ -217,7 +246,7 @@ fn __dns_answer(p: int, n: int) -> int? {
     return none
 }
 
-fn __resolve(host: str) -> int? {
+fn __resolve(host: str, deadline: int) -> int? {
     if let ip = __ip_parse(host) {
         return ip
     }
@@ -227,7 +256,7 @@ fn __resolve(host: str) -> int? {
     if let ip = __hosts_lookup(host) {
         return ip
     }
-    return __dns_query(host)
+    return __dns_query(host, deadline)
 }
 
 // Хост не идёт через прокси: localhost, 127.*, домены из NO_PROXY.
@@ -323,7 +352,201 @@ fn __parse_response(raw: str) -> Response {
     return Response { status, body, headers: hs }
 }
 
-fn __http_exchange(url: __Url, request: str) -> Response {
+// ---- Запас соединений (keep-alive) ----
+// Память — из mmap, а не из арены: запас живёт дольше запроса. Адрес i:
+// [0] ip, [8] порт, [16] сколько свободных, [24 + j * 16] — дескриптор и время,
+// когда соединение освободилось. Берётся последнее освобождённое.
+
+fn __pool() -> int {
+    let c = __ctx()
+    var p = load64(c + CTX_POOL)
+    if p == 0 {
+        p = __mmap(POOL_HOSTS * POOL_HOST_SIZE)
+        store64(c + CTX_POOL, p)
+    }
+    return p
+}
+
+// Свободное соединение с ip:port или -1.
+fn __pool_take(ip: int, port: int) -> int {
+    let p = __pool()
+    for i in 0..POOL_HOSTS {
+        let h = p + i * POOL_HOST_SIZE
+        if load64(h) == ip && load64(h + 8) == port {
+            let now = now_ms()
+            // самое старое соединение пролежало слишком долго — закрыть
+            var n = load64(h + 16)
+            if n > 0 && now - load64(h + 32) >= POOL_IDLE_MS {
+                syscall(SYS_CLOSE, load64(h + 24))
+                __memcpy(h + 24, h + 40, (n - 1) * 16)
+                n -= 1
+            }
+            let peek = __ctx() + 232
+            while n > 0 {
+                n -= 1
+                let e = h + 24 + n * 16
+                let fd = load64(e)
+                // сервер мог закрыть соединение, пока оно лежало: тогда из него
+                // читается конец (0), а у живого — EAGAIN
+                if now - load64(e + 8) < POOL_IDLE_MS && syscall(SYS_RECVFROM, fd, peek, 1, MSG_PEEK | MSG_DONTWAIT, 0, 0) == -EAGAIN {
+                    store64(h + 16, n)
+                    return fd
+                }
+                syscall(SYS_CLOSE, fd)
+            }
+            store64(h + 16, 0)
+            return -1
+        }
+    }
+    return -1
+}
+
+// Вернуть соединение в запас (или закрыть, если места нет).
+fn __pool_put(ip: int, port: int, fd: int) {
+    let p = __pool()
+    var slot = -1
+    for i in 0..POOL_HOSTS {
+        let h = p + i * POOL_HOST_SIZE
+        if load64(h) == ip && load64(h + 8) == port {
+            slot = i
+            break
+        }
+        if slot < 0 && load64(h + 16) == 0 {
+            slot = i
+        }
+    }
+    if slot >= 0 {
+        let h = p + slot * POOL_HOST_SIZE
+        let n = load64(h + 16)
+        if n < POOL_CONNS {
+            store64(h, ip)
+            store64(h + 8, port)
+            store64(h + 24 + n * 16, fd)
+            store64(h + 32 + n * 16, now_ms())
+            store64(h + 16, n + 1)
+            return
+        }
+    }
+    syscall(SYS_CLOSE, fd)
+}
+
+// Где кончается ответ в [p, p + n): его длина; -1 — пришёл не весь; -2 — тело
+// идёт до закрытия соединения. no_body — ответ на HEAD.
+fn __resp_end(p: int, n: int, no_body: bool) -> int {
+    let h = __find_crlf2(p, n)
+    if h >= n {
+        return -1
+    }
+    let start = h + 4
+    if h < 12 || load8(p + 8) != ' ' {
+        return -2
+    }
+    let status = __parse_len(p + 9, 3)
+    if status >= 100 && status < 200 && status != 101 {
+        // «100 Continue» перед настоящим ответом
+        let rest = __resp_end(p + start, n - start, no_body)
+        if rest < 0 {
+            return rest
+        }
+        return start + rest
+    }
+    if no_body || status == 204 || status == 304 {
+        return start
+    }
+    var len = -1
+    var chunked = false
+    var i = __find_byte(p, h, '\n') + 1
+    while i < h {
+        let line = p + i
+        let ll = __find_byte(line, h + 2 - i, '\r')
+        let k = __find_byte(line, ll, ':')
+        if k < ll {
+            var v = k + 1
+            while v < ll && load8(line + v) == ' ' {
+                v += 1
+            }
+            let first = __lower(load8(line))
+            if first == 'c' && __ieq(line, k, "content-length") {
+                len = __parse_len(line + v, ll - v)
+            } else if first == 't' && __ieq(line, k, "transfer-encoding") && __ieq(line + v, ll - v, "chunked") {
+                chunked = true
+            }
+        }
+        i += ll + 2
+    }
+    if chunked {
+        // «размер\r\nданные\r\n» ... «0\r\n», необязательные поля, «\r\n»
+        var at = start
+        while true {
+            let eol = __find_byte(p + at, n - at, '\r')
+            if at + eol + 1 >= n {
+                return -1
+            }
+            var size = 0
+            var j = 0
+            while j < eol && __hex_val(load8(p + at + j)) >= 0 {
+                size = size * 16 + __hex_val(load8(p + at + j))
+                j += 1
+            }
+            at += eol + 2
+            if size == 0 {
+                // поля после последней части — до пустой строки
+                while true {
+                    let e = __find_byte(p + at, n - at, '\r')
+                    if at + e + 1 >= n {
+                        return -1
+                    }
+                    at += e + 2
+                    if e == 0 {
+                        return at
+                    }
+                }
+            }
+            at += size + 2
+            if at > n {
+                return -1
+            }
+        }
+    }
+    if len >= 0 {
+        if start + len <= n {
+            return start + len
+        }
+        return -1
+    }
+    return -2
+}
+
+// Ошибка сокета после неблокирующего connect (0 — соединение есть).
+fn __sock_error(fd: int) -> int {
+    let v = __alloc(16)
+    store64(v + 8, 4)
+    syscall(SYS_GETSOCKOPT, fd, SOL_SOCKET, SO_ERROR, v, v + 8)
+    return load64(v) & 0xFFFFFFFF
+}
+
+// Новое соединение с ip:port или -1.
+fn __connect(ip: int, port: int, deadline: int) -> int {
+    let fd = syscall(SYS_SOCKET, AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)
+    if fd < 0 {
+        return -1
+    }
+    let r = syscall(SYS_CONNECT, fd, __sockaddr(ip, port), 16)
+    if r != 0 && (r != -EINPROGRESS || !__wait_fd(fd, EPOLLOUT, deadline) || __sock_error(fd) != 0) {
+        syscall(SYS_CLOSE, fd)
+        return -1
+    }
+    __setsockopt(__ctx() + 232, fd, IPPROTO_TCP, TCP_NODELAY, 1)
+    return fd
+}
+
+// Повторить запрос можно, только если он ничего не меняет повторно.
+fn __idempotent(method: str) -> bool {
+    return method == "GET" || method == "HEAD" || method == "PUT" || method == "DELETE" || method == "OPTIONS"
+}
+
+fn __http_exchange(url: __Url, request: str, method: str) -> Response {
+    let deadline = now_ms() + FETCH_TIMEOUT * 1000
     var host = url.host
     var port = url.port
     let proxy = env("HTTP_PROXY") ?? env("http_proxy") ?? ""
@@ -333,45 +556,82 @@ fn __http_exchange(url: __Url, request: str) -> Response {
             port = pu.port
         }
     }
-    let ip = __resolve(host) else {
+    let ip = __resolve(host, deadline) else {
         return __fetch_fail("cannot resolve host " + host)
     }
-    let fd = syscall(SYS_SOCKET, AF_INET, SOCK_STREAM, 0)
-    if fd < 0 {
-        return __fetch_fail("cannot create a socket")
-    }
-    __set_timeouts(fd, FETCH_TIMEOUT)
-    if syscall(SYS_CONNECT, fd, __sockaddr(ip, port), 16) < 0 {
-        syscall(SYS_CLOSE, fd)
-        return __fetch_fail("cannot connect to " + host + ":" + port.to_str())
-    }
-    var off = 0
-    while off < request.len() {
-        let w = syscall(SYS_WRITE, fd, __str_ptr(request) + off, request.len() - off)
-        if w <= 0 {
-            syscall(SYS_CLOSE, fd)
-            return __fetch_fail("connection closed while sending")
-        }
-        off += w
-    }
-    let b = buf_new(16384)
+    var fd = __pool_take(ip, port)
+    var reused = fd >= 0
+    // большинство ответов короче 4 КБ: буфер растёт, только если нужно
+    let b = buf_new(4096)
+    var end = -1
     while true {
-        buf_reserve(b, 16384)
-        let n = syscall(SYS_READ, fd, b.data + b.len, b.cap - b.len)
-        if n == 0 {
-            break
+        if fd < 0 {
+            fd = __connect(ip, port, deadline)
+            if fd < 0 {
+                return __fetch_fail("cannot connect to " + host + ":" + port.to_str())
+            }
         }
-        if n < 0 {
-            syscall(SYS_CLOSE, fd)
+        var sent = true
+        var off = 0
+        while off < request.len() {
+            let w = syscall(SYS_WRITE, fd, __str_ptr(request) + off, request.len() - off)
+            if w == -EAGAIN && __wait_fd(fd, EPOLLOUT, deadline) {
+                continue
+            }
+            if w <= 0 {
+                sent = false
+                break
+            }
+            off += w
+        }
+        var failed = !sent
+        b.len = 0
+        end = -1
+        while sent {
+            buf_reserve(b, 4096)
+            let n = syscall(SYS_READ, fd, b.data + b.len, b.cap - b.len)
+            if n == -EAGAIN && __wait_fd(fd, EPOLLIN, deadline) {
+                continue
+            }
+            if n == 0 {
+                break
+            }
+            if n < 0 {
+                failed = true
+                break
+            }
+            b.len += n
+            end = __resp_end(b.data, b.len, method == "HEAD")
+            if end >= 0 {
+                break
+            }
+        }
+        if b.len > 0 || !reused || !__idempotent(method) || now_ms() >= deadline {
             if b.len == 0 {
-                return __fetch_fail("timeout or connection error")
+                syscall(SYS_CLOSE, fd)
+                if !sent {
+                    return __fetch_fail("connection closed while sending")
+                }
+                if failed {
+                    return __fetch_fail("timeout or connection error")
+                }
+                return __fetch_fail("connection closed without a response")
             }
             break
         }
-        b.len += n
+        // соединение из запаса оказалось закрытым: ещё раз по новому
+        syscall(SYS_CLOSE, fd)
+        fd = -1
+        reused = false
     }
-    syscall(SYS_CLOSE, fd)
-    return __parse_response(__str_new(b.data, b.len))
+    let r = __parse_response(__str_new(b.data, b.len))
+    // ответ целиком и сервер не просит закрыть — соединение снова в запас
+    if end >= 0 && end == b.len && r.status > 0 && __memeq(b.data, __str_ptr("HTTP/1.1"), 8) && (r.headers["connection"] ?? "").lower() != "close" {
+        __pool_put(ip, port, fd)
+    } else {
+        syscall(SYS_CLOSE, fd)
+    }
+    return r
 }
 
 // ---- Внешние программы (curl для https) ----
@@ -392,13 +652,15 @@ fn __find_exe(name: str) -> str? {
     return none
 }
 
-// Запуск программы: input — на её stdin, stdout и stderr — в out.
-fn __run_capture(exe: str, args: [str], input: str) -> __Proc {
+// Запуск программы: input — на её stdin, stdout и stderr — в out. Программа
+// работает не дольше limit мс; ждёт её только сопрограмма запроса.
+fn __run_capture(exe: str, args: [str], input: str, limit: int) -> __Proc {
+    let deadline = now_ms() + limit
     let fds = __alloc(16)
-    syscall(SYS_PIPE2, fds, 0x80000)
+    syscall(SYS_PIPE2, fds, O_CLOEXEC)
     let in_r = load64(fds) & 0xFFFFFFFF
     let in_w = (load64(fds) >> 32) & 0xFFFFFFFF
-    syscall(SYS_PIPE2, fds, 0x80000)
+    syscall(SYS_PIPE2, fds, O_CLOEXEC)
     let out_r = load64(fds) & 0xFFFFFFFF
     let out_w = (load64(fds) >> 32) & 0xFFFFFFFF
     let argv = __alloc((args.len() + 1) * 8)
@@ -417,9 +679,15 @@ fn __run_capture(exe: str, args: [str], input: str) -> __Proc {
     }
     syscall(SYS_CLOSE, in_r)
     syscall(SYS_CLOSE, out_w)
+    // свои концы каналов — неблокирующие (у программы — обычные)
+    syscall(SYS_FCNTL, in_w, F_SETFL, O_NONBLOCK)
+    syscall(SYS_FCNTL, out_r, F_SETFL, O_NONBLOCK)
     var off = 0
     while off < input.len() {
         let w = syscall(SYS_WRITE, in_w, __str_ptr(input) + off, input.len() - off)
+        if w == -EAGAIN && __wait_fd(in_w, EPOLLOUT, deadline) {
+            continue
+        }
         if w <= 0 {
             break
         }
@@ -430,12 +698,23 @@ fn __run_capture(exe: str, args: [str], input: str) -> __Proc {
     while true {
         buf_reserve(b, 16384)
         let n = syscall(SYS_READ, out_r, b.data + b.len, b.cap - b.len)
+        if n == -EAGAIN && __wait_fd(out_r, EPOLLIN, deadline) {
+            continue
+        }
         if n <= 0 {
             break
         }
         b.len += n
     }
     syscall(SYS_CLOSE, out_r)
+    // конец программы: pidfd готов к чтению, когда она завершилась
+    let pfd = syscall(SYS_PIDFD_OPEN, pid, 0)
+    if pfd >= 0 {
+        if !__wait_fd(pfd, EPOLLIN, deadline) {
+            syscall(SYS_KILL, pid, SIGKILL)
+        }
+        syscall(SYS_CLOSE, pfd)
+    }
     let st = __alloc(8)
     syscall(SYS_WAIT4, pid, st, 0, 0)
     return __Proc { code: (load64(st) >> 8) & 255, out: __str_new(b.data, b.len) }
@@ -459,7 +738,7 @@ fn __fetch_curl(method: str, url: str, body: str, has_body: bool, ctype: str, he
         args.push("@-")
     }
     args.push(url)
-    let p = __run_capture(curl, args, body)
+    let p = __run_capture(curl, args, body, (FETCH_TIMEOUT + 5) * 1000)
     if p.code != 0 {
         return __fetch_fail(p.out.trim())
     }
@@ -530,7 +809,7 @@ fn __fetch(method: str, url: str, body: int, d: int, headers: int) -> Response {
             if u.port != 80 {
                 buf_add(req, ":" + u.port.to_str())
             }
-            buf_add(req, "\r\nUser-Agent: khrip\r\nAccept: */*\r\nConnection: close\r\n")
+            buf_add(req, "\r\nUser-Agent: khrip\r\nAccept: */*\r\n")
             for k, v in hs {
                 buf_add(req, k + ": " + v + "\r\n")
             }
@@ -542,7 +821,7 @@ fn __fetch(method: str, url: str, body: int, d: int, headers: int) -> Response {
             }
             buf_add(req, "\r\n")
             buf_add(req, text)
-            r = __http_exchange(u, __str_new(req.data, req.len))
+            r = __http_exchange(u, __str_new(req.data, req.len), method)
         }
     }
     if held {

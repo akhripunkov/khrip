@@ -1050,7 +1050,7 @@ fn parse_builtin(t: Token, w: int) -> int {
         emit_call(rt_func("__json_decode"))
         return ty_opt(inner)
     }
-    let lib_only = name == "__fsqrt" || name.starts_with("__simd_") || name == "__cpu_avx2" || name == "__cpu_sha" || name == "__spawn" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset"
+    let lib_only = name == "__fsqrt" || name.starts_with("__simd_") || name == "__sha256_x64" || name == "__cpu_avx2" || name == "__cpu_sha" || name == "__spawn" || name == "__co_call" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset"
     if lib_only && !files[t.file].is_lib {
         return -1
     }
@@ -1122,13 +1122,17 @@ fn parse_builtin(t: Token, w: int) -> int {
         emit_cpu_sha()
         return ty_bool
     }
-    if name == "__simd_sha256" {
+    if name == "__simd_sha256" || name == "__sha256_x64" {
         advance()
         builtin_args(3, t, name)
         emit_pop(RDX)
         emit_pop(RSI)
         emit_pop(RDI)
-        emit_sha256_ni()
+        if name == "__simd_sha256" {
+            emit_sha256_ni()
+        } else {
+            emit_sha256_x64()
+        }
         return ty_void
     }
     if name == "__cpu_avx2" {
@@ -1173,6 +1177,24 @@ fn parse_builtin(t: Token, w: int) -> int {
         emit8(0x05)
         patch_here(parent)
         return ty_int
+    }
+    if name == "__co_call" {
+        // __co_call(вершина стека, сопрограмма): перейти на стек запросов и
+        // выполнить __co_main(сопрограмма); возврата нет (lib/http.kh)
+        advance()
+        builtin_args(2, t, name)
+        emit_pop(RDI)
+        emit_pop(RAX)
+        // mov rsp, rax
+        emit8(0x48)
+        emit8(0x89)
+        emit8(0xC4)
+        emit_mov_imm(RBP, 0)
+        emit_call(rt_func("__co_main"))
+        emit8(0x0F)
+        emit8(0x0B)
+        barrier = code_len
+        return ty_void
     }
     if name == "__fsqrt" {
         advance()

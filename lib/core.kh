@@ -55,6 +55,13 @@ const CTX_PANIC = 96
 const CTX_SERVER = 104
 // 1 — запрос только читает store (так решил компилятор): блокировка разделяемая
 const CTX_STORE_MODE = 112
+// текущая сопрограмма (lib/rt.kh) или 0
+const CTX_CORO = 120
+// слова [8, CTX_CO_END) — свои у каждой сопрограммы: при переключении они
+// сохраняются и загружаются (CTX_SELF и всё дальше — общие для потока)
+const CTX_CO_END = 128
+// свободные соединения fetch этого потока (lib/fetch.kh) или 0
+const CTX_POOL = 136
 const CTX_SIZE = 256
 
 const CHUNK = 1048576
@@ -62,10 +69,11 @@ const BIG = 262144
 
 // Области адресов. Арена запроса освобождается целиком после ответа, поэтому
 // всё, что переживает запрос (store), копируется в постоянную память. Принадлежность
-// адреса определяется по старшим битам: адрес >> 40.
+// адреса определяется по старшим битам: арены — [32 ТБ, 64 ТБ) (адрес >> 45 == 1),
+// по 1 ГБ на арену, store — адрес >> 40 == 0x10.
 const ARENA_REGION = 0x200000000000
-const ARENA_SIZE = 0x100000000
-const ARENA_TAG = 0x20
+const ARENA_SIZE = 0x40000000
+const ARENA_SLOTS = 32767
 const STORE_REGION = 0x100000000000
 const STORE_SIZE = 0x4000000000
 const COMMIT = 4194304
@@ -112,11 +120,11 @@ fn __alloc(n: int) -> int {
 
 fn __alloc_slow(c: int, size: int) -> int {
     let p = load64(c + CTX_PTR)
-    let tag = p >> 40
-    if tag == ARENA_TAG || tag == (STORE_REGION >> 40) {
+    let arena = __in_arena(p)
+    if arena || (p >> 40) == (STORE_REGION >> 40) {
         // арена или постоянная память: зарезервированная область подключается кусками
         var limit = STORE_REGION + STORE_SIZE
-        if tag == ARENA_TAG {
+        if arena {
             limit = load64(c + CTX_ARENA) + ARENA_SIZE
         }
         let end = load64(c + CTX_END)
@@ -148,7 +156,7 @@ fn __reserve(at: int, size: int) -> bool {
 }
 
 fn __in_arena(p: int) -> bool {
-    return (p >> 40) == ARENA_TAG
+    return (p >> 45) == 1
 }
 
 // Память для внутренностей объекта h (рост списка, таблица словаря): объект
@@ -188,6 +196,11 @@ fn __pmode_on() -> bool {
         return false
     }
     __store_lock()
+    if load64(c + CTX_STORE_HELD) == 2 {
+        // компилятор решил, что маршрут только читает (src/rw.kh), а он пишет:
+        // лучше ответ 500, чем гонка с другими читателями
+        __panic_msg("internal: a read-only route changes store")
+    }
     store64(c + CTX_PSAVE_PTR, load64(c + CTX_PTR))
     store64(c + CTX_PSAVE_END, load64(c + CTX_END))
     store64(c + CTX_PTR, __store_ptr)
@@ -207,16 +220,24 @@ fn __pmode_off() {
 // Блокировка store (__store_lock, __store_unlock) — в lib/rt.kh: ей нужны
 // атомарные операции.
 
-// ---- Арена запроса: одна на поток ----
+// ---- Арена запроса: своя у каждой сопрограммы (и у потока задач, и у тестов) ----
 
-fn __arena_init(id: int) {
-    let c = __ctx()
-    let base = ARENA_REGION + id * ARENA_SIZE
-    if !__reserve(base, ARENA_SIZE) {
-        __panic(PANIC_MEMORY, "arena region")
+// Подключить арену с началом base к контексту cx (номер арены выдаёт
+// __arena_take в lib/rt.kh). Арена — 1 ГБ адресов: если система разрешает,
+// они сразу доступны на запись (страницы появятся при первом касании, соседние
+// арены — одна область для ядра), иначе подключаются кусками по COMMIT.
+fn __arena_attach(cx: int, base: int) {
+    // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE
+    let p = syscall(SYS_MMAP, base, ARENA_SIZE, 3, 0x22 | 0x4000 | 0x100000, -1, 0)
+    var end = base + ARENA_SIZE
+    if p != base {
+        if !__reserve(base, ARENA_SIZE) {
+            __panic(PANIC_MEMORY, "arena region")
+        }
+        end = base
     }
-    store64(c + CTX_ARENA, base)
-    store64(c + CTX_ARENA_END, base)
+    store64(cx + CTX_ARENA, base)
+    store64(cx + CTX_ARENA_END, end)
 }
 
 // Дальше память выделяется из арены.
@@ -237,7 +258,7 @@ fn __arena_end() {
     let end = load64(c + CTX_END)
     if used > 8 * COMMIT {
         // большой запрос: вернуть страницы системе (они вернутся нулевыми)
-        syscall(28, base, end - base, 4)
+        syscall(28, base, (used + 4095) & ~4095, 4)
     } else {
         __memset(base, 0, used)
     }
@@ -662,6 +683,9 @@ type Buf {
     data: int
     len: int
     cap: int
+    // память буфера — из mmap и растёт через mmap: так растут буферы, которые
+    // живут дольше запроса (ответ потока), — не за счёт арены и не в store
+    mm: bool
 }
 
 fn buf_new(cap: int) -> Buf {
@@ -669,7 +693,22 @@ fn buf_new(cap: int) -> Buf {
     if c < 16 {
         c = 16
     }
-    return Buf { data: __alloc(c), len: 0, cap: c }
+    return Buf { data: __alloc(c), len: 0, cap: c, mm: false }
+}
+
+fn buf_mm(cap: int) -> Buf {
+    let c = (cap + 4095) & ~4095
+    return Buf { data: __mmap(c), len: 0, cap: c, mm: true }
+}
+
+// Вернуть системе память буфера mm, выросшего больше max байт.
+fn buf_shrink(b: Buf, max: int) {
+    if b.mm && b.cap > max {
+        syscall(SYS_MUNMAP, b.data, b.cap)
+        b.cap = (max + 4095) & ~4095
+        b.data = __mmap(b.cap)
+        b.len = 0
+    }
 }
 
 fn buf_reserve(b: Buf, n: int) {
@@ -679,6 +718,15 @@ fn buf_reserve(b: Buf, n: int) {
     var c = b.cap * 2
     while c < b.len + n {
         c *= 2
+    }
+    if b.mm {
+        c = (c + 4095) & ~4095
+        let q = __mmap(c)
+        __memcpy(q, b.data, b.len)
+        syscall(SYS_MUNMAP, b.data, b.cap)
+        b.data = q
+        b.cap = c
+        return
     }
     let bh: int = __cast(b)
     let p = __alloc_for(bh, c)

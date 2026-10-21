@@ -378,3 +378,246 @@ fn __store_unlock() {
     }
     __mutex_unlock(rw)
 }
+
+// ---- Арены ----
+
+// Начало свободной арены или 0, если адреса арен кончились. Счётчик — слово
+// [32] в блоке __store_rw: его создают до запуска потоков.
+fn __arena_take() -> int {
+    __store_rw_init()
+    let slot = __xadd(__store_rw + 32, 1)
+    if slot >= ARENA_SLOTS {
+        return 0
+    }
+    return ARENA_REGION + slot * ARENA_SIZE
+}
+
+// Арена для текущего контекста (поток задач, тесты).
+fn __arena_init() {
+    let base = __arena_take()
+    if base == 0 {
+        __panic(PANIC_MEMORY, "arena region")
+    }
+    __arena_attach(__ctx(), base)
+}
+
+// ---- Сопрограммы ----
+// Запрос сервера выполняется в сопрограмме. Когда ему нужно ждать сеть (fetch)
+// или время (sleep), он останавливается, и поток тем временем выполняет другие
+// запросы; синтаксиса для этого нет — функция просто возвращается позже.
+//
+// Стек запросов у потока один: сопрограммы выполняются на нём по очереди.
+// Кадры остановленной сопрограммы копируются в кучу, только когда на стеке
+// нужно выполнить другую, и перед продолжением возвращаются на те же адреса,
+// поэтому указатели внутрь стека остаются верными. Ждущий запрос занимает
+// столько памяти, какова глубина его стека (обычно несколько КБ), каждому
+// запросу доступен весь стек, а запросы, которые не ждут, ничего не копируют.
+//
+// Переключение — __setjmp/__longjmp и часть контекста потока [8, CTX_CO_END):
+// выделитель, арена, блокировка store, состояние запроса — своя у сопрограммы.
+// Планировщик и цикл событий — в lib/http.kh.
+
+const SYS_POLL = 7
+const SYS_NANOSLEEP = 35
+const SYS_EPOLL_CTL = 233
+const EPOLL_CTL_ADD = 1
+const EPOLL_CTL_DEL = 2
+const EPOLL_CTL_MOD = 3
+const EPOLLIN = 1
+const EPOLLOUT = 4
+const EPOLLERR = 8
+const EPOLLHUP = 16
+const EPOLLONESHOT = 0x40000000
+
+// Планировщик сопрограмм потока.
+type __Sched {
+    ep: int
+    // куда сопрограмма возвращает управление (буфер __setjmp)
+    jb: int
+    // контекст потока [8, CTX_CO_END) планировщика, пока работает сопрограмма
+    ctx: int
+    // вершина стека запросов
+    top: int
+    // сопрограмма, чьи кадры сейчас лежат на стеке запросов, или 0
+    on_stack: int
+    // сроки ожидания: двоичная куча сопрограмм по deadline
+    heap: int
+    heap_len: int
+    // struct epoll_event для epoll_ctl
+    ev: int
+}
+
+type __Co {
+    sch: __Sched
+    // где продолжить (буфер __setjmp)
+    jb: int
+    // контекст [8, CTX_CO_END), пока работают другие
+    ctx: int
+    // копия кадров со стека запросов, пока на нём работают другие
+    stk: int
+    stk_len: int
+    stk_cap: int
+    started: bool
+    // ждёт события или срока
+    parked: bool
+    done: bool
+    deadline: int
+    // место в куче сроков или -1
+    hidx: int
+    // события, с которыми сопрограмму разбудили (0 — вышел срок)
+    revents: int
+    // для сервера: __Worker и задание (lib/http.kh)
+    w: int
+    job: int
+}
+
+fn __heap_at(s: __Sched, i: int) -> __Co {
+    return __cast(load64(s.heap + i * 8))
+}
+
+fn __heap_set(s: __Sched, i: int, co: __Co) {
+    store64(s.heap + i * 8, __cast(co))
+    co.hidx = i
+}
+
+fn __heap_up(s: __Sched, at: int) {
+    var i = at
+    let co = __heap_at(s, i)
+    while i > 0 {
+        let parent = (i - 1) / 2
+        let p = __heap_at(s, parent)
+        if p.deadline <= co.deadline {
+            break
+        }
+        __heap_set(s, i, p)
+        i = parent
+    }
+    __heap_set(s, i, co)
+}
+
+fn __heap_down(s: __Sched, at: int) {
+    var i = at
+    let co = __heap_at(s, i)
+    while true {
+        var m = 2 * i + 1
+        if m >= s.heap_len {
+            break
+        }
+        if m + 1 < s.heap_len && __heap_at(s, m + 1).deadline < __heap_at(s, m).deadline {
+            m += 1
+        }
+        let child = __heap_at(s, m)
+        if child.deadline >= co.deadline {
+            break
+        }
+        __heap_set(s, i, child)
+        i = m
+    }
+    __heap_set(s, i, co)
+}
+
+// Места в куче хватает всегда: её размер — наибольшее число сопрограмм потока.
+fn __heap_push(s: __Sched, co: __Co) {
+    __heap_set(s, s.heap_len, co)
+    s.heap_len += 1
+    __heap_up(s, s.heap_len - 1)
+}
+
+fn __heap_remove(s: __Sched, co: __Co) {
+    let i = co.hidx
+    co.hidx = -1
+    s.heap_len -= 1
+    if i == s.heap_len {
+        return
+    }
+    let last = __heap_at(s, s.heap_len)
+    __heap_set(s, i, last)
+    __heap_up(s, i)
+    __heap_down(s, last.hidx)
+}
+
+// Остановить сопрограмму co до того, как планировщик её разбудит.
+fn __co_park(co: __Co) {
+    co.parked = true
+    if __setjmp(co.jb) == 0 {
+        __longjmp(co.sch.jb)
+    }
+}
+
+// Ждать без сопрограммы: весь поток (тесты, фоновые задачи, программы без route).
+fn __poll(fd: int, events: int, ms: int) -> int {
+    let p = __ctx() + 208
+    if fd < 0 {
+        store64(p, ms / 1000)
+        store64(p + 8, ms % 1000 * 1000000)
+        syscall(SYS_NANOSLEEP, p, 0)
+        return 0
+    }
+    // struct pollfd: int fd, short events, short revents
+    store64(p, (fd & 0xFFFFFFFF) | (events << 32))
+    if syscall(SYS_POLL, p, 1, ms) <= 0 {
+        return 0
+    }
+    return (load64(p) >> 48) & 0xFFFF
+}
+
+// Ждать, пока fd будет готов к events (EPOLLIN, EPOLLOUT), но не дольше ms
+// миллисекунд (ms < 0 — без срока); fd < 0 — просто ждать ms. → события или 0,
+// если вышел срок. В сопрограмме ждёт только она: поток выполняет другие
+// запросы. Блокировка store на время ожидания отпускается — иначе ждали бы все.
+fn __co_wait(fd: int, events: int, ms: int) -> int {
+    let c = __ctx()
+    if load64(c + CTX_PSAVE_PTR) != 0 {
+        __panic_msg("internal: waiting while copying into store")
+    }
+    let held = load64(c + CTX_STORE_HELD)
+    if held != 0 {
+        __store_unlock()
+    }
+    var r = 0
+    let cv = load64(c + CTX_CORO)
+    var ok = cv != 0
+    if ok && fd >= 0 {
+        let co: __Co = __cast(cv)
+        let s = co.sch
+        store64(s.ev, events | EPOLLONESHOT)
+        store64(s.ev + 4, cv)
+        // такой fd epoll не принимает (обычный файл): ждать как без сопрограммы
+        ok = syscall(SYS_EPOLL_CTL, s.ep, EPOLL_CTL_ADD, fd, s.ev) == 0
+    }
+    if !ok {
+        r = __poll(fd, events, ms)
+    } else {
+        let co: __Co = __cast(cv)
+        let s = co.sch
+        co.revents = 0
+        if ms >= 0 {
+            co.deadline = now_ms() + ms
+            __heap_push(s, co)
+        }
+        __co_park(co)
+        if fd >= 0 {
+            syscall(SYS_EPOLL_CTL, s.ep, EPOLL_CTL_DEL, fd, s.ev)
+        }
+        r = co.revents
+    }
+    if held != 0 {
+        __store_lock()
+    }
+    return r
+}
+
+// Пауза на ms миллисекунд. В запросе сервера поток тем временем выполняет
+// другие запросы.
+fn sleep(ms: int) {
+    if ms >= 0 {
+        __co_wait(-1, 0, ms)
+    }
+}
+
+// Дать поработать другим запросам потока (долгие вычисления: хеш пароля).
+fn __co_yield() {
+    if load64(__ctx() + CTX_CORO) != 0 {
+        __co_wait(-1, 0, 0)
+    }
+}

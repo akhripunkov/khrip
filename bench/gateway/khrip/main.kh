@@ -1,0 +1,23 @@
+// Шлюз: цена товара из сервиса UPSTREAM с налогом 20%.
+
+type Item {
+    id: int
+    name: str
+    price: int
+}
+
+type Quote {
+    id: int
+    name: str
+    total: int
+}
+
+route GET "/quote" (id: int) -> Quote | 502 str {
+    let up = env("UPSTREAM") ?? "http://127.0.0.1:9090"
+    let r = fetch GET "{up}/item?id={id}"
+    let item: Item? = from_json(r.body)
+    if r.status != 200 || item == none {
+        return 502 "upstream failed: {r.status}"
+    }
+    return Quote { id: item.id, name: item.name, total: item.price * 120 / 100 }
+}

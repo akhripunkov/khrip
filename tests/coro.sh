@@ -1,0 +1,120 @@
+# Сопрограммы сервера: запросы, которые ждут (sleep, fetch), не держат поток.
+# Подключается из tests/run.sh (использует KHC, tmp, failed и функции из
+# tests/http.sh). Сервер — tests/coro/server.kh, один рабочий поток.
+
+CORO_PORT=${CORO_PORT:-18182}
+
+if ! "$KHC" -o "$tmp/coro" tests/coro/server.kh 2>"$tmp/coro.err"; then
+	failed "coro" "сервер не скомпилировался: $(cat "$tmp/coro.err")"
+	return 0
+fi
+
+coro_start() {
+	PORT=$CORO_PORT THREADS=1 "$@" "$tmp/coro" 2>"$tmp/coro.log" &
+	coro_pid=$!
+	for _ in $(seq 100); do
+		curl -s -o /dev/null "http://127.0.0.1:$CORO_PORT/log" && break
+		sleep 0.02
+	done
+}
+
+coro_stop() {
+	kill "$coro_pid"
+	wait "$coro_pid" 2>/dev/null
+}
+
+ms_now() {
+	echo $(($(date +%s%N) / 1000000))
+}
+
+# Ждать только своих curl: wait без аргументов ждал бы и сервер.
+curl_many() {
+	local n=$1 pids=()
+	shift
+	for _ in $(seq "$n"); do
+		curl -s -o /dev/null -w '%{http_code}\n' "$@" &
+		pids+=($!)
+	done
+	wait "${pids[@]}"
+}
+
+coro_start env
+url="http://127.0.0.1:$CORO_PORT"
+
+t0=$(ms_now)
+r=$(curl_many 50 "$url/sleep?ms=300" | sort | uniq -c | tr -s ' ')
+t1=$(ms_now)
+expect_count "50 запросов со sleep(300) на одном потоке" "$r" "^ 50 200$" 1
+if ((t1 - t0 < 1500)); then http_ok; else failed "coro: ожидания параллельны" "заняли $((t1 - t0)) мс"; fi
+
+r=$(curl -s "$url/self?port=$CORO_PORT")
+expect_count "fetch к себе на одном потоке" "$r" "^200 slept inner$" 1
+
+r=$(curl_many 20 "$url/self?port=$CORO_PORT" | sort | uniq -c | tr -s ' ')
+expect_count "20 одновременных fetch к себе" "$r" "^ 20 200$" 1
+
+r=$(curl -s "$url/deep?n=20000")
+expect_count "глубокий стек сохраняется на время ожидания" "$r" "^20000$" 1
+
+r=$(curl -s -w ' %{http_code}' "$url/boom")
+expect_count "паника после ожидания — 500" "$r" "^Internal Server Error 500$" 1
+
+r=$(curl -s -w ' %{http_code}' "$url/deny")
+expect_count "fail после ожидания" "$r" "^denied 403$" 1
+
+r=$(HTTP_PORT=$CORO_PORT http_raw 'GET /sleep?ms=200&tag=A HTTP/1.1\r\nHost: x\r\n\r\nGET /sleep?ms=1&tag=B HTTP/1.1\r\nHost: x\r\n\r\nGET /sleep?ms=50&tag=C HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n')
+expect_count "конвейер: ответы по порядку, хотя первый ждёт" "$(grep -oE 'slept [A-C]' <<<"$r" | tr '\n' ' ')" "^slept A slept B slept C $" 1
+
+curl_many 100 -X POST "$url/log?text=t" >/dev/null
+r=$(curl -s "$url/log")
+expect_count "запись в store через ожидание: ничего не потеряно" "$r" "^200$" 1
+
+# соединения fetch к себе остаются в запасе (keep-alive): база — после них
+fds=$(ls "/proc/$coro_pid/fd" | wc -l)
+curl_many 100 --max-time 0.05 "$url/sleep?ms=300" >/dev/null
+sleep 0.5
+r=$(ls "/proc/$coro_pid/fd" | wc -l)
+expect_count "клиенты ушли, не дождавшись: соединения закрыты" "$r" "^$fds$" 1
+r=$(curl -s "$url/sleep?ms=1&tag=alive")
+expect_count "сервер жив после ушедших клиентов" "$r" "^slept alive$" 1
+coro_stop
+
+# две сопрограммы на поток: остальные запросы ждут в очереди
+coro_start env KHRIP_COROUTINES=2
+t0=$(ms_now)
+r=$(curl_many 10 "$url/sleep?ms=100" | sort | uniq -c | tr -s ' ')
+t1=$(ms_now)
+expect_count "очередь: все 10 запросов выполнены" "$r" "^ 10 200$" 1
+if ((t1 - t0 >= 450)); then http_ok; else failed "coro: две сопрограммы" "10 запросов заняли $((t1 - t0)) мс, а должны — не меньше 500"; fi
+coro_stop
+
+# fetch: соединения переиспользуются, ответы любой формы читаются до конца
+if command -v python3 >/dev/null; then
+	up_port=$((CORO_PORT + 1))
+	python3 tests/coro/upstream.py "$up_port" &
+	up_pid=$!
+	coro_start env
+	for _ in $(seq 50); do
+		(exec 3<>"/dev/tcp/127.0.0.1/$up_port") 2>/dev/null && break
+		sleep 0.02
+	done
+	for p in "chunked:200:hello world" "len:200:abc" "eof:200:until-eof" "nolen:200:old-style" "drop:0:connection closed without a response"; do
+		path=${p%%:*}
+		want=${p#*:}
+		r=$(curl -s "$url/twice?port=$up_port&path=$path")
+		expect_count "fetch: ответ «$path»" "$r" "^$want|$want$" 1
+	done
+	r=$(curl -s -X POST "$url/post?port=$up_port")
+	expect_count "fetch: POST по соединению из запаса" "$r" "^200:abc$" 1
+	# сервис перезапущен: соединения из запаса мертвы, fetch открывает новые
+	kill "$up_pid"
+	wait "$up_pid" 2>/dev/null
+	python3 tests/coro/upstream.py "$up_port" &
+	up_pid=$!
+	sleep 0.3
+	r=$(curl -s "$url/twice?port=$up_port&path=len")
+	expect_count "fetch: сервис перезапущен — новое соединение" "$r" "^200:abc|200:abc$" 1
+	coro_stop
+	kill "$up_pid"
+	wait "$up_pid" 2>/dev/null
+fi
