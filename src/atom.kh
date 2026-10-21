@@ -1050,7 +1050,7 @@ fn parse_builtin(t: Token, w: int) -> int {
         emit_call(rt_func("__json_decode"))
         return ty_opt(inner)
     }
-    let lib_only = name == "__fsqrt" || name.starts_with("__simd_") || name == "__sha256_x64" || name == "__cpu_avx2" || name == "__cpu_sha" || name == "__spawn" || name == "__co_call" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset"
+    let lib_only = name == "__fsqrt" || name.starts_with("__simd_") || name == "__sha256_x64" || name == "__sha512_x64" || name == "__cpu_aes" || name == "__aes_ctr" || name == "__ghash" || name == "__chacha_block" || name == "__mp_add" || name == "__mp_sub" || name == "__mont_mul" || name == "__madd" || name == "__msub" || name == "__wmul" || name == "__cpu_avx2" || name == "__cpu_sha" || name == "__spawn" || name == "__co_call" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset"
     if lib_only && !files[t.file].is_lib {
         return -1
     }
@@ -1122,7 +1122,7 @@ fn parse_builtin(t: Token, w: int) -> int {
         emit_cpu_sha()
         return ty_bool
     }
-    if name == "__simd_sha256" || name == "__sha256_x64" {
+    if name == "__simd_sha256" || name == "__sha256_x64" || name == "__sha512_x64" {
         advance()
         builtin_args(3, t, name)
         emit_pop(RDX)
@@ -1130,9 +1130,94 @@ fn parse_builtin(t: Token, w: int) -> int {
         emit_pop(RDI)
         if name == "__simd_sha256" {
             emit_sha256_ni()
-        } else {
+        } else if name == "__sha256_x64" {
             emit_sha256_x64()
+        } else {
+            emit_sha512_x64()
         }
+        return ty_void
+    }
+    if name == "__cpu_aes" {
+        advance()
+        expect_tok(')')
+        emit_cpu_aes()
+        return ty_bool
+    }
+    if name == "__aes_ctr" {
+        advance()
+        builtin_args(6, t, name)
+        emit_pop(R9)
+        emit_pop(R8)
+        emit_pop(RCX)
+        emit_pop(RDX)
+        emit_pop(RSI)
+        emit_pop(RDI)
+        emit_aes_ctr()
+        return ty_void
+    }
+    if name == "__ghash" {
+        advance()
+        builtin_args(4, t, name)
+        emit_pop(RCX)
+        emit_pop(RDX)
+        emit_pop(RSI)
+        emit_pop(RDI)
+        emit_ghash()
+        return ty_void
+    }
+    if name == "__mp_add" || name == "__mp_sub" {
+        advance()
+        builtin_args(4, t, name)
+        emit_pop(RCX)
+        emit_pop(RDX)
+        emit_pop(RSI)
+        emit_pop(RDI)
+        if name == "__mp_add" {
+            emit_mp_addsub(0x13)
+        } else {
+            emit_mp_addsub(0x1B)
+        }
+        return ty_int
+    }
+    if name == "__mont_mul" {
+        advance()
+        builtin_args(6, t, name)
+        emit_pop(R9)
+        emit_pop(R8)
+        emit_pop(RCX)
+        emit_pop(RDX)
+        emit_pop(RSI)
+        emit_pop(RDI)
+        emit_mont_mul()
+        return ty_void
+    }
+    if name == "__madd" || name == "__msub" {
+        advance()
+        builtin_args(5, t, name)
+        emit_pop(R8)
+        emit_pop(RCX)
+        emit_pop(RDX)
+        emit_pop(RSI)
+        emit_pop(RDI)
+        emit_mod_addsub(name == "__madd")
+        return ty_void
+    }
+    if name == "__wmul" {
+        // произведение по модулю 2^64, без проверки переполнения
+        advance()
+        builtin_args(2, t, name)
+        emit_pop(RCX)
+        emit_pop(RAX)
+        // imul rax, rcx
+        emit_hex("48 0F AF C1")
+        return ty_int
+    }
+    if name == "__chacha_block" {
+        advance()
+        builtin_args(2, t, name)
+        emit_pop(RSI)
+        emit_pop(RDI)
+        emit_chacha_block()
         return ty_void
     }
     if name == "__cpu_avx2" {

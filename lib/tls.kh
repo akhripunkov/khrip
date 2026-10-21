@@ -1,0 +1,990 @@
+// Клиент TLS 1.3 (RFC 8446) для fetch по https: без OpenSSL и curl.
+//
+// Обмен ключами — X25519 (или P-256, если сервер попросит HelloRetryRequest),
+// шифры — AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305 (lib/cipher.kh), подписи
+// сервера — ECDSA P-256/P-384 и RSA-PSS, сертификаты — lib/x509.kh. Сокет
+// неблокирующий: запрос, который ждёт сеть, ждёт в своей сопрограмме.
+//
+// Состояние соединения (ключи, номера записей, буферы) лежит в отдельном блоке
+// mmap, а не в арене запроса: соединение переживает запрос и возвращается в
+// запас (keep-alive). Всё временное на время рукопожатия — в арене.
+
+const TLS_BLOCK = 4096
+// поля блока
+const TB_FD = 0
+const TB_HSIZE = 8
+const TB_KIND = 16
+const TB_RSEQ = 24
+const TB_WSEQ = 32
+const TB_CLOSED = 40
+const TB_PORT = 48
+const TB_RIV = 64
+const TB_WIV = 80
+const TB_RSEC = 96
+const TB_WSEC = 144
+const TB_RKS = 192
+const TB_WKS = 432
+const TB_RGH = 672
+const TB_WGH = 704
+// входящие байты: данные, длина, ёмкость (mmap)
+const TB_IN = 736
+// расшифрованные данные приложения: данные, длина, ёмкость, прочитано
+const TB_PLAIN = 760
+const TB_HOSTLEN = 800
+const TB_HOST = 808
+
+const TLS_REC_MAX = 16384
+
+// ---- Чтение байтов с проверкой границ ----
+
+type __Rd {
+    p: int
+    end: int
+    ok: bool
+}
+
+fn __rd_u8(r: __Rd) -> int {
+    if r.p + 1 > r.end {
+        r.ok = false
+        return 0
+    }
+    let v = load8(r.p)
+    r.p += 1
+    return v
+}
+
+fn __rd_u16(r: __Rd) -> int {
+    let a = __rd_u8(r)
+    return a * 256 + __rd_u8(r)
+}
+
+fn __rd_u24(r: __Rd) -> int {
+    let a = __rd_u8(r)
+    let b = __rd_u8(r)
+    return (a * 256 + b) * 256 + __rd_u8(r)
+}
+
+// Пропустить n байт; → их начало.
+fn __rd_skip(r: __Rd, n: int) -> int {
+    let at = r.p
+    if n < 0 || r.p + n > r.end {
+        r.ok = false
+        return at
+    }
+    r.p += n
+    return at
+}
+
+fn __wr_u16(b: Buf, v: int) {
+    buf_byte(b, (v >> 8) & 255)
+    buf_byte(b, v & 255)
+}
+
+fn __wr_u24(b: Buf, v: int) {
+    buf_byte(b, (v >> 16) & 255)
+    buf_byte(b, (v >> 8) & 255)
+    buf_byte(b, v & 255)
+}
+
+// Длину, записанную заранее двумя (или тремя) байтами в b по смещению at,
+// заполнить по концу буфера.
+fn __wr_len_at(b: Buf, at: int, bytes: int) {
+    let n = b.len - at - bytes
+    for i in 0..bytes {
+        store8(b.data + at + i, (n >> ((bytes - 1 - i) * 8)) & 255)
+    }
+}
+
+// ---- Буферы блока (растут через mmap) ----
+
+fn __tb_buf(blk: int, off: int) -> Buf {
+    return Buf { data: load64(blk + off), len: load64(blk + off + 8), cap: load64(blk + off + 16), mm: true }
+}
+
+fn __tb_save(blk: int, off: int, b: Buf) {
+    store64(blk + off, b.data)
+    store64(blk + off + 8, b.len)
+    store64(blk + off + 16, b.cap)
+}
+
+// ---- Сокет ----
+
+fn __fd_write_all(fd: int, p: int, n: int, deadline: int) -> bool {
+    var off = 0
+    while off < n {
+        let w = syscall(SYS_WRITE, fd, p + off, n - off)
+        if w == -EAGAIN && __wait_fd(fd, EPOLLOUT, deadline) {
+            continue
+        }
+        if w <= 0 {
+            return false
+        }
+        off += w
+    }
+    return true
+}
+
+// ---- Ключи записей ----
+
+fn __tls_aead(blk: int, ks: int, gh: int) -> __Aead {
+    let kind = load64(blk + TB_KIND)
+    var rounds = 0
+    if kind == AEAD_AES128 {
+        rounds = 10
+    } else if kind == AEAD_AES256 {
+        rounds = 14
+    }
+    return __Aead { kind, ks: blk + ks, rounds, gh: blk + gh }
+}
+
+// Ключи записей одного направления из секрета трафика (RFC 8446, 7.3).
+fn __tls_set_keys(blk: int, secret: int, write: bool) {
+    let hs = load64(blk + TB_HSIZE)
+    let kind = load64(blk + TB_KIND)
+    var iv = TB_RIV
+    var sec = TB_RSEC
+    var ks = TB_RKS
+    var gh = TB_RGH
+    var seq = TB_RSEQ
+    if write {
+        iv = TB_WIV
+        sec = TB_WSEC
+        ks = TB_WKS
+        gh = TB_WGH
+        seq = TB_WSEQ
+    }
+    let klen = __aead_key_len(kind)
+    let key = __alloc(32)
+    __hkdf_label(hs, secret, "key", 0, 0, key, klen)
+    __hkdf_label(hs, secret, "iv", 0, 0, blk + iv, 12)
+    __memcpy(blk + sec, secret, hs)
+    let a = __aead_new(kind, key)
+    if kind == AEAD_CHACHA {
+        __memcpy(blk + ks, a.ks, 32)
+    } else {
+        __memcpy(blk + ks, a.ks, (a.rounds + 1) * 16)
+        __memcpy(blk + gh, a.gh, 32)
+    }
+    store64(blk + seq, 0)
+}
+
+// nonce записи: iv ^ номер (RFC 8446, 5.3).
+fn __tls_nonce(blk: int, iv: int, seq: int) -> int {
+    let n = __alloc(16)
+    __memcpy(n, blk + iv, 12)
+    for i in 0..8 {
+        store8(n + 11 - i, load8(n + 11 - i) ^ ((seq >> (i * 8)) & 255))
+    }
+    return n
+}
+
+// Отправить данные ctype (23 — приложение, 22 — рукопожатие, 21 — alert)
+// зашифрованными записями.
+fn __tls_send(blk: int, ctype: int, p: int, n: int, deadline: int) -> bool {
+    let a = __tls_aead(blk, TB_WKS, TB_WGH)
+    var off = 0
+    while true {
+        let m = (n - off).min(TLS_REC_MAX)
+        let inner = __alloc(m + 1)
+        __memcpy(inner, p + off, m)
+        store8(inner + m, ctype)
+        let rec = __alloc(5 + m + 1 + 16)
+        let clen = m + 1 + 16
+        store8(rec, 23)
+        store8(rec + 1, 3)
+        store8(rec + 2, 3)
+        store8(rec + 3, clen >> 8)
+        store8(rec + 4, clen & 255)
+        let seq = load64(blk + TB_WSEQ)
+        __aead_seal(a, __tls_nonce(blk, TB_WIV, seq), rec, 5, inner, m + 1, rec + 5)
+        store64(blk + TB_WSEQ, seq + 1)
+        if !__fd_write_all(load64(blk + TB_FD), rec, 5 + clen, deadline) {
+            return false
+        }
+        off += m
+        if off >= n {
+            return true
+        }
+    }
+    return true
+}
+
+// Следующая запись из сокета: тип, содержимое (копия в арене). none — конец
+// соединения, срок или ошибка.
+type __Rec {
+    kind: int
+    p: int
+    n: int
+}
+
+fn __tls_raw_record(blk: int, deadline: int) -> __Rec? {
+    let fd = load64(blk + TB_FD)
+    var b = __tb_buf(blk, TB_IN)
+    while true {
+        if b.len >= 5 {
+            let rlen = load8(b.data + 3) * 256 + load8(b.data + 4)
+            if rlen > TLS_REC_MAX + 256 {
+                return none
+            }
+            if b.len >= 5 + rlen {
+                let body = __alloc(rlen + 5)
+                __memcpy(body, b.data, 5 + rlen)
+                let kind = load8(b.data)
+                __memcpy(b.data, b.data + 5 + rlen, b.len - 5 - rlen)
+                b.len -= 5 + rlen
+                __tb_save(blk, TB_IN, b)
+                return __Rec { kind, p: body, n: rlen }
+            }
+        }
+        buf_reserve(b, 16384)
+        __tb_save(blk, TB_IN, b)
+        let n = syscall(SYS_READ, fd, b.data + b.len, b.cap - b.len)
+        if n == -EAGAIN && __wait_fd(fd, EPOLLIN, deadline) {
+            continue
+        }
+        if n <= 0 {
+            return none
+        }
+        b.len += n
+        __tb_save(blk, TB_IN, b)
+    }
+    return none
+}
+
+// Расшифровать запись (p — заголовок и содержимое): → внутренний тип и
+// открытый текст; none — тег не сошёлся.
+fn __tls_open(blk: int, rec: __Rec) -> __Rec? {
+    if rec.n < 17 {
+        return none
+    }
+    let a = __tls_aead(blk, TB_RKS, TB_RGH)
+    let seq = load64(blk + TB_RSEQ)
+    let out = __alloc(rec.n)
+    if !__aead_open(a, __tls_nonce(blk, TB_RIV, seq), rec.p, 5, rec.p + 5, rec.n - 16, out) {
+        return none
+    }
+    store64(blk + TB_RSEQ, seq + 1)
+    // в конце — тип и нули дополнения
+    var i = rec.n - 17
+    while i >= 0 && load8(out + i) == 0 {
+        i -= 1
+    }
+    if i < 0 {
+        return none
+    }
+    return __Rec { kind: load8(out + i), p: out, n: i }
+}
+
+// ---- Рукопожатие ----
+
+type __Hs {
+    blk: int
+    host: str
+    deadline: int
+    // байты рукопожатия, ещё не разобранные на сообщения
+    msgs: Buf
+    // записи уже шифруются ключами рукопожатия
+    enc: bool
+    tr: __Hash
+    err: str
+}
+
+fn __hs_fail(h: __Hs, msg: str) -> bool {
+    if h.err.len() == 0 {
+        h.err = msg
+    }
+    return false
+}
+
+// Следующее сообщение рукопожатия целиком (тип, тело) или none.
+fn __hs_next(h: __Hs) -> __Rec? {
+    while true {
+        let b = h.msgs
+        if b.len >= 4 {
+            let mlen = (load8(b.data + 1) * 256 + load8(b.data + 2)) * 256 + load8(b.data + 3)
+            // цепочка сертификатов — десятки КБ; больше — не копить в памяти
+            if mlen > 262144 {
+                __hs_fail(h, "TLS handshake message is too large")
+                return none
+            }
+            if b.len >= 4 + mlen {
+                let m = __alloc(4 + mlen)
+                __memcpy(m, b.data, 4 + mlen)
+                __memcpy(b.data, b.data + 4 + mlen, b.len - 4 - mlen)
+                b.len -= 4 + mlen
+                return __Rec { kind: load8(m), p: m, n: 4 + mlen }
+            }
+        }
+        let rec = __tls_raw_record(h.blk, h.deadline) else {
+            __hs_fail(h, "connection closed during the TLS handshake")
+            return none
+        }
+        if rec.kind == 20 {
+            // ChangeCipherSpec для совместимости — пропустить
+            continue
+        }
+        if rec.kind == 21 {
+            __hs_fail(h, __tls_alert_text(load8(rec.p + 6)))
+            return none
+        }
+        if h.enc {
+            if rec.kind != 23 {
+                __hs_fail(h, "unexpected TLS record")
+                return none
+            }
+            let pt = __tls_open(h.blk, rec) else {
+                __hs_fail(h, "TLS record failed authentication")
+                return none
+            }
+            if pt.kind == 21 {
+                __hs_fail(h, __tls_alert_text(load8(pt.p + 1)))
+                return none
+            }
+            if pt.kind != 22 {
+                __hs_fail(h, "unexpected TLS record")
+                return none
+            }
+            buf_add_raw(b, pt.p, pt.n)
+        } else {
+            if rec.kind != 22 {
+                __hs_fail(h, "unexpected TLS record")
+                return none
+            }
+            buf_add_raw(b, rec.p + 5, rec.n)
+        }
+    }
+    return none
+}
+
+fn __tls_alert_text(code: int) -> str {
+    let name = match code {
+        40 => "handshake failure"
+        42 => "bad certificate"
+        45 => "certificate expired"
+        46 => "certificate unknown"
+        48 => "unknown CA"
+        70 => "protocol version (the server may not support TLS 1.3)"
+        71 => "insufficient security"
+        80 => "internal error"
+        112 => "unrecognized name"
+        120 => "no application protocol"
+        _ => "alert {code}"
+    }
+    return "the server rejected TLS: {name}"
+}
+
+// Шифры в порядке предпочтения: с AES-NI сначала AES-GCM.
+fn __tls_suites() -> [int] {
+    if __aes_ok() {
+        return [0x1301, 0x1302, 0x1303]
+    }
+    return [0x1303, 0x1301, 0x1302]
+}
+
+var __aes_checked: int
+
+fn __aes_ok() -> bool {
+    if __aes_checked == 0 {
+        __aes_checked = 2
+        if __cpu_aes() {
+            __aes_checked = 1
+        }
+    }
+    return __aes_checked == 1
+}
+
+// ClientHello (RFC 8446, 4.1.2) с ключом группы group (0x1d — X25519, 0x17 —
+// P-256); cookie — из HelloRetryRequest или пустой.
+fn __client_hello(host: str, random: int, sid: int, group: int, key: int, klen: int, cookie: str) -> Buf {
+    let b = buf_new(512)
+    buf_byte(b, 1)
+    __wr_u24(b, 0)
+    __wr_u16(b, 0x0303)
+    buf_add_raw(b, random, 32)
+    buf_byte(b, 32)
+    buf_add_raw(b, sid, 32)
+    let suites = __tls_suites()
+    __wr_u16(b, suites.len() * 2)
+    for s in suites {
+        __wr_u16(b, s)
+    }
+    buf_byte(b, 1)
+    buf_byte(b, 0)
+    let ext = b.len
+    __wr_u16(b, 0)
+    if __ip_parse(host) == none {
+        // server_name
+        __wr_u16(b, 0)
+        __wr_u16(b, host.len() + 5)
+        __wr_u16(b, host.len() + 3)
+        buf_byte(b, 0)
+        __wr_u16(b, host.len())
+        buf_add(b, host)
+    }
+    // supported_groups: X25519, P-256
+    __wr_u16(b, 10)
+    __wr_u16(b, 6)
+    __wr_u16(b, 4)
+    __wr_u16(b, 0x001d)
+    __wr_u16(b, 0x0017)
+    // signature_algorithms
+    let algs = [0x0403, 0x0503, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601]
+    __wr_u16(b, 13)
+    __wr_u16(b, algs.len() * 2 + 2)
+    __wr_u16(b, algs.len() * 2)
+    for a in algs {
+        __wr_u16(b, a)
+    }
+    // supported_versions: только TLS 1.3
+    __wr_u16(b, 43)
+    __wr_u16(b, 3)
+    buf_byte(b, 2)
+    __wr_u16(b, 0x0304)
+    // ALPN: http/1.1
+    __wr_u16(b, 16)
+    __wr_u16(b, 11)
+    __wr_u16(b, 9)
+    buf_byte(b, 8)
+    buf_add(b, "http/1.1")
+    // key_share
+    __wr_u16(b, 51)
+    __wr_u16(b, klen + 6)
+    __wr_u16(b, klen + 4)
+    __wr_u16(b, group)
+    __wr_u16(b, klen)
+    buf_add_raw(b, key, klen)
+    if cookie.len() > 0 {
+        __wr_u16(b, 44)
+        __wr_u16(b, cookie.len() + 2)
+        __wr_u16(b, cookie.len())
+        buf_add(b, cookie)
+    }
+    __wr_len_at(b, ext, 2)
+    __wr_len_at(b, 1, 3)
+    return b
+}
+
+// Запись ClientHello открытым текстом.
+fn __tls_send_plain(blk: int, msg: Buf, deadline: int) -> bool {
+    let rec = buf_new(msg.len + 5)
+    buf_byte(rec, 22)
+    __wr_u16(rec, 0x0301)
+    __wr_u16(rec, msg.len)
+    buf_add_raw(rec, msg.data, msg.len)
+    return __fd_write_all(load64(blk + TB_FD), rec.data, rec.len, deadline)
+}
+
+// Ключевая пара для группы: секрет и открытый ключ.
+type __Share {
+    group: int
+    secret: int
+    key: int
+    klen: int
+}
+
+fn __share_new(group: int) -> __Share {
+    let secret = __alloc(32)
+    if group == 0x001d {
+        __random_bytes(secret, 32)
+        let base = __alloc(32)
+        store8(base, 9)
+        let pub = __alloc(32)
+        __x25519(secret, base, pub)
+        return __Share { group, secret, key: pub, klen: 32 }
+    }
+    let pub = __alloc(65)
+    __ecdh_keygen(CURVE_P256, secret, pub)
+    return __Share { group, secret, key: pub, klen: 65 }
+}
+
+// Общий секрет с ключом сервера.
+fn __share_secret(s: __Share, peer: int, plen: int, out: int) -> bool {
+    if s.group == 0x001d {
+        if plen != 32 {
+            return false
+        }
+        __x25519(s.secret, peer, out)
+        // нулевой результат — ключ сервера негодный (RFC 7748, 6.1)
+        var acc = 0
+        for i in 0..32 {
+            acc = acc | load8(out + i)
+        }
+        return acc != 0
+    }
+    return __ecdh_shared(CURVE_P256, s.secret, peer, plen, out)
+}
+
+// Derive-Secret(secret, label, хеш переписки) — RFC 8446, 7.1.
+fn __derive(hs: int, secret: int, label: str, th: int, out: int) {
+    __hkdf_label(hs, secret, label, th, hs, out, hs)
+}
+
+fn __tr_hash(h: __Hs, out: int) {
+    __hash_final(__hash_copy(h.tr), out)
+}
+
+fn __tr_add(h: __Hs, m: __Rec) {
+    __hash_update(h.tr, m.p, m.n)
+}
+
+// Результат соединения: блок или текст ошибки.
+type __TlsConn {
+    blk: int
+    err: str
+}
+
+fn __tls_fail(blk: int, msg: str) -> __TlsConn {
+    __tls_free(blk)
+    return __TlsConn { blk: 0, err: "tls: " + msg }
+}
+
+// Освободить блок и его буферы (сокет закрывает вызывающий).
+fn __tls_free(blk: int) {
+    let a = load64(blk + TB_IN)
+    if a != 0 {
+        syscall(SYS_MUNMAP, a, load64(blk + TB_IN + 16))
+    }
+    let p = load64(blk + TB_PLAIN)
+    if p != 0 {
+        syscall(SYS_MUNMAP, p, load64(blk + TB_PLAIN + 16))
+    }
+    syscall(SYS_MUNMAP, blk, TLS_BLOCK)
+}
+
+// Рукопожатие по соединённому сокету fd с сервером host.
+fn __tls_connect(fd: int, host: str, port: int, deadline: int) -> __TlsConn {
+    let blk = __mmap(TLS_BLOCK)
+    store64(blk + TB_FD, fd)
+    store64(blk + TB_PORT, port)
+    __tb_save(blk, TB_IN, buf_mm(16384))
+    __tb_save(blk, TB_PLAIN, buf_mm(16384))
+    let hl = host.len().min(255)
+    store64(blk + TB_HOSTLEN, hl)
+    __memcpy(blk + TB_HOST, __str_ptr(host), hl)
+    let h = __Hs { blk, host, deadline, msgs: buf_new(16384), enc: false, tr: __hash_new(32), err: "" }
+    let random = __alloc(32)
+    __random_bytes(random, 32)
+    let sid = __alloc(32)
+    __random_bytes(sid, 32)
+    var share = __share_new(0x001d)
+    var ch = __client_hello(host, random, sid, share.group, share.key, share.klen, "")
+    if !__tls_send_plain(blk, ch, deadline) {
+        return __tls_fail(blk, "cannot send ClientHello")
+    }
+    let sh1 = __hs_next(h) else {
+        return __tls_fail(blk, h.err)
+    }
+    let si1 = __server_hello(h, sh1, sid) else {
+        return __tls_fail(blk, h.err)
+    }
+    var sh = sh1
+    var si = si1
+    var hrr_ch: Buf? = none
+    if si1.hrr {
+        // HelloRetryRequest: сервер просит другую группу (или cookie)
+        if si1.group != 0x0017 && si1.group != 0x001d {
+            return __tls_fail(blk, "the server wants an unsupported key exchange group")
+        }
+        hrr_ch = ch
+        share = __share_new(si1.group)
+        ch = __client_hello(host, random, sid, share.group, share.key, share.klen, si1.cookie)
+        if !__tls_send_plain(blk, ch, deadline) {
+            return __tls_fail(blk, "cannot send ClientHello")
+        }
+        let sh2 = __hs_next(h) else {
+            return __tls_fail(blk, h.err)
+        }
+        let si2 = __server_hello(h, sh2, sid) else {
+            return __tls_fail(blk, h.err)
+        }
+        if si2.hrr || si2.suite != si1.suite {
+            return __tls_fail(blk, "bad ServerHello after HelloRetryRequest")
+        }
+        sh = sh2
+        si = si2
+    }
+    if si.group != share.group {
+        return __tls_fail(blk, "the server chose another key exchange group")
+    }
+    var hs = 32
+    var kind = AEAD_AES128
+    if si.suite == 0x1302 {
+        hs = 48
+        kind = AEAD_AES256
+    } else if si.suite == 0x1303 {
+        kind = AEAD_CHACHA
+    } else if si.suite != 0x1301 {
+        return __tls_fail(blk, "the server chose an unsupported cipher")
+    }
+    store64(blk + TB_HSIZE, hs)
+    store64(blk + TB_KIND, kind)
+    // переписка: при HelloRetryRequest первый ClientHello заменяется его хешем
+    h.tr = __hash_new(hs)
+    if let first = hrr_ch {
+        let d = __alloc(64)
+        __hash(hs, first.data, first.len, d)
+        let mh = __alloc(4 + hs)
+        store8(mh, 254)
+        store8(mh + 3, hs)
+        __memcpy(mh + 4, d, hs)
+        __hash_update(h.tr, mh, 4 + hs)
+        __tr_add(h, sh1)
+    }
+    __hash_update(h.tr, ch.data, ch.len)
+    __tr_add(h, sh)
+    // ключи рукопожатия
+    let shared = __alloc(48)
+    if !__share_secret(share, si.key, si.klen, shared) {
+        return __tls_fail(blk, "bad key share from the server")
+    }
+    let zeros = __alloc(64)
+    let early = __alloc(64)
+    __hkdf_extract(hs, zeros, hs, zeros, hs, early)
+    let empty = __alloc(64)
+    __hash(hs, zeros, 0, empty)
+    let derived = __alloc(64)
+    __derive(hs, early, "derived", empty, derived)
+    let hsec = __alloc(64)
+    // общий секрет X25519 и P-256 — 32 байта
+    __hkdf_extract(hs, derived, hs, shared, 32, hsec)
+    let th = __alloc(64)
+    __tr_hash(h, th)
+    let c_hs = __alloc(64)
+    let s_hs = __alloc(64)
+    __derive(hs, hsec, "c hs traffic", th, c_hs)
+    __derive(hs, hsec, "s hs traffic", th, s_hs)
+    __tls_set_keys(blk, s_hs, false)
+    __tls_set_keys(blk, c_hs, true)
+    h.enc = true
+    // EncryptedExtensions
+    let ee = __hs_next(h) else {
+        return __tls_fail(blk, h.err)
+    }
+    if ee.kind != 8 {
+        return __tls_fail(blk, "expected EncryptedExtensions")
+    }
+    __tr_add(h, ee)
+    // Certificate
+    let cm = __hs_next(h) else {
+        return __tls_fail(blk, h.err)
+    }
+    if cm.kind == 13 {
+        return __tls_fail(blk, "the server asks for a client certificate")
+    }
+    if cm.kind != 11 {
+        return __tls_fail(blk, "expected Certificate")
+    }
+    __tr_add(h, cm)
+    let chain = __tls_certs(cm)
+    if let e = __verify_chain_cached(chain, host.lower(), now()) {
+        return __tls_fail(blk, e)
+    }
+    // CertificateVerify: подпись переписки ключом сертификата
+    let cv = __hs_next(h) else {
+        return __tls_fail(blk, h.err)
+    }
+    if cv.kind != 15 {
+        return __tls_fail(blk, "expected CertificateVerify")
+    }
+    let th2 = __alloc(64)
+    __tr_hash(h, th2)
+    if !__tls_cert_verify(chain[0], cv, th2, hs) {
+        return __tls_fail(blk, "the server signature does not match its certificate")
+    }
+    __tr_add(h, cv)
+    // Finished сервера
+    let fin = __hs_next(h) else {
+        return __tls_fail(blk, h.err)
+    }
+    if fin.kind != 20 || fin.n != 4 + hs {
+        return __tls_fail(blk, "expected Finished")
+    }
+    let th3 = __alloc(64)
+    __tr_hash(h, th3)
+    let fk = __alloc(64)
+    __hkdf_label(hs, s_hs, "finished", 0, 0, fk, hs)
+    let want = __alloc(64)
+    __hmac(hs, fk, hs, th3, hs, want)
+    if !__memeq(want, fin.p + 4, hs) {
+        return __tls_fail(blk, "the server Finished does not match")
+    }
+    __tr_add(h, fin)
+    // ключи приложения — по переписке до Finished сервера
+    let th4 = __alloc(64)
+    __tr_hash(h, th4)
+    let d2 = __alloc(64)
+    __derive(hs, hsec, "derived", empty, d2)
+    let master = __alloc(64)
+    __hkdf_extract(hs, d2, hs, zeros, hs, master)
+    let c_ap = __alloc(64)
+    let s_ap = __alloc(64)
+    __derive(hs, master, "c ap traffic", th4, c_ap)
+    __derive(hs, master, "s ap traffic", th4, s_ap)
+    // ChangeCipherSpec для совместимости и Finished клиента
+    let ccs = __alloc(6)
+    store8(ccs, 20)
+    store8(ccs + 1, 3)
+    store8(ccs + 2, 3)
+    store8(ccs + 4, 1)
+    store8(ccs + 5, 1)
+    if !__fd_write_all(fd, ccs, 6, deadline) {
+        return __tls_fail(blk, "cannot send Finished")
+    }
+    let cfk = __alloc(64)
+    __hkdf_label(hs, c_hs, "finished", 0, 0, cfk, hs)
+    let cf = __alloc(4 + hs)
+    store8(cf, 20)
+    store8(cf + 3, hs)
+    __hmac(hs, cfk, hs, th4, hs, cf + 4)
+    if !__tls_send(blk, 22, cf, 4 + hs, deadline) {
+        return __tls_fail(blk, "cannot send Finished")
+    }
+    __tls_set_keys(blk, s_ap, false)
+    __tls_set_keys(blk, c_ap, true)
+    // необработанные байты рукопожатия после Finished сервера не допускаются
+    if h.msgs.len > 0 {
+        return __tls_fail(blk, "unexpected handshake data")
+    }
+    return __TlsConn { blk, err: "" }
+}
+
+// Что выбрал сервер в ServerHello (или HelloRetryRequest).
+type __ShInfo {
+    hrr: bool = false
+    suite: int = 0
+    group: int = 0
+    key: int = 0
+    klen: int = 0
+    cookie: str = ""
+}
+
+fn __server_hello(h: __Hs, m: __Rec, sid: int) -> __ShInfo? {
+    if m.kind != 2 {
+        __hs_fail(h, "expected ServerHello")
+        return none
+    }
+    let r = __Rd { p: m.p + 4, end: m.p + m.n, ok: true }
+    let version = __rd_u16(r)
+    let random = __rd_skip(r, 32)
+    let sidlen = __rd_u8(r)
+    let echo = __rd_skip(r, sidlen)
+    let suite = __rd_u16(r)
+    let comp = __rd_u8(r)
+    let elen = __rd_u16(r)
+    let eend = r.p + elen
+    if !r.ok || eend > r.end || version != 0x0303 || comp != 0 || sidlen != 32 || !__memeq(echo, sid, 32) {
+        __hs_fail(h, "bad ServerHello")
+        return none
+    }
+    // HelloRetryRequest — особое значение random (SHA-256 строки «HelloRetryRequest»)
+    let hrr_random = __alloc(32)
+    __hash(32, __str_ptr("HelloRetryRequest"), 17, hrr_random)
+    let si = __ShInfo { hrr: __memeq(random, hrr_random, 32), suite }
+    var tls13 = false
+    while r.p < eend && r.ok {
+        let et = __rd_u16(r)
+        let el = __rd_u16(r)
+        let at = __rd_skip(r, el)
+        let e = __Rd { p: at, end: at + el, ok: r.ok }
+        if et == 43 {
+            tls13 = __rd_u16(e) == 0x0304
+        } else if et == 51 {
+            si.group = __rd_u16(e)
+            if !si.hrr {
+                si.klen = __rd_u16(e)
+                si.key = __rd_skip(e, si.klen)
+            }
+        } else if et == 44 {
+            let cl = __rd_u16(e)
+            si.cookie = __str_copy(__rd_skip(e, cl), cl)
+        }
+        if !e.ok {
+            r.ok = false
+        }
+    }
+    if !r.ok {
+        __hs_fail(h, "bad ServerHello")
+        return none
+    }
+    if !tls13 {
+        __hs_fail(h, "the server does not support TLS 1.3")
+        return none
+    }
+    return si
+}
+
+// Сертификаты из сообщения Certificate (RFC 8446, 4.4.2).
+fn __tls_certs(m: __Rec) -> [__Cert] {
+    var r: [__Cert] = []
+    let rd = __Rd { p: m.p + 4, end: m.p + m.n, ok: true }
+    let ctx = __rd_u8(rd)
+    __rd_skip(rd, ctx)
+    let total = __rd_u24(rd)
+    let end = rd.p + total
+    while rd.ok && rd.p < end {
+        let clen = __rd_u24(rd)
+        let at = __rd_skip(rd, clen)
+        let elen = __rd_u16(rd)
+        __rd_skip(rd, elen)
+        if !rd.ok {
+            break
+        }
+        if let c = __cert_parse(at, clen) {
+            r.push(c)
+        } else {
+            // негодный сертификат обрывает цепочку: проверка её не пропустит
+            break
+        }
+    }
+    return r
+}
+
+// CertificateVerify (RFC 8446, 4.4.3): подпись «64 пробела, контекст, 0, хеш».
+fn __tls_cert_verify(leaf: __Cert, m: __Rec, th: int, hs: int) -> bool {
+    let r = __Rd { p: m.p + 4, end: m.p + m.n, ok: true }
+    let alg = __rd_u16(r)
+    let slen = __rd_u16(r)
+    let sig = __rd_skip(r, slen)
+    if !r.ok {
+        return false
+    }
+    let ctx = "TLS 1.3, server CertificateVerify"
+    let content = __alloc(64 + ctx.len() + 1 + hs)
+    __memset(content, 0x20, 64)
+    __memcpy(content + 64, __str_ptr(ctx), ctx.len())
+    store8(content + 64 + ctx.len(), 0)
+    __memcpy(content + 65 + ctx.len(), th, hs)
+    let clen = 65 + ctx.len() + hs
+    let d = __alloc(64)
+    if alg == 0x0403 || alg == 0x0503 {
+        let size = if alg == 0x0403 { 32 } else { 48 }
+        let curve = if alg == 0x0403 { CURVE_P256 } else { CURVE_P384 }
+        if leaf.key_kind != KEY_EC || leaf.curve != curve {
+            return false
+        }
+        __hash(size, content, clen, d)
+        let seq = __tlv(sig, sig + slen) else {
+            return false
+        }
+        let rr = __tlv(seq.at, seq.end) else {
+            return false
+        }
+        let ss = __tlv(rr.end, seq.end) else {
+            return false
+        }
+        return __ecdsa_verify(curve, leaf.key, leaf.key_len, d, size, rr.at, rr.len, ss.at, ss.len)
+    }
+    if alg == 0x0804 || alg == 0x0805 || alg == 0x0806 {
+        if leaf.key_kind != KEY_RSA {
+            return false
+        }
+        let size = if alg == 0x0804 { 32 } else if alg == 0x0805 { 48 } else { 64 }
+        __hash(size, content, clen, d)
+        return __rsa_pss_verify(leaf.key, leaf.key_len, leaf.exp, leaf.exp_len, d, size, sig, slen)
+    }
+    return false
+}
+
+// ---- Данные приложения ----
+
+// Отправить данные по установленному соединению.
+fn __tls_write(blk: int, p: int, n: int, deadline: int) -> bool {
+    return __tls_send(blk, 23, p, n, deadline)
+}
+
+// Дописать в b расшифрованные данные: → сколько байт (0 — сервер закрыл
+// соединение, -1 — ошибка или срок).
+fn __tls_read(blk: int, b: Buf, deadline: int) -> int {
+    while true {
+        let rec = __tls_raw_record(blk, deadline) else {
+            return -1
+        }
+        if rec.kind == 20 {
+            continue
+        }
+        if rec.kind != 23 {
+            return -1
+        }
+        let pt = __tls_open(blk, rec) else {
+            return -1
+        }
+        if pt.kind == 23 {
+            if pt.n > 0 {
+                buf_add_raw(b, pt.p, pt.n)
+                return pt.n
+            }
+            continue
+        }
+        if pt.kind == 21 {
+            // close_notify — обычный конец, остальное — ошибка
+            if pt.n >= 2 && load8(pt.p + 1) == 0 {
+                store64(blk + TB_CLOSED, 1)
+                return 0
+            }
+            return -1
+        }
+        if pt.kind == 22 {
+            if !__tls_post_handshake(blk, pt, deadline) {
+                return -1
+            }
+            continue
+        }
+        return -1
+    }
+    return -1
+}
+
+// После рукопожатия: NewSessionTicket (не используем) и KeyUpdate.
+fn __tls_post_handshake(blk: int, pt: __Rec, deadline: int) -> bool {
+    var at = 0
+    while at + 4 <= pt.n {
+        let t = load8(pt.p + at)
+        let len = (load8(pt.p + at + 1) * 256 + load8(pt.p + at + 2)) * 256 + load8(pt.p + at + 3)
+        if at + 4 + len > pt.n {
+            return false
+        }
+        if t == 24 {
+            // KeyUpdate: новые ключи чтения; если просили — ответить и сменить ключи записи
+            let hs = load64(blk + TB_HSIZE)
+            let next = __alloc(64)
+            __hkdf_label(hs, blk + TB_RSEC, "traffic upd", 0, 0, next, hs)
+            __tls_set_keys(blk, next, false)
+            if len == 1 && load8(pt.p + at + 4) == 1 {
+                let ku = __alloc(5)
+                store8(ku, 24)
+                store8(ku + 3, 1)
+                store8(ku + 4, 0)
+                if !__tls_send(blk, 22, ku, 5, deadline) {
+                    return false
+                }
+                let wnext = __alloc(64)
+                __hkdf_label(hs, blk + TB_WSEC, "traffic upd", 0, 0, wnext, hs)
+                __tls_set_keys(blk, wnext, true)
+            }
+        } else if t != 4 {
+            return false
+        }
+        at += 4 + len
+    }
+    return at == pt.n
+}
+
+// Вежливо закрыть: close_notify (если получится сразу) и освободить блок.
+fn __tls_close(blk: int) {
+    let alert = __alloc(2)
+    store8(alert, 1)
+    store8(alert + 1, 0)
+    __tls_send(blk, 21, alert, 2, now_ms() + 100)
+    syscall(SYS_CLOSE, load64(blk + TB_FD))
+    __tls_free(blk)
+}
+
+// Можно ли отдать соединение в запас: нет непрочитанных данных и сервер не закрыл.
+fn __tls_idle_ok(blk: int) -> bool {
+    return load64(blk + TB_CLOSED) == 0 && load64(blk + TB_IN + 8) == 0
+}
+
+// Имя сервера и порт блока совпадают с нужными.
+fn __tls_same(blk: int, host: str, port: int) -> bool {
+    return load64(blk + TB_PORT) == port && load64(blk + TB_HOSTLEN) == host.len() && __memeq(blk + TB_HOST, __str_ptr(host), host.len())
+}

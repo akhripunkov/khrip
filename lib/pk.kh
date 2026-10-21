@@ -1,0 +1,801 @@
+// Открытые ключи для TLS: проверка подписей RSA (PKCS#1 v1.5, PSS) и ECDSA
+// (P-256, P-384), обмен ключами X25519 и ECDH P-256.
+//
+// Числа — массивы частей по 64 бита (младшие первыми) в памяти; арифметика по
+// модулю — Монтгомери. Умножение, сложение и вычитание с переносом — машинный
+// код компилятора (__mont_mul, __mp_add, __mp_sub в src/simd.kh): части
+// беззнаковые, а int в Khrip со знаком и с проверкой переполнения.
+
+// ---- Числа ----
+
+fn __mp_new(n: int) -> int {
+    return __alloc((n + 1) * 8)
+}
+
+fn __mp_copy(dst: int, src: int, n: int) {
+    __memcpy(dst, src, n * 8)
+}
+
+fn __mp_is_zero(a: int, n: int) -> bool {
+    var acc = 0
+    for i in 0..n {
+        acc = acc | load64(a + i * 8)
+    }
+    return acc == 0
+}
+
+// a < b для беззнаковых: вычитание с заёмом во временное число.
+fn __mp_less(a: int, b: int, n: int) -> bool {
+    let t = __alloc(n * 8)
+    return __mp_sub(t, a, b, n) != 0
+}
+
+// Число из байтов старшими вперёд (len байт) в n частях.
+fn __mp_from_be(p: int, len: int, n: int) -> int {
+    let r = __mp_new(n)
+    for i in 0..len {
+        let byte = load8(p + len - 1 - i)
+        let w = i / 8
+        if w < n {
+            store64(r + w * 8, load64(r + w * 8) | (byte << ((i % 8) * 8)))
+        }
+    }
+    return r
+}
+
+fn __mp_to_be(a: int, n: int, out: int, len: int) {
+    for i in 0..len {
+        let w = i / 8
+        var byte = 0
+        if w < n {
+            byte = (load64(a + w * 8) >> ((i % 8) * 8)) & 255
+        }
+        store8(out + len - 1 - i, byte)
+    }
+}
+
+// Число значащих бит.
+fn __mp_bits(a: int, n: int) -> int {
+    var i = n - 1
+    while i >= 0 {
+        let w = load64(a + i * 8)
+        if w != 0 {
+            var b = 64
+            while b > 0 && ((w >> (b - 1)) & 1) == 0 {
+                b -= 1
+            }
+            return i * 64 + b
+        }
+        i -= 1
+    }
+    return 0
+}
+
+fn __mp_bit(a: int, i: int) -> int {
+    return (load64(a + (i / 64) * 8) >> (i % 64)) & 1
+}
+
+// ---- Арифметика по модулю m (нечётному) ----
+
+type __Mont {
+    n: int
+    m: int
+    minv: int
+    // R^2 mod m и R mod m (R = 2^(64n)): перевод в форму Монтгомери и единица
+    r2: int
+    one: int
+    // временное число n + 1 частей
+    t: int
+}
+
+fn __mont_new(m: int, n: int) -> __Mont {
+    // minv = -m^(-1) mod 2^64 по Ньютону: каждый шаг удваивает верные биты
+    let m0 = load64(m)
+    var inv = m0
+    for _ in 0..6 {
+        inv = __wmul(inv, 2 - __wmul(m0, inv))
+    }
+    let c = __Mont { n, m, minv: 0 - inv, r2: __mp_new(n), one: __mp_new(n), t: __mp_new(n + 1) }
+    // R mod m: от старшего бита m удвоениями до 2^(64n)
+    let b = __mp_bits(m, n)
+    let x = __mp_new(n)
+    store64(x + (b - 1) / 64 * 8, 1 << ((b - 1) % 64))
+    for _ in 0..64 * n - b + 1 {
+        __mod_add(c, x, x, x)
+    }
+    __mp_copy(c.one, x, n)
+    // 2 в форме Монтгомери, в степени 64n — это R в форме Монтгомери, то есть R^2 mod m
+    __mod_add(c, x, x, x)
+    let e = __mp_new(1)
+    store64(e, 64 * n)
+    __mont_pow(c, c.r2, x, e, 1)
+    return c
+}
+
+// r = a · b / R mod m (результат меньше m; r может совпадать с a или b).
+fn __mont(c: __Mont, r: int, a: int, b: int) {
+    __mont_mul(r, a, b, c.m, c.n, c.minv)
+}
+
+fn __mont_to(c: __Mont, r: int, a: int) {
+    __mont_mul(r, a, c.r2, c.m, c.n, c.minv)
+}
+
+fn __mont_from(c: __Mont, r: int, a: int) {
+    let one = __mp_new(c.n)
+    store64(one, 1)
+    __mont_mul(r, a, one, c.m, c.n, c.minv)
+}
+
+// a + b и a - b по модулю (a, b < m) — машинный код без ветвлений.
+fn __mod_add(c: __Mont, r: int, a: int, b: int) {
+    __madd(r, a, b, c.m, c.n)
+}
+
+fn __mod_sub(c: __Mont, r: int, a: int, b: int) {
+    __msub(r, a, b, c.m, c.n)
+}
+
+// r = a^e (a и r — в форме Монтгомери; e — число из en частей).
+fn __mont_pow(c: __Mont, r: int, a: int, e: int, en: int) {
+    let x = __mp_new(c.n)
+    __mp_copy(x, c.one, c.n)
+    var i = __mp_bits(e, en) - 1
+    while i >= 0 {
+        __mont(c, x, x, x)
+        if __mp_bit(e, i) == 1 {
+            __mont(c, x, x, a)
+        }
+        i -= 1
+    }
+    __mp_copy(r, x, c.n)
+}
+
+// Обратное по модулю простого m: a^(m - 2).
+fn __mont_inv(c: __Mont, r: int, a: int) {
+    let e = __mp_new(c.n)
+    let two = __mp_new(c.n)
+    store64(two, 2)
+    __mp_sub(e, c.m, two, c.n)
+    __mont_pow(c, r, a, e, c.n)
+}
+
+// ---- RSA ----
+
+// Префиксы DigestInfo (RFC 8017, 9.2) для SHA-256, SHA-384, SHA-512.
+fn __rsa_digest_info(size: int) -> str {
+    if size == 32 {
+        return "3031300d060960864801650304020105000420"
+    }
+    if size == 48 {
+        return "3041300d060960864801650304020205000430"
+    }
+    return "3051300d060960864801650304020305000440"
+}
+
+// s^e mod n для подписи sig (k байт): → k байт в out или false.
+fn __rsa_public(nb: int, nlen: int, eb: int, elen: int, sig: int, slen: int, out: int) -> bool {
+    // ведущие нули модуля не считаются
+    var mp = nb
+    var ml = nlen
+    while ml > 0 && load8(mp) == 0 {
+        mp += 1
+        ml -= 1
+    }
+    if ml < 128 || ml > 1024 || slen != ml || elen > 8 || elen == 0 {
+        return false
+    }
+    let n = (ml + 7) / 8
+    let m = __mp_from_be(mp, ml, n)
+    if (load64(m) & 1) == 0 {
+        return false
+    }
+    let s = __mp_from_be(sig, slen, n)
+    if !__mp_less(s, m, n) {
+        return false
+    }
+    let e = __mp_from_be(eb, elen, 1)
+    let c = __mont_new(m, n)
+    let sm = __mp_new(n)
+    __mont_to(c, sm, s)
+    let x = __mp_new(n)
+    __mont_pow(c, x, sm, e, 1)
+    __mont_from(c, x, x)
+    __mp_to_be(x, n, out, ml)
+    return true
+}
+
+// PKCS#1 v1.5: 00 01 FF..FF 00 DigestInfo хеш.
+fn __rsa_pkcs1_verify(nb: int, nlen: int, eb: int, elen: int, hash: int, hlen: int, sig: int, slen: int) -> bool {
+    let em = __alloc(slen)
+    if !__rsa_public(nb, nlen, eb, elen, sig, slen, em) {
+        return false
+    }
+    let info = __rsa_digest_info(hlen)
+    let tlen = info.len() / 2 + hlen
+    if slen < tlen + 11 {
+        return false
+    }
+    let want = __alloc(slen)
+    store8(want, 0)
+    store8(want + 1, 1)
+    for i in 2..slen - tlen - 1 {
+        store8(want + i, 0xFF)
+    }
+    store8(want + slen - tlen - 1, 0)
+    for i in 0..info.len() / 2 {
+        store8(want + slen - tlen + i, __hex_val(info[2 * i]) * 16 + __hex_val(info[2 * i + 1]))
+    }
+    __memcpy(want + slen - hlen, hash, hlen)
+    return __memeq(em, want, slen)
+}
+
+// MGF1 (RFC 8017, B.2.1): маска len байт из seed.
+fn __mgf1(size: int, seed: int, slen: int, out: int, len: int) {
+    let buf = __alloc(slen + 4)
+    __memcpy(buf, seed, slen)
+    let h = __alloc(64)
+    var done = 0
+    var counter = 0
+    while done < len {
+        store8(buf + slen, (counter >> 24) & 255)
+        store8(buf + slen + 1, (counter >> 16) & 255)
+        store8(buf + slen + 2, (counter >> 8) & 255)
+        store8(buf + slen + 3, counter & 255)
+        __hash(size, buf, slen + 4, h)
+        let take = (len - done).min(size)
+        __memcpy(out + done, h, take)
+        done += take
+        counter += 1
+    }
+}
+
+// RSASSA-PSS (RFC 8017, 9.1.2), соль длиной в хеш — как требует TLS 1.3.
+fn __rsa_pss_verify(nb: int, nlen: int, eb: int, elen: int, hash: int, hlen: int, sig: int, slen: int) -> bool {
+    let k = slen
+    let em0 = __alloc(k)
+    if !__rsa_public(nb, nlen, eb, elen, sig, slen, em0) {
+        return false
+    }
+    // emBits = modBits - 1
+    var mp = nb
+    var ml = nlen
+    while ml > 0 && load8(mp) == 0 {
+        mp += 1
+        ml -= 1
+    }
+    var top = load8(mp)
+    var tb = 0
+    while top > 0 {
+        tb += 1
+        top = top >> 1
+    }
+    let mod_bits = (ml - 1) * 8 + tb
+    let em_bits = mod_bits - 1
+    let em_len = (em_bits + 7) / 8
+    var em = em0
+    if em_len < k {
+        if load8(em0) != 0 {
+            return false
+        }
+        em = em0 + 1
+    }
+    let slen_salt = hlen
+    if em_len < hlen + slen_salt + 2 || load8(em + em_len - 1) != 0xbc {
+        return false
+    }
+    let db_len = em_len - hlen - 1
+    let hp = em + db_len
+    let zero_bits = 8 * em_len - em_bits
+    let top_mask = (0xFF >> zero_bits) ^ 0xFF
+    if (load8(em) & top_mask) != 0 {
+        return false
+    }
+    let db = __alloc(db_len)
+    __mgf1(hlen, hp, hlen, db, db_len)
+    for i in 0..db_len {
+        store8(db + i, load8(db + i) ^ load8(em + i))
+    }
+    store8(db, load8(db) & (0xFF >> zero_bits))
+    let ps = db_len - slen_salt - 1
+    for i in 0..ps {
+        if load8(db + i) != 0 {
+            return false
+        }
+    }
+    if load8(db + ps) != 1 {
+        return false
+    }
+    let mp2 = __alloc(8 + hlen + slen_salt)
+    __memset(mp2, 0, 8)
+    __memcpy(mp2 + 8, hash, hlen)
+    __memcpy(mp2 + 8 + hlen, db + ps + 1, slen_salt)
+    let h2 = __alloc(64)
+    __hash(hlen, mp2, 8 + hlen + slen_salt, h2)
+    return __memeq(h2, hp, hlen)
+}
+
+// ---- Кривые P-256 и P-384 (y^2 = x^3 - 3x + b) ----
+
+const CURVE_P256 = 23
+const CURVE_P384 = 24
+
+type __Curve {
+    // длина координаты в байтах: 32 или 48
+    size: int
+    // поле (mod p) и скаляры (mod n)
+    f: __Mont
+    o: __Mont
+    // b и точка G — в форме Монтгомери
+    b: int
+    gx: int
+    gy: int
+    // временные числа для удвоения ([0..6)) и сложения ([6..16)) точек
+    tmp: [int]
+}
+
+// Точка в координатах Якоби (x/z^2, y/z^3); z = 0 — бесконечность.
+type __Pt {
+    x: int
+    y: int
+    z: int
+}
+
+fn __mp_hex(hex: str, n: int) -> int {
+    let len = hex.len() / 2
+    let b = __alloc(len)
+    for i in 0..len {
+        store8(b + i, __hex_val(hex[2 * i]) * 16 + __hex_val(hex[2 * i + 1]))
+    }
+    return __mp_from_be(b, len, n)
+}
+
+fn __curve(id: int) -> __Curve {
+    if id == CURVE_P256 {
+        let p = __mp_hex("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff", 4)
+        let n = __mp_hex("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551", 4)
+        return __curve_make(32, p, n, "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b", "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296", "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
+    }
+    let p = __mp_hex("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff", 6)
+    let n = __mp_hex("ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973", 6)
+    return __curve_make(48, p, n, "b3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875ac656398d8a2ed19d2a85c8edd3ec2aef", "aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7", "3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f")
+}
+
+fn __curve_make(size: int, p: int, n: int, b: str, gx: str, gy: str) -> __Curve {
+    let k = size / 8
+    let f = __mont_new(p, k)
+    var tmp: [int] = []
+    for _ in 0..16 {
+        tmp.push(__mp_new(k))
+    }
+    let c = __Curve { size, f, o: __mont_new(n, k), b: __mp_new(k), gx: __mp_new(k), gy: __mp_new(k), tmp }
+    __mont_to(f, c.b, __mp_hex(b, k))
+    __mont_to(f, c.gx, __mp_hex(gx, k))
+    __mont_to(f, c.gy, __mp_hex(gy, k))
+    return c
+}
+
+fn __pt_new(c: __Curve) -> __Pt {
+    let k = c.f.n
+    return __Pt { x: __mp_new(k), y: __mp_new(k), z: __mp_new(k) }
+}
+
+fn __pt_set(c: __Curve, r: __Pt, p: __Pt) {
+    __mp_copy(r.x, p.x, c.f.n)
+    __mp_copy(r.y, p.y, c.f.n)
+    __mp_copy(r.z, p.z, c.f.n)
+}
+
+// Удвоение для a = -3 (dbl-2001-b, Bernstein–Lange).
+fn __pt_double(c: __Curve, r: __Pt, p: __Pt) {
+    let f = c.f
+    let k = f.n
+    if __mp_is_zero(p.z, k) {
+        __memset(r.z, 0, k * 8)
+        return
+    }
+    let delta = c.tmp[0]
+    let gamma = c.tmp[1]
+    let beta = c.tmp[2]
+    let alpha = c.tmp[3]
+    let t1 = c.tmp[4]
+    let t2 = c.tmp[5]
+    __mont(f, delta, p.z, p.z)
+    __mont(f, gamma, p.y, p.y)
+    __mont(f, beta, p.x, gamma)
+    __mod_sub(f, t1, p.x, delta)
+    __mod_add(f, t2, p.x, delta)
+    __mont(f, alpha, t1, t2)
+    __mod_add(f, t1, alpha, alpha)
+    __mod_add(f, alpha, t1, alpha)
+    // z3 = (y + z)^2 - gamma - delta
+    __mod_add(f, t1, p.y, p.z)
+    __mont(f, t1, t1, t1)
+    __mod_sub(f, t1, t1, gamma)
+    __mod_sub(f, r.z, t1, delta)
+    // x3 = alpha^2 - 8 beta
+    __mod_add(f, beta, beta, beta)
+    __mod_add(f, beta, beta, beta)
+    __mont(f, t1, alpha, alpha)
+    __mod_add(f, t2, beta, beta)
+    __mod_sub(f, r.x, t1, t2)
+    // y3 = alpha (4 beta - x3) - 8 gamma^2
+    __mod_sub(f, t1, beta, r.x)
+    __mont(f, t1, alpha, t1)
+    __mont(f, gamma, gamma, gamma)
+    __mod_add(f, gamma, gamma, gamma)
+    __mod_add(f, gamma, gamma, gamma)
+    __mod_add(f, gamma, gamma, gamma)
+    __mod_sub(f, r.y, t1, gamma)
+}
+
+// Сложение (add-2007-bl); равные точки — через удвоение.
+fn __pt_add(c: __Curve, r: __Pt, p: __Pt, q: __Pt) {
+    let f = c.f
+    let k = f.n
+    if __mp_is_zero(p.z, k) {
+        __pt_set(c, r, q)
+        return
+    }
+    if __mp_is_zero(q.z, k) {
+        __pt_set(c, r, p)
+        return
+    }
+    let z1z1 = c.tmp[6]
+    let z2z2 = c.tmp[7]
+    let u1 = c.tmp[8]
+    let u2 = c.tmp[9]
+    let s1 = c.tmp[10]
+    let s2 = c.tmp[11]
+    __mont(f, z1z1, p.z, p.z)
+    __mont(f, z2z2, q.z, q.z)
+    __mont(f, u1, p.x, z2z2)
+    __mont(f, u2, q.x, z1z1)
+    __mont(f, s1, p.y, q.z)
+    __mont(f, s1, s1, z2z2)
+    __mont(f, s2, q.y, p.z)
+    __mont(f, s2, s2, z1z1)
+    let h = c.tmp[12]
+    let rr = c.tmp[13]
+    __mod_sub(f, h, u2, u1)
+    __mod_sub(f, rr, s2, s1)
+    if __mp_is_zero(h, k) {
+        if __mp_is_zero(rr, k) {
+            __pt_double(c, r, p)
+        } else {
+            __memset(r.z, 0, k * 8)
+        }
+        return
+    }
+    // i, j — во временных удвоения: оно здесь уже не вызывается
+    let i = c.tmp[14]
+    let j = c.tmp[15]
+    let v = c.tmp[0]
+    let t = c.tmp[1]
+    __mod_add(f, i, h, h)
+    __mont(f, i, i, i)
+    __mont(f, j, h, i)
+    __mod_add(f, rr, rr, rr)
+    __mont(f, v, u1, i)
+    // z3 = ((z1 + z2)^2 - z1z1 - z2z2) h
+    __mod_add(f, t, p.z, q.z)
+    __mont(f, t, t, t)
+    __mod_sub(f, t, t, z1z1)
+    __mod_sub(f, t, t, z2z2)
+    __mont(f, r.z, t, h)
+    // x3 = rr^2 - j - 2v
+    __mont(f, t, rr, rr)
+    __mod_sub(f, t, t, j)
+    __mod_sub(f, t, t, v)
+    __mod_sub(f, r.x, t, v)
+    // y3 = rr (v - x3) - 2 s1 j
+    __mod_sub(f, t, v, r.x)
+    __mont(f, t, rr, t)
+    __mont(f, s1, s1, j)
+    __mod_add(f, s1, s1, s1)
+    __mod_sub(f, r.y, t, s1)
+}
+
+// Точка в аффинные координаты (обычная форма, байты старшими вперёд): x, y.
+fn __pt_affine(c: __Curve, p: __Pt, out: int) -> bool {
+    let f = c.f
+    let k = f.n
+    if __mp_is_zero(p.z, k) {
+        return false
+    }
+    let zi = __mp_new(k)
+    let zi2 = __mp_new(k)
+    let x = __mp_new(k)
+    let y = __mp_new(k)
+    __mont_inv(f, zi, p.z)
+    __mont(f, zi2, zi, zi)
+    __mont(f, x, p.x, zi2)
+    __mont(f, zi2, zi2, zi)
+    __mont(f, y, p.y, zi2)
+    __mont_from(f, x, x)
+    __mont_from(f, y, y)
+    __mp_to_be(x, k, out, c.size)
+    __mp_to_be(y, k, out + c.size, c.size)
+    return true
+}
+
+// Точка из «04 || x || y» с проверкой, что она на кривой.
+fn __pt_decode(c: __Curve, p: int, len: int) -> __Pt? {
+    let f = c.f
+    let k = f.n
+    if len != 1 + 2 * c.size || load8(p) != 4 {
+        return none
+    }
+    let x = __mp_from_be(p + 1, c.size, k)
+    let y = __mp_from_be(p + 1 + c.size, c.size, k)
+    if !__mp_less(x, f.m, k) || !__mp_less(y, f.m, k) {
+        return none
+    }
+    let r = __pt_new(c)
+    __mont_to(f, r.x, x)
+    __mont_to(f, r.y, y)
+    __mp_copy(r.z, f.one, k)
+    // y^2 = x^3 - 3x + b
+    let l = __mp_new(k)
+    let rt = __mp_new(k)
+    let t = __mp_new(k)
+    __mont(f, l, r.y, r.y)
+    __mont(f, rt, r.x, r.x)
+    __mont(f, rt, rt, r.x)
+    __mod_add(f, t, r.x, r.x)
+    __mod_add(f, t, t, r.x)
+    __mod_sub(f, rt, rt, t)
+    __mod_add(f, rt, rt, c.b)
+    if !__memeq(l, rt, k * 8) {
+        return none
+    }
+    return r
+}
+
+fn __pt_g(c: __Curve) -> __Pt {
+    let g = __pt_new(c)
+    __mp_copy(g.x, c.gx, c.f.n)
+    __mp_copy(g.y, c.gy, c.f.n)
+    __mp_copy(g.z, c.f.one, c.f.n)
+    return g
+}
+
+// Кратные точки p: t[i] = i·p, i = 1..15 (t[0] не используется).
+fn __pt_table(c: __Curve, p: __Pt) -> [__Pt] {
+    var t: [__Pt] = [__pt_new(c), __pt_new(c)]
+    __pt_set(c, t[1], p)
+    for i in 2..16 {
+        let x = __pt_new(c)
+        __pt_add(c, x, t[i - 1], p)
+        t.push(x)
+    }
+    return t
+}
+
+fn __nibble(e: int, i: int) -> int {
+    return (load64(e + (i / 16) * 8) >> ((i % 16) * 4)) & 15
+}
+
+// u1·G + u2·Q одним проходом: окна по 4 бита для обоих множителей.
+fn __pt_mul2(c: __Curve, u1: int, q: __Pt, u2: int) -> __Pt {
+    let k = c.f.n
+    let tg = __pt_table(c, __pt_g(c))
+    let tq = __pt_table(c, q)
+    let r = __pt_new(c)
+    var i = (__mp_bits(u1, k).max(__mp_bits(u2, k)) + 3) / 4 - 1
+    while i >= 0 {
+        for _ in 0..4 {
+            __pt_double(c, r, r)
+        }
+        let a = __nibble(u1, i)
+        let b = __nibble(u2, i)
+        if a != 0 {
+            __pt_add(c, r, r, tg[a])
+        }
+        if b != 0 {
+            __pt_add(c, r, r, tq[b])
+        }
+        i -= 1
+    }
+    return r
+}
+
+fn __pt_mul(c: __Curve, e: int, p: __Pt) -> __Pt {
+    let k = c.f.n
+    let r = __pt_new(c)
+    var i = __mp_bits(e, k) - 1
+    while i >= 0 {
+        __pt_double(c, r, r)
+        if __mp_bit(e, i) == 1 {
+            __pt_add(c, r, r, p)
+        }
+        i -= 1
+    }
+    return r
+}
+
+// Скаляр 1..n-1 из байтов старшими вперёд (без ведущих нулей — не длиннее size).
+fn __ec_scalar(c: __Curve, p: int, len: int) -> int? {
+    var q = p
+    var l = len
+    while l > 0 && load8(q) == 0 {
+        q += 1
+        l -= 1
+    }
+    let k = c.f.n
+    if l > c.size {
+        return none
+    }
+    let v = __mp_from_be(q, l, k)
+    if __mp_is_zero(v, k) || !__mp_less(v, c.o.m, k) {
+        return none
+    }
+    return v
+}
+
+// ECDSA (FIPS 186-4, 6.4): pub — «04 || x || y», хеш, подпись (r, s).
+fn __ecdsa_verify(id: int, pub: int, plen: int, hash: int, hlen: int, rb: int, rlen: int, sb: int, slen: int) -> bool {
+    let c = __curve(id)
+    let o = c.o
+    let k = o.n
+    let q = __pt_decode(c, pub, plen) else {
+        return false
+    }
+    let r = __ec_scalar(c, rb, rlen) else {
+        return false
+    }
+    let s = __ec_scalar(c, sb, slen) else {
+        return false
+    }
+    // e — левые биты хеша по длине n
+    let e = __mp_from_be(hash, hlen.min(c.size), k)
+    if !__mp_less(e, o.m, k) {
+        __mp_sub(e, e, o.m, k)
+    }
+    let w = __mp_new(k)
+    __mont_to(o, w, s)
+    __mont_inv(o, w, w)
+    let u1 = __mp_new(k)
+    let u2 = __mp_new(k)
+    __mont_to(o, u1, e)
+    __mont(o, u1, u1, w)
+    __mont_from(o, u1, u1)
+    __mont_to(o, u2, r)
+    __mont(o, u2, u2, w)
+    __mont_from(o, u2, u2)
+    let p = __pt_mul2(c, u1, q, u2)
+    let xy = __alloc(2 * c.size)
+    if !__pt_affine(c, p, xy) {
+        return false
+    }
+    let x = __mp_from_be(xy, c.size, k)
+    if !__mp_less(x, o.m, k) {
+        __mp_sub(x, x, o.m, k)
+    }
+    return __memeq(x, r, k * 8)
+}
+
+// ECDH: секрет — случайный скаляр (size байт), открытый ключ — «04 || x || y».
+fn __ecdh_keygen(id: int, secret: int, pub: int) {
+    let c = __curve(id)
+    while true {
+        __random_bytes(secret, c.size)
+        if let e = __ec_scalar(c, secret, c.size) {
+            __pt_affine(c, __pt_mul(c, e, __pt_g(c)), pub + 1)
+            store8(pub, 4)
+            return
+        }
+    }
+}
+
+// Общий секрет — x точки secret · peer (size байт); false — точка не годится.
+fn __ecdh_shared(id: int, secret: int, peer: int, plen: int, out: int) -> bool {
+    let c = __curve(id)
+    let q = __pt_decode(c, peer, plen) else {
+        return false
+    }
+    let e = __ec_scalar(c, secret, c.size) else {
+        return false
+    }
+    let xy = __alloc(2 * c.size)
+    if !__pt_affine(c, __pt_mul(c, e, q), xy) {
+        return false
+    }
+    __memcpy(out, xy, c.size)
+    return true
+}
+
+// ---- X25519 (RFC 7748) ----
+
+// Число из 32 байт младшими вперёд (4 части).
+fn __x25519_load(p: int) -> int {
+    let r = __mp_new(4)
+    __memcpy(r, p, 32)
+    return r
+}
+
+// Обменять a и b, если swap = 1 (без ветвлений по секрету).
+fn __mp_cswap(swap: int, a: int, b: int, n: int) {
+    let mask = 0 - swap
+    for i in 0..n {
+        let x = load64(a + i * 8)
+        let y = load64(b + i * 8)
+        let d = (x ^ y) & mask
+        store64(a + i * 8, x ^ d)
+        store64(b + i * 8, y ^ d)
+    }
+}
+
+// out = k · u (по 32 байта).
+fn __x25519(k: int, u: int, out: int) {
+    let p = __mp_hex("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed", 4)
+    let f = __mont_new(p, 4)
+    let sc = __alloc(32)
+    __memcpy(sc, k, 32)
+    store8(sc, load8(sc) & 248)
+    store8(sc + 31, (load8(sc + 31) & 127) | 64)
+    let ub = __alloc(32)
+    __memcpy(ub, u, 32)
+    store8(ub + 31, load8(ub + 31) & 127)
+    let x1 = __mp_new(4)
+    let u0 = __x25519_load(ub)
+    // u может быть не меньше p: привести
+    if !__mp_less(u0, p, 4) {
+        __mp_sub(u0, u0, p, 4)
+    }
+    __mont_to(f, x1, u0)
+    let x2 = __mp_new(4)
+    __mp_copy(x2, f.one, 4)
+    let z2 = __mp_new(4)
+    let x3 = __mp_new(4)
+    __mp_copy(x3, x1, 4)
+    let z3 = __mp_new(4)
+    __mp_copy(z3, f.one, 4)
+    let a24 = __mp_new(4)
+    let a24n = __mp_new(4)
+    store64(a24n, 121665)
+    __mont_to(f, a24, a24n)
+    let a = __mp_new(4)
+    let aa = __mp_new(4)
+    let b = __mp_new(4)
+    let bb = __mp_new(4)
+    let e = __mp_new(4)
+    let cc = __mp_new(4)
+    let d = __mp_new(4)
+    let da = __mp_new(4)
+    let cb = __mp_new(4)
+    var swap = 0
+    var t = 254
+    while t >= 0 {
+        let kt = (load8(sc + t / 8) >> (t % 8)) & 1
+        swap = swap ^ kt
+        __mp_cswap(swap, x2, x3, 4)
+        __mp_cswap(swap, z2, z3, 4)
+        swap = kt
+        __mod_add(f, a, x2, z2)
+        __mont(f, aa, a, a)
+        __mod_sub(f, b, x2, z2)
+        __mont(f, bb, b, b)
+        __mod_sub(f, e, aa, bb)
+        __mod_add(f, cc, x3, z3)
+        __mod_sub(f, d, x3, z3)
+        __mont(f, da, d, a)
+        __mont(f, cb, cc, b)
+        __mod_add(f, x3, da, cb)
+        __mont(f, x3, x3, x3)
+        __mod_sub(f, z3, da, cb)
+        __mont(f, z3, z3, z3)
+        __mont(f, z3, x1, z3)
+        __mont(f, x2, aa, bb)
+        __mont(f, z2, a24, e)
+        __mod_add(f, z2, aa, z2)
+        __mont(f, z2, e, z2)
+        t -= 1
+    }
+    __mp_cswap(swap, x2, x3, 4)
+    __mp_cswap(swap, z2, z3, 4)
+    __mont_inv(f, z2, z2)
+    __mont(f, x2, x2, z2)
+    __mont_from(f, x2, x2)
+    __memcpy(out, x2, 32)
+}

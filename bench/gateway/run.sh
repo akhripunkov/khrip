@@ -2,12 +2,16 @@
 # Шлюз к медленному сервису: GET /quote?id= → запрос к UPSTREAM, разбор JSON,
 # ответ. Одно и то же на Khrip, Go, C# и Python (bench/gateway/<язык>).
 #
-#   bench/gateway/run.sh [slow|fast ...]
+#   bench/gateway/run.sh [slow|fast|tls|tls-new ...]
 #
-# slow — сервис отвечает через 100 мс, 1000 одновременных клиентов: сколько
-#        ждущих запросов держит шлюз и сколько памяти они стоят;
-# fast — сервис отвечает сразу, 64 клиента: сколько стоит один проход через шлюз.
-# Шлюз — на ядрах 0,1; сервис (Khrip, 1 поток) — на ядре 2; wrk — на ядре 3.
+# slow    — сервис отвечает через 100 мс, 1000 одновременных клиентов: сколько
+#           ждущих запросов держит шлюз и сколько памяти они стоят;
+# fast    — сервис отвечает сразу, 64 клиента: сколько стоит один проход;
+# tls     — то же по HTTPS (сервис на Go, keep-alive);
+# tls-new — HTTPS, сервис закрывает соединение после ответа: каждый запрос
+#           шлюза начинается с рукопожатия TLS.
+# Шлюз — на ядрах 0,1; сервис (Khrip, 1 поток, или Go для TLS) — на ядре 2; wrk —
+# на ядре 3. Тестовые сертификаты — tests/tls/gen.sh.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
@@ -15,7 +19,7 @@ root=$(cd "$here/../.." && pwd)
 LANGS=${LANGS:-khrip go csharp python}
 DURATION=${DURATION:-10s}
 scenarios=("$@")
-[[ ${#scenarios[@]} -eq 0 ]] && scenarios=(slow fast)
+[[ ${#scenarios[@]} -eq 0 ]] && scenarios=(slow fast tls tls-new)
 
 tmp=$(mktemp -d)
 pid=
@@ -23,7 +27,9 @@ up_pid=
 trap '[[ -n $pid ]] && kill $pid 2>/dev/null; [[ -n $up_pid ]] && kill $up_pid 2>/dev/null; wait 2>/dev/null; rm -rf "$tmp"' EXIT
 
 "$root/build/khc" -o "$tmp/upstream" "$here/upstream.kh" || exit 1
-export UPSTREAM=http://127.0.0.1:9090
+mkdir -p "$tmp/pki"
+"$root/tests/tls/gen.sh" "$tmp/pki" || exit 1
+(cd "$here/upstream_tls" && go build -o "$tmp/upstream_tls" .) || exit 1
 
 status_kb() { awk -v k="$1:" '$1 == k {print $2}' "/proc/$pid/status"; }
 # память процесса и его потомков (dotnet и uvicorn — один процесс)
@@ -37,8 +43,18 @@ printf 'сценарий\tязык\tзапросов/с\tp50 мс\tp99 мс\tо�
 for sc in "${scenarios[@]}"; do
 	delay=0 conns=64
 	[[ $sc == slow ]] && delay=100 conns=1000
-	DELAY=$delay PORT=9090 THREADS=1 taskset -c 2 "$tmp/upstream" 2>/dev/null &
+	if [[ $sc == tls* ]]; then
+		close=0
+		[[ $sc == tls-new ]] && close=1
+		export UPSTREAM=https://127.0.0.1:9443 SSL_CERT_FILE="$tmp/pki/root.pem"
+		CERT="$tmp/pki/chain_ec.pem" KEY="$tmp/pki/leaf.key" PORT=9443 CLOSE=$close taskset -c 2 "$tmp/upstream_tls" 2>/dev/null &
+	else
+		export UPSTREAM=http://127.0.0.1:9090
+		unset SSL_CERT_FILE
+		DELAY=$delay PORT=9090 THREADS=1 taskset -c 2 "$tmp/upstream" 2>/dev/null &
+	fi
 	up_pid=$!
+	sleep 0.5
 	for lang in $LANGS; do
 		dir=$here/$lang
 		rm -rf "${tmp:?}/$lang" && mkdir -p "$tmp/$lang"

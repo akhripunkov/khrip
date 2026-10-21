@@ -1,0 +1,83 @@
+// Проверка криптографии на случайных данных от tests/tls/vectors.py:
+// печатает «N cases, M failed» и каждую ошибку.
+
+fn unhex(s: str) -> int {
+    if s == "-" {
+        return __alloc(16)
+    }
+    let p = __alloc(s.len() / 2 + 16)
+    for i in 0..s.len() / 2 {
+        store8(p + i, __hex_val(s[2 * i]) * 16 + __hex_val(s[2 * i + 1]))
+    }
+    return p
+}
+
+fn hlen(s: str) -> int {
+    if s == "-" {
+        return 0
+    }
+    return s.len() / 2
+}
+
+fn check(f: [str]) -> bool {
+    if f[0] == "aead" {
+        var kind = AEAD_CHACHA
+        if f[1] == "aes128" {
+            kind = AEAD_AES128
+        } else if f[1] == "aes256" {
+            kind = AEAD_AES256
+        }
+        let a = __aead_new(kind, unhex(f[2]))
+        let n = hlen(f[5])
+        let ct = __alloc(n + 16)
+        __aead_seal(a, unhex(f[3]), unhex(f[4]), hlen(f[4]), unhex(f[5]), n, ct)
+        let back = __alloc(n + 16)
+        let ok = __aead_open(a, unhex(f[3]), unhex(f[4]), hlen(f[4]), ct, n, back) && __memeq(back, unhex(f[5]), n)
+        store8(ct + n, load8(ct + n) ^ 1)
+        let forged = __aead_open(a, unhex(f[3]), unhex(f[4]), hlen(f[4]), ct, n, back)
+        store8(ct + n, load8(ct + n) ^ 1)
+        return ok && !forged && __hex_bytes(ct, n + 16) == f[6]
+    }
+    if f[0] == "pkcs1" || f[0] == "pss" {
+        var got = false
+        if f[0] == "pkcs1" {
+            got = __rsa_pkcs1_verify(unhex(f[1]), hlen(f[1]), unhex(f[2]), hlen(f[2]), unhex(f[3]), hlen(f[3]), unhex(f[4]), hlen(f[4]))
+        } else {
+            got = __rsa_pss_verify(unhex(f[1]), hlen(f[1]), unhex(f[2]), hlen(f[2]), unhex(f[3]), hlen(f[3]), unhex(f[4]), hlen(f[4]))
+        }
+        return got.to_str() == f[5]
+    }
+    if f[0] == "ecdsa" {
+        let got = __ecdsa_verify(f[1].to_int() ?? 0, unhex(f[2]), hlen(f[2]), unhex(f[3]), hlen(f[3]), unhex(f[4]), hlen(f[4]), unhex(f[5]), hlen(f[5]))
+        return got.to_str() == f[6]
+    }
+    if f[0] == "ecdh" {
+        let out = __alloc(48)
+        return __ecdh_shared(f[1].to_int() ?? 0, unhex(f[2]), unhex(f[3]), hlen(f[3]), out) && __hex_bytes(out, hlen(f[4])) == f[4]
+    }
+    if f[0] == "x25519" {
+        let out = __alloc(32)
+        __x25519(unhex(f[1]), unhex(f[2]), out)
+        return __hex_bytes(out, 32) == f[3]
+    }
+    return false
+}
+
+fn main() -> int {
+    let text = read_file(args()[1]) ?? ""
+    var total = 0
+    var bad = 0
+    for line in text.split("\n") {
+        let f = line.split(" ")
+        if f.len() < 4 {
+            continue
+        }
+        total += 1
+        if !check(f) {
+            bad += 1
+            print("FAIL {line[..60]}")
+        }
+    }
+    print("{total} cases, {bad} failed")
+    return 0
+}

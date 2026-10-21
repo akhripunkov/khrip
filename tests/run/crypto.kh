@@ -1,0 +1,79 @@
+// Криптография для TLS на фиксированных данных; ожидаемый вывод — от Python
+// (hashlib, hmac, cryptography). Случайные проверки — в tests/tls.sh.
+
+fn unhex(s: str) -> int {
+    let p = __alloc(s.len() / 2 + 16)
+    for i in 0..s.len() / 2 {
+        store8(p + i, __hex_val(s[2 * i]) * 16 + __hex_val(s[2 * i + 1]))
+    }
+    return p
+}
+
+fn seq(from: int, n: int) -> int {
+    let p = __alloc(n + 16)
+    for i in 0..n {
+        store8(p + i, from + i)
+    }
+    return p
+}
+
+fn main() -> int {
+    let out = __alloc(256)
+    let names = ["sha256", "sha384", "sha512"]
+    let sizes = [32, 48, 64]
+    for i in 0..3 {
+        for msg in ["", "abc", "a".repeat(1000)] {
+            __hash(sizes[i], __str_ptr(msg), msg.len(), out)
+            print("{names[i]} {msg.len()}: {__hex_bytes(out, sizes[i])}")
+        }
+    }
+    let key = seq(0, 32)
+    let msg = "Khrip TLS"
+    __hmac(32, key, 32, __str_ptr(msg), msg.len(), out)
+    print("hmac sha256: {__hex_bytes(out, 32)}")
+    __hmac(48, key, 32, __str_ptr(msg), msg.len(), out)
+    print("hmac sha384: {__hex_bytes(out, 48)}")
+    __hkdf_label(32, key, "key", 0, 0, out, 16)
+    print("hkdf label sha256: {__hex_bytes(out, 16)}")
+    let key48 = __alloc(48)
+    __memcpy(key48, key, 32)
+    __memcpy(key48 + 32, key, 16)
+    __hkdf_label(48, key48, "iv", 0, 0, out, 12)
+    print("hkdf label sha384: {__hex_bytes(out, 12)}")
+    let nonce = seq(0, 12)
+    let aad = "header"
+    let pt = seq(0, 100)
+    let ct = __alloc(116)
+    for kind in [AEAD_AES128, AEAD_AES256, AEAD_CHACHA] {
+        let a = __aead_new(kind, key)
+        __aead_seal(a, nonce, __str_ptr(aad), aad.len(), pt, 100, ct)
+        let name = match kind {
+            1 => "aes128gcm"
+            2 => "aes256gcm"
+            _ => "chacha20poly1305"
+        }
+        print("{name}: {__hex_bytes(ct, 116)}")
+    }
+    let nine = __alloc(32)
+    store8(nine, 9)
+    let bpub = __alloc(32)
+    __x25519(seq(33, 32), nine, bpub)
+    print("x25519 public: {__hex_bytes(bpub, 32)}")
+    __x25519(seq(1, 32), bpub, out)
+    print("x25519 shared: {__hex_bytes(out, 32)}")
+    let ok23 = __ecdsa_verify(23, unhex("04b6d34f8ffc3634315541505c0d342bb301ee49f4b4ef9e3c9e1fc6dcc03db0012bfa621e778c3f1d2d0d33291a2e6bcc577502b22fb29cdcbb297c85b668a0d4"), 65, unhex("ab530a13e45914982b79f9b7e3fba994cfd1f3fb22f71cea1afbf02b460c6d1d"), 32, unhex("67f9cd20a1b8a606264efe82860d9dae8fa7edc1085f8e2ba519c24358f119ad"), 32, unhex("3a89e99e7cfa8188412f4f691474607a08f3dc24daa0ec88794befc2969a2060"), 32)
+    let bad23 = __ecdsa_verify(23, unhex("04b6d34f8ffc3634315541505c0d342bb301ee49f4b4ef9e3c9e1fc6dcc03db0012bfa621e778c3f1d2d0d33291a2e6bcc577502b22fb29cdcbb297c85b668a0d4"), 65, unhex("00530a13e45914982b79f9b7e3fba994cfd1f3fb22f71cea1afbf02b460c6d1d"), 32, unhex("67f9cd20a1b8a606264efe82860d9dae8fa7edc1085f8e2ba519c24358f119ad"), 32, unhex("3a89e99e7cfa8188412f4f691474607a08f3dc24daa0ec88794befc2969a2060"), 32)
+    print("ecdsa 23: {ok23} {bad23}")
+    let ok24 = __ecdsa_verify(24, unhex("046e5ca05f1113c6c08bedf202a09f20a6a37a67c4253c91100d06fe9672e5f988ec6f55976d7681c7de6b31466059e21aa5c909e55073c09e4f1db894853bb756b4a0c5ba4913f54cebdd7d37d817f888634040b213a1663288a3da5944bf8029"), 97, unhex("353eb7516a27ef92e96d1a319712d84b902eaa828819e53a8b09af7028103a9978ba8feb6161e33c3619c5da4c4666a5"), 48, unhex("2c23ab1756935c7075bb94ea7d22f7828f943eace860b6448a00ed0bba395ede43654d138b5cab129b5e165bb3d64534"), 48, unhex("6ab070e91202734b6b0283d65535e8ae02a6b6b4f8fc6369e355154a608500d8c0131dda140374c35a6cfba6dcd95b01"), 48)
+    let bad24 = __ecdsa_verify(24, unhex("046e5ca05f1113c6c08bedf202a09f20a6a37a67c4253c91100d06fe9672e5f988ec6f55976d7681c7de6b31466059e21aa5c909e55073c09e4f1db894853bb756b4a0c5ba4913f54cebdd7d37d817f888634040b213a1663288a3da5944bf8029"), 97, unhex("003eb7516a27ef92e96d1a319712d84b902eaa828819e53a8b09af7028103a9978ba8feb6161e33c3619c5da4c4666a5"), 48, unhex("2c23ab1756935c7075bb94ea7d22f7828f943eace860b6448a00ed0bba395ede43654d138b5cab129b5e165bb3d64534"), 48, unhex("6ab070e91202734b6b0283d65535e8ae02a6b6b4f8fc6369e355154a608500d8c0131dda140374c35a6cfba6dcd95b01"), 48)
+    print("ecdsa 24: {ok24} {bad24}")
+    let n = unhex("b46daf7601d3864849ef17678f96daab867029eb97ef7f4a6a43afc09876ddb73131c7fe44d99f41d78fcd80a7cb55c9de2b888be7d431da07c11ce1c5c13b8ae11c64ed9b385761181c666a55f5c20e9c72db2eb5da7fd94b4ea044296aece1503ebefc98da5e2d701d7fcdd2365202f7518a072cc8c9fab5cf880f4578943f63aee962cc8b229140607b3f41b5c925b2052cfd3307690817061f6bf3d26fa339a728d268307ab8e9a55d15b285fcd8944bb57903aac00e3780665c72ccc967ca31972c40dde79f73aaafc700f78dac16148780a256028722cdbdb3ac4e197ac73ed5d32f29737868f64735a9e548ee1357826574306fcc65d5738b69cf3abf")
+    let e = unhex("010001")
+    let h = unhex("ab530a13e45914982b79f9b7e3fba994cfd1f3fb22f71cea1afbf02b460c6d1d")
+    let bad = unhex("aa530a13e45914982b79f9b7e3fba994cfd1f3fb22f71cea1afbf02b460c6d1d")
+    let s1 = unhex("675bf16df753f386cc876711c85bc62d6e10a43b366cf8e3dd72b54987175a14d02595bf56aa986d094ee5b243131c7beb3c876a3bc08207fd06a44869406f34242428f1239400e079a293037b58bee3fd0063aaa0d579b755808aeb77ad44d1cd0d39a380ce3270666a1cfb05bf8b42a8dcfc2fc00214504175fda0dd694a1bb7f9bedf2b62585bbfe6c91cc1be31a27f1025e0da0428764a37c484084badba1d2b6324e09c6491cf59df82a05f74d4e22479fb526bec7ddba2893c834d1e324636ac2254aeed20674bdf668617a1f59996284c31faabe593a3c9bc2ae0166b1774ebfd422658366e03473879e2726fd8660486700d8325cb507d7ff4c69b8b")
+    let s2 = unhex("04a02422de247fc3582dc3c9848d57efee72c885d58a279095d7c576066b09d29bcaa1beeb04613e6db13f97dc947b837784eaf1d5f0aaf7926c1d093c28ad9dc1c70ac035e258a8ea2d42db7da8ff536c9fa0f479379a4b914bef5615499d8f9002f583e8b5e0e33f6a66d379ce2d7fc00993aa28d704ce7a9a64ba52d36046000c01806335c39f8142c8fc14c800d75961e8ca762a0edff2650602a369a5833b2d6453abcba8ab4341e8c4c0e0493601d217bcd478e78baf3c92280108ea666bb8c1104495f25d68dcb3f41f2e4cde930a2ef658bc0833ac7f0313fb91df3e9d191e4d8262ef7ac6be585ba0c5f965a9868a0e6b8e4306b6663aba7f291507")
+    print("rsa pkcs1: {__rsa_pkcs1_verify(n, 256, e, 3, h, 32, s1, 256)} {__rsa_pkcs1_verify(n, 256, e, 3, bad, 32, s1, 256)}")
+    print("rsa pss: {__rsa_pss_verify(n, 256, e, 3, h, 32, s2, 256)} {__rsa_pss_verify(n, 256, e, 3, bad, 32, s2, 256)}")
+    return 0
+}

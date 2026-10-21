@@ -1,0 +1,733 @@
+// Сертификаты X.509 (RFC 5280) для TLS: разбор DER, корневые сертификаты
+// системы, проверка цепочки до корня и имени сервера.
+//
+// Корни читаются один раз на процесс из SSL_CERT_FILE или системного файла
+// (Debian, Alpine, RHEL, SUSE) в постоянную память. Цепочка строится от
+// сертификата сервера: на каждом шаге сначала ищется корень с нужным именем,
+// затем промежуточный сертификат из присланных; подпись проверяется на каждом
+// шаге. Имя сервера — только из subjectAltName (как в Go и браузерах).
+
+// ---- DER ----
+
+// Элемент DER: тег, начало и длина содержимого, конец элемента.
+type __Tlv {
+    tag: int
+    at: int
+    len: int
+    end: int
+}
+
+fn __tlv(p: int, end: int) -> __Tlv? {
+    if p + 2 > end {
+        return none
+    }
+    let tag = load8(p)
+    var l = load8(p + 1)
+    var at = p + 2
+    if l >= 0x80 {
+        let k = l & 0x7F
+        if k == 0 || k > 4 || at + k > end {
+            return none
+        }
+        l = 0
+        for i in 0..k {
+            l = l * 256 + load8(at + i)
+        }
+        at += k
+    }
+    if at + l > end {
+        return none
+    }
+    return __Tlv { tag, at, len: l, end: at + l }
+}
+
+// Содержимое элемента — равно ли байтам hex.
+fn __der_is(t: __Tlv, hex: str) -> bool {
+    if t.len * 2 != hex.len() {
+        return false
+    }
+    for i in 0..t.len {
+        if load8(t.at + i) != __hex_val(hex[2 * i]) * 16 + __hex_val(hex[2 * i + 1]) {
+            return false
+        }
+    }
+    return true
+}
+
+// Время UTCTime (ГГММДДччммссZ) или GeneralizedTime (ГГГГММДДччммссZ) → unix.
+fn __der_time(t: __Tlv) -> int? {
+    let s = __str_new(t.at, t.len)
+    var y = 0
+    var rest = ""
+    if t.tag == 0x17 && s.len() == 13 {
+        y = s[..2].to_int() ?? -1
+        if y < 0 {
+            return none
+        }
+        if y < 50 {
+            y += 2000
+        } else {
+            y += 1900
+        }
+        rest = s[2..]
+    } else if t.tag == 0x18 && s.len() == 15 {
+        y = s[..4].to_int() ?? -1
+        rest = s[4..]
+    } else {
+        return none
+    }
+    if !rest.ends_with("Z") {
+        return none
+    }
+    let mo = rest[0..2].to_int() ?? 0
+    let d = rest[2..4].to_int() ?? 0
+    let h = rest[4..6].to_int() ?? -1
+    let mi = rest[6..8].to_int() ?? -1
+    let sec = rest[8..10].to_int() ?? -1
+    if y < 0 || mo < 1 || mo > 12 || d < 1 || d > 31 || h < 0 || h > 23 || mi < 0 || mi > 59 || sec < 0 || sec > 60 {
+        return none
+    }
+    return __days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + sec
+}
+
+// ---- Сертификат ----
+
+const SIG_RSA = 1
+const SIG_ECDSA = 2
+const KEY_RSA = 1
+const KEY_EC = 2
+
+type __Cert {
+    der: int
+    len: int
+    // tbsCertificate целиком (то, что подписано)
+    tbs: int
+    tbs_len: int
+    // подпись: вид, хеш (32, 48, 64), байты
+    sig_kind: int
+    sig_hash: int
+    sig: int
+    sig_len: int
+    // имена издателя и владельца — сырые байты DER
+    issuer: int
+    issuer_len: int
+    subject: int
+    subject_len: int
+    not_before: int
+    not_after: int
+    // ключ: RSA — модуль и экспонента, EC — кривая и точка
+    key_kind: int
+    curve: int
+    key: int
+    key_len: int
+    exp: int
+    exp_len: int
+    is_ca: bool
+    // -1 — без ограничения
+    path_len: int
+    // -1 — расширения нет
+    key_usage: int
+    // EKU нет, или в нём serverAuth, или anyExtendedKeyUsage
+    server_auth: bool
+    dns: [str]
+    ips: [str]
+    // ограничения имён (nameConstraints): разрешённые и запрещённые домены
+    permitted: [str]
+    excluded: [str]
+    // критическое расширение, которого мы не знаем
+    unknown_critical: bool
+}
+
+// Алгоритм подписи по OID: вид и длина хеша (0 — не поддерживается).
+fn __sig_alg(c: __Cert, oid: __Tlv) {
+    c.sig_kind = 0
+    if __der_is(oid, "2a864886f70d01010b") {
+        c.sig_kind = SIG_RSA
+        c.sig_hash = 32
+    } else if __der_is(oid, "2a864886f70d01010c") {
+        c.sig_kind = SIG_RSA
+        c.sig_hash = 48
+    } else if __der_is(oid, "2a864886f70d01010d") {
+        c.sig_kind = SIG_RSA
+        c.sig_hash = 64
+    } else if __der_is(oid, "2a8648ce3d040302") {
+        c.sig_kind = SIG_ECDSA
+        c.sig_hash = 32
+    } else if __der_is(oid, "2a8648ce3d040303") {
+        c.sig_kind = SIG_ECDSA
+        c.sig_hash = 48
+    } else if __der_is(oid, "2a8648ce3d040304") {
+        c.sig_kind = SIG_ECDSA
+        c.sig_hash = 64
+    }
+}
+
+// SubjectPublicKeyInfo → ключ.
+fn __cert_key(c: __Cert, spki: __Tlv) -> bool {
+    let alg = __tlv(spki.at, spki.end) else {
+        return false
+    }
+    let bits = __tlv(alg.end, spki.end) else {
+        return false
+    }
+    let oid = __tlv(alg.at, alg.end) else {
+        return false
+    }
+    if bits.tag != 0x03 || bits.len < 2 || load8(bits.at) != 0 {
+        return false
+    }
+    if __der_is(oid, "2a864886f70d010101") {
+        // RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }
+        let seq = __tlv(bits.at + 1, bits.end) else {
+            return false
+        }
+        let n = __tlv(seq.at, seq.end) else {
+            return false
+        }
+        let e = __tlv(n.end, seq.end) else {
+            return false
+        }
+        c.key_kind = KEY_RSA
+        c.key = n.at
+        c.key_len = n.len
+        c.exp = e.at
+        c.exp_len = e.len
+        return true
+    }
+    if __der_is(oid, "2a8648ce3d0201") {
+        let curve = __tlv(oid.end, alg.end) else {
+            return false
+        }
+        if __der_is(curve, "2a8648ce3d030107") {
+            c.curve = CURVE_P256
+        } else if __der_is(curve, "2b81040022") {
+            c.curve = CURVE_P384
+        } else {
+            return false
+        }
+        c.key_kind = KEY_EC
+        c.key = bits.at + 1
+        c.key_len = bits.len - 1
+        return true
+    }
+    return false
+}
+
+// Расширения: SAN, basicConstraints, keyUsage, extKeyUsage, nameConstraints.
+fn __cert_extensions(c: __Cert, exts: __Tlv) {
+    let seq = __tlv(exts.at, exts.end) else {
+        c.unknown_critical = true
+        return
+    }
+    var p = seq.at
+    while p < seq.end {
+        let ext = __tlv(p, seq.end) else {
+            c.unknown_critical = true
+            return
+        }
+        p = ext.end
+        let oid = __tlv(ext.at, ext.end) else {
+            continue
+        }
+        var critical = false
+        var vp = oid.end
+        let maybe = __tlv(vp, ext.end) else {
+            continue
+        }
+        if maybe.tag == 0x01 {
+            critical = maybe.len == 1 && load8(maybe.at) != 0
+            vp = maybe.end
+        }
+        let val = __tlv(vp, ext.end) else {
+            continue
+        }
+        let inner = __tlv(val.at, val.end) else {
+            continue
+        }
+        if __der_is(oid, "551d11") {
+            // subjectAltName: [2] dNSName, [7] iPAddress
+            var q = inner.at
+            while q < inner.end {
+                let gn = __tlv(q, inner.end) else {
+                    break
+                }
+                q = gn.end
+                if gn.tag == 0x82 {
+                    c.dns.push(__str_copy(gn.at, gn.len).lower())
+                } else if gn.tag == 0x87 {
+                    c.ips.push(__str_copy(gn.at, gn.len))
+                }
+            }
+        } else if __der_is(oid, "551d13") {
+            // basicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLen INTEGER OPTIONAL }
+            var q = inner.at
+            while q < inner.end {
+                let f = __tlv(q, inner.end) else {
+                    break
+                }
+                q = f.end
+                if f.tag == 0x01 && f.len == 1 {
+                    c.is_ca = load8(f.at) != 0
+                } else if f.tag == 0x02 && f.len >= 1 && f.len <= 2 {
+                    var v = 0
+                    for i in 0..f.len {
+                        v = v * 256 + load8(f.at + i)
+                    }
+                    c.path_len = v
+                }
+            }
+        } else if __der_is(oid, "551d0f") {
+            // keyUsage BIT STRING: бит 0 — старший бит первого байта
+            if inner.tag == 0x03 && inner.len >= 2 {
+                var v = load8(inner.at + 1) << 8
+                if inner.len >= 3 {
+                    v = v | load8(inner.at + 2)
+                }
+                c.key_usage = v
+            }
+        } else if __der_is(oid, "551d25") {
+            c.server_auth = false
+            var q = inner.at
+            while q < inner.end {
+                let k = __tlv(q, inner.end) else {
+                    break
+                }
+                q = k.end
+                if __der_is(k, "2b06010505070301") || __der_is(k, "551d2500") {
+                    c.server_auth = true
+                }
+            }
+        } else if __der_is(oid, "551d1e") {
+            // nameConstraints: [0] permitted, [1] excluded — поддеревья dNSName
+            var q = inner.at
+            while q < inner.end {
+                let sub = __tlv(q, inner.end) else {
+                    break
+                }
+                q = sub.end
+                var r = sub.at
+                while r < sub.end {
+                    let tree = __tlv(r, sub.end) else {
+                        break
+                    }
+                    r = tree.end
+                    let gn = __tlv(tree.at, tree.end) else {
+                        continue
+                    }
+                    if gn.tag == 0x82 {
+                        let name = __str_copy(gn.at, gn.len).lower()
+                        if sub.tag == 0xA0 {
+                            c.permitted.push(name)
+                        } else {
+                            c.excluded.push(name)
+                        }
+                    }
+                }
+            }
+        } else if critical && !__der_is(oid, "551d24") && !__der_is(oid, "551d36") && !__der_is(oid, "551d20") {
+            c.unknown_critical = true
+        }
+    }
+}
+
+// Сертификат из DER [p, p + n) — указатели внутрь этих байтов.
+fn __cert_parse(p: int, n: int) -> __Cert? {
+    let cert = __tlv(p, p + n) else {
+        return none
+    }
+    let tbs = __tlv(cert.at, cert.end) else {
+        return none
+    }
+    let outer_alg = __tlv(tbs.end, cert.end) else {
+        return none
+    }
+    let sigv = __tlv(outer_alg.end, cert.end) else {
+        return none
+    }
+    if sigv.tag != 0x03 || sigv.len < 2 {
+        return none
+    }
+    let c = __Cert { der: p, len: cert.end - p, tbs: 0, tbs_len: 0, sig_kind: 0, sig_hash: 0, sig: sigv.at + 1, sig_len: sigv.len - 1, issuer: 0, issuer_len: 0, subject: 0, subject_len: 0, not_before: 0, not_after: 0, key_kind: 0, curve: 0, key: 0, key_len: 0, exp: 0, exp_len: 0, is_ca: false, path_len: -1, key_usage: -1, server_auth: true, dns: [], ips: [], permitted: [], excluded: [], unknown_critical: false }
+    // tbs — элемент целиком, с заголовком
+    c.tbs = cert.at
+    c.tbs_len = tbs.end - cert.at
+    let alg_oid = __tlv(outer_alg.at, outer_alg.end) else {
+        return none
+    }
+    __sig_alg(c, alg_oid)
+    // [0] version (если есть), serialNumber, signature, issuer, validity, subject, spki
+    let first = __tlv(tbs.at, tbs.end) else {
+        return none
+    }
+    var serial_at = tbs.at
+    if first.tag == 0xA0 {
+        serial_at = first.end
+    }
+    let serial = __tlv(serial_at, tbs.end) else {
+        return none
+    }
+    let inner_alg = __tlv(serial.end, tbs.end) else {
+        return none
+    }
+    if inner_alg.len != outer_alg.len || !__memeq(inner_alg.at, outer_alg.at, inner_alg.len) {
+        return none
+    }
+    let issuer = __tlv(inner_alg.end, tbs.end) else {
+        return none
+    }
+    c.issuer = inner_alg.end
+    c.issuer_len = issuer.end - inner_alg.end
+    let validity = __tlv(issuer.end, tbs.end) else {
+        return none
+    }
+    let nb = __tlv(validity.at, validity.end) else {
+        return none
+    }
+    let na = __tlv(nb.end, validity.end) else {
+        return none
+    }
+    c.not_before = __der_time(nb) ?? 0
+    c.not_after = __der_time(na) ?? 0
+    let subject = __tlv(validity.end, tbs.end) else {
+        return none
+    }
+    c.subject = validity.end
+    c.subject_len = subject.end - validity.end
+    let spki = __tlv(subject.end, tbs.end) else {
+        return none
+    }
+    if !__cert_key(c, spki) {
+        // ключ, который мы не умеем проверять: годится только как лист без проверки
+        c.key_kind = 0
+    }
+    var q = spki.end
+    while q < tbs.end {
+        let x = __tlv(q, tbs.end) else {
+            return none
+        }
+        q = x.end
+        if x.tag == 0xA3 {
+            __cert_extensions(c, x)
+        }
+    }
+    return c
+}
+
+// Подпись сертификата c ключом издателя issuer.
+fn __cert_signed_by(c: __Cert, issuer: __Cert) -> bool {
+    if c.sig_kind == 0 || issuer.key_kind == 0 {
+        return false
+    }
+    let h = __alloc(64)
+    __hash(c.sig_hash, c.tbs, c.tbs_len, h)
+    if c.sig_kind == SIG_RSA {
+        return issuer.key_kind == KEY_RSA && __rsa_pkcs1_verify(issuer.key, issuer.key_len, issuer.exp, issuer.exp_len, h, c.sig_hash, c.sig, c.sig_len)
+    }
+    if issuer.key_kind != KEY_EC {
+        return false
+    }
+    // ECDSA-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }
+    let seq = __tlv(c.sig, c.sig + c.sig_len) else {
+        return false
+    }
+    let r = __tlv(seq.at, seq.end) else {
+        return false
+    }
+    let s = __tlv(r.end, seq.end) else {
+        return false
+    }
+    return __ecdsa_verify(issuer.curve, issuer.key, issuer.key_len, h, c.sig_hash, r.at, r.len, s.at, s.len)
+}
+
+// ---- Корневые сертификаты ----
+
+fn __b64_val(c: int) -> int {
+    if c >= 'A' && c <= 'Z' {
+        return c - 'A'
+    }
+    if c >= 'a' && c <= 'z' {
+        return c - 'a' + 26
+    }
+    if c >= '0' && c <= '9' {
+        return c - '0' + 52
+    }
+    if c == '+' {
+        return 62
+    }
+    if c == '/' {
+        return 63
+    }
+    return -1
+}
+
+// Base64 (пробелы и переводы строк пропускаются) → байты в buf.
+fn __b64_decode(p: int, n: int, b: Buf) {
+    var acc = 0
+    var bits = 0
+    for i in 0..n {
+        let v = __b64_val(load8(p + i))
+        if v < 0 {
+            continue
+        }
+        acc = ((acc << 6) | v) & 0xFFFFFF
+        bits += 6
+        if bits >= 8 {
+            bits -= 8
+            buf_byte(b, (acc >> bits) & 255)
+        }
+    }
+}
+
+// Сертификаты из текста PEM.
+fn __pem_certs(text: str) -> [__Cert] {
+    var r: [__Cert] = []
+    let begin = "-----BEGIN CERTIFICATE-----"
+    let end = "-----END CERTIFICATE-----"
+    var at = 0
+    while true {
+        let a = text.find_from(begin, at)
+        if a < 0 {
+            break
+        }
+        let e = text.find_from(end, a)
+        if e < 0 {
+            break
+        }
+        let b = buf_new(2048)
+        __b64_decode(__str_ptr(text) + a + begin.len(), e - a - begin.len(), b)
+        if let c = __cert_parse(b.data, b.len) {
+            r.push(c)
+        }
+        at = e + end.len()
+    }
+    return r
+}
+
+fn __ca_file() -> str? {
+    let own = env("SSL_CERT_FILE") ?? ""
+    if own.len() > 0 {
+        return own
+    }
+    for f in ["/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/ca-bundle.pem", "/etc/pki/tls/cacert.pem", "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", "/etc/ssl/cert.pem"] {
+        if syscall(SYS_ACCESS, __cstr(f), 4) == 0 {
+            return f
+        }
+    }
+    return none
+}
+
+// Корни читаются один раз на процесс в постоянную память (не в арену
+// запроса); слово [40] блока __store_rw — замок на время чтения.
+var __ca_roots: int
+
+fn __roots() -> [__Cert] {
+    if __ca_roots == 0 {
+        __store_rw_init()
+        let lock = __store_rw + 40
+        __mutex_lock(lock)
+        if __ca_roots == 0 {
+            let c = __ctx()
+            let sp = load64(c + CTX_PTR)
+            let se = load64(c + CTX_END)
+            // следующее выделение — свежий кусок mmap, который не освобождается
+            store64(c + CTX_PTR, 0)
+            store64(c + CTX_END, 0)
+            var roots: [__Cert] = []
+            if let f = __ca_file() {
+                if let text = read_file(f) {
+                    roots = __pem_certs(text)
+                }
+            }
+            let rh: int = __cast(roots)
+            store64(c + CTX_PTR, sp)
+            store64(c + CTX_END, se)
+            __ca_roots = rh
+        }
+        __mutex_unlock(lock)
+    }
+    let roots: [__Cert] = __cast(__ca_roots)
+    return roots
+}
+
+// ---- Проверка цепочки ----
+
+fn __name_eq(a: int, alen: int, b: int, blen: int) -> bool {
+    return alen == blen && __memeq(a, b, alen)
+}
+
+// Имя по шаблону из сертификата: «*.example.com» — ровно одна метка слева.
+fn __dns_match(pattern: str, host: str) -> bool {
+    if pattern == host {
+        return true
+    }
+    if pattern.starts_with("*.") {
+        let dot = host.find(".") ?? -1
+        return dot > 0 && host[dot..] == pattern[1..]
+    }
+    return false
+}
+
+// host внутри поддерева nameConstraints: «example.com» — сам домен и поддомены.
+fn __dns_within(host: str, tree: str) -> bool {
+    var t = tree
+    if t.starts_with(".") {
+        t = t[1..]
+    }
+    return host == t || host.ends_with("." + t)
+}
+
+fn __host_ip(host: str) -> str? {
+    let ip = __ip_parse(host) else {
+        return none
+    }
+    let b = buf_new(4)
+    buf_byte(b, (ip >> 24) & 255)
+    buf_byte(b, (ip >> 16) & 255)
+    buf_byte(b, (ip >> 8) & 255)
+    buf_byte(b, ip & 255)
+    return __str_new(b.data, 4)
+}
+
+fn __host_ok(c: __Cert, host: str) -> bool {
+    if let ip = __host_ip(host) {
+        return c.ips.contains(ip)
+    }
+    for d in c.dns {
+        if __dns_match(d, host) {
+            return true
+        }
+    }
+    return false
+}
+
+// Годится ли c на месте сертификата, выпускающего другие (промежуточный).
+fn __cert_can_issue(c: __Cert, below: int) -> bool {
+    if !c.is_ca || c.unknown_critical || !c.server_auth {
+        return false
+    }
+    // keyUsage: keyCertSign — бит 5
+    if c.key_usage >= 0 && (c.key_usage & 0x0400) == 0 {
+        return false
+    }
+    return c.path_len < 0 || below <= c.path_len
+}
+
+fn __cert_time_ok(c: __Cert, now: int) -> bool {
+    return now >= c.not_before && now <= c.not_after
+}
+
+// Цепочка: chain[0] — сертификат сервера, дальше — присланные промежуточные.
+// → none, если всё в порядке, иначе текст ошибки.
+fn __verify_chain(chain: [__Cert], host: str, now: int) -> str? {
+    if chain.len() == 0 {
+        return "the server sent no certificate"
+    }
+    let leaf = chain[0]
+    if leaf.unknown_critical || !leaf.server_auth {
+        return "the server certificate is not for TLS servers"
+    }
+    if !__host_ok(leaf, host) {
+        return "the certificate is for another name, not {host}"
+    }
+    if !__cert_time_ok(leaf, now) {
+        return "the server certificate has expired or is not yet valid"
+    }
+    let roots = __roots()
+    if roots.len() == 0 {
+        return "no root certificates: set SSL_CERT_FILE to a CA bundle"
+    }
+    var cur = leaf
+    var used: [int] = [0]
+    var below = 0
+    var path: [__Cert] = [leaf]
+    while below < 8 {
+        // корень с именем издателя, чья подпись сходится
+        for r in roots {
+            if __name_eq(r.subject, r.subject_len, cur.issuer, cur.issuer_len) && __cert_time_ok(r, now) && __cert_signed_by(cur, r) {
+                return __check_constraints(path, host)
+            }
+        }
+        var next = -1
+        for i, c in chain {
+            if !used.contains(i) && __name_eq(c.subject, c.subject_len, cur.issuer, cur.issuer_len) && __cert_can_issue(c, below) && __cert_time_ok(c, now) && __cert_signed_by(cur, c) {
+                next = i
+                break
+            }
+        }
+        if next < 0 {
+            return "the certificate is not signed by a trusted authority"
+        }
+        used.push(next)
+        cur = chain[next]
+        path.push(cur)
+        below += 1
+    }
+    return "the certificate chain is too long"
+}
+
+// nameConstraints промежуточных сертификатов для имени сервера.
+fn __check_constraints(path: [__Cert], host: str) -> str? {
+    if __host_ip(host) != none {
+        return none
+    }
+    for c in path {
+        for x in c.excluded {
+            if __dns_within(host, x) {
+                return "the name {host} is excluded by the certificate authority"
+            }
+        }
+        if c.permitted.len() > 0 && !c.permitted.any(t => __dns_within(host, t)) {
+            return "the name {host} is outside what the certificate authority may sign"
+        }
+    }
+    return none
+}
+
+// ---- Кеш проверенных цепочек ----
+// Новое соединение с тем же сервером присылает ту же цепочку: проверять её
+// снова не нужно (как в браузерах). У потока — 64 записи: SHA-256 от
+// сертификата сервера и имени, до какого времени верить (не дольше часа и не
+// дольше срока сертификата). Память — mmap, общая для запросов потока.
+
+const VCACHE_N = 64
+
+fn __vcache() -> int {
+    let c = __ctx()
+    var p = load64(c + CTX_VCACHE)
+    if p == 0 {
+        p = __mmap(VCACHE_N * 40 + 8)
+        store64(c + CTX_VCACHE, p)
+    }
+    return p
+}
+
+fn __vcache_key(leaf: __Cert, host: str, out: int) {
+    let h = __hash_new(32)
+    __hash_update(h, leaf.der, leaf.len)
+    __hash_update(h, __str_ptr(host), host.len())
+    __hash_final(h, out)
+}
+
+fn __verify_chain_cached(chain: [__Cert], host: str, now: int) -> str? {
+    if chain.len() == 0 {
+        return __verify_chain(chain, host, now)
+    }
+    let t = __vcache()
+    let key = __alloc(32)
+    __vcache_key(chain[0], host, key)
+    for i in 0..VCACHE_N {
+        let e = t + i * 40
+        if load64(e + 32) > now && __memeq(e, key, 32) {
+            return none
+        }
+    }
+    let err = __verify_chain(chain, host, now)
+    if err == none {
+        let next = load64(t + VCACHE_N * 40)
+        let e = t + next * 40
+        __memcpy(e, key, 32)
+        store64(e + 32, (now + 3600).min(chain[0].not_after))
+        store64(t + VCACHE_N * 40, (next + 1) % VCACHE_N)
+    }
+    return err
+}

@@ -1,0 +1,35 @@
+// Клиент для tests/tls.sh: fetch по https к тестовым серверам.
+
+route GET "/get" (url: str) -> str {
+    let r = fetch GET url
+    if r.status != 200 {
+        return "{r.status} {r.body}"
+    }
+    // s_server -www пишет согласованный шифр
+    let at = r.body.find("Cipher is ") ?? -1
+    if at >= 0 {
+        return "200 " + r.body[at + 10..].split("\n")[0]
+    }
+    return "200 {r.body.len()} bytes"
+}
+
+// n запросов подряд; сервер отвечает числом принятых соединений
+route GET "/seq" (n: int, url: str) -> str {
+    let hello = url + "/hello"
+    for i in 0..n {
+        let r = fetch GET hello
+        if r.status != 200 {
+            return "{r.status} {r.body}"
+        }
+    }
+    let conns = url + "/conns"
+    let h = fetch GET conns
+    return "connections: {h.body}"
+}
+
+route GET "/post" (size: int, url: str) -> str {
+    let echo = url + "/echo"
+    let data = "ab".repeat(size / 2)
+    let r = fetch POST echo data
+    return "{r.status} {r.body}"
+}

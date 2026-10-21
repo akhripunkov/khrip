@@ -62,6 +62,8 @@ const CTX_CORO = 120
 const CTX_CO_END = 128
 // свободные соединения fetch этого потока (lib/fetch.kh) или 0
 const CTX_POOL = 136
+// проверенные цепочки сертификатов этого потока (lib/x509.kh) или 0
+const CTX_VCACHE = 144
 const CTX_SIZE = 256
 
 const CHUNK = 1048576

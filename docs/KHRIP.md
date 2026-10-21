@@ -1,4 +1,4 @@
-# Khrip language reference (v0.10)
+# Khrip language reference (v0.11)
 
 Khrip is a compiled, strictly typed language for HTTP APIs on Linux x86-64.
 One project = one namespace: no imports, declaration order does not matter.
@@ -215,8 +215,10 @@ every 10 min {
 ```
 
 `fetch METHOD url [body] [headers map]` returns `Response { status, body,
-headers }` (names lower case); `status` 0 means unreachable (`body` says why). A
-body value is sent as JSON, a str as text; https uses `curl`. `fetch` and
+headers }` (names lower case); `status` 0 means unreachable or a TLS error (`body`
+says why). A body value is sent as JSON, a str as text. https is built in (TLS
+1.3, system root certificates or `SSL_CERT_FILE`); `HTTPS_PROXY`, `HTTP_PROXY`,
+`NO_PROXY` are honored; connections are reused. `fetch` and
 `sleep` are plain calls (no async/await): while a request waits, the server runs
 other requests, and they may change store (so may password hashing). `every N
 ms|s|min|h|d` runs a block in a background thread. `KHRIP_DATA=file.json` keeps

@@ -72,6 +72,8 @@ fn lib_files() -> [str] {
     names.push("rt.kh")
     names.push("float.kh")
     names.push("crypto.kh")
+    names.push("cipher.kh")
+    names.push("pk.kh")
     names.push("regex.kh")
     return names
 }
@@ -81,6 +83,8 @@ fn api_lib_files() -> [str] {
     names.push("api.kh")
     names.push("http.kh")
     names.push("fetch.kh")
+    names.push("x509.kh")
+    names.push("tls.kh")
     return names
 }
 

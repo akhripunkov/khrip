@@ -1,0 +1,9 @@
+// chain.pem host: проверить цепочку по корням из SSL_CERT_FILE.
+fn main() -> int {
+    // JSON подключает библиотеку API, а с ней — x509
+    let unused: int? = from_json("1")
+    let a = args()
+    let chain = __pem_certs(read_file(a[1]) ?? "")
+    print("{a[2]}: {__verify_chain(chain, a[2], now()) ?? "ok"}")
+    return 0
+}

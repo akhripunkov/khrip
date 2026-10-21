@@ -581,3 +581,472 @@ fn emit_sha256_x64() {
     // add rsp, 264; pop r15–r12, rbp, rbx
     emit_hex("48 81 C4 08 01 00 00 41 5F 41 5E 41 5D 41 5C 5D 5B")
 }
+
+// ---- SHA-512 (и SHA-384): тот же приём на 64-битных регистрах ----
+
+// 64-битная операция «r/m, r» (0x89 mov, 0x01 add, 0x31 xor, 0x21 and, 0x09 or).
+fn q_rr(op: int, dst: int, src: int) {
+    emit8(0x48 | ((src >> 3) << 2) | (dst >> 3))
+    emit8(op)
+    emit8(0xC0 | ((src & 7) << 3) | (dst & 7))
+}
+
+// ror/shr r64, n (ext: 1 — ror, 5 — shr)
+fn q_shift(ext: int, reg: int, n: int) {
+    emit8(0x48 | (reg >> 3))
+    emit8(0xC1)
+    emit8(0xC0 | (ext << 3) | (reg & 7))
+    emit8(n)
+}
+
+// op reg, [rsp + disp] (0x8B — в регистр, 0x03 — add) или 0x89 — в память.
+fn q_rsp(op: int, reg: int, disp: int) {
+    emit8(0x48 | ((reg >> 3) << 2))
+    emit8(op)
+    if disp < 128 {
+        emit8(0x44 | ((reg & 7) << 3))
+        emit8(0x24)
+        emit8(disp)
+    } else {
+        emit8(0x84 | ((reg & 7) << 3))
+        emit8(0x24)
+        emit32(disp)
+    }
+}
+
+// add reg, [base + rsi + disp8] (sib: 0x34 — rsp, 0x32 — rdx)
+fn q_add_idx(reg: int, sib: int, disp: int) {
+    emit8(0x48 | ((reg >> 3) << 2))
+    emit8(0x03)
+    emit8(0x44 | ((reg & 7) << 3))
+    emit8(sib)
+    emit8(disp)
+}
+
+// Один 128-байтовый блок: rdi — состояние (8 слов по 64 бита), rsi — блок,
+// rdx — константы K (80 слов). a..h — в r8..r15, W[80] — на стеке.
+fn emit_sha512_x64() {
+    let rax = 0
+    let rcx = 1
+    let rbx = 3
+    let rbp = 5
+    // push rbx, rbp, r12–r15, rdi; sub rsp, 640
+    emit_hex("53 55 41 54 41 55 41 56 41 57 57 48 81 EC 80 02 00 00")
+    for i in 0..16 {
+        // mov rax, [rsi + 8i]; bswap rax; mov [rsp + 8i], rax
+        emit_hex("48 8B 46")
+        emit8(i * 8)
+        emit_hex("48 0F C8")
+        q_rsp(0x89, rax, i * 8)
+    }
+    for i in 16..80 {
+        // s0 = ror(x, 1) ^ ror(x, 8) ^ (x >> 7), x = W[i - 15]
+        q_rsp(0x8B, rax, (i - 15) * 8)
+        q_rr(0x89, rcx, rax)
+        q_rr(0x89, rbx, rax)
+        q_shift(1, rax, 1)
+        q_shift(1, rcx, 8)
+        q_rr(0x31, rax, rcx)
+        q_shift(5, rbx, 7)
+        q_rr(0x31, rax, rbx)
+        // s1 = ror(y, 19) ^ ror(y, 61) ^ (y >> 6), y = W[i - 2]
+        q_rsp(0x8B, rcx, (i - 2) * 8)
+        q_rr(0x89, rbx, rcx)
+        q_rr(0x89, rbp, rcx)
+        q_shift(1, rcx, 19)
+        q_shift(1, rbx, 61)
+        q_rr(0x31, rcx, rbx)
+        q_shift(5, rbp, 6)
+        q_rr(0x31, rcx, rbp)
+        q_rr(0x01, rax, rcx)
+        q_rsp(0x03, rax, (i - 16) * 8)
+        q_rsp(0x03, rax, (i - 7) * 8)
+        q_rsp(0x89, rax, i * 8)
+    }
+    // mov r8..r15, [rdi + 8r]
+    for r in 0..8 {
+        emit8(0x4C)
+        emit8(0x8B)
+        emit8(0x47 | (r << 3))
+        emit8(r * 8)
+    }
+    // xor esi, esi: смещение раунда в W и K
+    emit_hex("31 F6")
+    let top = code_len
+    for j in 0..8 {
+        let a = 8 + (8 - j) % 8
+        let b = 8 + (9 - j) % 8
+        let c = 8 + (10 - j) % 8
+        let d = 8 + (11 - j) % 8
+        let e = 8 + (12 - j) % 8
+        let f = 8 + (13 - j) % 8
+        let g = 8 + (14 - j) % 8
+        let h = 8 + (15 - j) % 8
+        // h += S1(e) + ch(e, f, g) + K[i] + W[i]
+        q_rr(0x89, rax, e)
+        q_rr(0x89, rcx, e)
+        q_shift(1, rax, 14)
+        q_shift(1, rcx, 18)
+        q_rr(0x31, rax, rcx)
+        q_shift(1, rcx, 23)
+        q_rr(0x31, rax, rcx)
+        q_rr(0x89, rcx, f)
+        q_rr(0x31, rcx, g)
+        q_rr(0x21, rcx, e)
+        q_rr(0x31, rcx, g)
+        q_rr(0x01, h, rax)
+        q_rr(0x01, h, rcx)
+        q_add_idx(h, 0x32, j * 8)
+        q_add_idx(h, 0x34, j * 8)
+        q_rr(0x01, d, h)
+        // h += S0(a) + maj(a, b, c)
+        q_rr(0x89, rax, a)
+        q_rr(0x89, rcx, a)
+        q_shift(1, rax, 28)
+        q_shift(1, rcx, 34)
+        q_rr(0x31, rax, rcx)
+        q_shift(1, rcx, 5)
+        q_rr(0x31, rax, rcx)
+        q_rr(0x89, rcx, a)
+        q_rr(0x09, rcx, b)
+        q_rr(0x21, rcx, c)
+        q_rr(0x89, rbx, a)
+        q_rr(0x21, rbx, b)
+        q_rr(0x09, rcx, rbx)
+        q_rr(0x01, h, rax)
+        q_rr(0x01, h, rcx)
+    }
+    // add rsi, 64; cmp rsi, 640; jne top
+    emit_hex("48 83 C6 40 48 81 FE 80 02 00 00")
+    emit_jcc_to(CC_NE, top)
+    // mov rdi, [rsp + 640]; add [rdi + 8r], r8..r15
+    emit_hex("48 8B BC 24 80 02 00 00")
+    for r in 0..8 {
+        emit8(0x4C)
+        emit8(0x01)
+        emit8(0x47 | (r << 3))
+        emit8(r * 8)
+    }
+    // add rsp, 648; pop r15–r12, rbp, rbx
+    emit_hex("48 81 C4 88 02 00 00 41 5F 41 5E 41 5D 41 5C 5D 5B")
+}
+
+// ---- AES-NI, PCLMULQDQ и ChaCha20 для TLS ----
+
+// __cpu_aes(): есть ли AES-NI, PCLMULQDQ и SSSE3 (cpuid 1: ecx биты 25, 1, 9).
+fn emit_cpu_aes() {
+    // push rbx; mov eax, 1; xor ecx, ecx; cpuid
+    emit_hex("53 B8 01 00 00 00 31 C9 0F A2")
+    // and ecx, маска; cmp ecx, маска; sete al; movzx eax, al; pop rbx
+    emit_hex("81 E1 02 02 00 02 81 F9 02 02 00 02")
+    emit_setcc(CC_E)
+    emit8(0x5B)
+}
+
+// __aes_ctr(ключи, 16 × раундов, счётчик, откуда, куда, блоков): AES в режиме
+// счётчика. rdi — ключи раундов подряд, rsi — смещение последнего, rdx —
+// 16 байт счётчика (последние 4 — номер блока старшими байтами вперёд; растёт
+// на месте), rcx — открытый текст, r8 — результат, r9 — число блоков.
+fn emit_aes_ctr() {
+    // test r9, r9; jz конец
+    emit_hex("4D 85 C9")
+    let skip = emit_jcc(CC_E)
+    let top = code_len
+    // movdqu xmm0, [rdx]; movdqu xmm1, [rdi]; pxor xmm0, xmm1; mov eax, 16
+    emit_hex("F3 0F 6F 02 F3 0F 6F 0F 66 0F EF C1 B8 10 00 00 00")
+    let inner = code_len
+    // movdqu xmm1, [rdi + rax]; aesenc xmm0, xmm1; add eax, 16; cmp rax, rsi; jb inner
+    emit_hex("F3 0F 6F 0C 07 66 0F 38 DC C1 83 C0 10 48 39 F0 72")
+    emit8((inner - (code_len + 1)) & 255)
+    // movdqu xmm1, [rdi + rsi]; aesenclast xmm0, xmm1
+    emit_hex("F3 0F 6F 0C 37 66 0F 38 DD C1")
+    // movdqu xmm1, [rcx]; pxor xmm0, xmm1; movdqu [r8], xmm0
+    emit_hex("F3 0F 6F 09 66 0F EF C1 F3 41 0F 7F 00")
+    // счётчик + 1: mov eax, [rdx + 12]; bswap eax; inc eax; bswap eax; mov [rdx + 12], eax
+    emit_hex("8B 42 0C 0F C8 FF C0 0F C8 89 42 0C")
+    // add rcx, 16; add r8, 16; dec r9; jnz top
+    emit_hex("48 83 C1 10 49 83 C0 10 49 FF C9")
+    emit_jcc_to(CC_NE, top)
+    patch_here(skip)
+}
+
+// xmm0 = xmm0 · xmm5 в GF(2^128) для GHASH. Оба значения — с переставленными
+// байтами (pshufb); схема — из статьи Intel «Carry-Less Multiplication
+// Instruction and its Usage for Computing the GCM Mode» (функция gfmul).
+// Временные: xmm1–xmm4, xmm7.
+fn emit_gfmul() {
+    let movdqa = "66 0F 6F"
+    let pclmul = "66 0F 3A 44"
+    let pxor = "66 0F EF"
+    let por = "66 0F EB"
+    let dq = "66 0F 73"
+    let d = "66 0F 72"
+    sse_rr(movdqa, 1, 0)
+    sse_rri(pclmul, 1, 5, 0x00)
+    sse_rr(movdqa, 2, 0)
+    sse_rri(pclmul, 2, 5, 0x10)
+    sse_rr(movdqa, 3, 0)
+    sse_rri(pclmul, 3, 5, 0x01)
+    sse_rr(movdqa, 4, 0)
+    sse_rri(pclmul, 4, 5, 0x11)
+    sse_rr(pxor, 2, 3)
+    sse_rr(movdqa, 3, 2)
+    sse_rri(dq, 7, 3, 8)
+    sse_rri(dq, 3, 2, 8)
+    sse_rr(pxor, 1, 3)
+    sse_rr(pxor, 4, 2)
+    // произведение [xmm4:xmm1] сдвинуть на бит влево
+    sse_rr(movdqa, 7, 1)
+    sse_rri(d, 2, 7, 31)
+    sse_rr(movdqa, 2, 4)
+    sse_rri(d, 2, 2, 31)
+    sse_rri(d, 6, 1, 1)
+    sse_rri(d, 6, 4, 1)
+    sse_rr(movdqa, 3, 7)
+    sse_rri(dq, 3, 3, 12)
+    sse_rri(dq, 7, 2, 4)
+    sse_rri(dq, 7, 7, 4)
+    sse_rr(por, 1, 7)
+    sse_rr(por, 4, 2)
+    sse_rr(por, 4, 3)
+    // приведение по модулю x^128 + x^7 + x^2 + x + 1
+    sse_rr(movdqa, 7, 1)
+    sse_rri(d, 6, 7, 31)
+    sse_rr(movdqa, 2, 1)
+    sse_rri(d, 6, 2, 30)
+    sse_rr(movdqa, 3, 1)
+    sse_rri(d, 6, 3, 25)
+    sse_rr(pxor, 7, 2)
+    sse_rr(pxor, 7, 3)
+    sse_rr(movdqa, 2, 7)
+    sse_rri(dq, 3, 2, 4)
+    sse_rri(dq, 7, 7, 12)
+    sse_rr(pxor, 1, 7)
+    sse_rr(movdqa, 3, 1)
+    sse_rri(d, 2, 3, 1)
+    sse_rr(movdqa, 7, 1)
+    sse_rri(d, 2, 7, 2)
+    sse_rr(movdqa, 0, 1)
+    sse_rri(d, 2, 0, 7)
+    sse_rr(pxor, 3, 7)
+    sse_rr(pxor, 3, 0)
+    sse_rr(pxor, 3, 2)
+    sse_rr(pxor, 1, 3)
+    sse_rr(pxor, 4, 1)
+    sse_rr(movdqa, 0, 4)
+}
+
+// __ghash(ключ, x, данные, блоков): x = (x ^ блок) · H по всем блокам. rdi —
+// H с переставленными байтами и за ним маска pshufb, rsi — 16 байт x (на месте),
+// rdx — данные, rcx — число блоков.
+fn emit_ghash() {
+    // test rcx, rcx; jz конец
+    emit_hex("48 85 C9")
+    let skip = emit_jcc(CC_E)
+    // movdqu xmm6, [rdi + 16]; movdqu xmm5, [rdi]; movdqu xmm0, [rsi]; pshufb xmm0, xmm6
+    emit_hex("F3 0F 6F 77 10 F3 0F 6F 2F F3 0F 6F 06 66 0F 38 00 C6")
+    let top = code_len
+    // movdqu xmm1, [rdx]; pshufb xmm1, xmm6; pxor xmm0, xmm1
+    emit_hex("F3 0F 6F 0A 66 0F 38 00 CE 66 0F EF C1")
+    emit_gfmul()
+    // add rdx, 16; dec rcx; jnz top
+    emit_hex("48 83 C2 10 48 FF C9")
+    emit_jcc_to(CC_NE, top)
+    // pshufb xmm0, xmm6; movdqu [rsi], xmm0
+    emit_hex("66 0F 38 00 C6 F3 0F 7F 06")
+    patch_here(skip)
+}
+
+// Поворот 32-битных слов xmm-регистра reg влево на n (xmm4 — временный).
+fn sse_rotl(reg: int, n: int) {
+    sse_rr("66 0F 6F", 4, reg)
+    sse_rri("66 0F 72", 6, reg, n)
+    sse_rri("66 0F 72", 2, 4, 32 - n)
+    sse_rr("66 0F EB", reg, 4)
+}
+
+// Четверть раунда ChaCha20 сразу для четырёх столбцов (строки — xmm0–xmm3).
+fn chacha_quarter() {
+    let paddd = "66 0F FE"
+    let pxor = "66 0F EF"
+    sse_rr(paddd, 0, 1)
+    sse_rr(pxor, 3, 0)
+    sse_rotl(3, 16)
+    sse_rr(paddd, 2, 3)
+    sse_rr(pxor, 1, 2)
+    sse_rotl(1, 12)
+    sse_rr(paddd, 0, 1)
+    sse_rr(pxor, 3, 0)
+    sse_rotl(3, 8)
+    sse_rr(paddd, 2, 3)
+    sse_rr(pxor, 1, 2)
+    sse_rotl(1, 7)
+}
+
+// __chacha_block(состояние, куда): 64 байта ключевого потока ChaCha20 по
+// состоянию из 16 слов (rdi), в rsi. Строки состояния — в xmm0–xmm3; диагонали
+// получаются сдвигом строк (pshufd), как в известных реализациях на SSE2.
+fn emit_chacha_block() {
+    let pshufd = "66 0F 70"
+    emit_hex("F3 0F 6F 07 F3 0F 6F 4F 10 F3 0F 6F 57 20 F3 0F 6F 5F 30")
+    // mov eax, 10
+    emit_hex("B8 0A 00 00 00")
+    let top = code_len
+    chacha_quarter()
+    sse_rri(pshufd, 1, 1, 0x39)
+    sse_rri(pshufd, 2, 2, 0x4E)
+    sse_rri(pshufd, 3, 3, 0x93)
+    chacha_quarter()
+    sse_rri(pshufd, 1, 1, 0x93)
+    sse_rri(pshufd, 2, 2, 0x4E)
+    sse_rri(pshufd, 3, 3, 0x39)
+    // dec eax; jnz top
+    emit_hex("FF C8")
+    emit_jcc_to(CC_NE, top)
+    // прибавить исходное состояние и записать: movdqu xmm4, [rdi + 16i]; paddd; movdqu [rsi + 16i]
+    for i in 0..4 {
+        emit_hex("F3 0F 6F 67")
+        emit8(i * 16)
+        sse_rr("66 0F FE", i, 4)
+        emit_hex("F3 0F 7F")
+        emit8(0x46 + i * 8)
+        emit8(i * 16)
+    }
+}
+
+// ---- Длинная арифметика: части по 64 бита, младшие первыми ----
+
+// Короткий переход назад (jcc rel8) на метку target.
+fn emit_jcc8_back(cc: int, target: int) {
+    emit8(0x70 + cc)
+    emit8((target - (code_len + 1)) & 255)
+}
+
+// __mp_add(r, a, b, n) / __mp_sub: r = a ± b по n частям, → перенос (заём).
+// rdi — r, rsi — a, rdx — b, rcx — n (больше 0). op: 0x13 adc, 0x1B sbb.
+fn emit_mp_addsub(op: int) {
+    // xor r8d, r8d (заодно CF = 0)
+    emit_hex("45 31 C0")
+    let top = code_len
+    // mov rax, [rsi + r8*8]; adc/sbb rax, [rdx + r8*8]; mov [rdi + r8*8], rax
+    emit_hex("4A 8B 04 C6 4A")
+    emit8(op)
+    emit_hex("04 C2 4A 89 04 C7")
+    // inc r8; dec rcx; jnz top (inc и dec не трогают CF)
+    emit_hex("49 FF C0 48 FF C9")
+    emit_jcc8_back(CC_NE, top)
+    emit_setcc(CC_B)
+}
+
+// __mont_mul(r, a, b, m, n, minv): r = a · b · 2^(-64n) mod m с точностью до
+// одного вычитания m (r — n + 1 частей, верхняя 0 или 1; дальше — в lib/pk.kh).
+// Схема CIOS (Koç, Acar, Kaliski, 1996); minv = -m^(-1) mod 2^64. rdi — r,
+// rsi — a, rdx — b (уходит в r10), rcx — m, r8 — n (не меньше 2), r9 — minv.
+// Промежуточное t (n + 2 частей) — на стеке, r15 — его адрес.
+fn emit_mont_mul() {
+    // push rbx, rbp, r12–r15; mov r10, rdx
+    emit_hex("53 55 41 54 41 55 41 56 41 57 49 89 D2")
+    // rax = (8n + 31) & -16; sub rsp, rax; mov rbp, rax
+    emit_hex("4A 8D 04 C5 1F 00 00 00 48 83 E0 F0 48 29 C4 48 89 C5")
+    // t = 0: xor eax, eax; xor r11d, r11d; lea rbx, [r8 + 2]
+    emit_hex("31 C0 45 31 DB 49 8D 58 02")
+    let zero = code_len
+    // mov [rsp + r11*8], rax; inc r11; cmp r11, rbx; jb zero
+    emit_hex("4A 89 04 DC 49 FF C3 49 39 DB")
+    emit_jcc8_back(CC_B, zero)
+    // mov r15, rsp; xor r11d, r11d
+    emit_hex("49 89 E7 45 31 DB")
+    let outer = code_len
+    // r13 = a[i]; r14 = 0 (перенос); r12 = 0 (j)
+    emit_hex("4E 8B 2C DE 45 31 F6 45 31 E4")
+    let inner1 = code_len
+    // t[j] += b[j] · a[i] + перенос
+    // mov rax, [r10 + r12*8]; mul r13; add rax, r14; adc rdx, 0
+    emit_hex("4B 8B 04 E2 49 F7 E5 4C 01 F0 48 83 D2 00")
+    // add rax, [r15 + r12*8]; adc rdx, 0; mov [r15 + r12*8], rax; mov r14, rdx
+    emit_hex("4B 03 04 E7 48 83 D2 00 4B 89 04 E7 49 89 D6")
+    // inc r12; cmp r12, r8; jb inner1
+    emit_hex("49 FF C4 4D 39 C4")
+    emit_jcc8_back(CC_B, inner1)
+    // t[n] += перенос; t[n + 1] += CF
+    emit_hex("4F 01 34 C7 4B 83 54 C7 08 00")
+    // r13 = t[0] · minv (младшие 64 бита)
+    emit_hex("4D 8B 2F 4D 0F AF E9")
+    // t[0] + m[0] · r13: младшая часть обнуляется, остаётся перенос
+    // mov rax, [rcx]; mul r13; add rax, [r15]; adc rdx, 0; mov r14, rdx; mov r12d, 1
+    emit_hex("48 8B 01 49 F7 E5 49 03 07 48 83 D2 00 49 89 D6 41 BC 01 00 00 00")
+    let inner2 = code_len
+    // t[j - 1] = t[j] + m[j] · r13 + перенос
+    // mov rax, [rcx + r12*8]; mul r13; add rax, r14; adc rdx, 0
+    emit_hex("4A 8B 04 E1 49 F7 E5 4C 01 F0 48 83 D2 00")
+    // add rax, [r15 + r12*8]; adc rdx, 0; mov [r15 + r12*8 - 8], rax; mov r14, rdx
+    emit_hex("4B 03 04 E7 48 83 D2 00 4B 89 44 E7 F8 49 89 D6")
+    // inc r12; cmp r12, r8; jb inner2
+    emit_hex("49 FF C4 4D 39 C4")
+    emit_jcc8_back(CC_B, inner2)
+    // t[n - 1] = t[n] + перенос; t[n] = t[n + 1] + CF; t[n + 1] = 0
+    emit_hex("4B 8B 04 C7 4C 01 F0 4B 89 44 C7 F8 4B 8B 44 C7 08 48 83 D0 00 4B 89 04 C7")
+    emit_hex("4B C7 44 C7 08 00 00 00 00")
+    // inc r11; cmp r11, r8; jb outer
+    emit_hex("49 FF C3 4D 39 C3")
+    emit_jcc_to(CC_B, outer)
+    // r = t - m (по n частям): xor r11d, r11d; mov rbx, r8 (счётчик, dec не трогает CF)
+    emit_hex("45 31 DB 4C 89 C3")
+    let sub = code_len
+    // mov rax, [r15 + r11*8]; sbb rax, [rcx + r11*8]; mov [rdi + r11*8], rax; inc r11; dec rbx; jnz sub
+    emit_hex("4B 8B 04 DF 4A 1B 04 D9 4A 89 04 DF 49 FF C3 48 FF CB")
+    emit_jcc8_back(CC_NE, sub)
+    // оставить t, если был заём и t[n] = 0: маска rax = -(заём) & -(t[n] ^ 1)
+    // sbb rax, rax; mov rdx, [r15 + r8*8]; xor rdx, 1; neg rdx; and rax, rdx
+    emit_hex("48 19 C0 4B 8B 14 C7 48 83 F2 01 48 F7 DA 48 21 D0")
+    // r[i] ^= (r[i] ^ t[i]) & маска: xor r11d, r11d
+    emit_hex("45 31 DB")
+    let sel = code_len
+    // mov rdx, [rdi + r11*8]; mov rbx, [r15 + r11*8]; xor rbx, rdx; and rbx, rax; xor rdx, rbx; mov [rdi + r11*8], rdx
+    emit_hex("4A 8B 14 DF 4B 8B 1C DF 48 31 D3 48 21 C3 48 31 DA 4A 89 14 DF")
+    // inc r11; cmp r11, r8; jb sel
+    emit_hex("49 FF C3 4D 39 C3")
+    emit_jcc8_back(CC_B, sel)
+    // add rsp, rbp; pop r15–r12, rbp, rbx
+    emit_hex("48 01 EC 41 5F 41 5E 41 5D 41 5C 5D 5B")
+}
+
+// __mod_add(r, a, b, m, n): r = a + b mod m; __mod_sub: r = a - b mod m
+// (a, b < m). rdi — r, rsi — a, rdx — b, rcx — m, r8 — n. Без временной памяти:
+// сложение, вычитание m и обратное прибавление m под маской.
+fn emit_mod_addsub(add: bool) {
+    // xor r9d, r9d; mov r10, r8
+    emit_hex("45 31 C9 4D 89 C2")
+    let l1 = code_len
+    // mov rax, [rsi + r9*8]; adc/sbb rax, [rdx + r9*8]; mov [rdi + r9*8], rax; inc r9; dec r10; jnz l1
+    emit_hex("4A 8B 04 CE 4A")
+    if add {
+        emit8(0x13)
+    } else {
+        emit8(0x1B)
+    }
+    emit_hex("04 CA 4A 89 04 CF 49 FF C1 49 FF CA")
+    emit_jcc8_back(CC_NE, l1)
+    // r11 = -(перенос или заём)
+    emit_hex("4D 19 DB")
+    if add {
+        // r -= m; маска = -(заём) & ~(-перенос): вернуть m, если вычитать было не нужно
+        emit_hex("45 31 C9 4D 89 C2")
+        let l2 = code_len
+        // mov rax, [rdi + r9*8]; sbb rax, [rcx + r9*8]; mov [rdi + r9*8], rax; inc r9; dec r10; jnz l2
+        emit_hex("4A 8B 04 CF 4A 1B 04 C9 4A 89 04 CF 49 FF C1 49 FF CA")
+        emit_jcc8_back(CC_NE, l2)
+        // sbb rax, rax; not r11; and r11, rax
+        emit_hex("48 19 C0 49 F7 D3 49 21 C3")
+    }
+    // r += m & r11; перенос — в rdx: and сбрасывает CF, поэтому adc по цепочке нельзя.
+    // xor edx, edx; xor r9d, r9d; mov r10, r8
+    emit_hex("31 D2 45 31 C9 4D 89 C2")
+    let l3 = code_len
+    // mov rax, [rcx + r9*8]; and rax, r11; add rax, rdx; setc dl; movzx edx, dl
+    emit_hex("4A 8B 04 C9 4C 21 D8 48 01 D0 0F 92 C2 0F B6 D2")
+    // add [rdi + r9*8], rax; adc rdx, 0; inc r9; dec r10; jnz l3
+    emit_hex("4A 01 04 CF 48 83 D2 00 49 FF C1 49 FF CA")
+    emit_jcc8_back(CC_NE, l3)
+}
+
