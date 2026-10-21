@@ -682,9 +682,19 @@ fn __pg_int(r: __PgRes, i: int) -> int {
         p += 1
     }
     var v = 0
-    while p < end {
+    while p < end && load8(p) != '.' {
         v = v * 10 + load8(p) - '0'
         p += 1
+    }
+    // numeric (sum по bigint, avg): дробная часть должна быть нулевой
+    if p < end {
+        p += 1
+        while p < end {
+            if load8(p) != '0' {
+                __panic_msg("the database returned {__pg_str(r, i)} where the program expects int: use float, or round in SQL")
+            }
+            p += 1
+        }
     }
     if neg {
         return -v
@@ -830,6 +840,14 @@ fn __pg_stmt(c: int, key: int) -> int {
 // Выполнить запрос с параметрами в текстовом виде (none — NULL). Parse (если
 // запроса ещё нет в кеше соединения), Bind, Execute и Sync уходят одним пакетом.
 fn __pg_exec(c: int, sql: str, params: [str?], deadline: int) -> __PgRes {
+    return __pg_query(c, sql, params, [], [], deadline)
+}
+
+// То же с типами параметров: types — OID (0 или нет — тип выводит сервер, так
+// строка подходит и к uuid, и к jsonb, и к date). Если вывести не вышло
+// («$1 is null», код 42P18), запрос подготавливается снова, и параметр получает
+// тип из fallback (int8 для int, text для str…).
+fn __pg_query(c: int, sql: str, params: [str?], types: [int], fallback: [int], deadline: int) -> __PgRes {
     let key = __alloc(32)
     __hash(32, __str_ptr(sql), sql.len(), key)
     var idx = __pg_stmt(c, key)
@@ -848,20 +866,18 @@ fn __pg_exec(c: int, sql: str, params: [str?], deadline: int) -> __PgRes {
         if n < PG_STMTS {
             idx = n
             name = "k{n}"
-            let at = __pg_begin(b, 'P')
-            __wr_cstr(b, name)
-            __wr_cstr(b, sql)
-            __wr_u16(b, 0)
-            __pg_end(b, at)
         } else {
             // кеш полон: безымянный запрос, соединение потом закроется
             store64(c + PB_BROKEN, 1)
-            let at = __pg_begin(b, 'P')
-            __wr_cstr(b, "")
-            __wr_cstr(b, sql)
-            __wr_u16(b, 0)
-            __pg_end(b, at)
         }
+        let at = __pg_begin(b, 'P')
+        __wr_cstr(b, name)
+        __wr_cstr(b, sql)
+        __wr_u16(b, types.len())
+        for t in types {
+            __wr_u32(b, t)
+        }
+        __pg_end(b, at)
     } else {
         name = "k{idx}"
     }
@@ -936,10 +952,57 @@ fn __pg_exec(c: int, sql: str, params: [str?], deadline: int) -> __PgRes {
                 __memcpy(c + PB_STMT + idx * 40, key, 32)
                 store64(c + PB_NSTMT, idx + 1)
             }
+            // тип параметра не вывелся (42P08/42P18 — какой именно, сказано в
+            // сообщении) или оператор неоднозначен с «unknown» (42725): взять
+            // типы из fallback и подготовить запрос снова
+            if fresh && ones < want && fallback.len() == params.len() && (load8(m.p) == 'I' || begin != 0) {
+                var only = -1
+                var retry = false
+                if res.err.code == "42P18" || res.err.code == "42P08" {
+                    if let k = __pg_param_no(res.err.message) {
+                        only = k
+                        retry = k >= 0 && k < params.len() && (k >= types.len() || types[k] == 0)
+                    }
+                } else if res.err.code == "42725" && res.err.message.contains("unknown") {
+                    for j in 0..params.len() {
+                        retry = retry || j >= types.len() || types[j] == 0
+                    }
+                }
+                if retry {
+                    if begin != 0 {
+                        // BEGIN ушёл в этом же пакете: откатить и отложить снова
+                        __pg_simple(c, "rollback", deadline)
+                        store64(c + PB_BEGIN, begin)
+                    }
+                    var t2: [int] = []
+                    for j in 0..params.len() {
+                        var t = 0
+                        if j < types.len() {
+                            t = types[j]
+                        }
+                        if t == 0 && (only < 0 || only == j) {
+                            t = fallback[j]
+                        }
+                        t2.push(t)
+                    }
+                    return __pg_query(c, sql, params, t2, fallback, deadline)
+                }
+            }
             return res
         }
     }
     return res
+}
+
+// Номер параметра (с 0) из «could not determine data type of parameter $2».
+fn __pg_param_no(msg: str) -> int? {
+    let at = msg.find("parameter $") else {
+        return none
+    }
+    let n = msg[at + 11..].to_int() else {
+        return none
+    }
+    return n - 1
 }
 
 // Простой запрос без параметров (BEGIN, COMMIT, миграции): несколько команд подряд.
@@ -1072,8 +1135,9 @@ fn __pg_tx_end(c: int, commit: bool, deadline: int) -> __PgErr {
     return e
 }
 
-// Конец запроса или задачи every: соединение, которое держит незавершённая
-// транзакция (паника, ранний выход), закрывается — сервер откатит транзакцию.
+// Конец запроса или задачи every: транзакция, которую прервали (fail,
+// паника), откатывается, и соединение возвращается в запас; если откатить не
+// вышло — закрывается (сервер откатит сам).
 fn __pg_request_end() {
     let cx = __ctx()
     let c = load64(cx + CTX_PGHELD)
@@ -1081,7 +1145,10 @@ fn __pg_request_end() {
         return
     }
     store64(cx + CTX_PGHELD, 0)
-    if load64(c + PB_BEGIN) != 0 || load64(c + PB_TX) != 'I' {
+    if load64(c + PB_BROKEN) == 0 && load64(c + PB_IN + 8) == 0 {
+        __pg_tx_end(c, false, now_ms() + 5000)
+    }
+    if load64(c + PB_TX) != 'I' {
         store64(c + PB_BROKEN, 1)
     }
     __pg_release(c)
@@ -1227,6 +1294,54 @@ fn __pg_cancel(c: int) {
     __wr_u32(b, load64(c + PB_SECRET))
     __fd_write_all(fd, b.data, 16, deadline)
     syscall(SYS_CLOSE, fd)
+}
+
+// ---- Запуск ----
+// Адрес базы — из DATABASE_URL, разбирается один раз до запуска потоков.
+// Пока база не отвечает (контейнер базы ещё стартует), запуск ждёт до минуты.
+
+var __pg_url: __PgUrl = __PgUrl { host: "", port: 0, user: "", password: "", db: "", ssl: "", root: "" }
+
+fn __pg_default() -> __PgUrl {
+    return __pg_url
+}
+
+// → соединение для миграций и проверки запросов; ошибка — выход с кодом 1.
+fn __pg_startup() -> int {
+    let raw = env("DATABASE_URL") ?? ""
+    if raw.len() == 0 {
+        eprint("khrip: DATABASE_URL is not set (postgres://user:password@host:5432/database)")
+        exit(1)
+    }
+    let u = __pg_parse_url(raw) else {
+        eprint("khrip: DATABASE_URL is not a postgres:// URL")
+        exit(1)
+        return 0
+    }
+    __pg_url = u
+    let until = now_ms() + 60000
+    var said = false
+    while true {
+        let pc = __pg_connect(u, now_ms() + 10000)
+        if pc.c != 0 {
+            return pc.c
+        }
+        // неверный пароль, нет такой базы, чужой сертификат — ждать бесполезно;
+        // «starting up», «too many clients» и т. п. — проходят сами
+        let e = pc.err
+        let passing = e.contains("starting up") || e.contains("shutting down") || e.contains("recovery") || e.contains("too many")
+        let hopeless = (e.starts_with("database:") || e.starts_with("tls:")) && !passing
+        if hopeless || now_ms() >= until {
+            eprint("khrip: cannot connect to the database at {u.host}:{u.port}: {pc.err}")
+            exit(1)
+        }
+        if !said {
+            eprint("khrip: waiting for the database at {u.host}:{u.port} ({pc.err})")
+            said = true
+        }
+        sleep(500)
+    }
+    return 0
 }
 
 // ---- Миграции ----
