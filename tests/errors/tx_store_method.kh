@@ -1,0 +1,9 @@
+// expect: store log is not rolled back with the tx block
+store log: [int] = []
+route POST "/x" -> 204 {
+    tx {
+        let n: int = sql "SELECT count(*) FROM t"
+        log.push(n)
+    }
+    return 204
+}

@@ -1,0 +1,12 @@
+// expect: add() changes its argument xs, which comes from outside tx
+fn add(xs: [int], v: int) {
+    xs.push(v)
+}
+route POST "/x" -> 204 {
+    var xs: [int] = []
+    tx {
+        let n: int = sql "SELECT count(*) FROM t"
+        add(xs, n)
+    }
+    return 204
+}

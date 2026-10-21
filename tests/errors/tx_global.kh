@@ -1,0 +1,8 @@
+// expect: 'hits' is a global, and the tx block may run again after a conflict
+var hits: int = 0
+fn main() {
+    tx {
+        let n: int = sql "SELECT count(*) FROM t"
+        hits += n
+    }
+}

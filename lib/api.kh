@@ -1432,7 +1432,11 @@ fn __call(method: str, target: str, body: int, d: int, headers: int) -> Response
     // как в сервере: всё, что запрос выделил в арене, освобождается после ответа
     let c = __ctx()
     let mark = load64(c + CTX_PTR)
+    // запрос — со своим соединением с базой, не с транзакцией теста
+    let held = load64(c + CTX_PGHELD)
+    store64(c + CTX_PGHELD, 0)
     __serve_one(w, req)
+    store64(c + CTX_PGHELD, held)
     let used = load64(c + CTX_PTR) - mark
     __memset(mark, 0, used)
     store64(c + CTX_PTR, mark)

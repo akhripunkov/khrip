@@ -1,0 +1,10 @@
+// expect: call inside tx: the request runs on its own connection, outside this transaction
+route GET "/y" -> int {
+    return 1
+}
+test "t" {
+    tx {
+        let n: int = sql "SELECT 1"
+        expect (call GET "/y").status == 200
+    }
+}

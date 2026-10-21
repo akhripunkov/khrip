@@ -1,8 +1,8 @@
-// expect: store is not rolled back with the tx block
+// expect: store hits is not rolled back with the tx block
 store hits: int = 0
 route POST "/x" -> 204 {
     tx {
-        sql "DELETE FROM t"
+        sql "DELETE FROM t WHERE id = 1"
         hits = hits + 1
     }
     return 204

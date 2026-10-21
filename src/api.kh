@@ -1026,6 +1026,9 @@ fn parse_call_expr() -> int {
     if !in_test() {
         error_tok(at, "call is only allowed inside test blocks", "")
     }
+    if tx_depth > 0 {
+        error_tok(at, "call inside tx: the request runs on its own connection, outside this transaction", "call it before or after the tx block")
+    }
     let mt = tok()
     var method = "GET"
     if mt.kind == T_IDENT && is_http_method(mt.text) {

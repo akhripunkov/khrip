@@ -404,10 +404,16 @@ fn fn_effect(fi: int) -> str {
         fx_state.push(0)
         fx_why.push("")
     }
-    if fx_state[fi] >= 2 || fx_state[fi] == 1 {
+    if fx_state[fi] >= 2 {
         return fx_why[fi]
     }
+    if fx_state[fi] == 1 {
+        // цикл вызовов: ответ ещё не готов, «чистый» результат не запоминать
+        fx_cycles += 1
+        return ""
+    }
     fx_state[fi] = 1
+    let cycles = fx_cycles
     let f = funcs[fi]
     var why = ""
     if f.body >= 0 && !f.is_lib {
@@ -416,9 +422,11 @@ fn fn_effect(fi: int) -> str {
             let t = toks[i]
             if t.kind == T_IDENT {
                 let nk = kind_at(i + 1)
-                if t.text == "fetch" || t.text == "sleep" {
+                let dotted = i > 0 && toks[i - 1].kind == '.'
+                if (t.text == "fetch" && !dotted) || (t.text == "sleep" && nk == '(') {
                     why = "calls " + t.text
                 } else if nk == '(' {
+                    // f(...) и x.f(...)
                     let g = func_find(t.text)
                     if g >= 0 && g != fi && !funcs[g].is_lib {
                         let w = fn_effect(g)
@@ -426,11 +434,13 @@ fn fn_effect(fi: int) -> str {
                             why = "calls " + t.text + "(), which " + w
                         }
                     }
-                } else {
+                } else if !dotted {
                     let s = sym_find(t.text)
-                    if s >= 0 && sym_kind(s) == SK_GLOBAL && globals[sym_idx(s)].is_store && (nk == '=' || is_assign_op(nk) || nk == '.' || nk == '[') && (i == 0 || toks[i - 1].kind != '.') {
-                        if nk != '.' || kind_at(i + 3) == '(' || is_assign_op(kind_at(i + 3)) {
+                    if s >= 0 && sym_kind(s) == SK_GLOBAL && fx_changes(i) {
+                        if globals[sym_idx(s)].is_store {
                             why = "changes store " + t.text
+                        } else {
+                            why = "changes the global " + t.text
                         }
                     }
                 }
@@ -439,12 +449,122 @@ fn fn_effect(fi: int) -> str {
         }
     }
     fx_why[fi] = why
-    if why == "" {
+    if why != "" {
+        fx_state[fi] = 3
+    } else if fx_cycles == cycles {
         fx_state[fi] = 2
     } else {
-        fx_state[fi] = 3
+        // зависел от функции, которую ещё считали: посчитать заново в следующий раз
+        fx_state[fi] = 0
     }
     return why
+}
+
+var fx_cycles: int
+
+// По функциям: какие параметры функция меняет (xs.push, b.n = ..., передаёт их
+// функции, которая меняет), сама или через вызовы.
+var pm_state: [int]
+var pm_vals: [[bool]]
+
+fn fn_param_mut(fi: int) -> [bool] {
+    while pm_state.len() < funcs.len() {
+        pm_state.push(0)
+        pm_vals.push([])
+    }
+    let f = funcs[fi]
+    if pm_state[fi] == 2 {
+        return pm_vals[fi]
+    }
+    var res: [bool] = []
+    for p in f.params {
+        res.push(false)
+    }
+    if pm_state[fi] == 1 {
+        return res
+    }
+    pm_state[fi] = 1
+    if f.body >= 0 && !f.is_lib {
+        for i in f.body..f.body_end {
+            let t = toks[i]
+            if t.kind != T_IDENT {
+                continue
+            }
+            let dotted = i > 0 && toks[i - 1].kind == '.'
+            if !dotted {
+                for p in 0..f.params.len() {
+                    if f.params[p].name == t.text && fx_mutates_through(i) {
+                        res[p] = true
+                    }
+                }
+            }
+            if kind_at(i + 1) == '(' {
+                let g = func_find(t.text)
+                if g >= 0 && g != fi && !funcs[g].is_lib {
+                    let gm = fn_param_mut(g)
+                    var shift = 0
+                    if dotted && i >= 2 && toks[i - 2].kind == T_IDENT {
+                        // x.g(...): x — первый параметр g
+                        shift = 1
+                        for p in 0..f.params.len() {
+                            if gm.len() > 0 && gm[0] && f.params[p].name == toks[i - 2].text {
+                                res[p] = true
+                            }
+                        }
+                    }
+                    let roots = call_arg_roots(i + 1)
+                    for a in 0..roots.len() {
+                        if a + shift < gm.len() && gm[a + shift] {
+                            for p in 0..f.params.len() {
+                                if f.params[p].name == roots[a] {
+                                    res[p] = true
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    pm_vals[fi] = res
+    pm_state[fi] = 2
+    return res
+}
+
+// Значение по имени toks[i] меняется через путь: x.f = ..., x[k] = ...,
+// x.push(...), x.a.push(...) (простое x = ... параметр не меняет).
+fn fx_mutates_through(i: int) -> bool {
+    let k = kind_at(i + 1)
+    if k != '.' && k != '[' {
+        return false
+    }
+    return fx_changes(i)
+}
+
+// Имя toks[i] (глобальная) меняется здесь: x = / x += / x.f = / x[k] = /
+// x.push(...) и т. п. (а не только читается: x[k], x.len(), x.f).
+fn fx_changes(i: int) -> bool {
+    var j = i + 1
+    while j < toks.len() {
+        let k = kind_at(j)
+        if is_assign_op(k) {
+            return true
+        }
+        if k == '.' && kind_at(j + 1) == T_IDENT {
+            if kind_at(j + 2) == '(' {
+                let m = toks[j + 1].text
+                return rw_mutating(m) || m == "extend" || m == "set" || m == "delete"
+            }
+            j += 2
+            continue
+        }
+        if k == '[' {
+            j = matching_close(j) + 1
+            continue
+        }
+        return false
+    }
+    return false
 }
 
 // ---- migration N `...` ----
@@ -1068,7 +1188,13 @@ fn sql_rules(at: Token, s: str, shape: int) {
             }
         }
         if seen && !has_where {
-            error_tok(at, sql_upper(main) + " without WHERE changes every row of " + sql_target_table(s).trim(), "add WHERE ...; write WHERE true if you mean every row")
+            var table = sql_target_table(s).trim()
+            for i in 0..ws.len() - 1 {
+                if table.len() == 0 && ws[i].w == "from" && ws[i].depth == 0 {
+                    table = ws[i + 1].w
+                }
+            }
+            error_tok(at, sql_upper(main) + " without WHERE changes every row of " + table, "add WHERE ...; write WHERE true if you mean every row")
             return
         }
     }

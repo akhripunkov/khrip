@@ -1,0 +1,11 @@
+// expect: 'a' refers to a value from outside tx, and the block may run again after a conflict
+type Box { n: int }
+route POST "/x" -> 204 {
+    let b = Box { n: 0 }
+    tx {
+        let n: int = sql "SELECT count(*) FROM t"
+        let a = b
+        a.n = n
+    }
+    return 204
+}

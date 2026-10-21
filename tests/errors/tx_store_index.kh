@@ -1,0 +1,10 @@
+// expect: store users is not rolled back with the tx block
+type U { n: int }
+store users: map[int, U] = {}
+route POST "/x" -> 204 {
+    tx {
+        let n: int = sql "SELECT count(*) FROM t"
+        users[n] = U { n: n }
+    }
+    return 204
+}

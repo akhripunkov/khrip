@@ -42,6 +42,8 @@ const PB_TXLOCK = 152
 const PB_ROFF = 160
 // место, чей подготовленный оператор устарел (номер + 1): перед новым Parse — Close
 const PB_STALE = 168
+// запрос отправлен, ответ ещё не дочитан: прерванное так соединение не годится
+const PB_INFLIGHT = 176
 // подготовленные запросы: SHA-256 текста (32 байта) и номер — по 40 байт
 const PB_STMT = 256
 const PG_STMTS = 200
@@ -223,6 +225,17 @@ type __PgMsg {
 }
 
 fn __pg_read(c: int, deadline: int) -> __PgMsg? {
+    let v = __pg_read_view(c, deadline) else {
+        return none
+    }
+    let m = __alloc(v.n + 1)
+    __memcpy(m, v.p, v.n)
+    return __PgMsg { kind: v.kind, p: m, n: v.n }
+}
+
+// То же без копии: тело сообщения — во входном буфере и живо до следующего
+// чтения (DataRow большого ответа не копируется лишний раз).
+fn __pg_read_view(c: int, deadline: int) -> __PgMsg? {
     var b = __pg_buf(c)
     while true {
         let off = load64(c + PB_ROFF)
@@ -234,8 +247,6 @@ fn __pg_read(c: int, deadline: int) -> __PgMsg? {
                 return none
             }
             if avail >= 1 + len {
-                let m = __alloc(len)
-                __memcpy(m, at + 5, len - 4)
                 let kind = load8(at)
                 if avail == 1 + len {
                     b.len = 0
@@ -244,7 +255,7 @@ fn __pg_read(c: int, deadline: int) -> __PgMsg? {
                 } else {
                     store64(c + PB_ROFF, off + 1 + len)
                 }
-                return __PgMsg { kind, p: m, n: len - 4 }
+                return __PgMsg { kind, p: at + 5, n: len - 4 }
             }
         }
         if off > 0 {
@@ -909,6 +920,10 @@ fn __pg_query(c: int, sql: str, params: [str?], types: [int], fallback: [int], d
 // site — номер места sql в программе: подготовленный запрос ищется по нему,
 // без хеша текста; -1 — по SHA-256 текста (запросы рантайма).
 fn __pg_query_at(c: int, site: int, sql: str, params: [str?], types: [int], fallback: [int], deadline: int) -> __PgRes {
+    if now_ms() >= deadline {
+        // срок вышел до отправки: ничего не произошло, соединение цело
+        return __PgRes { cols: 0, rows: 0, data: buf_new(16), at: [], affected: 0, err: __PgErr { code: "57014", message: "the database time budget ran out before the query was sent" } }
+    }
     var key = 0
     var idx = -1
     var fresh = true
@@ -1000,7 +1015,7 @@ fn __pg_query_at(c: int, site: int, sql: str, params: [str?], types: [int], fall
         }
     }
     while true {
-        let m = __pg_read(c, deadline) else {
+        let m = __pg_read_view(c, deadline) else {
             res.err = __pg_lost(c, deadline)
             return res
         }
@@ -1244,11 +1259,18 @@ fn __pg_tx_end(c: int, commit: bool, deadline: int) -> __PgErr {
     if load64(c + PB_TX) == 'I' {
         return __PgErr {}
     }
+    // COMMIT и ROLLBACK — со своим запасом времени: бюджет блока мог кончиться,
+    // а оборвать фиксацию на полпути — значит не знать, что с ней стало
+    let grace = deadline.max(now_ms() + 5000)
     if !commit {
-        return __pg_simple(c, "rollback", deadline)
+        return __pg_simple(c, "rollback", grace)
     }
     let failed = load64(c + PB_TX) == 'E'
-    let e = __pg_simple(c, "commit", deadline)
+    let e = __pg_simple(c, "commit", grace)
+    if e.code == "08006" || e.code == "57014" {
+        // связь пропала после отправки COMMIT: зафиксировано или нет — неизвестно
+        return __PgErr { code: "08007", message: "the connection was lost during COMMIT: the outcome is unknown" }
+    }
     if e.code.len() == 0 && failed {
         // после ошибки COMMIT молча откатывает: сказать об этом явно
         return __PgErr { code: "25P02", message: "the transaction was rolled back because a statement in it failed" }
@@ -1266,6 +1288,10 @@ fn __pg_request_end() {
         return
     }
     store64(cx + CTX_PGHELD, 0)
+    if load64(c + PB_INFLIGHT) != 0 {
+        // паника посреди запроса: ответ не дочитан
+        store64(c + PB_BROKEN, 1)
+    }
     if load64(c + PB_BROKEN) == 0 && load64(c + PB_IN + 8) == 0 {
         __pg_tx_end(c, false, now_ms() + 5000)
         __pg_unlock_tx(c)
@@ -1325,14 +1351,17 @@ fn __pg_pool() -> int {
     var p = load64(c + CTX_PGPOOL)
     if p == 0 {
         p = __mmap(PGP_SIZE)
-        var per = 4
-        if let total = env("DATABASE_POOL") {
-            let t = total.to_int() ?? 0
+        // DATABASE_POOL — на процесс (по умолчанию 4 на поток, не больше 32),
+        // делится между потоками; у каждого потока хотя бы одно
+        let threads = __threads.max(1)
+        var total = (4 * threads).min(32)
+        if let v = env("DATABASE_POOL") {
+            let t = v.to_int() ?? 0
             if t > 0 {
-                per = (t + __threads.max(1) - 1) / __threads.max(1)
+                total = t
             }
         }
-        store64(p + 16, per.max(1).min(PGP_MAX_IDLE))
+        store64(p + 16, (total / threads).max(1).min(PGP_MAX_IDLE))
         store64(c + CTX_PGPOOL, p)
     }
     return p
@@ -1341,7 +1370,7 @@ fn __pg_pool() -> int {
 // Живо ли свободное соединение: сервер мог закрыть его (перезапуск, тайм-аут
 // простоя) — тогда из сокета читается конец или сообщение об ошибке.
 fn __pg_alive(c: int) -> bool {
-    if load64(c + PB_BROKEN) != 0 || load64(c + PB_TX) != 'I' || load64(c + PB_IN + 8) != 0 {
+    if load64(c + PB_BROKEN) != 0 || load64(c + PB_TX) != 'I' || load64(c + PB_IN + 8) != 0 || load64(c + PB_INFLIGHT) != 0 {
         return false
     }
     let fd = load64(c + PB_FD)
@@ -1365,13 +1394,12 @@ fn __pg_acquire(u: __PgUrl, deadline: int) -> __PgConn {
             store64(p + 8, load64(p + 8) - 1)
         }
         let cv = load64(__ctx() + CTX_CORO)
+        if now_ms() >= deadline {
+            return __PgConn { c: 0, err: "timeout waiting for a database connection" }
+        }
         if load64(p + 8) < load64(p + 16) || cv == 0 {
             store64(p + 8, load64(p + 8) + 1)
-            let pc = __pg_connect(u, deadline)
-            if pc.c == 0 {
-                store64(p + 8, load64(p + 8) - 1)
-            }
-            return pc
+            return __pg_open_slot(p, u, deadline)
         }
         // все заняты: встать в очередь
         let w = load64(p + 24)
@@ -1389,13 +1417,44 @@ fn __pg_acquire(u: __PgUrl, deadline: int) -> __PgConn {
         store64(p + 24, w + 1)
         __co_wait(-1, 0, left)
         let got = load64(cell)
-        if got != 0 {
+        if got > 0 {
             return __PgConn { c: got, err: "" }
+        }
+        if got < 0 {
+            // передано место: открыть своё соединение (счётчик уже учтён)
+            if now_ms() >= deadline {
+                __pg_slot_free(p)
+                return __PgConn { c: 0, err: "timeout waiting for a database connection" }
+            }
+            return __pg_open_slot(p, u, deadline)
         }
         // не дождались (срок) или соединение закрылось — снова с начала
         __pg_unwait(p, cv)
     }
     return __PgConn { c: 0, err: "" }
+}
+
+// Открыть соединение на занятое (уже посчитанное) место; не вышло — место
+// следующему ждущему.
+fn __pg_open_slot(p: int, u: __PgUrl, deadline: int) -> __PgConn {
+    let pc = __pg_connect(u, deadline)
+    if pc.c == 0 {
+        __pg_slot_free(p)
+    }
+    return pc
+}
+
+// Место в запасе освободилось (соединение закрыто или не открылось): первый
+// ждущий получает право открыть своё (-1 в ячейке), иначе открытых меньше.
+fn __pg_slot_free(p: int) {
+    if load64(p + 24) > 0 {
+        let cell = load64(p + PGP_WAIT + 8)
+        let cv = __pg_first_waiter(p)
+        store64(cell, -1)
+        __co_notify(cv)
+        return
+    }
+    store64(p + 8, load64(p + 8) - 1)
 }
 
 fn __pg_unwait(p: int, cv: int) {
@@ -1423,7 +1482,13 @@ fn __pg_first_waiter(p: int) -> int {
 fn __pg_release(c: int) {
     let p = __pg_pool()
     let n = load64(p)
-    let healthy = load64(c + PB_BROKEN) == 0 && load64(c + PB_TX) == 'I' && load64(c + PB_BEGIN) == 0
+    let healthy = load64(c + PB_BROKEN) == 0 && load64(c + PB_TX) == 'I' && load64(c + PB_BEGIN) == 0 && load64(c + PB_INFLIGHT) == 0
+    if healthy && load64(c + PB_IN + 16) > 1048576 && load64(c + PB_IN + 8) == 0 {
+        // буфер вырос под большое значение: вернуть память системе
+        syscall(SYS_MUNMAP, load64(c + PB_IN), load64(c + PB_IN + 16))
+        __pg_save(c, buf_mm(16384))
+        store64(c + PB_ROFF, 0)
+    }
     if healthy && load64(p + 24) > 0 {
         let cell = load64(p + PGP_WAIT + 8)
         let cv = __pg_first_waiter(p)
@@ -1435,13 +1500,10 @@ fn __pg_release(c: int) {
         store64(c + PB_USED, now_ms())
         store64(p + PGP_IDLE + n * 8, c)
         store64(p, n + 1)
-    } else {
-        __pg_free(c)
-        store64(p + 8, load64(p + 8) - 1)
+        return
     }
-    if load64(p + 24) > 0 {
-        __co_notify(__pg_first_waiter(p))
-    }
+    __pg_free(c)
+    __pg_slot_free(p)
 }
 
 // Отменить запрос, который выполняется на соединении c (CancelRequest по

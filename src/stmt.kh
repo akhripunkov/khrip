@@ -159,16 +159,6 @@ fn parse_stmt() -> bool {
         parse_assign()
         return false
     }
-    if tx_depth > 0 && k == T_IDENT && kind_at(pos + 1) == '.' && kind_at(pos + 2) == T_IDENT && kind_at(pos + 3) == '(' {
-        // xs.push(...) над списком снаружи блока
-        let m = toks[pos + 2].text
-        if m == "push" || m == "pop" || m == "insert" || m == "remove" || m == "clear" || m == "sort" || m == "sort_by" || m == "reverse" || m == "extend" || m == "set" || m == "delete" {
-            let li = find_local(t.text)
-            if li >= 0 {
-                tx_outer_check(t, li)
-            }
-        }
-    }
     let ty = parse_expr(ty_err)
     if kind() == T_ELSE && tkind(ty) == K_OPT {
         // выражение else { ... } — блок выполняется, если значения нет
@@ -248,10 +238,15 @@ fn tx_open() -> int {
     tx_loop_base = loop_depth
     tx_depth += 1
     tx_locals.push(li)
+    tx_alias_marks.push(tx_aliases.len())
     return li
 }
 
 fn tx_close() {
+    let mark = tx_alias_marks.pop()
+    while tx_aliases.len() > mark {
+        tx_aliases.pop()
+    }
     tx_locals = tx_locals[0..tx_locals.len() - 1]
     tx_depth -= 1
     tx_local_base = tx_saved_base.pop()
@@ -261,6 +256,7 @@ fn tx_close() {
 // return внутри tx в обычной функции: зафиксировать блоки этой функции.
 var tx_saved_base: [int]
 var tx_saved_loop: [int]
+var tx_alias_marks: [int]
 
 fn tx_commit_all() {
     if tx_locals.len() == 0 {
@@ -279,6 +275,10 @@ fn tx_commit_all() {
 
 // Изменение внешней переменной внутри tx: блок может выполниться дважды.
 fn tx_outer_check(t: Token, li: int) {
+    if tx_depth > 0 && li >= tx_local_base && tx_alias_has(t.text) {
+        error_tok(t, "'" + t.text + "' refers to a value from outside tx, and the block may run again after a conflict", "change a copy, or change it after the block")
+        return
+    }
     if tx_depth > 0 && li < tx_local_base {
         error_tok(t, "'" + t.text + "' is declared outside tx, and the block may run again after a conflict", "compute the value inside: let " + t.text + "2 = tx \{ ... } — or change it after the block")
     }
@@ -407,9 +407,13 @@ fn parse_let() {
         error_tok(eq, "this expression has no value", "")
         final_t = ty_err
     }
+    let alias = tx_alias_source(from) && is_ref(final_t)
     let li = declare_local(name.text, final_t, mutable)
     if final_t == ty_str {
         locals[li].lits = lits
+    }
+    if alias {
+        tx_aliases.push(name.text)
     }
     emit_store_local(li)
 }
@@ -465,12 +469,16 @@ fn parse_assign() {
         assign_name(t, op, at)
         return
     }
+    // x.f = ..., x[k] = ..., x.a.push(...): корень — x
+    let saved_root = mut_root
+    let saved_fresh = mut_fresh
+    mut_root = t
+    mut_fresh = false
     if tx_depth > 0 {
-        let li = find_local(t.text)
-        if li >= 0 {
-            tx_outer_check(t, li)
-        }
+        tx_mutation(t)
     }
+    mut_root = saved_root
+    mut_fresh = saved_fresh
     advance()
     var ty = load_name_value(t)
     while !panic_mode {
@@ -690,9 +698,11 @@ fn assign_name(t: Token, op: int, at: Token) {
     let g = globals[sym_idx(s)]
     if g.is_store {
         if tx_depth > 0 {
-            error_tok(t, "store is not rolled back with the tx block", "change it after the block, from the block's result")
+            error_tok(t, "store " + name + " is not rolled back with the tx block, and the block may run again after a conflict", "change it after the block, from the block's result")
         }
         store_touch()
+    } else if tx_depth > 0 {
+        error_tok(t, "'" + name + "' is a global, and the tx block may run again after a conflict", "change it after the block, from the block's result")
     }
     if op == '=' {
         let vtok = tok()
@@ -1309,7 +1319,14 @@ fn parse_for() {
     let saved_ns = no_struct
     no_struct = true
     let at = tok()
+    let from = pos
     let t = parse_expr(ty_err)
+    // for x in xs (xs снаружи tx): элементы — те же значения
+    let mark = tx_aliases.len()
+    if tx_alias_source(from) {
+        tx_aliases.push(n1.text)
+        tx_aliases.push(n2.text)
+    }
     if kind() == T_DOTDOT || kind() == T_DOTDOTEQ {
         let inclusive = kind() == T_DOTDOTEQ
         advance()
@@ -1339,6 +1356,9 @@ fn parse_for() {
             }
             parse_block()
         }
+    }
+    while tx_aliases.len() > mark {
+        tx_aliases.pop()
     }
     nlocals = saved_n
 }

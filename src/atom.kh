@@ -563,16 +563,27 @@ fn count_name(xs: [str], s: str) -> int {
 
 fn parse_postfix(t0: int, at: Token) -> int {
     var t = t0
+    // корень цепочки — для проверки изменений внутри tx (tx_mutation)
+    let saved_root = mut_root
+    let saved_fresh = mut_fresh
+    mut_root = at
+    mut_fresh = at.kind != T_IDENT
     while true {
         let k = kind()
         if k == '.' {
             advance()
             let nt = expect_ident()
             if panic_mode {
+                mut_root = saved_root
+                mut_fresh = saved_fresh
                 return ty_err
             }
             if kind() == '(' {
                 t = parse_method(t, nt)
+                // результат метода — новое значение (кроме sort/reverse: тот же список)
+                if !rw_same_method(nt.text) {
+                    mut_fresh = true
+                }
             } else {
                 t = field_load(t, nt)
             }
@@ -580,12 +591,152 @@ fn parse_postfix(t0: int, at: Token) -> int {
             t = parse_index(t)
         } else if k == '?' && kind_at(pos + 1) == '.' {
             syntax_error(tok(), "Khrip has no ?. operator", "unwrap first: let v = x else \{ ... } or if let v = x \{ ... }")
+            mut_root = saved_root
+            mut_fresh = saved_fresh
             return ty_err
         } else {
+            // цепочка кончилась: запомнить, откуда она (let a = b.items — псевдоним)
+            last_chain_root = mut_root
+            last_chain_fresh = mut_fresh
+            last_chain_end = pos
+            mut_root = saved_root
+            mut_fresh = saved_fresh
             return t
         }
     }
     return t
+}
+
+// ---- Изменения внутри tx ----
+// Блок tx может выполниться снова после конфликта: всё, что он меняет вне
+// базы, изменилось бы дважды. Корень цепочки (xs в xs.a[i].push(v)) — внешняя
+// локальная, store или глобальная → ошибка.
+var mut_root: Token = Token { kind: 0, val: 0, text: "", line: 0, col: 0, file: 0 }
+var mut_fresh: bool
+var last_chain_root: Token = Token { kind: 0, val: 0, text: "", line: 0, col: 0, file: 0 }
+var last_chain_fresh: bool
+var last_chain_end: int
+// внутри tx: локальные, которые ссылаются на значения снаружи (let a = b,
+// for x in xs) — менять их так же нельзя
+var tx_aliases: [str]
+
+fn tx_alias_has(name: str) -> bool {
+    var i = tx_aliases.len() - 1
+    while i >= 0 {
+        if tx_aliases[i] == name {
+            return true
+        }
+        i -= 1
+    }
+    return false
+}
+
+// Имя — значение снаружи блока tx: внешняя локальная, псевдоним, store, глобальная.
+fn tx_is_outer(name: str) -> bool {
+    let li = find_local(name)
+    if li >= 0 {
+        return li < tx_local_base || tx_alias_has(name)
+    }
+    let s = sym_find(name)
+    return s >= 0 && sym_kind(s) == SK_GLOBAL
+}
+
+// Выражение toks[from..pos] — путь к значению снаружи tx (b, b.items, users[k])
+// без вызовов методов, которые дают новое значение.
+fn tx_alias_source(from: int) -> bool {
+    if tx_depth == 0 || last_chain_end != pos || last_chain_fresh || last_chain_root.kind != T_IDENT {
+        return false
+    }
+    let r = toks[from]
+    if r.line != last_chain_root.line || r.col != last_chain_root.col || r.file != last_chain_root.file {
+        return false
+    }
+    return tx_is_outer(r.text)
+}
+
+// Аргументы вызова, открытого скобкой open: для каждого — корень пути (xs в
+// xs, b.items, m[k]) или "".
+fn call_arg_roots(open: int) -> [str] {
+    var out: [str] = []
+    let close = matching_close(open)
+    var i = open + 1
+    while i < close {
+        var j = i
+        var depth = 0
+        while j < close && !(depth == 0 && kind_at(j) == ',') {
+            let k = kind_at(j)
+            if k == '(' || k == '[' || k == '\{' {
+                depth += 1
+            } else if k == ')' || k == ']' || k == '}' {
+                depth -= 1
+            }
+            j += 1
+        }
+        var root = ""
+        if kind_at(i) == T_IDENT {
+            var q = i + 1
+            var path = true
+            while q < j && path {
+                if kind_at(q) == '.' && kind_at(q + 1) == T_IDENT && kind_at(q + 2) != '(' {
+                    q += 2
+                } else if kind_at(q) == '[' {
+                    q = matching_close(q) + 1
+                } else {
+                    path = false
+                }
+            }
+            if path {
+                root = toks[i].text
+            }
+        }
+        out.push(root)
+        i = j + 1
+    }
+    return out
+}
+
+// Вызов функции программы внутри tx: она меняет параметр, а ей передали значение снаружи.
+fn tx_arg_check(t: Token, fi: int, shift: int) {
+    // скобка вызова — текущая или только что пройденная
+    var open = pos
+    if kind() != '(' {
+        open = pos - 1
+    }
+    if kind_at(open) != '(' {
+        return
+    }
+    let pm = fn_param_mut(fi)
+    let roots = call_arg_roots(open)
+    for a in 0..roots.len() {
+        let p = a + shift
+        if p < pm.len() && pm[p] && roots[a].len() > 0 && tx_is_outer(roots[a]) {
+            error_tok(t, t.text + "() changes its argument " + roots[a] + ", which comes from outside tx, and the block may run again after a conflict", "pass a copy, or call it after the block")
+        }
+    }
+}
+
+fn tx_mutation(at: Token) {
+    if tx_depth == 0 || mut_fresh || mut_root.kind != T_IDENT {
+        return
+    }
+    let name = mut_root.text
+    let li = find_local(name)
+    if li >= 0 {
+        tx_outer_check(mut_root, li)
+        return
+    }
+    let s = sym_find(name)
+    if s >= 0 && sym_kind(s) == SK_GLOBAL {
+        if globals[sym_idx(s)].is_store {
+            error_tok(at, "store " + name + " is not rolled back with the tx block, and the block may run again after a conflict", "change it after the block, from the block's result")
+        } else {
+            error_tok(at, "'" + name + "' is a global, and the tx block may run again after a conflict", "change it after the block, from the block's result")
+        }
+    }
+}
+
+fn mutating_method(name: str) -> bool {
+    return rw_mutating(name) || name == "extend" || name == "set" || name == "delete"
 }
 
 fn field_load(t: int, nt: Token) -> int {
@@ -1455,6 +1606,7 @@ fn parse_call(t: Token, w: int) -> int {
         if why != "" {
             error_tok(t, name + "() " + why + ", and the tx block may run again after a conflict", "call it before or after the tx block")
         }
+        tx_arg_check(t, fi, 0)
     }
     let n = compile_args(f.params, 0, ty_err, ty_err, ty_err, name, t)
     if n != f.params.len() {
@@ -1504,6 +1656,14 @@ fn skip_call_args() {
 fn parse_method(rt: int, nt: Token) -> int {
     let name = nt.text
     let k = tkind(rt)
+    if tx_depth > 0 {
+        if mutating_method(name) {
+            tx_mutation(nt)
+        }
+        if (name == "sleep" || name == "fetch") && !files[nt.file].is_lib {
+            error_tok(nt, name + " inside tx: the block may run again after a conflict", "call it before or after the tx block")
+        }
+    }
     if rt == ty_err {
         skip_call_args()
         return ty_err
@@ -1559,6 +1719,18 @@ fn parse_method(rt: int, nt: Token) -> int {
         let uf = func_find(name)
         if uf >= 0 && funcs[uf].params.len() > 0 && assignable(rt, funcs[uf].params[0].ty) {
             fi = uf
+            if tx_depth > 0 && !funcs[uf].is_lib {
+                let why = fn_effect(uf)
+                if why != "" {
+                    error_tok(nt, name + "() " + why + ", and the tx block may run again after a conflict", "call it before or after the tx block")
+                }
+                // x.f(...): x — первый параметр
+                let pm = fn_param_mut(uf)
+                if pm.len() > 0 && pm[0] {
+                    tx_mutation(nt)
+                }
+                tx_arg_check(nt, uf, 1)
+            }
         }
     }
     if fi < 0 {

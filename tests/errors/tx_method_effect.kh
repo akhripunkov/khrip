@@ -1,0 +1,11 @@
+// expect: notify() calls fetch, and the tx block may run again after a conflict
+fn notify(id: int) {
+    fetch POST "http://127.0.0.1:9/hit/{id}"
+}
+route POST "/x" -> 204 {
+    tx {
+        let n: int = sql "SELECT count(*) FROM t"
+        n.notify()
+    }
+    return 204
+}
