@@ -366,9 +366,18 @@ fn default_literal() -> int {
         advance()
         return ty_int
     }
+    if k == '-' && kind_at(pos + 1) == T_FLOAT {
+        advance()
+        advance()
+        return ty_float
+    }
     if k == T_INT {
         advance()
         return ty_int
+    }
+    if k == T_FLOAT {
+        advance()
+        return ty_float
     }
     if k == T_STR {
         advance()
@@ -406,6 +415,9 @@ fn default_literal() -> int {
 fn default_fits(lt: int, ft: int) -> bool {
     if lt == ty_none {
         return tkind(ft) == K_OPT
+    }
+    if lt == ty_int && ty_inner(ft) == ty_float {
+        return true
     }
     if tkind(lt) == K_LIST || tkind(lt) == K_MAP {
         return tkind(ft) == tkind(lt)
@@ -456,7 +468,10 @@ fn prescan_struct_fields(s: int) {
                     if lt < 0 {
                         error_tok(at, "a field default must be a literal: a number, string, true, false, none, [], \{} or a variant without fields", "compute other values in the code that creates the value")
                         def = -1
-                        skip_line()
+                        // до следующего поля: «,», «}» или конец строки
+                        while kind() != ',' && kind() != '}' && kind() != T_EOF && tok().line == at.line {
+                            advance()
+                        }
                     } else if !default_fits(lt, ft) && ft != ty_err {
                         error_tok(at, "the default does not fit field '" + fname.text + "' of type " + ty_name(ft), "")
                     }

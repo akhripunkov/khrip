@@ -1,0 +1,10 @@
+// Значения по умолчанию полей в JSON: отсутствует — по умолчанию, null — none у T?.
+type P { a: int? = 5, b: str? = "keep", c: float = 1.5, d: float? = -2, e: int = -3, f: bool? = true }
+fn main() {
+    for t in ["\{}", "\{\"a\": null, \"b\": null, \"d\": null, \"f\": null}", "\{\"a\": 7, \"b\": \"x\", \"c\": 2.5, \"d\": 0.5, \"e\": 4, \"f\": false}"] {
+        let p: P? = from_json(t)
+        if let v = p {
+            print("{t}: a={v.a ?? -1} b={v.b ?? "<none>"} c={v.c} d={v.d ?? 99.0} e={v.e} f={v.f ?? false}")
+        }
+    }
+}

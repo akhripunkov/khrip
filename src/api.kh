@@ -571,7 +571,7 @@ fn type_desc(t: int) -> int {
                     desc_put(off, fo + 4, sk)
                 } else {
                     desc_put(off, fo + 3, 1)
-                    desc_put(off, fo + 4, default_word(f.def))
+                    desc_put(off, fo + 4, default_word(f.def, f.ty))
                 }
             }
             i += 1
@@ -607,24 +607,46 @@ fn type_desc(t: int) -> int {
 }
 
 // Слово значения по умолчанию из литерала в позиции i.
-fn default_word(i: int) -> int {
+// Значение по умолчанию поля (литерал в токене i) как слово для JSON: у T?
+// скаляра — адрес ячейки с ним, float — биты double.
+fn default_word(i: int, ty: int) -> int {
     let t = toks[i]
+    let inner = ty_inner(ty)
+    var v = 0
+    if t.kind == T_NONE {
+        return 0
+    }
     if t.kind == '-' {
-        return -toks[i + 1].val
-    }
-    if t.kind == T_INT {
-        return t.val
-    }
-    if t.kind == T_STR {
+        let n = toks[i + 1]
+        if n.kind == T_FLOAT {
+            v = n.val ^ (1 << 63)
+        } else if inner == ty_float {
+            v = __int_to_f64_bits(-n.val)
+        } else {
+            v = -n.val
+        }
+    } else if t.kind == T_INT {
+        v = t.val
+        if inner == ty_float {
+            v = __int_to_f64_bits(t.val)
+        }
+    } else if t.kind == T_FLOAT {
+        v = t.val
+    } else if t.kind == T_STR {
         return strlit(t.val)
-    }
-    if t.kind == T_TRUE {
-        return 1
-    }
-    if t.kind == T_IDENT {
+    } else if t.kind == T_TRUE {
+        v = 1
+    } else if t.kind == T_IDENT {
         return unit_addr(struct_find(t.text))
     }
-    return 0
+    if tkind(ty) == K_OPT && (inner == ty_int || inner == ty_float || inner == ty_bool) {
+        // T?: ячейка со значением в данных программы
+        data_align()
+        let a = DATA_BASE + data_len
+        data_u64(v)
+        return a
+    }
+    return v
 }
 
 // ---- Ответы маршрутов ----
