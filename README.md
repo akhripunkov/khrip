@@ -83,6 +83,71 @@ build/khc -o users users.kh  # статический бинарник ~140 КБ
 доступны обработчикам так, будто запросы идут по одному. Паника в обработчике — 500,
 сервер работает дальше.
 
+## PostgreSQL
+
+```khrip
+migration 1 `
+CREATE TABLE accounts (id bigserial PRIMARY KEY, owner text NOT NULL,
+    balance bigint NOT NULL DEFAULT 0 CHECK (balance >= 0));
+`
+type Account { id: int, owner: str, balance: int }
+type Transfer { from: int, to: int, amount: int }
+
+route GET "/accounts/{id}" (id: int) -> Account | 404 {
+    return sql "SELECT * FROM accounts WHERE id = {id}"      // нет строки — 404
+}
+
+route POST "/transfers" (body: Transfer) -> 204 | 404 | 409 str {
+    tx {                                                      // SERIALIZABLE, повтор при конфликте
+        let from: Account = sql `SELECT * FROM accounts WHERE id = {body.from}`
+        if from.balance < body.amount {
+            return 409 "insufficient funds"                   // откат
+        }
+        sql "UPDATE accounts SET balance = balance - {body.amount} WHERE id = {body.from}"
+        sql "UPDATE accounts SET balance = balance + {body.amount} WHERE id = {body.to}"
+    }
+    return 204
+}
+```
+
+SQL пишется как есть, `{x}` уходит параметром (собрать текст запроса из строки
+времени выполнения нельзя — инъекции нет по построению), тип результата задаёт
+ожидаемый тип: `T` — одна строка или 404, `T?` — одна или ни одной, `[T]` — все.
+Компилятор ловит привычки других драйверов и диалектов (`$1`, `?`, `BEGIN`,
+`INSERT IGNORE`, `IFNULL`...), запись после чтения вне `tx`, неизвестные таблицы и
+столбцы по миграциям; сервер при запуске готовит каждый запрос на настоящей базе и
+сверяет типы — и не запускается, если что-то не сходится. Свой клиент протокола:
+без libpq, SCRAM, TLS через свой TLS 1.3, пул соединений на сопрограммах.
+
+| Переменная | Что задаёт |
+|---|---|
+| `DATABASE_URL` | `postgres://user:password@host:5432/db?sslmode=…` (`disable`, `prefer` — по умолчанию, `require`, `verify-ca`, `verify-full`; `sslrootcert=system` — корни системы) |
+| `DATABASE_POOL` | соединений на процесс; по умолчанию 4 на поток, не больше 32 |
+| `DATABASE_TIMEOUT` | мс на запрос или блок `tx` вместе с ожиданием соединения и повторами (10000); дальше — CancelRequest и 503 |
+| `DATABASE_MIGRATE` | `apply` — миграции при запуске (по умолчанию); `check` — только проверить, применяет отдельный шаг `./app migrate` |
+| `KHRIP_TEST_DATABASE_URL` | база для `khc test` (иначе `DATABASE_URL`); тесты работают во временной схеме и удаляют её |
+
+| Ошибка базы | Ответ |
+|---|---|
+| дубликат (23505), нарушение CHECK | 409 |
+| нет строки, на которую ссылается внешний ключ | 404; на строку ещё ссылаются — 409 |
+| NOT NULL, неверное значение (22xxx) | 400 |
+| база недоступна, перегружена, тайм-аут | 503 и `Retry-After` |
+| связь пропала во время COMMIT | 500 «transaction outcome unknown» |
+| остальное | 500; текст запроса — в журнал, не клиенту |
+
+| PostgreSQL | Khrip |
+|---|---|
+| `smallint`, `integer`, `bigint`, `numeric` без дробной части | `int` |
+| `real`, `double precision`, `numeric` | `float` |
+| `text`, `varchar`, `uuid`, `citext` и другие | `str` |
+| `boolean` | `bool` |
+| `timestamptz`, `timestamp`, `date` | `str` (как `time_iso`) или `int` (секунды Unix) |
+| `json`, `jsonb` | любой тип |
+| массивы | `[T]` |
+| свой `ENUM` | вариант `type Role = Admin \| Member` или `str` |
+| столбец без NOT NULL | `T?` |
+
 ## Где мы сейчас (v0.11)
 
 **Свой TLS 1.3** ([отчёт](bench/results/2026-10-21-v0.11-tls.md)): `fetch` по https

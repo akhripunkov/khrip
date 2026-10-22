@@ -1,0 +1,20 @@
+// Разбор больших результатов: 300 тыс. чисел и 100 тыс. строк по три столбца.
+// Лучшее из пяти, мс.
+type R { id: int, name: str, note: str }
+fn main() {
+    var ints = 1000000
+    var rows = 1000000
+    for _ in 0..5 {
+        let t0 = now_ms()
+        let xs: [int] = sql "SELECT g FROM generate_series(1, 300000) g"
+        let t1 = now_ms()
+        let rs: [R] = sql "SELECT g AS id, 'name ' || g AS name, repeat('x', 100) AS note FROM generate_series(1, 100000) g"
+        let t2 = now_ms()
+        if xs.len() != 300000 || rs.len() != 100000 {
+            exit(1)
+        }
+        ints = ints.min(t1 - t0)
+        rows = rows.min(t2 - t1)
+    }
+    print("khrip\t{ints}\t{rows}")
+}
