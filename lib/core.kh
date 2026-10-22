@@ -1894,7 +1894,8 @@ fn __map_clear(m: int) {
     store64(load64(m + 24) + 8, 0)
     store64(m + 8, 0)
     store64(m + 56, 0)
-    store64(m + 32, __alloc(16 * 8))
+    // словарь в store: новая таблица — тоже в постоянной памяти, не в арене
+    store64(m + 32, __alloc_for(m, 16 * 8))
     store64(m + 40, 15)
 }
 

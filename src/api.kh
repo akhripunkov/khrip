@@ -458,8 +458,57 @@ fn prescan_every() {
     everies.push(EveryDecl { ms: nt.val * ms, fi: funcs.len() - 1 })
 }
 
+// Структура библиотеки с сырым указателем (Buf, служебные __-типы) внутри
+// типа t: в store её не увидит сборщик памяти. → имя или "".
+fn store_raw_type(t: int, seen: [int]) -> str {
+    let k = tkind(t)
+    if k == K_LIST || k == K_OPT {
+        return store_raw_type(types[t].a, seen)
+    }
+    if k == K_MAP {
+        return store_raw_type(types[t].b, seen)
+    }
+    var parts: [int] = []
+    if k == K_STRUCT {
+        parts.push(types[t].a)
+    } else if k == K_SUM {
+        for v in sums[types[t].a].variants {
+            parts.push(v)
+        }
+    }
+    for si in parts {
+        var dup = false
+        for x in seen {
+            dup = dup || x == si
+        }
+        if !dup {
+            seen.push(si)
+            let st = structs[si]
+            if st.tok >= 0 && files[toks[st.tok].file].is_lib && (st.name == "Buf" || st.name.starts_with("__")) {
+                return st.name
+            }
+            for f in st.fields {
+                let r = store_raw_type(f.ty, seen)
+                if r.len() > 0 {
+                    return r
+                }
+            }
+        }
+    }
+    return ""
+}
+
 // Проверки программы-сервера после предварительного прохода.
 fn check_api() {
+    for g in globals {
+        if g.is_store && !files[toks[g.tok].file].is_lib {
+            var seen: [int] = []
+            let bad = store_raw_type(g.ty, seen)
+            if bad.len() > 0 {
+                error_tok(toks[g.tok], "store '" + g.name + "' holds " + bad + ", which is a byte buffer of the library, not a value", "store the text instead: buf_str(b) gives a str")
+            }
+        }
+    }
     if routes.len() == 0 && everies.len() == 0 {
         return
     }
@@ -880,9 +929,11 @@ fn route_qq_ok() -> bool {
 
 // ---- store ----
 
-// Первое обращение к store в запросе берёт блокировку store.
+// Первое обращение к store в запросе берёт блокировку store. Решает файл кода,
+// а не функция, куда он встроен: встроенная пользовательская функция тоже
+// берёт блокировку, библиотечный и сгенерированный код — нет.
 fn store_touch() {
-    if !api_mode || inline_depth > 0 || funcs[cur_fn].is_lib {
+    if !api_mode || files[tok().file].is_lib {
         return
     }
     // cmp qword fs:[CTX_STORE_HELD], 0

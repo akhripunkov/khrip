@@ -1,0 +1,23 @@
+// Запись в store из маленькой функции, которую компилятор встраивает в
+// маршрут: блокировку store она берёт так же, как код самого маршрута
+// (tests/http.sh: 2000 одновременных запросов на 4 потоках — ни одной потери).
+store counter: int
+store seen: map[int, int]
+
+fn bump(k: int) {
+    counter += 1
+    seen[k % 100] = (seen[k % 100] ?? 0) + 1
+}
+
+route POST "/bump/{k}" (k: int) -> 204 {
+    bump(k)
+    return 204
+}
+
+route GET "/count" -> str {
+    var sum = 0
+    for v in seen.values() {
+        sum += v
+    }
+    return "{counter} {sum}"
+}

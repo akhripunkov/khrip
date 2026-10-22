@@ -1,4 +1,5 @@
 ok    create
 ok    read after the arena is reset
 ok    panic in a handler is a 500
-3 tests: 3 passed, 0 failed
+ok    map clear survives the next request
+4 tests: 4 passed, 0 failed

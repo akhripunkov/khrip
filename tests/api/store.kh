@@ -81,3 +81,30 @@ test "panic in a handler is a 500" {
     expect r.body.starts_with("panic: index out of range at tests/api/store.kh:")
     expect (call GET "/boom/2").body == "3"
 }
+
+// clear у словаря в store: новая таблица — в постоянной памяти, а не в арене
+// запроса, которую следующий запрос перезапишет
+store tags: map[str, int]
+store total: float
+
+route POST "/tags/reset" -> 204 {
+    tags["old"] = 1
+    tags.clear()
+    tags["new"] = 2
+    total += 0.5
+    return 204
+}
+
+route GET "/tags/new" -> int | 404 {
+    return tags["new"] ?? 404
+}
+
+test "map clear survives the next request" {
+    expect (call POST "/tags/reset").status == 204
+    var junk: [int] = []
+    for i in 0..10000 {
+        junk.push(i * 7 + 3)
+    }
+    expect (call GET "/tags/new").body == "2"
+    expect tags.len() == 1 && total == 0.5
+}

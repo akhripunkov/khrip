@@ -104,3 +104,26 @@ expect_count "сервер жив после ошибок" "$r" "^Hello, World!$
 
 kill "$server_pid"
 wait "$server_pid" 2>/dev/null
+
+# Запись в store из встроенной функции под одновременной нагрузкой: блокировка
+# store берётся и там (раньше встроенный код писал без неё и терял обновления).
+inl_port=$((HTTP_PORT + 1))
+if "$KHC" -o "$tmp/inline_store" tests/load/inline_store.kh >"$tmp/inline_store.err" 2>&1; then
+	PORT=$inl_port THREADS=4 "$tmp/inline_store" 2>/dev/null &
+	inl_pid=$!
+	for _ in $(seq 100); do
+		curl -s -o /dev/null "http://127.0.0.1:$inl_port/count" && break
+		sleep 0.05
+	done
+	seq 2000 | xargs -P 32 -I{} curl -s -o /dev/null -X POST "http://127.0.0.1:$inl_port/bump/{}"
+	r=$(curl -s "http://127.0.0.1:$inl_port/count")
+	kill "$inl_pid"
+	wait "$inl_pid" 2>/dev/null
+	if [[ "$r" == "2000 2000" ]]; then
+		http_ok
+	else
+		failed "http: store из встроенной функции" "ожидалось «2000 2000», получено «$r»"
+	fi
+else
+	failed "tests/load/inline_store.kh" "$(cat "$tmp/inline_store.err")"
+fi

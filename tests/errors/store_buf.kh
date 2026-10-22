@@ -1,0 +1,7 @@
+// expect: store 'cache' holds Buf, which is a byte buffer of the library, not a value
+// expect: buf_str(b) gives a str
+type Cache { name: str, data: Buf }
+store cache: [Cache]
+route GET "/n" -> int {
+    return cache.len()
+}

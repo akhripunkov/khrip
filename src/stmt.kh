@@ -288,7 +288,8 @@ fn tx_outer_check(t: Token, li: int) {
 
 fn zero_value(t: int, at: Token) -> bool {
     let k = tkind(t)
-    if k == K_INT || k == K_BOOL || k == K_OPT {
+    // float: нулевые биты — это 0.0
+    if k == K_INT || k == K_BOOL || k == K_OPT || k == K_FLOAT {
         emit_mov_imm(RAX, 0)
         return true
     }
