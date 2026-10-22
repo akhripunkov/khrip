@@ -87,6 +87,17 @@ for src in tests/pg/*.kh; do
 	pass=$((pass + 1))
 done
 
+# Урок 7 учебника и ответ к нему (docs/tutorial/db): khc test на своей базе.
+for src in docs/tutorial/db/*.kh docs/tutorial/db/answers/*.kh; do
+	name=tut_$(basename "$src" .kh)
+	"${as_pg[@]}" "$pg_bin/psql" -q -h "$pg_dir" -p "$PG_PORT" -U postgres -d postgres -c "create database $name" >/dev/null 2>&1
+	if DATABASE_URL="postgres://u_scram:pw-u_scram@127.0.0.1:$PG_PORT/$name?sslmode=disable" "$KHC" test "$src" >"$tmp/pg/$name.out" 2>&1; then
+		pass=$((pass + 1))
+	else
+		failed "$src" "$(tail -20 "$tmp/pg/$name.out")"
+	fi
+done
+
 # Корпус правильного SQL: PostgreSQL подтверждает каждый запрос (khc test).
 for src in tests/sqlcheck/*.kh; do
 	name=$(basename "$src" .kh)

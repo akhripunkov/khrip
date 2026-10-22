@@ -227,6 +227,78 @@ MISTAKES_OUTPUT
 `count++` → `count += 1`. Для нейросетей есть `khc check --json` — те же ошибки в
 виде JSON.
 
+## Урок 7. PostgreSQL
+
+Нужен PostgreSQL. Проще всего — в контейнере:
+
+```
+docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=secret postgres:16
+export DATABASE_URL=postgres://postgres:secret@localhost:5432/postgres?sslmode=disable
+export KHRIP_TEST_DATABASE_URL=$DATABASE_URL
+```
+
+Та же библиотека, но книги и выдачи — в базе
+([db/07_library.kh](tutorial/db/07_library.kh)):
+
+{{file:docs/tutorial/db/07_library.kh}}
+
+`khc test docs/tutorial/db/07_library.kh` — тесты идут во временной схеме, которую
+`khc test` создаёт и удаляет; таблицы в ней строит миграция:
+
+{{test:docs/tutorial/db/07_library.kh}}
+
+Что здесь важно:
+
+- `migration N` — изменение схемы. Сервер применяет новые миграции при запуске по
+  порядку номеров; ту, что уже применена, менять нельзя — только добавить следующую.
+- `sql "..."` — запрос как есть. `{id}` уходит в базу параметром, а не текстом, так
+  что подставить в SQL строку от пользователя нельзя даже по ошибке.
+- Что вернёт запрос, решает ожидаемый тип: `Book` — одна строка, а если её нет —
+  ответ 404 (поэтому у маршрута в объявлении есть `| 404`); `Book?` — одна или
+  `none`; `[Book]` — все строки; без типа — число изменённых строк. Столбцы
+  раскладываются по полям с теми же именами.
+- `INSERT INTO books {body} RETURNING *` — поля `body` становятся столбцами.
+- `({genre} IS NULL OR genre = {genre})` — фильтр, который работает, только если
+  параметр пришёл.
+- `tx { }` — транзакция SERIALIZABLE: если параллельный запрос изменил те же
+  строки, база откатит её, и блок выполнится заново. Поэтому внутри нельзя то,
+  что нельзя повторить: `fetch`, `sleep`, изменения `store`. Ответ со статусом
+  от 400 (`return 409 ...`) откатывает транзакцию.
+- Ошибки базы сами становятся ответами: дубликат или нарушение CHECK — 409, ссылка
+  на несуществующую строку — 404, неверное значение — 400, база недоступна — 503.
+- При запуске сервер готовит каждый `sql` на настоящей базе и сверяет типы
+  столбцов с полями: если они не сходятся, сервер не запустится и скажет, где.
+
+Привычки других языков компилятор ловит сразу. Такой код:
+
+```khrip
+SQL_MISTAKES_SOURCE
+```
+
+`khc check` отвечает:
+
+```
+SQL_MISTAKES_OUTPUT
+```
+
+Последняя ошибка — гонка: между проверкой `copies` и `UPDATE` другой запрос мог
+взять последний экземпляр. Внутри `tx { }` этого не случится.
+
+**Задание.** Добавьте `POST /loans/{id}/return`: удаляет выдачу и возвращает
+экземпляр книги; неизвестная выдача — 404.
+
+<details><summary>Ответ</summary>
+
+Добавка к уроку 7 (весь файл —
+[db/answers/7_return.kh](tutorial/db/answers/7_return.kh)):
+
+{{tail:docs/tutorial/db/answers/7_return.kh}}
+
+`DELETE ... RETURNING *` в тип `Loan` — нет такой выдачи, значит 404, и `UPDATE`
+не выполнится.
+
+</details>
+
 ## Шпаргалка «C# → Khrip»
 
 | C# | Khrip |
@@ -249,13 +321,14 @@ MISTAKES_OUTPUT
 | `lock (gate) { ... }` | не нужен: `store` защищён автоматически |
 | xUnit + WebApplicationFactory | `test "..." { let r = call GET "/x"; expect r.status == 200 }` |
 | `async`/`await`, `Task.Delay` | не нужны: `fetch` и `sleep(ms)` — обычные вызовы, пока запрос ждёт, поток выполняет другие |
+| Dapper: `QueryAsync<User>("... WHERE id = @id", new { id })` | `let u: User? = sql "... WHERE id = {id}"` |
+| `BeginTransaction()` / `Commit()` | `tx { ... }` — SERIALIZABLE, повтор при конфликте |
+| миграции EF Core | `` migration 2 `ALTER TABLE ...` `` |
 | `using`, `namespace`, NuGet | не нужны: один проект — одно пространство имён |
 
 ## Чего пока нет
 
-- **Баз данных** (Postgres, Kafka, Redis): данные живут в `store` и могут сохраняться в
-  файл (`KHRIP_DATA=file.json`). План работы с базами и миграциями — в
-  [ROADMAP.md](ROADMAP.md).
+- **Других баз и очередей** (MySQL, Redis, Kafka): из баз — только PostgreSQL.
 - **Освобождения старых значений в `store`:** при постоянных обновлениях память растёт.
 - **Строк с учётом Юникода:** длина и срезы — в байтах.
 - **TLS 1.2 и TLS на стороне сервера:** `fetch` умеет только TLS 1.3, сервер Khrip
@@ -265,7 +338,7 @@ MISTAKES_OUTPUT
 ## Что читать дальше
 
 - [KHRIP.md](KHRIP.md) — полное описание языка (для промпта нейросети, англ.).
-- [eval/](../eval/README.md) — восемь задач бэкенда, решённых на Khrip, Go, C# и Python,
+- [eval/](../eval/README.md) — одиннадцать задач бэкенда (три — на PostgreSQL), решённых на Khrip, Go, C# и Python,
   с замерами токенов, скорости и памяти.
 - [examples/weather/weather.kh](../examples/weather/weather.kh) — погодный бэкенд:
   внешний API, подписки, фоновые проверки, вебхуки.

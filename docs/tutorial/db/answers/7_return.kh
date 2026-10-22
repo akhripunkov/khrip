@@ -1,0 +1,84 @@
+migration 1 `
+CREATE TABLE books (
+    id bigserial PRIMARY KEY,
+    title text NOT NULL,
+    genre text NOT NULL,
+    copies int NOT NULL CHECK (copies >= 0)
+);
+CREATE TABLE loans (
+    id bigserial PRIMARY KEY,
+    book_id bigint NOT NULL REFERENCES books,
+    reader text NOT NULL,
+    taken_at timestamptz NOT NULL DEFAULT now()
+);
+`
+
+type NewBook { title: str, genre: str, copies: int = 1 }
+type Book { id: int, ...NewBook }
+type Take { reader: str }
+type Loan { id: int, book_id: int, reader: str, taken_at: str }
+
+route POST "/books" (body: NewBook) -> 201 Book | 400 str {
+    if body.title.trim().len() == 0 || body.copies < 0 {
+        return 400 "title is required, copies >= 0"
+    }
+    return 201 sql "INSERT INTO books {body} RETURNING *"
+}
+
+route GET "/books/{id}" (id: int) -> Book | 404 {
+    return sql "SELECT * FROM books WHERE id = {id}"
+}
+
+route GET "/books" (genre: str?) -> [Book] {
+    return sql "SELECT * FROM books WHERE ({genre} IS NULL OR genre = {genre}) ORDER BY title"
+}
+
+route POST "/books/{id}/take" (id: int, body: Take) -> 201 Loan | 404 | 409 str {
+    tx {
+        let book: Book = sql "SELECT * FROM books WHERE id = {id}"
+        if book.copies == 0 {
+            return 409 "no copies left"
+        }
+        sql "UPDATE books SET copies = copies - 1 WHERE id = {id}"
+        return 201 sql "INSERT INTO loans (book_id, reader) VALUES ({id}, {body.reader}) RETURNING *"
+    }
+}
+
+test "books and loans" {
+    let r = call POST "/books" NewBook { title: "Dune", genre: "sf" }
+    expect r.status == 201
+    let book: Book? = from_json(r.body)
+    expect book != none
+    expect (call POST "/books" NewBook { title: "Emma", genre: "novel", copies: 2 }).status == 201
+    expect (call GET "/books?genre=sf").body.contains("Dune")
+    expect !(call GET "/books?genre=sf").body.contains("Emma")
+    expect (call GET "/books/999").status == 404
+    expect (call POST "/books/{book.id}/take" Take { reader: "ann" }).status == 201
+    let again = call POST "/books/{book.id}/take" Take { reader: "bob" }
+    expect again.status == 409
+    expect again.body.contains("no copies left")
+    let copies: int = sql "SELECT copies FROM books WHERE id = {book.id}"
+    expect copies == 0
+}
+
+// --- ответ ---
+
+route POST "/loans/{id}/return" (id: int) -> 204 | 404 {
+    tx {
+        let loan: Loan = sql "DELETE FROM loans WHERE id = {id} RETURNING *"
+        sql "UPDATE books SET copies = copies + 1 WHERE id = {loan.book_id}"
+    }
+    return 204
+}
+
+test "return a book" {
+    let r = call POST "/books" NewBook { title: "Ulysses", genre: "novel" }
+    let book: Book? = from_json(r.body)
+    expect book != none
+    let t = call POST "/books/{book.id}/take" Take { reader: "cid" }
+    let loan: Loan? = from_json(t.body)
+    expect loan != none
+    expect (call POST "/loans/{loan.id}/return").status == 204
+    expect (call POST "/loans/{loan.id}/return").status == 404
+    expect (call GET "/books/{book.id}").body.contains("\"copies\":1")
+}

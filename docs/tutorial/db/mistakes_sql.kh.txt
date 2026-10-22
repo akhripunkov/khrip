@@ -1,0 +1,21 @@
+migration 1 `
+CREATE TABLE books (id bigserial PRIMARY KEY, title text NOT NULL, copies int NOT NULL);
+`
+type Book { id: int, title: str, copies: int }
+
+route GET "/books/{id}" (id: int) -> Book {
+    return sql "SELECT * FROM books WHERE id = $1"
+}
+
+route GET "/books" (title: str?) -> [Book] {
+    return sql "SELECT * FROM books WHERE title = {title} LIMIT 10"
+}
+
+route POST "/books/{id}/take" (id: int) -> 204 | 404 | 409 {
+    let book: Book = sql "SELECT * FROM books WHERE id = {id}"
+    if book.copies == 0 {
+        return 409
+    }
+    sql "UPDATE books SET copies = copies - 1 WHERE id = {id}"
+    return 204
+}

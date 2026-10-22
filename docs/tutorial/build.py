@@ -4,6 +4,8 @@
 
 {{file:путь}} — код файла, {{out:путь}} — вывод khc run, {{test:путь}} —
 вывод khc test, {{tail:путь}} — часть файла после «// --- ответ ---».
+Урок 7 работает с PostgreSQL: его тесты идут на базе из
+KHRIP_TEST_DATABASE_URL (каждый — в своей временной схеме).
 Вывод снимается с настоящих запусков, поэтому код в учебнике всегда
 компилируется. Сессия curl (curl-session.txt) снята вручную с урока 4.
 """
@@ -22,7 +24,9 @@ def block(text, lang=""):
 
 def khc_run(*args):
     r = subprocess.run([khc, *args], capture_output=True, text=True, cwd=root)
-    return (r.stdout + r.stderr).rstrip()
+    # строка о миграции (в stderr) — не часть вывода тестов
+    err = "".join(l for l in r.stderr.splitlines(True) if not l.startswith("khrip: applied migration"))
+    return (r.stdout + err).rstrip()
 
 
 def tail(path):
@@ -37,6 +41,9 @@ t = re.sub(r"\{\{test:([^}]+)\}\}", lambda m: block(khc_run("test", m.group(1)))
 t = re.sub(r"\{\{tail:([^}]+)\}\}", lambda m: block(tail(m.group(1)), "khrip"), t)
 t = t.replace("CURL_SESSION", open(os.path.join(here, "curl-session.txt")).read().rstrip())
 mistakes = os.path.join(here, "mistakes.kh.txt")
+t = t.replace("SQL_MISTAKES_SOURCE", open(os.path.join(here, "db", "mistakes_sql.kh.txt")).read().rstrip())
+sql_mistakes = os.path.join(here, "db", "mistakes_sql.kh.txt")
+t = t.replace("SQL_MISTAKES_OUTPUT", khc_run("check", sql_mistakes).replace(sql_mistakes, "mistakes.kh"))
 t = t.replace("MISTAKES_SOURCE", open(mistakes).read().rstrip())
 out = khc_run("check", mistakes).replace(mistakes, "mistakes.kh")
 t = t.replace("MISTAKES_OUTPUT", out)

@@ -794,6 +794,196 @@ mistakes.kh:21:12: error: this route returns Book | 404, found Book?
 `count++` → `count += 1`. Для нейросетей есть `khc check --json` — те же ошибки в
 виде JSON.
 
+## Урок 7. PostgreSQL
+
+Нужен PostgreSQL. Проще всего — в контейнере:
+
+```
+docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=secret postgres:16
+export DATABASE_URL=postgres://postgres:secret@localhost:5432/postgres?sslmode=disable
+export KHRIP_TEST_DATABASE_URL=$DATABASE_URL
+```
+
+Та же библиотека, но книги и выдачи — в базе
+([db/07_library.kh](tutorial/db/07_library.kh)):
+
+```khrip
+migration 1 `
+CREATE TABLE books (
+    id bigserial PRIMARY KEY,
+    title text NOT NULL,
+    genre text NOT NULL,
+    copies int NOT NULL CHECK (copies >= 0)
+);
+CREATE TABLE loans (
+    id bigserial PRIMARY KEY,
+    book_id bigint NOT NULL REFERENCES books,
+    reader text NOT NULL,
+    taken_at timestamptz NOT NULL DEFAULT now()
+);
+`
+
+type NewBook { title: str, genre: str, copies: int = 1 }
+type Book { id: int, ...NewBook }
+type Take { reader: str }
+type Loan { id: int, book_id: int, reader: str, taken_at: str }
+
+route POST "/books" (body: NewBook) -> 201 Book | 400 str {
+    if body.title.trim().len() == 0 || body.copies < 0 {
+        return 400 "title is required, copies >= 0"
+    }
+    return 201 sql "INSERT INTO books {body} RETURNING *"
+}
+
+route GET "/books/{id}" (id: int) -> Book | 404 {
+    return sql "SELECT * FROM books WHERE id = {id}"
+}
+
+route GET "/books" (genre: str?) -> [Book] {
+    return sql "SELECT * FROM books WHERE ({genre} IS NULL OR genre = {genre}) ORDER BY title"
+}
+
+route POST "/books/{id}/take" (id: int, body: Take) -> 201 Loan | 404 | 409 str {
+    tx {
+        let book: Book = sql "SELECT * FROM books WHERE id = {id}"
+        if book.copies == 0 {
+            return 409 "no copies left"
+        }
+        sql "UPDATE books SET copies = copies - 1 WHERE id = {id}"
+        return 201 sql "INSERT INTO loans (book_id, reader) VALUES ({id}, {body.reader}) RETURNING *"
+    }
+}
+
+test "books and loans" {
+    let r = call POST "/books" NewBook { title: "Dune", genre: "sf" }
+    expect r.status == 201
+    let book: Book? = from_json(r.body)
+    expect book != none
+    expect (call POST "/books" NewBook { title: "Emma", genre: "novel", copies: 2 }).status == 201
+    expect (call GET "/books?genre=sf").body.contains("Dune")
+    expect !(call GET "/books?genre=sf").body.contains("Emma")
+    expect (call GET "/books/999").status == 404
+    expect (call POST "/books/{book.id}/take" Take { reader: "ann" }).status == 201
+    let again = call POST "/books/{book.id}/take" Take { reader: "bob" }
+    expect again.status == 409
+    expect again.body.contains("no copies left")
+    let copies: int = sql "SELECT copies FROM books WHERE id = {book.id}"
+    expect copies == 0
+}
+```
+
+`khc test docs/tutorial/db/07_library.kh` — тесты идут во временной схеме, которую
+`khc test` создаёт и удаляет; таблицы в ней строит миграция:
+
+```
+ok    books and loans
+1 tests: 1 passed, 0 failed
+```
+
+Что здесь важно:
+
+- `migration N` — изменение схемы. Сервер применяет новые миграции при запуске по
+  порядку номеров; ту, что уже применена, менять нельзя — только добавить следующую.
+- `sql "..."` — запрос как есть. `{id}` уходит в базу параметром, а не текстом, так
+  что подставить в SQL строку от пользователя нельзя даже по ошибке.
+- Что вернёт запрос, решает ожидаемый тип: `Book` — одна строка, а если её нет —
+  ответ 404 (поэтому у маршрута в объявлении есть `| 404`); `Book?` — одна или
+  `none`; `[Book]` — все строки; без типа — число изменённых строк. Столбцы
+  раскладываются по полям с теми же именами.
+- `INSERT INTO books {body} RETURNING *` — поля `body` становятся столбцами.
+- `({genre} IS NULL OR genre = {genre})` — фильтр, который работает, только если
+  параметр пришёл.
+- `tx { }` — транзакция SERIALIZABLE: если параллельный запрос изменил те же
+  строки, база откатит её, и блок выполнится заново. Поэтому внутри нельзя то,
+  что нельзя повторить: `fetch`, `sleep`, изменения `store`. Ответ со статусом
+  от 400 (`return 409 ...`) откатывает транзакцию.
+- Ошибки базы сами становятся ответами: дубликат или нарушение CHECK — 409, ссылка
+  на несуществующую строку — 404, неверное значение — 400, база недоступна — 503.
+- При запуске сервер готовит каждый `sql` на настоящей базе и сверяет типы
+  столбцов с полями: если они не сходятся, сервер не запустится и скажет, где.
+
+Привычки других языков компилятор ловит сразу. Такой код:
+
+```khrip
+migration 1 `
+CREATE TABLE books (id bigserial PRIMARY KEY, title text NOT NULL, copies int NOT NULL);
+`
+type Book { id: int, title: str, copies: int }
+
+route GET "/books/{id}" (id: int) -> Book {
+    return sql "SELECT * FROM books WHERE id = $1"
+}
+
+route GET "/books" (title: str?) -> [Book] {
+    return sql "SELECT * FROM books WHERE title = {title} LIMIT 10"
+}
+
+route POST "/books/{id}/take" (id: int) -> 204 | 404 | 409 {
+    let book: Book = sql "SELECT * FROM books WHERE id = {id}"
+    if book.copies == 0 {
+        return 409
+    }
+    sql "UPDATE books SET copies = copies - 1 WHERE id = {id}"
+    return 204
+}
+```
+
+`khc check` отвечает:
+
+```
+mistakes.kh:7:12: error: values go in place in sql: WHERE id = {id}, not $1
+        return sql "SELECT * FROM books WHERE id = $1"
+               ^
+    hint: every {expression} is sent as a parameter, never as SQL text
+mistakes.kh:11:51: error: {title} may be none, and a comparison with NULL is never true: rows would silently not match
+        return sql "SELECT * FROM books WHERE title = {title} LIMIT 10"
+                                                      ^
+    hint: write ({title} IS NULL OR column = {title}), or unwrap it first: let v = title else { return 400 }
+mistakes.kh:19:5: error: this write runs outside tx and another statement runs before it: another request can change the data in between
+        sql "UPDATE books SET copies = copies - 1 WHERE id = {id}"
+        ^
+    hint: put the statements of this request in tx { ... }
+3 errors
+```
+
+Последняя ошибка — гонка: между проверкой `copies` и `UPDATE` другой запрос мог
+взять последний экземпляр. Внутри `tx { }` этого не случится.
+
+**Задание.** Добавьте `POST /loans/{id}/return`: удаляет выдачу и возвращает
+экземпляр книги; неизвестная выдача — 404.
+
+<details><summary>Ответ</summary>
+
+Добавка к уроку 7 (весь файл —
+[db/answers/7_return.kh](tutorial/db/answers/7_return.kh)):
+
+```khrip
+route POST "/loans/{id}/return" (id: int) -> 204 | 404 {
+    tx {
+        let loan: Loan = sql "DELETE FROM loans WHERE id = {id} RETURNING *"
+        sql "UPDATE books SET copies = copies + 1 WHERE id = {loan.book_id}"
+    }
+    return 204
+}
+
+test "return a book" {
+    let r = call POST "/books" NewBook { title: "Ulysses", genre: "novel" }
+    let book: Book? = from_json(r.body)
+    expect book != none
+    let t = call POST "/books/{book.id}/take" Take { reader: "cid" }
+    let loan: Loan? = from_json(t.body)
+    expect loan != none
+    expect (call POST "/loans/{loan.id}/return").status == 204
+    expect (call POST "/loans/{loan.id}/return").status == 404
+    expect (call GET "/books/{book.id}").body.contains("\"copies\":1")
+}
+```
+
+`DELETE ... RETURNING *` в тип `Loan` — нет такой выдачи, значит 404, и `UPDATE`
+не выполнится.
+
+</details>
+
 ## Шпаргалка «C# → Khrip»
 
 | C# | Khrip |
@@ -816,13 +1006,14 @@ mistakes.kh:21:12: error: this route returns Book | 404, found Book?
 | `lock (gate) { ... }` | не нужен: `store` защищён автоматически |
 | xUnit + WebApplicationFactory | `test "..." { let r = call GET "/x"; expect r.status == 200 }` |
 | `async`/`await`, `Task.Delay` | не нужны: `fetch` и `sleep(ms)` — обычные вызовы, пока запрос ждёт, поток выполняет другие |
+| Dapper: `QueryAsync<User>("... WHERE id = @id", new { id })` | `let u: User? = sql "... WHERE id = {id}"` |
+| `BeginTransaction()` / `Commit()` | `tx { ... }` — SERIALIZABLE, повтор при конфликте |
+| миграции EF Core | `` migration 2 `ALTER TABLE ...` `` |
 | `using`, `namespace`, NuGet | не нужны: один проект — одно пространство имён |
 
 ## Чего пока нет
 
-- **Баз данных** (Postgres, Kafka, Redis): данные живут в `store` и могут сохраняться в
-  файл (`KHRIP_DATA=file.json`). План работы с базами и миграциями — в
-  [ROADMAP.md](ROADMAP.md).
+- **Других баз и очередей** (MySQL, Redis, Kafka): из баз — только PostgreSQL.
 - **Освобождения старых значений в `store`:** при постоянных обновлениях память растёт.
 - **Строк с учётом Юникода:** длина и срезы — в байтах.
 - **TLS 1.2 и TLS на стороне сервера:** `fetch` умеет только TLS 1.3, сервер Khrip
@@ -832,7 +1023,7 @@ mistakes.kh:21:12: error: this route returns Book | 404, found Book?
 ## Что читать дальше
 
 - [KHRIP.md](KHRIP.md) — полное описание языка (для промпта нейросети, англ.).
-- [eval/](../eval/README.md) — восемь задач бэкенда, решённых на Khrip, Go, C# и Python,
+- [eval/](../eval/README.md) — одиннадцать задач бэкенда (три — на PostgreSQL), решённых на Khrip, Go, C# и Python,
   с замерами токенов, скорости и памяти.
 - [examples/weather/weather.kh](../examples/weather/weather.kh) — погодный бэкенд:
   внешний API, подписки, фоновые проверки, вебхуки.
