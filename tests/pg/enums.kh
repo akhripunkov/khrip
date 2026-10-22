@@ -1,0 +1,21 @@
+// Перечисления PostgreSQL: IN ({список}) по столбцу-перечислению, массивы
+// перечислений в обе стороны.
+
+migration 1 `
+CREATE TYPE level AS ENUM ('low', 'high');
+CREATE TABLE ev (id bigserial PRIMARY KEY, lvl level NOT NULL, lvls level[] NOT NULL DEFAULT '{}');
+INSERT INTO ev (lvl, lvls) VALUES ('low', '{low,high}'), ('high', '{}');
+`
+
+type Level = low | high
+type Ev { id: int, lvl: Level, lvls: [Level] }
+
+test "enum lists" {
+    let want: [Level] = [low]
+    let a: [Ev] = sql "SELECT * FROM ev WHERE lvl IN ({want}) ORDER BY id"
+    expect a.len() == 1 && a[0].lvls.len() == 2 && a[0].lvls[1] == high
+    let b: [Ev] = sql "SELECT * FROM ev WHERE lvl NOT IN ({want}) ORDER BY id"
+    expect b.len() == 1 && b[0].lvl == high
+    let c: Ev = sql "INSERT INTO ev (lvl, lvls) VALUES ({high}, {want}) RETURNING *"
+    expect c.lvls.len() == 1 && c.lvl == high && c.lvls[0] == low
+}

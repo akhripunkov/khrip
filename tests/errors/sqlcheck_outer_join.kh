@@ -1,0 +1,9 @@
+// expect: Row.pet is str, but column pet can be NULL
+migration 1 `
+CREATE TABLE owners (id bigserial PRIMARY KEY, name text NOT NULL);
+CREATE TABLE pets (id bigserial PRIMARY KEY, owner_id bigint REFERENCES owners(id), name text NOT NULL);
+`
+type Row { owner: str, pet: str }
+route GET "/rows" -> [Row] {
+    return sql "SELECT o.name AS owner, p.name AS pet FROM owners o LEFT JOIN pets p ON p.owner_id = o.id ORDER BY o.id"
+}

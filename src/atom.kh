@@ -118,6 +118,10 @@ fn similar_name(name: str) -> str {
 }
 
 fn unknown_name_hint(name: str) -> str {
+    if sql_quoted_param {
+        // '{city}' в sql — параметр; литерал PostgreSQL пишется с \{
+        return "in sql, \{" + name + "} is a value from Khrip; for the PostgreSQL literal '\{" + name + "}' write '\\\{" + name + "}'"
+    }
     let h = name_hint(name)
     if h.len() > 0 {
         return h

@@ -44,6 +44,8 @@ const PB_ROFF = 160
 const PB_STALE = 168
 // запрос отправлен, ответ ещё не дочитан: прерванное так соединение не годится
 const PB_INFLIGHT = 176
+// ячейка счётчика очереди повторов, в которую соединение встало (или 0)
+const PB_TXQ = 184
 // подготовленные запросы: SHA-256 текста (32 байта) и номер — по 40 байт
 const PB_STMT = 256
 const PG_STMTS = 200
@@ -141,6 +143,7 @@ fn __pg_parse_url(url: str) -> __PgUrl? {
         db = user
     }
     var ssl = "prefer"
+    var given = false
     var root = ""
     for kv in query.split("&") {
         if let e = kv.find("=") {
@@ -148,12 +151,30 @@ fn __pg_parse_url(url: str) -> __PgUrl? {
             let v = __pct_decode(kv[e + 1..])
             if k == "sslmode" {
                 ssl = v
-            } else if k == "sslrootcert" && v != "system" {
+                given = true
+            } else if k == "sslrootcert" {
                 root = v
             }
         }
     }
     if ssl != "disable" && ssl != "prefer" && ssl != "require" && ssl != "verify-ca" && ssl != "verify-full" {
+        __pg_url_err = "sslmode must be disable, prefer, require, verify-ca or verify-full"
+        return none
+    }
+    // как в libpq: sslrootcert=system — корни системы и проверка имени
+    // (verify-full); более слабый режим с ним — ошибка
+    if root == "system" {
+        if !given {
+            ssl = "verify-full"
+        } else if ssl != "verify-full" {
+            __pg_url_err = "sslmode={ssl} may not be used with sslrootcert=system: use sslmode=verify-full"
+            return none
+        }
+    }
+    // verify-ca проверяет цепочку без имени: с корнями системы его прошёл бы любой
+    // сертификат публичного центра — нужен свой корень
+    if ssl == "verify-ca" && (root.len() == 0 || root == "system") {
+        __pg_url_err = "sslmode=verify-ca needs sslrootcert=<file with the database CA>; to check the name against the system roots use sslmode=verify-full"
         return none
     }
     return __PgUrl { host, port, user, password, db, ssl, root }
@@ -408,6 +429,7 @@ type __PgConn {
 }
 
 fn __pg_free(c: int) {
+    __pg_queue_leave(c)
     let t = load64(c + PB_TLS)
     if t != 0 {
         __tls_close(t)
@@ -560,13 +582,23 @@ fn __pg_connect(u: __PgUrl, deadline: int) -> __PgConn {
             var verify = TLS_VERIFY_NONE
             if u.ssl == "verify-full" {
                 verify = TLS_VERIFY_FULL
-            } else if u.ssl == "verify-ca" || (u.ssl == "require" && u.root.len() > 0) {
+            } else if u.ssl == "verify-ca" || (u.ssl == "require" && u.root.len() > 0 && u.root != "system") {
                 verify = TLS_VERIFY_CHAIN
             }
-            let tc = __tls_connect_roots(fd, u.host, u.port, u.root, verify, deadline)
+            var roots = u.root
+            if roots == "system" {
+                roots = ""
+            }
+            let tc = __tls_connect_roots(fd, u.host, u.port, roots, verify, deadline)
             if tc.blk == 0 {
                 store64(c + PB_FD, -1)
                 syscall(SYS_CLOSE, fd)
+                if u.ssl == "prefer" {
+                    // как в libpq: prefer без TLS (сервер только с TLS 1.2 и т. п.) —
+                    // новое соединение без шифрования
+                    __pg_fail_free(c, tc.err)
+                    return __pg_connect(__PgUrl { host: u.host, port: u.port, user: u.user, password: u.password, db: u.db, ssl: "disable", root: u.root, schema: u.schema }, deadline)
+                }
                 return __pg_fail_free(c, tc.err)
             }
             store64(c + PB_TLS, tc.blk)
@@ -749,7 +781,12 @@ fn __pg_int(r: __PgRes, i: int) -> int {
     }
     var v = 0
     while p < end && load8(p) != '.' {
-        v = v * 10 + load8(p) - '0'
+        let c = load8(p)
+        if c < '0' || c > '9' || v > (0x7FFFFFFFFFFFFFFF - (c - '0')) / 10 {
+            // NaN, Infinity, больше 2^63 — молча испортить число нельзя
+            __panic_msg("the database returned {__pg_str(r, i)} where the program expects int: it does not fit int; use float or str")
+        }
+        v = v * 10 + c - '0'
         p += 1
     }
     // numeric (sum по bigint, avg): дробная часть должна быть нулевой
@@ -773,7 +810,21 @@ fn __pg_float(r: __PgRes, i: int) -> float {
     if n < 0 {
         return 0.0
     }
-    return __float_parse(r.data.data + r.at[2 * i], n) ?? 0.0
+    let s = __pg_str(r, i)
+    if s == "NaN" {
+        return __cast(0x7FF8000000000000)
+    }
+    if s == "Infinity" {
+        return __cast(0x7FF0000000000000)
+    }
+    if s == "-Infinity" {
+        return __cast(-4503599627370496)
+    }
+    let f = __float_parse(r.data.data + r.at[2 * i], n) else {
+        __panic_msg("the database returned {s} where the program expects float")
+        return 0.0
+    }
+    return f
 }
 
 fn __pg_bool(r: __PgRes, i: int) -> bool {
@@ -791,7 +842,15 @@ fn __pg_time(r: __PgRes, i: int) -> int {
     } else {
         s = s + "Z"
     }
-    return parse_time(s) ?? parse_date(s[..10.min(s.len())]) ?? 0
+    if let t = parse_time(s) {
+        return t
+    }
+    if let t = parse_date(s[..10.min(s.len())]) {
+        return t
+    }
+    // infinity, даты до нашей эры, годы после 9999: 0 был бы неверной датой
+    __panic_msg("the database returned the time {__pg_str(r, i)}, which Khrip cannot represent: use a str field and ::text in SQL")
+    return 0
 }
 
 // Одномерный массив «{a,"b c",NULL}» — элементы в текстовом виде (none — NULL).
@@ -802,6 +861,10 @@ fn __pg_arr(r: __PgRes, i: int) -> [str?] {
         return out
     }
     let p = r.data.data + r.at[2 * i]
+    if load8(p) != '{' || (n > 1 && load8(p + 1) == '{') {
+        // '[0:2]={...}' или многомерный массив: список Khrip — одномерный с 1
+        __panic_msg("the database returned the array {__pg_str(r, i)}, but a list is one-dimensional: use jsonb, or unnest in SQL")
+    }
     var k = 1
     let end = n - 1
     if end == 1 {
@@ -941,11 +1004,19 @@ fn __pg_query_at(c: int, site: int, sql: str, params: [str?], types: [int], fall
     // отложенный BEGIN — тем же пакетом и до Sync: если он не пройдёт, сервер
     // пропустит и сам запрос, вне транзакции тот не выполнится
     let begin = load64(c + PB_BEGIN)
+    // очередь повторов этого места не пуста (в этом процессе)
+    let queued = begin & PG_SHORT_LOCKS != 0 && __pg_queue != 0 && load64(__pg_queue + (load64(c + PB_TXID) & 4095) * 8) > 0
     if begin != 0 {
         store64(c + PB_BEGIN, 0)
         __pg_put_plain(b, __pg_begin_sql(begin))
         if begin & PG_SHORT_LOCKS != 0 {
             __pg_put_plain(b, "set local lock_timeout = 100")
+            if queued {
+                // первая попытка встаёт в ту же очередь, что и повторные: пока
+                // проигравший конфликт держит исключительную блокировку своего
+                // места, новые попытки ждут, а не обгоняют его снова и снова
+                __pg_put_plain(b, "select pg_advisory_xact_lock_shared({0x4B48520000000000 + load64(c + PB_TXID)})")
+            }
         }
     }
     if fresh {
@@ -1012,8 +1083,14 @@ fn __pg_query_at(c: int, site: int, sql: str, params: [str?], types: [int], fall
         want = 2
         if begin & PG_SHORT_LOCKS != 0 {
             want = 3
+            if queued {
+                want = 4
+            }
         }
     }
+    // строки и итоги служебных операторов перед запросом — не его
+    let prelude = want - 1
+    var done_cmds = 0
     while true {
         let m = __pg_read_view(c, deadline) else {
             res.err = __pg_lost(c, deadline)
@@ -1021,6 +1098,8 @@ fn __pg_query_at(c: int, site: int, sql: str, params: [str?], types: [int], fall
         }
         if m.kind == '1' {
             ones += 1
+        } else if m.kind == 'D' && done_cmds < prelude {
+            // строка служебного select pg_advisory_xact_lock_shared
         } else if m.kind == 'D' {
             let ncols = __be16(m.p)
             res.cols = ncols
@@ -1039,6 +1118,8 @@ fn __pg_query_at(c: int, site: int, sql: str, params: [str?], types: [int], fall
                     at += len
                 }
             }
+        } else if m.kind == 'C' && done_cmds < prelude {
+            done_cmds += 1
         } else if m.kind == 'C' {
             // «INSERT 0 3», «UPDATE 2», «SELECT 5»: число — последнее слово
             let tag = __str_copy(m.p, (m.n - 1).max(0))
@@ -1086,12 +1167,13 @@ fn __pg_query_at(c: int, site: int, sql: str, params: [str?], types: [int], fall
             if fresh && ones < want && fallback.len() == params.len() && (load8(m.p) == 'I' || begin != 0) {
                 var only = -1
                 var retry = false
-                if res.err.code == "42P18" || res.err.code == "42P08" {
-                    if let k = __pg_param_no(res.err.message) {
-                        only = k
-                        retry = k >= 0 && k < params.len() && (k >= types.len() || types[k] == 0)
-                    }
-                } else if res.err.code == "42725" && res.err.message.contains("unknown") {
+                if (res.err.code == "42P18" || res.err.code == "42P08") && __pg_param_no(res.err.message) != none {
+                    let k = __pg_param_no(res.err.message) ?? -1
+                    only = k
+                    retry = k >= 0 && k < params.len() && (k >= types.len() || types[k] == 0)
+                } else if res.err.code == "42P18" || res.err.code == "42P08" || res.err.code == "42725" {
+                    // номер не прочитать (сообщение на другом языке) или оператор
+                    // неоднозначен: тип из fallback — всем, у кого его нет
                     for j in 0..params.len() {
                         retry = retry || j >= types.len() || types[j] == 0
                     }
@@ -1303,7 +1385,29 @@ fn __pg_request_end() {
 }
 
 // Снять advisory-блокировку очереди повторов, если соединение её держит.
+// Счётчики очереди повторов по местам tx (4096 ячеек): пока повторяющиеся есть,
+// первые попытки того же места встают в очередь за ними. Заводятся при запуске.
+var __pg_queue: int = 0
+
+fn __pg_queue_enter(c: int) {
+    if __pg_queue == 0 || load64(c + PB_TXQ) != 0 {
+        return
+    }
+    let cell = __pg_queue + (load64(c + PB_TXID) & 4095) * 8
+    __xadd(cell, 1)
+    store64(c + PB_TXQ, cell)
+}
+
+fn __pg_queue_leave(c: int) {
+    let cell = load64(c + PB_TXQ)
+    if cell != 0 {
+        store64(c + PB_TXQ, 0)
+        __xadd(cell, -1)
+    }
+}
+
 fn __pg_unlock_tx(c: int) {
+    __pg_queue_leave(c)
     let key = load64(c + PB_TXLOCK)
     if key == 0 {
         return
@@ -1341,6 +1445,7 @@ fn __pg_backoff(n: int) {
 // очередь честная, новый запрос не перехватит его.
 
 const PGP_IDLE = 32
+const PG_MAX_IDLE_MS = 300000
 const PGP_MAX_IDLE = 64
 const PGP_WAIT = 544
 const PGP_MAX_WAIT = 4096
@@ -1387,7 +1492,9 @@ fn __pg_acquire(u: __PgUrl, deadline: int) -> __PgConn {
             n -= 1
             store64(p, n)
             let c = load64(p + PGP_IDLE + n * 8)
-            if __pg_alive(c) {
+            // простаивало дольше 5 минут — закрыть: промежуточные пулы и NAT
+            // молча забывают такие соединения
+            if __pg_alive(c) && now_ms() - load64(c + PB_USED) < PG_MAX_IDLE_MS {
                 return __PgConn { c, err: "" }
             }
             __pg_free(c)
@@ -1525,6 +1632,9 @@ fn __pg_cancel(c: int) {
 
 // ---- Запуск ----
 // Адрес базы — из DATABASE_URL, разбирается один раз до запуска потоков.
+
+// почему адрес не разобран (для сообщения при запуске)
+var __pg_url_err: str = ""
 // Пока база не отвечает (контейнер базы ещё стартует), запуск ждёт до минуты.
 
 var __pg_url: __PgUrl = __PgUrl { host: "", port: 0, user: "", password: "", db: "", ssl: "", root: "" }
@@ -1556,11 +1666,18 @@ fn __pg_startup(testing: bool) -> int {
         exit(1)
     }
     let u = __pg_parse_url(raw) else {
-        eprint("khrip: {var_name} is not a postgres:// URL")
+        if __pg_url_err.len() > 0 {
+            eprint("khrip: {var_name}: {__pg_url_err}")
+        } else {
+            eprint("khrip: {var_name} is not a postgres:// URL")
+        }
         exit(1)
         return 0
     }
     __pg_url = u
+    if __pg_queue == 0 {
+        __pg_queue = __mmap(4096 * 8)
+    }
     let until = now_ms() + 60000
     var said = false
     while true {

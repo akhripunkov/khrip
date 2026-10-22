@@ -525,6 +525,9 @@ fn __heap_push(s: __Sched, co: __Co) {
 
 fn __heap_remove(s: __Sched, co: __Co) {
     let i = co.hidx
+    if i < 0 {
+        return
+    }
     co.hidx = -1
     s.heap_len -= 1
     if i == s.heap_len {
@@ -596,6 +599,12 @@ fn __co_wait(fd: int, events: int, ms: int) -> int {
             __heap_push(s, co)
         }
         __co_park(co)
+        // проснулась любым путём (событие, срок, уведомление, пока стояла в
+        // очереди готовых): записи в куче сроков не остаться — иначе её снимут
+        // второй раз с несуществующего места
+        if co.hidx >= 0 {
+            __heap_remove(s, co)
+        }
         if fd >= 0 {
             syscall(SYS_EPOLL_CTL, s.ep, EPOLL_CTL_DEL, fd, s.ev)
         }

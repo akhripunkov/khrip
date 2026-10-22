@@ -1,0 +1,5 @@
+// expect: sql in the initial value of a global runs before the database is connected
+var total: int = sql "SELECT count(*) FROM t"
+fn main() {
+    print("{total}")
+}

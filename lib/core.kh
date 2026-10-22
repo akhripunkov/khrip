@@ -70,6 +70,10 @@ const CTX_POOL = 144
 const CTX_VCACHE = 152
 // соединения с базой этого потока (lib/pg.kh) или 0
 const CTX_PGPOOL = 160
+// поток уже в панике из-за памяти: остаток арены (запас) — на её обработку
+const CTX_MEMPANIC = 168
+// запас в конце арены для ответа 500 и журнала после исчерпания памяти
+const ARENA_RESERVE = 16777216
 const CTX_SIZE = 256
 
 const CHUNK = 1048576
@@ -134,13 +138,28 @@ fn __alloc_slow(c: int, size: int) -> int {
         var limit = STORE_REGION + STORE_SIZE
         if arena {
             limit = load64(c + CTX_ARENA) + ARENA_SIZE
+            if load64(c + CTX_MEMPANIC) == 0 {
+                limit -= ARENA_RESERVE
+            }
         }
         let end = load64(c + CTX_END)
         var new_end = (p + size + COMMIT - 1) & ~(COMMIT - 1)
         if new_end > limit {
+            if arena && load64(c + CTX_MEMPANIC) == 0 {
+                // запрос исчерпал свою память: паника (500), а запас — на неё
+                store64(c + CTX_MEMPANIC, 1)
+                __panic(PANIC_MEMORY, "region")
+            }
+            if arena {
+                // исчерпан и запас: без выделений сообщить и выйти (иначе паника
+                // выделяет память, снова паникует — и так до переполнения стека)
+                let fixed = "panic: out of memory: the request used all of its 1 GB arena\n"
+                syscall(1, 2, __str_ptr(fixed), __str_len(fixed))
+                syscall(231, 101)
+            }
             __panic(PANIC_MEMORY, "region")
         }
-        if syscall(10, end, new_end - end, 3) < 0 {
+        if new_end > end && syscall(10, end, new_end - end, 3) < 0 {
             __panic(PANIC_MEMORY, "mprotect")
         }
         store64(c + CTX_END, new_end)
@@ -251,10 +270,18 @@ fn __arena_attach(cx: int, base: int) {
 // Дальше память выделяется из арены.
 fn __arena_begin() {
     let c = __ctx()
+    store64(c + CTX_MEMPANIC, 0)
     store64(c + CTX_SAVE_PTR, load64(c + CTX_PTR))
     store64(c + CTX_SAVE_END, load64(c + CTX_END))
     store64(c + CTX_PTR, load64(c + CTX_ARENA))
-    store64(c + CTX_END, load64(c + CTX_ARENA_END))
+    // последние ARENA_RESERVE байт — запас на ответ 500 после исчерпания памяти:
+    // быстрый путь выделения до них не доходит
+    var end = load64(c + CTX_ARENA_END)
+    let cap = load64(c + CTX_ARENA) + ARENA_SIZE - ARENA_RESERVE
+    if end > cap {
+        end = cap
+    }
+    store64(c + CTX_END, end)
 }
 
 // Освободить всё, что выделено в арене, и вернуться к обычной памяти.
@@ -353,6 +380,14 @@ fn __panic_msg(text: str) {
 }
 
 fn __panic(kind: int, at: str) {
+    if kind == PANIC_MEMORY && load64(__ctx() + CTX_MEMPANIC) != 0 {
+        // память кончилась: текст без выделений, и не исчерпать запас повторно
+        let fixed = "panic: out of memory: the request used all of its 1 GB arena"
+        store64(__ctx() + CTX_PANIC, __cast(fixed))
+        __panic_recover()
+        eprint(fixed)
+        exit(101)
+    }
     let msg = "panic: " + __panic_text(kind) + " at " + at
     let mh: int = __cast(msg)
     store64(__ctx() + CTX_PANIC, mh)

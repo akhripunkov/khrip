@@ -1868,6 +1868,7 @@ fn gen_func(name: str, ret: int) -> int {
 
 fn compile_init_globals(fi: int) {
     let frame_at = begin_fn(fi)
+    in_global_init = true
     for g in globals {
         if g.init >= 0 {
             pos = g.init
@@ -1882,6 +1883,7 @@ fn compile_init_globals(fi: int) {
             }
         }
     }
+    in_global_init = false
     end_fn(frame_at, false)
 }
 

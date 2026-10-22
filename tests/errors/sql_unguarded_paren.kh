@@ -1,0 +1,6 @@
+// expect: {nick} may be none, and a comparison with NULL is never true
+type P { id: int }
+route PUT "/p/{id}" (id: int, nick: str?) -> 204 | 404 {
+    sql "UPDATE people SET flag = (nick = {nick}) WHERE id = {id}"
+    return 204
+}

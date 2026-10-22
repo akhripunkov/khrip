@@ -47,6 +47,11 @@ type Migration {
     tok: int
 }
 
+// разбирается параметр внутри '...' (для подсказки про литералы PostgreSQL)
+var sql_quoted_param: bool
+// компилируются начальные значения глобальных переменных (до подключения к базе)
+var in_global_init: bool
+
 // запросы маршрута вне tx: сколько уже было (запись после них — гонка);
 // по веткам — наибольшее из путей, которые доходят до следующего оператора
 var sql_outside: int
@@ -215,6 +220,13 @@ fn sql_lit_writes(lit: SqlLit) -> bool {
 
 // Вызов функции программы в маршруте вне tx: её запросы считаются, как свои.
 fn sql_call_check(t: Token, fi: int) {
+    if in_global_init && !funcs[fi].is_lib {
+        fn_sql_summary(fi)
+        if fs_count[fi] > 0 {
+            error_tok(t, t.text + "() runs sql, and the initial value of a global is computed before the database is connected", "compute it in main, a route or an every task")
+        }
+        return
+    }
     if route_ctx < 0 || tx_depth > 0 || inline_depth > 0 || funcs[fi].is_lib {
         return
     }
@@ -1302,6 +1314,9 @@ fn sql_habit_placeholder(at: Token, text: str) {
 
 fn parse_sql(w: int) -> int {
     let at = tok()
+    if in_global_init {
+        error_tok(at, "sql in the initial value of a global runs before the database is connected", "compute it in main, a route or an every task")
+    }
     let lit = sqllits[at.val]
     advance()
     let n = lit.quoted.len()
@@ -1321,7 +1336,9 @@ fn parse_sql(w: int) -> int {
         let from = pos
         let saved = no_struct
         no_struct = false
+        sql_quoted_param = lit.quoted[i]
         let et = parse_expr(ty_err)
+        sql_quoted_param = false
         no_struct = saved
         let to = pos
         pfrom.push(from)
@@ -1368,6 +1385,9 @@ fn parse_sql(w: int) -> int {
             shape = SH_LIST
             inner = ty_elem(w)
             rt = w
+            if tkind(inner) == K_OPT && tkind(ty_inner(inner)) == K_STRUCT {
+                error_tok(at, "a row is never none: a list of rows is " + ty_name(ty_list(ty_inner(inner))), "let rows: " + ty_name(ty_list(ty_inner(inner))) + " = sql ...")
+            }
         } else if tkind(w) == K_OPT {
             shape = SH_OPT
             inner = ty_inner(w)
@@ -1430,7 +1450,7 @@ fn parse_sql(w: int) -> int {
             // ('{d}'::date); в шаблоне LIKE % и _ значения — буквы
             if !in_lit {
                 let q = sql_open_quote(cur)
-                lit_like = q >= 0 && (sql_ends_word(cur, q, "like") >= 0 || sql_ends_word(cur, q, "ilike") >= 0)
+                lit_like = q >= 0 && sql_like_context(cur, q)
                 if q >= 0 {
                     cur = cur[0..q] + "(" + cur[q..cur.len()]
                     in_lit = true
@@ -1446,6 +1466,9 @@ fn parse_sql(w: int) -> int {
                 // закрывающая кавычка строки — в следующем куске (если там нет нового параметра)
                 let close = sql_close_quote(next)
                 if close >= 0 {
+                    if lit_like && sql_starts_words(next[close + 1..next.len()], ["escape"]) > 0 {
+                        error_tok(ptoks[i], "ESCAPE with a value inside the pattern: % and _ in \{" + vtexts[vi] + "} are already escaped with \\", "drop the ESCAPE clause")
+                    }
                     next = next[0..close + 1] + ")" + next[close + 1..next.len()]
                     in_lit = false
                 }
@@ -1484,7 +1507,9 @@ fn parse_sql(w: int) -> int {
             let fs = structs[si].fields
             // таблица — для меток %%T (тип столбца) и %%D (DEFAULT столбца), которые
             // рантайм заменяет при запуске по каталогу базы (lib/db.kh)
-            let table = sql_name_at(cur, sql_insert_name_at(cur))
+            // имя — как написано (со схемой и кавычками): при запуске to_regclass
+            // найдёт ту же таблицу, что и сам INSERT
+            let table = cur[sql_insert_name_at(cur)..sql_trim_end(cur)]
             var names = ""
             var values = ""
             // для списка: столбцы unnest и что из них выбрать
@@ -1502,7 +1527,24 @@ fn parse_sql(w: int) -> int {
                 let mark = table + "." + f.name + "%%"
                 // поле T? со значением none — DEFAULT столбца (без DEFAULT — NULL)
                 let opt = tkind(f.ty) == K_OPT
-                if vk == K_LIST {
+                var fk = tkind(f.ty)
+                if fk == K_OPT {
+                    fk = tkind(ty_inner(f.ty))
+                }
+                if vk == K_LIST && fk == K_LIST {
+                    // поле-список: unnest массива массивов не бывает — каждое
+                    // значение едет как jsonb и становится массивом столбца
+                    let no = sql_param_no(ps, PK_COLUMN, ty_list(f.ty), vi, j)
+                    values = values + "$" + no.to_str() + "::jsonb[]"
+                    let k = "k" + j.to_str()
+                    cols = cols + k
+                    let conv = "%%A:" + table + "." + f.name + ":" + k + "%%"
+                    if opt {
+                        picks = picks + "CASE WHEN " + k + " IS NULL THEN %%D:" + mark + " ELSE " + conv + " END"
+                    } else {
+                        picks = picks + conv
+                    }
+                } else if vk == K_LIST {
                     // unnest($n::<тип столбца>[]): дата, uuid, перечисление — как в таблице
                     let no = sql_param_no(ps, PK_COLUMN, ty_list(f.ty), vi, j)
                     values = values + "$" + no.to_str() + "::%%T:" + mark + "[]"
@@ -1749,20 +1791,80 @@ fn sql_close_quote(s: str) -> int {
     return -1
 }
 
+// Строка '...' с начала q — шаблон LIKE: до неё в том же условии стоит LIKE,
+// ILIKE или ~~ (name LIKE lower('%{q}%'), LIKE ANY (ARRAY['%{q}%']), ~~*).
+fn sql_like_context(cur: str, q: int) -> bool {
+    let head = cur[0..q]
+    let ws = sql_code_words(head)
+    var bound = 0
+    var i = ws.len() - 1
+    while i >= 0 {
+        let w = ws[i].w
+        if w == "like" || w == "ilike" {
+            return true
+        }
+        if w == "and" || w == "or" || w == "where" || w == "on" || w == "when" || w == "then" || w == "else" || w == "having" || w == "select" || w == "set" || w == "returning" || w == "values" {
+            bound = ws[i].at
+            i = -1
+        }
+        i -= 1
+    }
+    let st = sql_states(head)
+    for j in bound..q - 1 {
+        if st[j] == 0 && head[j] == '~' && head[j + 1] == '~' {
+            return true
+        }
+    }
+    return false
+}
+
 // Параметр — значение присваивания SET col = {x} (а не сравнение): ближайшее
 // слово-раздел перед ним — SET.
 fn sql_in_set(cur: str) -> bool {
     let ws = sql_code_words(cur)
+    // глубина скобок у самого параметра
+    let st = sql_states(cur)
+    var depth = 0
+    for j in 0..cur.len() {
+        if st[j] == 0 {
+            if cur[j] == '(' {
+                depth += 1
+            } else if cur[j] == ')' {
+                depth -= 1
+            }
+        }
+    }
+    var cases = 0
     var i = ws.len() - 1
     while i >= 0 {
-        let w = ws[i].w
+        let x = ws[i]
+        i -= 1
+        if x.depth > depth {
+            // подзапрос или вызов в прежнем элементе списка SET
+            continue
+        }
+        if x.depth < depth {
+            // параметр в скобках: (nick = {x}) — это сравнение
+            return false
+        }
+        let w = x.w
+        // CASE ... END прежнего элемента: идя назад, END открывает, CASE закрывает
+        if w == "end" {
+            cases += 1
+            continue
+        }
+        if cases > 0 {
+            if w == "case" {
+                cases -= 1
+            }
+            continue
+        }
         if w == "set" {
             return true
         }
         if w == "where" || w == "on" || w == "having" || w == "when" || w == "then" || w == "else" || w == "and" || w == "or" || w == "not" || w == "select" || w == "returning" || w == "values" || w == "case" || w == "join" || w == "using" || w == "from" || w == "limit" || w == "offset" || w == "by" || w == "filter" {
             return false
         }
-        i -= 1
     }
     return false
 }
@@ -1774,7 +1876,10 @@ fn sql_ends_cmp(cur: str) -> bool {
     if e == 0 {
         return false
     }
-    if e >= 2 && (cur[e - 2..e] == "=>" || cur[e - 2..e] == "->") {
+    if e >= 2 && (cur[e - 2..e] == "=>" || cur[e - 2..e] == "->" || cur[e - 2..e] == "#>") {
+        return false
+    }
+    if e >= 3 && (cur[e - 3..e] == "->>" || cur[e - 3..e] == "#>>") {
         return false
     }
     let c = cur[e - 1]
@@ -1832,7 +1937,7 @@ fn sql_unmark(s: str) -> str {
     let n = s.len()
     while i < n {
         let cast = i + 5 < n && s[i] == ':' && s[i + 1] == ':' && s[i + 2] == '%' && s[i + 3] == '%' && s[i + 4] == 'T'
-        if cast || (i + 3 < n && s[i] == '%' && s[i + 1] == '%' && s[i + 2] == 'D' && s[i + 3] == ':') {
+        if cast || (i + 3 < n && s[i] == '%' && s[i + 1] == '%' && (s[i + 2] == 'D' || s[i + 2] == 'A') && s[i + 3] == ':') {
             var j = i + 4
             while j + 1 < n && !(s[j] == '%' && s[j + 1] == '%') {
                 j += 1

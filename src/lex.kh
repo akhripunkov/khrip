@@ -336,6 +336,10 @@ fn lex_number(end: int) -> int {
                 break
             }
             if d >= 0 {
+                if v > 0x7FFFFFFFFFFFFFF {
+                    lex_error("integer literal is too large", lx_p)
+                    v = 0
+                }
                 v = v * 16 + d
             }
             lx_p += 1

@@ -662,6 +662,8 @@ type SqScope {
     defined: [str]
     // встретилось то, чего проверка не понимает в FROM (функция, подзапрос)
     loose: bool
+    // таблица — на стороне внешнего соединения, которую дополняют NULL
+    outer: [bool]
 }
 
 fn sq_has(xs: [str], s: str) -> bool {
@@ -800,12 +802,13 @@ fn sq_table_kw(t: [SqTok], i: int, calls: [bool]) -> bool {
 
 // Таблицы запроса (FROM, JOIN, INTO, UPDATE, USING) и имена, которые он определяет.
 fn sq_scope(t: [SqTok]) -> SqScope {
-    let sc = SqScope { tables: [], aliases: [], defined: [], loose: false }
+    let sc = SqScope { tables: [], aliases: [], defined: [], loose: false, outer: [] }
     let calls = sq_in_call(t)
     var i = 0
     while i < t.len() {
         let tk = t[i]
         if sq_table_kw(t, i, calls) {
+            let kw = i
             var k = i + 1
             if sq_is(t, k, "only") || sq_is(t, k, "lateral") {
                 k += 1
@@ -828,10 +831,21 @@ fn sq_scope(t: [SqTok]) -> SqScope {
                 let e = sq_table_name(t, k)
                 let name = sq_last_name
                 let ti = sq_table(name)
+                let before = sc.tables.len()
                 i = sq_alias(t, e, sc, ti)
                 if ti >= 0 {
                     sc.tables.push(ti)
                     sc.aliases.push(name)
+                }
+                // LEFT JOIN — NULL у этой таблицы, RIGHT — у прежних, FULL — у всех
+                let kind = sq_join_kind(t, kw)
+                for x in before..sc.tables.len() {
+                    sc.outer.push(kind == 1 || kind == 3)
+                }
+                if kind == 2 || kind == 3 {
+                    for x in 0..before {
+                        sc.outer[x] = true
+                    }
                 }
                 continue
             }
@@ -951,7 +965,9 @@ fn sq_fits(field_ty: int, col_ty: str) -> str {
             return "an array"
         }
         let e = ty_inner(ty_elem(t))
-        if (ints && e != ty_int) || (floats && e != ty_float) || (base == "boolean" && e != ty_bool) || ((texts || times) && e != ty_str) {
+        // перечисление Khrip — в массив текста или перечисления базы
+        let enum_ok = tkind(e) == K_SUM && texts
+        if (ints && e != ty_int) || (floats && e != ty_float) || (base == "boolean" && e != ty_bool) || ((texts || times) && e != ty_str && !enum_ok) {
             return "an array of " + base
         }
         return ""
@@ -1470,7 +1486,7 @@ fn sq_outputs(t: [SqTok], sc: SqScope) -> [SqOut] {
             for x in 0..sc.aliases.len() {
                 if sc.aliases[x] == it[0].text && !found {
                     found = true
-                    let lj = sq_left_joined(t)
+                    let lj = sc.outer[x]
                     for c in sq_tables[sc.tables[x]].cols {
                         out.push(SqOut { name: c.name, ty: c.ty, notnull: c.notnull && !lj })
                     }
@@ -1492,24 +1508,29 @@ fn sq_outputs(t: [SqTok], sc: SqScope) -> [SqOut] {
         var col_ty = ""
         var col_nn = false
         var col_name = ""
+        var col_al = ""
         if expr_end == 1 && sq_name(it, 0) {
             col_name = it[0].text
         } else if expr_end == 3 && sq_name(it, 0) && sq_is(it, 1, ".") && sq_name(it, 2) {
             col_name = it[2].text
+            col_al = it[0].text
         }
         if col_name.len() > 0 {
-            var n_found = 0
-            for ti in sc.tables {
+            let x = sq_owner(sc, col_al, col_name)
+            if x >= 0 {
+                let ti = sc.tables[x]
                 let ci = sq_find_col(ti, col_name)
-                if ci >= 0 {
-                    n_found += 1
-                    col_ty = sq_tables[ti].cols[ci].ty
-                    col_nn = sq_tables[ti].cols[ci].notnull
+                col_ty = sq_tables[ti].cols[ci].ty
+                col_nn = sq_tables[ti].cols[ci].notnull
+                if sc.outer[x] {
+                    // сторона внешнего соединения: без пары — NULL (если WHERE
+                    // не отбрасывает такие строки — тогда неизвестно)
+                    if sq_where_mentions(t, sc.aliases[x]) {
+                        col_ty = ""
+                    } else {
+                        col_nn = false
+                    }
                 }
-            }
-            if n_found != 1 || sq_left_joined(t) {
-                // неоднозначно или внешнее соединение: тип и NULL не известны точно
-                col_ty = ""
             }
             if name.len() == 0 {
                 name = col_name
@@ -1522,6 +1543,63 @@ fn sq_outputs(t: [SqTok], sc: SqScope) -> [SqOut] {
         out.push(SqOut { name: name, ty: col_ty, notnull: col_nn })
     }
     return out
+}
+
+// Вид соединения у ключевого слова t[i]: 0 — не внешнее, 1 — LEFT, 2 — RIGHT, 3 — FULL.
+fn sq_join_kind(t: [SqTok], i: int) -> int {
+    if !sq_is(t, i, "join") {
+        return 0
+    }
+    var k = i - 1
+    if sq_is(t, k, "outer") {
+        k -= 1
+    }
+    if sq_is(t, k, "left") {
+        return 1
+    }
+    if sq_is(t, k, "right") {
+        return 2
+    }
+    if sq_is(t, k, "full") {
+        return 3
+    }
+    return 0
+}
+
+// Упоминается ли псевдоним a в WHERE (a.x): тогда строки без пары могли быть
+// отброшены, и про NULL ничего не известно наверняка.
+fn sq_where_mentions(t: [SqTok], a: str) -> bool {
+    var after = false
+    for i in 0..t.len() {
+        if sq_is(t, i, "where") {
+            after = true
+        }
+        if after && sq_name(t, i) && t[i].text == a && sq_is(t, i + 1, ".") {
+            return true
+        }
+    }
+    return false
+}
+
+// Таблица столбца: c — единственная таблица с таким столбцом, a.c — таблица
+// с псевдонимом a. → номер в sc (первый) или -1.
+fn sq_owner(sc: SqScope, al: str, col: str) -> int {
+    var found = -1
+    var ti_found = -1
+    for x in 0..sc.tables.len() {
+        let ti = sc.tables[x]
+        if (al.len() == 0 || sc.aliases[x] == al) && sq_find_col(ti, col) >= 0 {
+            if found < 0 {
+                found = x
+                ti_found = ti
+            } else if ti != ti_found || al.len() > 0 {
+                if al.len() == 0 {
+                    return -2
+                }
+            }
+        }
+    }
+    return found
 }
 
 // В запросе есть LEFT/RIGHT/FULL JOIN: столбцы могут быть NULL.

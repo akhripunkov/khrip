@@ -1,0 +1,5 @@
+khrip: applied migration 1
+ok    bulk insert keeps bools, lists and defaults
+ok    varchar(n) is not truncated
+ok    NaN and infinity
+3 tests: 3 passed, 0 failed

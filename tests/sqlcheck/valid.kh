@@ -40,6 +40,7 @@ type Post { id: int, user_id: int, title: str, text: str?, likes: int, created_a
 type Count { user_id: int, n: int }
 type Stat { name: str, posts: int, last: str?, avg_likes: float? }
 type Pair { a: str, b: str }
+type WithPost { id: int, email: str, title: str? }
 
 const NEWEST = "created_at DESC, id"
 
@@ -51,6 +52,8 @@ fn queries(id: int, q: str, ids: [int], since: int, tag: str?, limit: int, sort:
     }
     let sorted: [User] = sql "SELECT * FROM users ORDER BY {order} LIMIT {limit}"
     let by_name: [str] = sql `SELECT name FROM users ORDER BY name COLLATE "C"`
+    let joined: [WithPost] = sql "SELECT u.*, p.title FROM users u LEFT JOIN posts p ON p.user_id = u.id ORDER BY u.id"
+    let only_with: [Pair] = sql "SELECT u.name AS a, p.title AS b FROM users u LEFT JOIN posts p ON p.user_id = u.id WHERE p.id IS NOT NULL"
     let u: User? = sql "SELECT * FROM users WHERE id = {id}"
     let us: [User] = sql `SELECT u.* FROM users u WHERE u.email ILIKE '%{q}%' ORDER BY u."order" DESC NULLS LAST, u.id LIMIT {limit} OFFSET 0`
     let ps: [Post] = sql "SELECT * FROM posts WHERE user_id = ANY({ids}) AND created_at > to_timestamp({since}) ORDER BY id"
@@ -85,13 +88,15 @@ fn queries(id: int, q: str, ids: [int], since: int, tag: str?, limit: int, sort:
     let filt: int = sql "SELECT count(*) FILTER (WHERE likes > 0) FROM posts"
 }
 
-fn writes(id: int, email: str, name: str, title: str) {
+fn writes(id: int, email: str, name: str, title: str, nick: str?) {
     tx {
         let u: User = sql `INSERT INTO users (email, name) VALUES ({email}, {name})
             ON CONFLICT (email) DO UPDATE SET name = excluded.name, "order" = users."order" + 1 RETURNING *`
         let p: Post = sql "INSERT INTO posts (user_id, title) VALUES ({u.id}, {title}) RETURNING *"
         sql "UPDATE posts SET likes = likes + 1, text = coalesce(text, '') || '!' WHERE id = {p.id}"
         sql "UPDATE users SET tags = array_append(tags, {title}) WHERE id = {u.id}"
+        sql "UPDATE users SET score = CASE WHEN id > 0 THEN 1 ELSE 2 END, nick = {nick} WHERE id = {u.id}"
+        sql "UPDATE users SET score = (SELECT count(*) FROM posts p WHERE p.likes > 0), nick = {nick} WHERE id = {u.id}"
         sql "DELETE FROM posts p USING users u WHERE p.user_id = u.id AND u.email = {email} AND p.id <> {p.id}"
         let n = sql `WITH gone AS (DELETE FROM posts WHERE likes < 0 RETURNING user_id)
             UPDATE users SET score = score - 1 WHERE id IN (SELECT user_id FROM gone)`
@@ -102,7 +107,8 @@ fn main() {
 }
 
 test "every query is valid PostgreSQL" {
-    writes(1, "a@x.io", "Ann", "Hello")
+    writes(1, "a@x.io", "Ann", "Hello", "annie")
+    writes(1, "a@x.io", "Ann", "Hi", none)
     queries(1, "a", [1, 2], 0, none, 10, "name")
     queries(1, "a", [], 0, "x", 1, "-score")
     queries(1, "a", [], 0, "x", 1, "")

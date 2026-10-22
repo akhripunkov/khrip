@@ -105,8 +105,29 @@ fn float_compare(op: int, at: Token, left_int: bool) -> int {
     let rt = parse_add()
     float_right(rt, rt_tok, op)
     float_operands(left_int)
+    // NaN не равен ничему, в том числе себе, и не меньше и не больше ничего:
+    // ucomisd на нём ставит ZF, PF и CF
+    if op == '<' || op == T_LE {
+        // a < b — это b > a: условия «выше» ложны при NaN
+        // ucomisd xmm1, xmm0
+        emit_hex("66 0F 2E C8")
+        if op == '<' {
+            return CC_A
+        }
+        return CC_AE
+    }
     // ucomisd xmm0, xmm1
     emit_hex("66 0F 2E C1")
+    if op == T_EQ {
+        // равно и упорядочено: setnp al; sete cl; and al, cl; test al, al
+        emit_hex("0F 9B C0 0F 94 C1 20 C8 84 C0")
+        return CC_NE
+    }
+    if op == T_NE {
+        // не равно или неупорядочено: setp al; setne cl; or al, cl; test al, al
+        emit_hex("0F 9A C0 0F 95 C1 08 C8 84 C0")
+        return CC_NE
+    }
     return float_cc(op)
 }
 

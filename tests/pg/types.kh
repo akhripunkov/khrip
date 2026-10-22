@@ -1,0 +1,45 @@
+// Типы при вставке и чтении: поля bool и списки в массовой вставке, varchar(n)
+// без молчаливой обрезки, единственный столбец jsonb — поле, NaN и бесконечность.
+
+migration 1 `
+CREATE TABLE f (id bigserial PRIMARY KEY, done bool NOT NULL, code varchar(5) NOT NULL, tags text[] NOT NULL DEFAULT '{}', nums bigint[], meta jsonb);
+CREATE TABLE nums (x float8 NOT NULL);
+`
+
+type Meta { city: str }
+type NewF { done: bool, code: str, tags: [str] = [], nums: [int]?, meta: Meta? }
+type F { id: int, done: bool, code: str, tags: [str], nums: [int]?, meta: Meta? }
+type OnlyMeta { meta: Meta? }
+
+route POST "/f" (body: [NewF]) -> 201 [F] {
+    if body.len() == 1 {
+        let one: F = sql "INSERT INTO f {body[0]} RETURNING *"
+        return 201 [one]
+    }
+    return 201 sql "INSERT INTO f {body} RETURNING *"
+}
+
+test "bulk insert keeps bools, lists and defaults" {
+    let r = call POST "/f" [NewF { done: true, code: "a", tags: ["x", "y"], nums: [1, 2] }, NewF { done: false, code: "b" }, NewF { done: true, code: "c", meta: Meta { city: "Oslo" } }, NewF { done: true, code: "d", tags: ["z"] }]
+    expect r.status == 201
+    let fs: [F]? = from_json(r.body)
+    expect fs != none
+    expect fs.map(x => "{x.done}").join(",") == "true,false,true,true"
+    expect fs[0].tags.join(",") == "x,y" && fs[1].tags.len() == 0 && fs[3].tags.join(",") == "z"
+    expect (fs[0].nums ?? []).len() == 2 && fs[1].nums == none
+    let m: OnlyMeta = sql "SELECT meta FROM f WHERE code = 'c'"
+    expect (m.meta ?? Meta { city: "" }).city == "Oslo"
+}
+
+test "varchar(n) is not truncated" {
+    expect (call POST "/f" [NewF { done: true, code: "toolong" }]).status == 400
+    expect (call POST "/f" [NewF { done: true, code: "ok" }, NewF { done: true, code: "toolong" }]).status == 400
+}
+
+test "NaN and infinity" {
+    sql "INSERT INTO nums VALUES ('NaN'), ('Infinity'), ('-Infinity'), (1.5)"
+    let xs: [float] = sql "SELECT x FROM nums ORDER BY x"
+    // порядок PostgreSQL: -Infinity, числа, Infinity, NaN
+    expect xs.len() == 4 && xs[0] < -1000000.0 && xs[1] == 1.5
+    expect xs[2] > 1000000.0 && xs[3] != xs[3]
+}

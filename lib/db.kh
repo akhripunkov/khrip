@@ -162,7 +162,36 @@ fn __oid_elem(o: int) -> int {
     if o == 1001 {
         return OID_BYTEA
     }
-    return 0
+    // массивы типов программы (перечисления, домены, citext): из pg_type при запуске
+    return __db_user_elem[o] ?? 0
+}
+
+// Типы базы с OID от 16384: элемент массива и имя (читаются один раз при запуске).
+var __db_user_elem: map[int, int] = {}
+var __db_user_name: map[int, str] = {}
+
+fn __db_load_types(c: int, deadline: int) {
+    let r = __pg_exec(c, "select oid::bigint, typelem::bigint, format_type(oid, null), typcategory::text from pg_type where oid >= 16384", [], deadline)
+    for i in 0..r.rows {
+        let o = __pg_int(r, 4 * i)
+        __db_user_name[o] = __pg_str(r, 4 * i + 2)
+        if __pg_str(r, 4 * i + 3) == "A" {
+            __db_user_elem[o] = __pg_int(r, 4 * i + 1)
+        }
+    }
+}
+
+// Значение варианта перечисления по метке или -1.
+fn __db_enum_value(d: int, label: str) -> int {
+    let n = load64(d + 8)
+    for j in 0..n {
+        let e = d + 32 + j * 24
+        let vn: str = __cast(load64(e))
+        if vn == label {
+            return load64(e + 16)
+        }
+    }
+    return -1
 }
 
 fn __oid_name(o: int) -> str {
@@ -221,7 +250,7 @@ fn __oid_name(o: int) -> str {
     if e != 0 {
         return __oid_name(e) + "[]"
     }
-    return "type {o}"
+    return __db_user_name[o] ?? "type {o}"
 }
 
 // Название типа Khrip по описанию (для сообщений).
@@ -335,7 +364,9 @@ fn __param_fits(d: int, o: int) -> str {
         return "it is bool"
     }
     if k == D_STR || __desc_enum(dd) {
-        if __oid_texty(o) {
+        // строку разбирает сервер: годится любой тип, кроме чисел, bool и
+        // массивов (tsrange, timetz, tsvector, money, inet, домены...)
+        if __oid_texty(o) || (o != OID_BOOL && !__oid_int(o) && !__oid_float(o) && __oid_elem(o) == 0) {
             return ""
         }
         if __oid_int(o) || __oid_float(o) {
@@ -474,11 +505,20 @@ fn __db_params(site: int, vals: int) -> [str?] {
         } else if kind == PK_COLUMN {
             // список структур: значения поля f всех элементов — массивом
             let xs: [int] = __cast(v)
-            var col: [int] = []
-            for x in xs {
-                col.push(load64(x + f * 8))
+            if load64(load64(d + 8)) == D_BOOL {
+                // [bool] в памяти — по байту на элемент
+                var bs: [bool] = []
+                for x in xs {
+                    bs.push(load64(x + f * 8) != 0)
+                }
+                out.push(__db_encode(d, __cast(bs), o))
+            } else {
+                var col: [int] = []
+                for x in xs {
+                    col.push(load64(x + f * 8))
+                }
+                out.push(__db_encode(d, __cast(col), o))
             }
-            out.push(__db_encode(d, __cast(col), o))
         } else {
             out.push(__db_encode(d, v, o))
         }
@@ -556,13 +596,9 @@ fn __db_decode(r: __PgRes, i: int, d: int, cv: int, site: int, fi: int) -> int {
     }
     if cv == CV_ENUM {
         let label = __pg_str(r, i)
-        let n = load64(d + 8)
-        for j in 0..n {
-            let e = d + 32 + j * 24
-            let vn: str = __cast(load64(e))
-            if vn == label {
-                return load64(e + 16)
-            }
+        let ev = __db_enum_value(d, label)
+        if ev >= 0 {
+            return ev
         }
         __panic_msg("{__db_at(site, fi)} is '{label}', which is not a value of {__desc_name(d)}")
     }
@@ -573,7 +609,11 @@ fn __db_decode(r: __PgRes, i: int, d: int, cv: int, site: int, fi: int) -> int {
         if ek == D_BOOL {
             var xs: [bool] = []
             for x in items {
-                xs.push((x ?? "") == "t")
+                let s = x else {
+                    __panic_msg("{__db_at(site, fi)} has a NULL element, but its type {__desc_name(d)} has no none")
+                    return 0
+                }
+                xs.push(s == "t")
             }
             return __cast(xs)
         }
@@ -584,10 +624,33 @@ fn __db_decode(r: __PgRes, i: int, d: int, cv: int, site: int, fi: int) -> int {
                 return 0
             }
             if ek == D_INT {
-                xs.push(s.to_int() ?? 0)
+                let v = s.to_int() else {
+                    __panic_msg("{__db_at(site, fi)} has the element {s}, which is not an int")
+                    return 0
+                }
+                xs.push(v)
             } else if ek == D_FLOAT {
-                let f = s.to_float() ?? 0.0
+                var f = 0.0
+                if s == "NaN" {
+                    f = __cast(0x7FF8000000000000)
+                } else if s == "Infinity" {
+                    f = __cast(0x7FF0000000000000)
+                } else if s == "-Infinity" {
+                    f = __cast(-4503599627370496)
+                } else {
+                    let parsed = s.to_float() else {
+                        __panic_msg("{__db_at(site, fi)} has the element {s}, which is not a float")
+                        return 0
+                    }
+                    f = parsed
+                }
                 xs.push(__cast(f))
+            } else if __desc_enum(ed) {
+                let ev = __db_enum_value(ed, s)
+                if ev < 0 {
+                    __panic_msg("{__db_at(site, fi)} has '{s}', which is not a value of {__desc_name(ed)}")
+                }
+                xs.push(ev)
             } else {
                 xs.push(__cast(s))
             }
@@ -685,7 +748,8 @@ fn __db_conv(d: int, o: int) -> int {
             return 0
         }
         let ek = load64(load64(dd + 8))
-        if (ek == D_INT && __oid_int(eo)) || (ek == D_FLOAT && (__oid_float(eo) || __oid_int(eo))) || (ek == D_BOOL && eo == OID_BOOL) || (ek == D_STR && eo != OID_BOOL && !__oid_int(eo) && !__oid_float(eo) && !__oid_time(eo)) {
+        let texty = eo != OID_BOOL && !__oid_int(eo) && !__oid_float(eo) && !__oid_time(eo)
+        if (ek == D_INT && __oid_int(eo)) || (ek == D_FLOAT && (__oid_float(eo) || __oid_int(eo))) || (ek == D_BOOL && eo == OID_BOOL) || (ek == D_STR && texty) || (__desc_enum(load64(dd + 8)) && texty) {
             return CV_ARRAY
         }
     }
@@ -747,27 +811,45 @@ fn __db_markers(c: int, sql: str, deadline: int) -> str {
     var i = 0
     let n = sql.len()
     while i < n {
-        if i + 3 < n && sql[i] == '%' && sql[i + 1] == '%' && (sql[i + 2] == 'T' || sql[i + 2] == 'D') && sql[i + 3] == ':' {
+        if i + 3 < n && sql[i] == '%' && sql[i + 1] == '%' && (sql[i + 2] == 'T' || sql[i + 2] == 'D' || sql[i + 2] == 'A') && sql[i + 3] == ':' {
             var j = i + 4
             while j + 1 < n && !(sql[j] == '%' && sql[j + 1] == '%') {
                 j += 1
             }
+            var refend = j
+            var val = ""
+            if sql[i + 2] == 'A' {
+                // %%A:таблица.столбец:значение%%
+                while refend > i + 4 && sql[refend - 1] != ':' {
+                    refend -= 1
+                }
+                val = sql[refend..j]
+                refend -= 1
+            }
             // имя таблицы может быть со схемой: столбец — после последней точки
-            var dot = j - 1
+            var dot = refend - 1
             while dot > i + 4 && sql[dot] != '.' {
                 dot -= 1
             }
             let table = sql[i + 4..dot]
-            let col = sql[dot + 1..j]
-            let r = __pg_exec(c, "select format_type(a.atttypid, a.atttypmod), case when a.attidentity <> '' then 'nextval(' || quote_literal(pg_get_serial_sequence($1, a.attname)) || ')' else '(' || pg_get_expr(d.adbin, d.adrelid) || ')' end from pg_attribute a left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum where a.attrelid = to_regclass($1) and a.attname::text in ($2::text, lower($2::text)) and a.attnum > 0 and not a.attisdropped order by a.attname::text = $2::text desc limit 1", [table, col], deadline)
+            let col = sql[dot + 1..refend]
+            // тип — без модификатора: приведение к varchar(5) молча обрезало бы
+            // строку, а присваивание столбцу даёт ошибку 22001 (400)
+            let r = __pg_exec(c, "select format_type(a.atttypid, null), case when a.attidentity <> '' then 'nextval(' || quote_literal(pg_get_serial_sequence($1, a.attname)) || ')' else '(' || pg_get_expr(d.adbin, d.adrelid) || ')' end, t.typcategory::text from pg_attribute a join pg_type t on t.oid = a.atttypid left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum where a.attrelid = to_regclass($1) and a.attname::text in ($2::text, lower($2::text)) and a.attnum > 0 and not a.attisdropped order by a.attname::text = $2::text desc limit 1", [table, col], deadline)
             if r.err.code.len() > 0 || r.rows == 0 {
                 __db_mark_err = "table {table} has no column {col}"
                 return ""
             }
+            let ty = __pg_str(r, 0)
             if sql[i + 2] == 'T' {
-                buf_add(b, __pg_str(r, 0))
-            } else {
+                buf_add(b, ty)
+            } else if sql[i + 2] == 'D' {
                 buf_add(b, __pg_text(r, 1) ?? "NULL")
+            } else if __pg_str(r, 2) == "A" {
+                // список из jsonb — в массив столбца, по порядку
+                buf_add(b, "ARRAY(SELECT e FROM jsonb_array_elements_text({val}) WITH ORDINALITY AS x(e, o) ORDER BY o)::{ty}")
+            } else {
+                buf_add(b, "{val}::{ty}")
             }
             i = j + 2
             continue
@@ -809,14 +891,15 @@ fn __db_check(c: int, site: int, notnull: map[str, bool], deadline: int) -> str 
     while desc.err.code.len() > 0 && tries <= np {
         tries += 1
         var changed = false
-        if desc.err.code == "42P18" || desc.err.code == "42P08" {
-            if let k = __pg_param_no(desc.err.message) {
-                if k >= 0 && k < np && types[k] == 0 {
-                    types[k] = fallback[k]
-                    changed = true
-                }
+        if (desc.err.code == "42P18" || desc.err.code == "42P08") && __pg_param_no(desc.err.message) != none {
+            let k = __pg_param_no(desc.err.message) ?? -1
+            if k >= 0 && k < np && types[k] == 0 {
+                types[k] = fallback[k]
+                changed = true
             }
-        } else if desc.err.code == "42725" && desc.err.message.contains("unknown") {
+        } else if desc.err.code == "42P18" || desc.err.code == "42P08" || desc.err.code == "42725" {
+            // номер не прочитать (сообщение на другом языке) или оператор
+            // неоднозначен: тип из fallback — всем, у кого его нет
             for j in 0..np {
                 if types[j] == 0 {
                     types[j] = fallback[j]
@@ -842,8 +925,14 @@ fn __db_check(c: int, site: int, notnull: map[str, bool], deadline: int) -> str 
         oids.push(o)
         let kind = load64(pt + i * 32)
         let d = load64(pt + i * 32 + 8)
-        if kind == PK_VAL || kind == PK_FIELD {
-            let why = __param_fits(d, o)
+        if kind == PK_VAL || kind == PK_FIELD || kind == PK_COLUMN {
+            var why = ""
+            if kind == PK_COLUMN {
+                // массовая вставка: элемент списка — против элемента массива
+                why = __param_fits(load64(d + 8), __oid_elem(o))
+            } else {
+                why = __param_fits(d, o)
+            }
             if why.len() > 0 {
                 return "parameter ${i + 1} is sent to a {__oid_name(o)} place, but {why}\n    in: {sql}"
             }
@@ -876,7 +965,19 @@ fn __db_check(c: int, site: int, notnull: map[str, bool], deadline: int) -> str 
     if load64(d) == D_OPT {
         dd = load64(d + 8)
     }
-    let is_struct = load64(dd) == D_STRUCT && !(desc.cols.len() == 1 && __oid_json(desc.cols[0].ty))
+    // один столбец json, чьё имя — не поле структуры: это вся строка в JSON
+    var whole_json = false
+    if load64(dd) == D_STRUCT && desc.cols.len() == 1 && __oid_json(desc.cols[0].ty) {
+        whole_json = true
+        let cname = desc.cols[0].name.lower()
+        for fi in 0..load64(dd + 8) {
+            let fname: str = __cast(load64(__field(dd, fi)))
+            if fname.lower() == cname {
+                whole_json = false
+            }
+        }
+    }
+    let is_struct = load64(dd) == D_STRUCT && !whole_json
     var plan: [int] = []
     if !is_struct {
         if desc.cols.len() != 1 {
@@ -886,6 +987,11 @@ fn __db_check(c: int, site: int, notnull: map[str, bool], deadline: int) -> str 
         let cv = __db_conv(d, col.ty)
         if cv == 0 {
             return "column {col.name} is {__oid_name(col.ty)}, but {__desc_name(d)} is expected; {__db_conv_hint(d, col.ty)}"
+        }
+        if col.table != 0 && load64(d) != D_OPT && shape != SH_OPT {
+            if !(notnull["{col.table}:{col.attnum}"] ?? true) {
+                return "column {col.name} can be NULL, but {__desc_name(d)} has no none\n    fix: {__desc_name(d)}? (or [{__desc_name(d)}?]), add NOT NULL to the column, or select coalesce({col.name}, ...)"
+            }
         }
         plan.push(0)
         plan.push(cv)
@@ -963,9 +1069,11 @@ fn __db_sql_error(sql: str, e: __PgErr) -> str {
 }
 
 // NOT NULL столбцов, которые возвращают запросы: «таблица:номер» → attnotnull.
+// NOT NULL столбцов таблиц (у представлений и выражений его не знают — их не
+// проверяем, чтобы не отказывать правильным запросам).
 fn __db_notnull(c: int, deadline: int) -> map[str, bool] {
     var m: map[str, bool] = {}
-    let r = __pg_exec(c, "select attrelid::bigint, attnum::bigint, attnotnull from pg_attribute where attnum > 0 and attrelid in (select oid from pg_class where relnamespace not in (select oid from pg_namespace where nspname in ('pg_catalog', 'information_schema')))", [], deadline)
+    let r = __pg_exec(c, "select attrelid::bigint, attnum::bigint, attnotnull from pg_attribute where attnum > 0 and attrelid in (select oid from pg_class where relkind in ('r', 'p') and relnamespace not in (select oid from pg_namespace where nspname in ('pg_catalog', 'information_schema')))", [], deadline)
     for i in 0..r.rows {
         m["{__pg_int(r, 3 * i)}:{__pg_int(r, 3 * i + 1)}"] = __pg_bool(r, 3 * i + 2)
     }
@@ -1062,6 +1170,7 @@ fn __db_start_here() {
     var bad = 0
     if st != 0 {
         let notnull = __db_notnull(c, deadline)
+        __db_load_types(c, deadline)
         for i in 0..load64(st) {
             let site = load64(st + 8 + 8 * i)
             let err = __db_check(c, site, notnull, deadline)
@@ -1124,6 +1233,14 @@ fn __db_classify(e: __PgErr, target: str) -> __DbFail {
         return __DbFail { status: 409, msg: "conflict: " + name }
     }
     if code == "23503" {
+        // направление — по тексту PostgreSQL, если он английский; иначе — по
+        // таблицам, в которые пишет оператор
+        if e.detail.contains("is still referenced") {
+            return __DbFail { status: 409, msg: "still referenced: " + name }
+        }
+        if e.detail.contains("is not present") {
+            return __DbFail { status: 404, msg: "not found: " + name }
+        }
         if target.len() > 0 && target.contains(" " + e.table + " ") {
             return __DbFail { status: 404, msg: "not found: " + name }
         }
@@ -1132,14 +1249,16 @@ fn __db_classify(e: __PgErr, target: str) -> __DbFail {
     if code == "23502" {
         return __DbFail { status: 400, msg: "missing value: " + e.table + "." + e.column }
     }
-    if code.starts_with("22") || code == "P0001" {
+    // неверное значение от клиента — 400; ошибка вычисления в запросе (деление
+    // на ноль, регулярное выражение, индекс массива) — ошибка программы, 500
+    if code == "22P02" || code == "22001" || code == "22003" || code == "22007" || code == "22008" || code == "22009" || code == "22023" || code == "22004" || code == "22021" || code == "22P05" || code == "P0001" {
         return __DbFail { status: 400, msg: e.message }
     }
     if code == "08007" {
         // связь пропала во время COMMIT: повторять небезопасно
         return __DbFail { status: 500, msg: "transaction outcome unknown" }
     }
-    if code == "57014" || code.starts_with("08") || code.starts_with("53") || code.starts_with("57P") || code.starts_with("40") {
+    if code == "57014" || code == "55P03" || code.starts_with("08") || code.starts_with("53") || code.starts_with("57P") || code.starts_with("40") {
         return __DbFail { status: 503, msg: "database unavailable, try again" }
     }
     return __DbFail { status: 500, msg: "internal error" }
@@ -1241,7 +1360,9 @@ fn __db_run(site0: int, vals: int) -> int {
         if res.err.code.len() == 0 {
             break
         }
-        if __pg_retryable(res.err) || (held != 0 && res.err.code == "55P03") {
+        // 55P03 — повтор, только если это наш короткий lock_timeout первой
+        // попытки; NOWAIT и свой lock_timeout программы — обычная ошибка (503)
+        if __pg_retryable(res.err) || (held != 0 && res.err.code == "55P03" && load64(held + PB_TXTRY) == 0) {
             if held != 0 {
                 // конфликт в транзакции: она повторяется целиком
                 __db_tx_retry(res.err)
@@ -1338,9 +1459,11 @@ fn __db_tx_begin(id: int) -> int {
 }
 
 fn __db_tx_unavailable(why: str) {
+    // подробности (адрес, пользователь, ошибка TLS) — только в журнал
+    eprint("tx failed: database unavailable: " + why)
     if load64(__ctx() + CTX_WORKER) != 0 && __w().cur != 0 {
         set_header("Retry-After", "1")
-        fail(503, "database unavailable: " + why)
+        fail(503, "database unavailable, try again")
     }
     __panic_msg("database unavailable: " + why)
 }
@@ -1366,7 +1489,7 @@ fn __db_tx_commit(jb: int) {
     }
     let e = __pg_tx_end(c, true, load64(c + PB_TXDL))
     if e.code.len() > 0 {
-        if __pg_retryable(e) || e.code == "55P03" {
+        if __pg_retryable(e) || (e.code == "55P03" && load64(c + PB_TXTRY) == 0) {
             __db_tx_retry(e)
         }
         __db_tx_release(c)
@@ -1433,6 +1556,12 @@ fn __db_tx_retry(e: __PgErr) {
         store64(c + PB_TXLOCK, key)
     } else {
         __pg_backoff(n)
+    }
+    // проигрывает подряд (горячая строка): новые первые попытки этого места
+    // встают в очередь за ним, а не обгоняют его снова; одиночный ложный
+    // конфликт SERIALIZABLE (страница индекса) очередь не включает
+    if n >= 3 {
+        __pg_queue_enter(c)
     }
     __pg_tx_begin(c, PG_SERIALIZABLE)
     __longjmp(jb)
