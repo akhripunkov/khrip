@@ -1190,8 +1190,15 @@ fn sql_dialect(s: str) -> [SqlHabit] {
             return out
         }
     }
+    // внутри CREATE/ALTER TABLE (до следующего SELECT, VIEW и т. п.)
+    var ddl = false
     for i in 0..ws.len() {
         let w = ws[i].w
+        if w == "table" && i > 0 && (ws[i - 1].w == "create" || ws[i - 1].w == "alter" || ws[i - 1].w == "temp" || ws[i - 1].w == "temporary" || ws[i - 1].w == "unlogged") {
+            ddl = true
+        } else if w == "select" || w == "insert" || w == "update" || w == "delete" || w == "values" || w == "view" || w == "function" || w == "index" {
+            ddl = false
+        }
         var next = ""
         if i + 1 < ws.len() {
             next = ws[i + 1].w
@@ -1206,7 +1213,15 @@ fn sql_dialect(s: str) -> [SqlHabit] {
             p += 1
         }
         let fcall = p < n && s[p] == '('
-        let typed = sql_type_slot(s, ws[i].at)
+        let typed = sql_type_word(w) && sql_type_slot(s, ws, i, ddl)
+        // после «(»: число (IDENTITY(1,1), INT(11), DATETIME(6))
+        var a = p + 1
+        while a < n && sql_space(s[a]) {
+            a += 1
+        }
+        let num_arg = fcall && a < n && is_digit(s[a])
+        // определение своей функции с таким именем — не вызов
+        let defn = prev == "function" || (ws[i].at > 0 && s[ws[i].at - 1] == '.')
         var msg = ""
         var fix = ""
         if w == "insert" && next == "ignore" {
@@ -1221,28 +1236,28 @@ fn sql_dialect(s: str) -> [SqlHabit] {
         } else if w == "limit" && sql_limit_comma(s, p) {
             msg = "LIMIT a, b is MySQL"
             fix = "LIMIT b OFFSET a"
-        } else if w == "top" && prev == "select" {
+        } else if w == "top" && prev == "select" && p < n && (is_digit(s[p]) || s[p] == '(' || s[p] == '$') {
             msg = "SELECT TOP n is SQL Server"
             fix = "... ORDER BY ... LIMIT n"
-        } else if fcall && (w == "ifnull" || w == "isnull" || w == "nvl") {
+        } else if fcall && !defn && (w == "ifnull" || w == "isnull" || w == "nvl") {
             msg = w + "() is not PostgreSQL"
             fix = "coalesce(a, b)"
-        } else if fcall && (w == "getdate" || w == "curdate" || w == "sysdate" || w == "getutcdate") {
+        } else if fcall && !defn && (w == "getdate" || w == "curdate" || w == "sysdate" || w == "getutcdate") {
             msg = w + "() is not PostgreSQL"
             fix = "now() (current_date for the date)"
-        } else if fcall && (w == "last_insert_id" || w == "lastval" || w == "scope_identity" || w == "last_insert_rowid") {
+        } else if fcall && !defn && (w == "last_insert_id" || w == "lastval" || w == "scope_identity" || w == "last_insert_rowid") {
             msg = w + "() can return an id from another table or request"
             fix = "INSERT ... RETURNING id"
-        } else if fcall && w == "group_concat" {
+        } else if fcall && !defn && w == "group_concat" {
             msg = "group_concat() is MySQL"
             fix = "string_agg(x, ',')"
-        } else if fcall && (w == "len" || w == "charindex" || w == "datediff") {
+        } else if fcall && !defn && (w == "len" || w == "charindex" || w == "datediff") {
             msg = w + "() is SQL Server"
             fix = "length(s), strpos(s, sub), b - a (dates) or age(b, a)"
-        } else if w == "auto_increment" || w == "autoincrement" || (w == "identity" && fcall && prev != "as") {
+        } else if w == "auto_increment" || w == "autoincrement" || (w == "identity" && num_arg && prev != "as") {
             msg = sql_upper(w) + " is not PostgreSQL"
             fix = "id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY (or bigserial PRIMARY KEY)"
-        } else if typed && !fcall && (w == "datetime" || w == "datetime2") {
+        } else if typed && (w == "datetime" || w == "datetime2") {
             msg = "DATETIME is not a PostgreSQL type"
             fix = "timestamptz"
         } else if typed && (w == "tinyint" || w == "mediumint") {
@@ -1251,7 +1266,10 @@ fn sql_dialect(s: str) -> [SqlHabit] {
         } else if typed && (w == "nvarchar" || w == "longtext" || w == "mediumtext") {
             msg = sql_upper(w) + " is not a PostgreSQL type"
             fix = "text"
-        } else if w == "unsigned" && (prev == "int" || prev == "integer" || prev == "bigint" || prev == "smallint" || prev == "tinyint") {
+        } else if typed && num_arg && (w == "int" || w == "integer" || w == "bigint" || w == "smallint") {
+            msg = sql_upper(w) + "(n) is MySQL: the number is a display width"
+            fix = sql_upper(w) + " without (n); bigint for ids and amounts"
+        } else if w == "unsigned" && (prev == "int" || prev == "integer" || prev == "bigint" || prev == "smallint" || prev == "tinyint") && sql_only_space(s, ws[i - 1].at + prev.len(), ws[i].at) {
             msg = "PostgreSQL has no unsigned numbers"
             fix = "bigint with CHECK (col >= 0)"
         } else if typed && !fcall && w == "money" {
@@ -1266,10 +1284,11 @@ fn sql_dialect(s: str) -> [SqlHabit] {
     return out
 }
 
-// Слово с позиции at стоит на месте типа: после «::», в определении столбца
-// («(имя тип», «, имя тип», «ADD [COLUMN] имя тип») или после TYPE.
-fn sql_type_slot(s: str, at: int) -> bool {
-    var q = at - 1
+// Слово ws[i] стоит на месте типа: после «::», после TYPE (ALTER COLUMN ...
+// TYPE), или в определении столбца внутри CREATE/ALTER TABLE: «(имя тип»,
+// «, имя тип», «ADD [COLUMN] имя тип». Имя — не ключевое слово.
+fn sql_type_slot(s: str, ws: [SqlWord], i: int, ddl: bool) -> bool {
+    var q = ws[i].at - 1
     while q >= 0 && sql_space(s[q]) {
         q -= 1
     }
@@ -1279,46 +1298,78 @@ fn sql_type_slot(s: str, at: int) -> bool {
     if s[q] == ':' {
         return true
     }
-    // предыдущее слово (или "имя")
-    let e = q
+    // предыдущее: "имя" или слово вплотную; before — индекс слова перед именем
+    var start = -1
+    var before = i - 1
     if s[q] == '"' {
-        q -= 1
-        while q >= 0 && s[q] != '"' {
-            q -= 1
+        var r = q - 1
+        while r >= 0 && s[r] != '"' {
+            r -= 1
         }
-        q -= 1
+        if r < 0 {
+            return false
+        }
+        start = r
+    } else if i > 0 && ws[i - 1].at + ws[i - 1].w.len() == q + 1 {
+        let pw = ws[i - 1].w
+        if pw == "type" {
+            return ddl
+        }
+        if sql_reserved(pw) {
+            return false
+        }
+        start = ws[i - 1].at
+        before = i - 2
     } else {
-        while q >= 0 && is_ident_char(s[q]) {
-            q -= 1
-        }
-    }
-    if q == e {
         return false
     }
-    let b = buf_new(8)
-    for k in q + 1..e + 1 {
-        buf_byte(b, sql_lower(s[k]))
+    if !ddl {
+        return false
     }
-    if buf_str(b) == "type" {
+    var r = start - 1
+    while r >= 0 && sql_space(s[r]) {
+        r -= 1
+    }
+    if r < 0 {
+        return false
+    }
+    if s[r] == '(' || s[r] == ',' {
         return true
     }
-    while q >= 0 && sql_space(s[q]) {
-        q -= 1
+    if before >= 0 && ws[before].at + ws[before].w.len() == r + 1 {
+        return ws[before].w == "column" || ws[before].w == "add"
     }
-    if q >= 0 && (s[q] == '(' || s[q] == ',') {
-        return true
+    return false
+}
+
+// Типы других диалектов (и int с шириной): только их место проверяется.
+fn sql_type_word(w: str) -> bool {
+    for k in ["datetime", "datetime2", "tinyint", "mediumint", "nvarchar", "longtext", "mediumtext", "money", "int", "integer", "bigint", "smallint"] {
+        if w == k {
+            return true
+        }
     }
-    // ADD [COLUMN] имя тип
-    let e2 = q
-    while q >= 0 && is_ident_char(s[q]) {
-        q -= 1
+    return false
+}
+
+// Ключевое слово SQL, которое не бывает именем столбца перед типом.
+fn sql_reserved(w: str) -> bool {
+    for k in ["select", "distinct", "all", "by", "on", "and", "or", "not", "as", "from", "where", "column", "add", "table", "constraint", "primary", "key", "unique", "check", "references", "default", "null", "foreign", "set", "with", "returning", "into", "values", "case", "when", "then", "else", "end", "in", "is", "like", "between", "exists", "only", "if", "using", "alter", "drop", "rename", "to"] {
+        if w == k {
+            return true
+        }
     }
-    let b2 = buf_new(8)
-    for k in q + 1..e2 + 1 {
-        buf_byte(b2, sql_lower(s[k]))
+    return false
+}
+
+// Между позициями a и b только пробелы.
+fn sql_only_space(s: str, a: int, b: int) -> bool {
+    for k in a..b {
+        if !sql_space(s[k]) {
+            return false
+        }
     }
-    let w = buf_str(b2)
-    return w == "column" || w == "add"
+    return true
 }
 
 // После LIMIT с позиции p: число или $n, затем запятая (LIMIT a, b из MySQL).

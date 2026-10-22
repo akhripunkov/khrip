@@ -1357,7 +1357,12 @@ fn __db_run(site0: int, vals: int) -> int {
             dl = dl.min(load64(c + PB_TXDL))
         }
         store64(c + PB_INFLIGHT, 1)
-        res = __pg_query_at(c, load64(site + SITE_INDEX), sql, params, types, [], dl)
+        // в транзакции — свой подготовленный оператор места (см. PG_SITES)
+        var idx = load64(site + SITE_INDEX)
+        if held != 0 && idx >= 0 && idx < PG_SITES {
+            idx += PG_SITES
+        }
+        res = __pg_query_at(c, idx, sql, params, types, [], dl)
         store64(c + PB_INFLIGHT, 0)
         if held == 0 {
             store64(cx + CTX_PGHELD, 0)
@@ -1483,7 +1488,11 @@ fn __db_note_keys(c: int, site: int, params: [str?]) {
                 let k = __pg_row_key(__cast(load64(kt + 8 + 16 * i)), v)
                 __pg_key_add(c + PB_KEYS, k)
                 __pg_key_add(mine, k)
-                hot = hot || (__pg_key_hot(k) && !__pg_key_has(held, k))
+                // строка, которую повтор не возьмёт (набор полон), — не повод
+                // уступать: иначе попытка уступала бы без конца
+                if __pg_key_has(c + PB_KEYS, k) && !__pg_key_has(held, k) && __pg_key_hot(c, k) {
+                    hot = true
+                }
             }
         }
     }

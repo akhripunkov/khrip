@@ -48,14 +48,16 @@ const PB_GATE = 192
 // подготовленные запросы: SHA-256 текста (32 байта) и номер — по 40 байт
 const PB_STMT = 256
 const PG_STMTS = 200
+// подготовленные места sql (lib/db.kh): по биту на номер места, имя «s<номер>»;
+// в транзакции у места свой оператор (номер + PG_SITES): план, построенный вне
+// tx, мог выбрать последовательный просмотр, а в tx он выключен — и наоборот
+const PB_SITES = 8448
+const PG_SITES = 16384
 // очередь повторов tx: ключи строк, которых коснулась попытка, и ключи
 // сессионных advisory-блокировок, которые соединение держит (число, ключи)
-const PB_KEYS = 8256
-const PB_HELD = 8352
-const PG_KEYS = 11
-// подготовленные места sql (lib/db.kh): по биту на номер места, имя «s<номер>»
-const PB_SITES = 8448
-const PG_SITES = 63488
+const PB_KEYS = 12544
+const PB_HELD = 13056
+const PG_KEYS = 63
 
 // ---- Адрес базы ----
 
@@ -709,7 +711,9 @@ const PG_SHORT_LOCKS = 16
 fn __pg_begin_settings(mode: int) -> str {
     var parts: [str] = []
     if mode & 7 == PG_SERIALIZABLE {
-        parts.push("set_config('enable_seqscan', 'off', true)")
+        // без JIT: если просмотр всё же нужен, его «запретная» стоимость
+        // перешагнёт порог JIT, и компиляция плана займёт десятки миллисекунд
+        parts.push("set_config('enable_seqscan', 'off', true), set_config('jit', 'off', true)")
     }
     if mode & PG_SHORT_LOCKS != 0 {
         parts.push("set_config('lock_timeout', '100', true)")
@@ -1013,7 +1017,7 @@ fn __pg_query_at(c: int, site: int, sql: str, params: [str?], types: [int], fall
     var key = 0
     var idx = -1
     var fresh = true
-    let by_site = site >= 0 && site < PG_SITES
+    let by_site = site >= 0 && site < 2 * PG_SITES
     if by_site {
         fresh = (load8(c + PB_SITES + (site >> 3)) & (1 << (site & 7))) == 0
     } else {
@@ -1468,9 +1472,20 @@ fn __pg_key_add(area: int, k: int) {
     }
 }
 
-// Строку ждёт или держит в очереди повторов соединение этого процесса.
-fn __pg_key_hot(k: int) -> bool {
-    return __pg_hot != 0 && load64(__pg_hot + (k & 4095) * 8) > 0
+// Строку ждёт или держит в очереди повторов другое соединение этого процесса
+// (свои ключи с той же ячейкой счётчика не в счёт).
+fn __pg_key_hot(c: int, k: int) -> bool {
+    if __pg_hot == 0 {
+        return false
+    }
+    var n = load64(__pg_hot + (k & 4095) * 8)
+    let h = c + PB_HELD
+    for i in 0..load64(h) {
+        if load64(h + 8 + i * 8) & 4095 == k & 4095 {
+            n -= 1
+        }
+    }
+    return n > 0
 }
 
 // Ключи набора area — в PB_HELD по возрастанию (блокировки берутся везде в

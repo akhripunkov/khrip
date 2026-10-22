@@ -125,21 +125,29 @@ else
 		sleep 0.1
 	done
 	url=http://127.0.0.1:$race_port
-	seq 300 | xargs -P 32 -I{} curl -s -o /dev/null -w '%{http_code}\n' -X POST "$url/hit" >"$tmp/pg/race.hits"
+	# горячая строка 1 и строка 75 (за пределами 63 ключей очереди) вместе с
+	# транзакциями на все 80 строк; затем переводы «прочитал — записал»
+	{
+		seq 300 | sed "s|.*|$url/hit/1|"
+		seq 100 | sed "s|.*|$url/hit/75|"
+		seq 20 | sed "s|.*|$url/sweep|"
+	} | shuf | xargs -P 32 -I{} curl -s -o /dev/null -w '%{http_code}\n' -X POST {} >"$tmp/pg/race.hits"
 	for i in $(seq 300); do
 		a=$((RANDOM % 5 + 1)) b=$((RANDOM % 4 + 1))
 		((b >= a)) && b=$((b + 1))
 		echo "$url/move/$a/$b/$((RANDOM % 300 + 1))"
 	done | xargs -P 32 -I{} curl -s -o /dev/null -w '%{http_code}\n' -X POST {} >"$tmp/pg/race.moves"
 	total=$(curl -s "$url/total")
+	one=$(curl -s "$url/counter/1")
 	kill "$race_pid" 2>/dev/null
 	wait "$race_pid" 2>/dev/null
-	hits=$(grep -c '^200$' "$tmp/pg/race.hits")
+	hits=$(grep -c '^20[04]$' "$tmp/pg/race.hits")
 	bad=$(grep -cv '^20[04]$\|^409$' "$tmp/pg/race.moves")
-	if [[ $hits == 300 && $bad == 0 && $total == '{"n":300,"balance":5000}' ]]; then
+	# 400 попаданий по одной строке и 20 проходов по 80 строкам
+	if [[ $hits == 420 && $bad == 0 && $total == '{"n":2000,"balance":5000}' && $one == '{"id":1,"n":320}' ]]; then
 		pass=$((pass + 1))
 	else
-		failed "tests/pg/load/race.kh" "200 на /hit: $hits из 300, других ответов на /move: $bad, итог: $total"$'\n'"$(sort "$tmp/pg/race.hits" "$tmp/pg/race.moves" | uniq -c)"$'\n'"$(tail -5 "$tmp/pg/race.log")"
+		failed "tests/pg/load/race.kh" "успешных /hit и /sweep: $hits из 420, других ответов на /move: $bad, итог: $total, строка 1: $one"$'\n'"$(sort "$tmp/pg/race.hits" "$tmp/pg/race.moves" | uniq -c)"$'\n'"$(tail -5 "$tmp/pg/race.log")"
 	fi
 fi
 

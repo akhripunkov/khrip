@@ -1,8 +1,9 @@
 // Сервер для проверки очереди повторов tx под одновременными запросами
-// (tests/pg.sh): горячая строка и переводы между пятью счетами.
+// (tests/pg.sh): горячая строка, переводы между пятью счетами и транзакция на
+// 80 строк (больше, чем ключей в очереди), пока одна из последних — горячая.
 migration 1 `
 CREATE TABLE counters (id bigint PRIMARY KEY, n bigint NOT NULL);
-INSERT INTO counters VALUES (1, 0);
+INSERT INTO counters SELECT g, 0 FROM generate_series(1, 80) g;
 CREATE TABLE accounts (id bigint PRIMARY KEY, balance bigint NOT NULL CHECK (balance >= 0));
 INSERT INTO accounts SELECT g, 1000 FROM generate_series(1, 5) g;
 `
@@ -10,11 +11,30 @@ type Counter { id: int, n: int }
 type Account { id: int, balance: int }
 type Total { n: int, balance: int }
 
-route POST "/hit" -> Counter | 404 {
+// одно и то же место sql и в tx, и вне его
+fn counter(id: int) -> Counter {
+    return sql "SELECT * FROM counters WHERE id = {id}"
+}
+
+route POST "/hit/{id}" (id: int) -> Counter | 404 {
     return tx {
-        let c: Counter = sql "SELECT * FROM counters WHERE id = 1"
-        sql "UPDATE counters SET n = {c.n + 1} WHERE id = 1 RETURNING *"
+        let c = counter(id)
+        sql "UPDATE counters SET n = {c.n + 1} WHERE id = {id} RETURNING *"
     }
+}
+
+route GET "/counter/{id}" (id: int) -> Counter | 404 {
+    return counter(id)
+}
+
+route POST "/sweep" -> 204 | 404 {
+    tx {
+        for id in 1..81 {
+            let c = counter(id)
+            sql "UPDATE counters SET n = {c.n + 1} WHERE id = {id}"
+        }
+    }
+    return 204
 }
 
 route POST "/move/{a}/{b}/{amount}" (a: int, b: int, amount: int) -> 204 | 404 | 409 str {
@@ -31,5 +51,5 @@ route POST "/move/{a}/{b}/{amount}" (a: int, b: int, amount: int) -> 204 | 404 |
 }
 
 route GET "/total" -> Total {
-    return sql "SELECT (SELECT n FROM counters WHERE id = 1) AS n, (SELECT sum(balance)::bigint FROM accounts) AS balance"
+    return sql "SELECT (SELECT sum(n)::bigint FROM counters) AS n, (SELECT sum(balance)::bigint FROM accounts) AS balance"
 }

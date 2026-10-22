@@ -35,6 +35,17 @@ ALTER TABLE users ALTER COLUMN born SET NOT NULL;
 ALTER TABLE users ALTER COLUMN born DROP NOT NULL;
 `
 
+// имена, похожие на привычки других диалектов: столбцы money, top, unsigned,
+// datetime и len, таблица identity, своя функция nvl; кавычка в комментарии SQL
+migration 3 `
+-- одинокая " в комментарии
+CREATE TABLE identity (id bigserial PRIMARY KEY, money bigint NOT NULL, top int NOT NULL,
+    unsigned int NOT NULL, len int NOT NULL DEFAULT 0);
+ALTER TABLE identity ADD COLUMN datetime text;
+ALTER TABLE identity ADD COLUMN money2 bigint, ADD flag boolean;
+CREATE FUNCTION nvl(a text, b text) RETURNS text LANGUAGE sql AS $$ SELECT coalesce(a, b) $$;
+`
+
 type User { id: int, email: str, name: str, born: str?, tags: [str], created_at: str, score: float, nick: str?, mood: str }
 type Post { id: int, user_id: int, title: str, text: str?, likes: int, created_at: int }
 type Count { user_id: int, n: int }
@@ -88,6 +99,17 @@ fn queries(id: int, q: str, ids: [int], since: int, tag: str?, limit: int, sort:
     let filt: int = sql "SELECT count(*) FILTER (WHERE likes > 0) FROM posts"
 }
 
+type Ident { money: int, top: int, unsigned: int, len: int }
+
+fn names() {
+    let rows: [Ident] = sql `SELECT money, top, unsigned, len FROM identity -- "кавычка
+        WHERE top > 0 ORDER BY money, top`
+    let n: int = sql "SELECT count(DISTINCT money) FROM identity"
+    let d: str? = sql "SELECT max(datetime) FROM identity"
+    sql "INSERT INTO identity (money, top, unsigned) VALUES (1, 2, 3)"
+    let t: int = sql "SELECT sum(x.money)::bigint FROM (SELECT money FROM identity) x"
+}
+
 fn writes(id: int, email: str, name: str, title: str, nick: str?) {
     tx {
         let u: User = sql `INSERT INTO users (email, name) VALUES ({email}, {name})
@@ -112,4 +134,5 @@ test "every query is valid PostgreSQL" {
     queries(1, "a", [1, 2], 0, none, 10, "name")
     queries(1, "a", [], 0, "x", 1, "-score")
     queries(1, "a", [], 0, "x", 1, "")
+    names()
 }

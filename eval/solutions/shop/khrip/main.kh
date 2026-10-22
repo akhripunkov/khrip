@@ -98,7 +98,7 @@ route PATCH "/products/{id}" (id: int, body: ProductPatch) -> Product | 400 str 
 }
 
 route GET "/products" (category_id: int?, tag: str?, q: str?, min_price: int?, max_price: int?, in_stock: bool = false, sort: str = "", page: int = 1, per_page: int = 10) -> Page | 400 str {
-    if page < 1 || per_page < 1 || per_page > 50 {
+    if page < 1 || page > 2147483647 || per_page < 1 || per_page > 50 {
         return 400 "bad query"
     }
     let o = match sort {
