@@ -14,10 +14,19 @@ CREATE TABLE orders (
     customer text NOT NULL,
     status text NOT NULL DEFAULT 'placed',
     total bigint NOT NULL,
-    lines jsonb NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX ON orders (customer);
+CREATE TABLE order_lines (
+    order_id bigint NOT NULL REFERENCES orders,
+    line int NOT NULL,
+    product_id bigint NOT NULL REFERENCES products,
+    qty bigint NOT NULL,
+    price bigint NOT NULL,
+    PRIMARY KEY (order_id, line)
+);
+CREATE VIEW order_view AS SELECT o.*, coalesce((SELECT jsonb_agg(jsonb_build_object('product_id', product_id,
+    'qty', qty, 'price', price) ORDER BY line) FROM order_lines WHERE order_id = o.id), '[]') AS lines FROM orders o;
 `
 
 type NewCategory { name: str }
@@ -29,8 +38,9 @@ type Page { items: [Product], total: int }
 type Line { product_id: int, qty: int }
 type PricedLine { product_id: int, qty: int, price: int }
 type NewOrder { customer: str, lines: [Line] }
-type Order { id: int, customer: str, status: str, total: int, created_at: str, lines: [PricedLine] }
-type OrderRow { customer: str, total: int, lines: [PricedLine] }
+type OrderHead { id: int, customer: str, status: str, total: int, created_at: str }
+type Order { ...OrderHead, lines: [PricedLine] }
+type OrderLine { order_id: int, line: int, product_id: int, qty: int, price: int }
 type CategoryStats { category: str, products: int, units_sold: int, revenue: int }
 
 fn tags_ok(tags: [str]) -> bool {
@@ -88,26 +98,32 @@ route PATCH "/products/{id}" (id: int, body: ProductPatch) -> Product | 400 str 
 }
 
 route GET "/products" (category_id: int?, tag: str?, q: str?, min_price: int?, max_price: int?, in_stock: bool = false, sort: str = "", page: int = 1, per_page: int = 10) -> Page | 400 str {
-    if !["", "price", "-price", "name"].contains(sort) || page < 1 || per_page < 1 || per_page > 50 {
+    if page < 1 || per_page < 1 || per_page > 50 {
         return 400 "bad query"
     }
-    var items: [Product] = sql `SELECT * FROM products
+    let o = match sort {
+        "" => "id"
+        "price" => "price, id"
+        "-price" => "price DESC, id"
+        "name" => "name, id"
+        _ => return 400 "bad query"
+    }
+    let total: int = sql `SELECT count(*) FROM products
+        WHERE ({category_id} IS NULL OR category_id = {category_id})
+          AND ({tag} IS NULL OR {tag} = ANY(tags))
+          AND ({q} IS NULL OR name ILIKE '%{q ?? ""}%')
+          AND ({min_price} IS NULL OR price >= {min_price})
+          AND ({max_price} IS NULL OR price <= {max_price})
+          AND (NOT {in_stock} OR stock > 0)`
+    let items: [Product] = sql `SELECT * FROM products
         WHERE ({category_id} IS NULL OR category_id = {category_id})
           AND ({tag} IS NULL OR {tag} = ANY(tags))
           AND ({q} IS NULL OR name ILIKE '%{q ?? ""}%')
           AND ({min_price} IS NULL OR price >= {min_price})
           AND ({max_price} IS NULL OR price <= {max_price})
           AND (NOT {in_stock} OR stock > 0)
-        ORDER BY id`
-    if sort == "price" {
-        items = items.sort_by(p => p.price)
-    } else if sort == "-price" {
-        items = items.sort_by(p => -p.price)
-    } else if sort == "name" {
-        items = items.sort_by(p => p.name)
-    }
-    let start = (page - 1) * per_page
-    return Page { items: items[start.min(items.len())..(start + per_page).min(items.len())], total: items.len() }
+        ORDER BY {o} LIMIT {per_page} OFFSET {(page - 1) * per_page}`
+    return Page { items, total }
 }
 
 route POST "/orders" (body: NewOrder) -> 201 Order | 400 str | 404 | 409 str {
@@ -135,33 +151,41 @@ route POST "/orders" (body: NewOrder) -> 201 Order | 400 str | 404 | 409 str {
             sql "UPDATE products SET stock = stock - {l.qty} WHERE id = {l.product_id}"
         }
         let total = priced.map(l => l.qty * l.price).sum()
-        return 201 sql "INSERT INTO orders {OrderRow { customer: body.customer.lower(), total, lines: priced }} RETURNING *"
+        let o: OrderHead = sql "INSERT INTO orders (customer, total) VALUES ({body.customer.lower()}, {total}) RETURNING *"
+        var rows: [OrderLine] = []
+        for i, l in priced {
+            rows.push(OrderLine { order_id: o.id, line: i + 1, ...l })
+        }
+        sql "INSERT INTO order_lines {rows}"
+        return 201 Order { ...o, lines: priced }
     }
 }
 
 route POST "/orders/{id}/cancel" (id: int) -> Order | 404 | 409 str {
     tx {
-        let o: Order = sql "SELECT * FROM orders WHERE id = {id}"
+        let o: Order = sql "SELECT * FROM order_view WHERE id = {id}"
         if o.status == "cancelled" {
             return 409 "already cancelled"
         }
         for l in o.lines {
             sql "UPDATE products SET stock = stock + {l.qty} WHERE id = {l.product_id}"
         }
-        return sql "UPDATE orders SET status = 'cancelled' WHERE id = {id} RETURNING *"
+        sql "UPDATE orders SET status = 'cancelled' WHERE id = {id}"
+        return Order { ...o, status: "cancelled" }
     }
 }
 
 route GET "/customers/{email}/orders" (email: str) -> [Order] {
-    return sql "SELECT * FROM orders WHERE customer = {email.lower()} ORDER BY id DESC"
+    return sql "SELECT * FROM order_view WHERE customer = {email.lower()} ORDER BY id DESC"
 }
 
 route GET "/stats/categories" -> [CategoryStats] {
-    return sql `SELECT c.name AS category, count(DISTINCT p.id) AS products,
-            coalesce(sum(l.qty), 0) AS units_sold, coalesce(sum(l.qty * l.price), 0) AS revenue
+    return sql `SELECT c.name AS category, count(p.id) AS products,
+            coalesce(sum(s.units), 0) AS units_sold, coalesce(sum(s.revenue), 0) AS revenue
         FROM categories c
         LEFT JOIN products p ON p.category_id = c.id
-        LEFT JOIN (SELECT l.* FROM orders o, jsonb_to_recordset(o.lines) AS l(product_id bigint, qty bigint, price bigint)
-            WHERE o.status = 'placed') l ON l.product_id = p.id
-        GROUP BY c.name ORDER BY revenue DESC, c.name`
+        LEFT JOIN (SELECT l.product_id, sum(l.qty) AS units, sum(l.qty * l.price) AS revenue
+            FROM order_lines l JOIN orders o ON o.id = l.order_id
+            WHERE o.status = 'placed' GROUP BY l.product_id) s ON s.product_id = p.id
+        GROUP BY c.id ORDER BY revenue DESC, c.name`
 }

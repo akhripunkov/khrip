@@ -113,6 +113,9 @@ for sc in "${scenarios[@]}"; do
 		g0=$(pg_ticks)
 		out=$("${wrk_cmd[@]}" -d"$DURATION" 2>&1)
 		c1=$(cpu_ticks)
+		# закрытые в конце нагрузки соединения: их процессор попадёт к главному
+		# процессу PostgreSQL, когда тот их дождётся
+		[[ $db == 1 ]] && sleep 1
 		g1=$(pg_ticks)
 		peak=$(status_kb VmHWM)
 		after=$(status_kb VmRSS)

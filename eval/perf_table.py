@@ -1,4 +1,5 @@
-"""Таблицы из results/perf.tsv: python3 eval/perf_table.py > eval/results/perf.md"""
+"""Таблицы из results/perf.tsv: python3 eval/perf_table.py > eval/results/perf.md
+Задачи с базой: python3 eval/perf_table.py eval/results/perf_db.tsv > eval/results/perf_db.md"""
 import csv
 import math
 import os
@@ -24,11 +25,20 @@ TITLES = {
     "inventory": "склад: 70% заказов, 30% списка",
     "polls": "опросы: 60% голосов, 40% чтений",
     "bookings": "бронирование: 70% расписаний, 30% броней",
+    "ledger": "ledger: 70% переводов, 20% счетов, 10% истории",
+    "shop": "shop: 40% поиска, 30% карточек, 25% заказов, 5% сводки",
+    "tracker": "tracker: 40% чтений, 20% правок, 20% новых задач, 20% сводки",
 }
 
 
 def num(v):
     return float(v) if v not in ("", None) else math.nan
+
+
+db = bool(rows) and "db_cpu_us_per_req" in rows[0]
+if db:
+    for r in rows:
+        r["total_cpu_us"] = str(num(r["cpu_us_per_req"]) + num(r["db_cpu_us_per_req"]))
 
 
 def table(title, field, fmt, better):
@@ -59,6 +69,9 @@ thousands = lambda v: f"{v:,.0f}".replace(",", " ")
 table("Пропускная способность, запросов в секунду (больше — лучше)", "rps", thousands, "max")
 table("Задержка p99, мс (меньше — лучше)", "p99_ms", lambda v: f"{v:.2f}", "min")
 table("Процессорное время на запрос, мкс (меньше — лучше)", "cpu_us_per_req", lambda v: f"{v:.1f}", "min")
+if db:
+    table("Процессор PostgreSQL на запрос, мкс (меньше — лучше)", "db_cpu_us_per_req", lambda v: f"{v:.0f}", "min")
+    table("Процессор сервера и PostgreSQL вместе на запрос, мкс (меньше — лучше)", "total_cpu_us", lambda v: f"{v:.0f}", "min")
 table("Память с данными до нагрузки (RSS), МБ (меньше — лучше)", "seeded_mb", lambda v: f"{v:.1f}", "min")
 table("Память после нагрузки (RSS), МБ (меньше — лучше)", "after_mb", lambda v: f"{v:.1f}", "min")
 
@@ -78,6 +91,10 @@ for title, field, fmt in [
     ("p50, мс", "p50_ms", lambda v: f"{v:.2f}"),
     ("p99, мс", "p99_ms", lambda v: f"{v:.2f}"),
     ("мкс процессора на запрос", "cpu_us_per_req", lambda v: f"{v:.1f}"),
+] + ([
+    ("мкс процессора PostgreSQL на запрос", "db_cpu_us_per_req", lambda v: f"{v:.0f}"),
+    ("мкс процессора сервера и PostgreSQL", "total_cpu_us", lambda v: f"{v:.0f}"),
+] if db else []) + [
     ("память в покое, МБ", "idle_mb", lambda v: f"{v:.1f}"),
     ("память с данными, МБ", "seeded_mb", lambda v: f"{v:.1f}"),
     ("память после нагрузки, МБ", "after_mb", lambda v: f"{v:.1f}"),
