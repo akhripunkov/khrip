@@ -46,6 +46,8 @@ const PB_STALE = 168
 const PB_INFLIGHT = 176
 // ячейка счётчика очереди повторов, в которую соединение встало (или 0)
 const PB_TXQ = 184
+// ключ разделяемой блокировки сессии, взятой первой попыткой в очереди (или 0)
+const PB_SHLOCK = 192
 // подготовленные запросы: SHA-256 текста (32 байта) и номер — по 40 байт
 const PB_STMT = 256
 const PG_STMTS = 200
@@ -1006,17 +1008,21 @@ fn __pg_query_at(c: int, site: int, sql: str, params: [str?], types: [int], fall
     let begin = load64(c + PB_BEGIN)
     // очередь повторов этого места не пуста (в этом процессе)
     let queued = begin & PG_SHORT_LOCKS != 0 && __pg_queue != 0 && load64(__pg_queue + (load64(c + PB_TXID) & 4095) * 8) > 0
+    if queued {
+        // очередь: подождать повторяющегося на разделяемой блокировке сессии
+        // ДО BEGIN (своя неявная транзакция и свой Sync) — снимок транзакции
+        // возьмётся уже после ожидания; тем же пакетом, без лишнего обмена
+        let key = 0x4B48520000000000 + load64(c + PB_TXID)
+        __pg_put_plain(b, "select pg_advisory_lock_shared({key})")
+        let lat = __pg_begin(b, 'S')
+        __pg_end(b, lat)
+        store64(c + PB_SHLOCK, key)
+    }
     if begin != 0 {
         store64(c + PB_BEGIN, 0)
         __pg_put_plain(b, __pg_begin_sql(begin))
         if begin & PG_SHORT_LOCKS != 0 {
             __pg_put_plain(b, "set local lock_timeout = 100")
-            if queued {
-                // первая попытка встаёт в ту же очередь, что и повторные: пока
-                // проигравший конфликт держит исключительную блокировку своего
-                // места, новые попытки ждут, а не обгоняют его снова и снова
-                __pg_put_plain(b, "select pg_advisory_xact_lock_shared({0x4B48520000000000 + load64(c + PB_TXID)})")
-            }
         }
     }
     if fresh {
@@ -1083,10 +1089,13 @@ fn __pg_query_at(c: int, site: int, sql: str, params: [str?], types: [int], fall
         want = 2
         if begin & PG_SHORT_LOCKS != 0 {
             want = 3
-            if queued {
-                want = 4
-            }
         }
+    }
+    // ответы блокировки очереди — до своего ReadyForQuery
+    var skip_z = 0
+    if queued {
+        want += 1
+        skip_z = 1
     }
     // строки и итоги служебных операторов перед запросом — не его
     let prelude = want - 1
@@ -1127,6 +1136,8 @@ fn __pg_query_at(c: int, site: int, sql: str, params: [str?], types: [int], fall
             res.affected = words[words.len() - 1].to_int() ?? 0
         } else if m.kind == 'E' {
             res.err = __pg_error(m)
+        } else if m.kind == 'Z' && skip_z > 0 {
+            skip_z -= 1
         } else if m.kind == 'Z' {
             store64(c + PB_TX, load8(m.p))
             if fresh && ones == want && name.len() > 0 {
@@ -1389,6 +1400,19 @@ fn __pg_request_end() {
 // первые попытки того же места встают в очередь за ними. Заводятся при запуске.
 var __pg_queue: int = 0
 
+// Снять разделяемую блокировку очереди, если первая попытка её брала.
+fn __pg_unlock_shared(c: int) {
+    let key = load64(c + PB_SHLOCK)
+    if key == 0 {
+        return
+    }
+    store64(c + PB_SHLOCK, 0)
+    let e = __pg_simple(c, "select pg_advisory_unlock_shared({key})", now_ms() + 5000)
+    if e.code.len() > 0 {
+        store64(c + PB_BROKEN, 1)
+    }
+}
+
 fn __pg_queue_enter(c: int) {
     if __pg_queue == 0 || load64(c + PB_TXQ) != 0 {
         return
@@ -1408,6 +1432,7 @@ fn __pg_queue_leave(c: int) {
 
 fn __pg_unlock_tx(c: int) {
     __pg_queue_leave(c)
+    __pg_unlock_shared(c)
     let key = load64(c + PB_TXLOCK)
     if key == 0 {
         return
