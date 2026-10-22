@@ -264,7 +264,7 @@ p99 на plaintext шумит от прогона к прогону (1,4–8,6 �
 
 ```
 ./build.sh       # зерно на ассемблере → загрузчик → khc → khc собирает сам себя
-tests/run.sh     # 231 тест: программы, ошибки, блоки test, HTTP, сопрограммы, TLS, PostgreSQL, погода, задачи eval
+tests/run.sh     # 233 теста: программы, ошибки, блоки test, HTTP, сопрограммы, TLS, PostgreSQL, погода, задачи eval
 eval/perf.sh     # нагрузочный замер решений на Khrip, Go, C# и Python (нужны wrk, Go, .NET, FastAPI; для задач на базе — PostgreSQL)
 ```
 
