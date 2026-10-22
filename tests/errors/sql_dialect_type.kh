@@ -1,0 +1,7 @@
+// expect: migration 1: DATETIME is not a PostgreSQL type
+// expect: timestamptz
+migration 1 `
+CREATE TABLE events (id bigserial PRIMARY KEY, "at" datetime NOT NULL, money bigint NOT NULL);
+`
+fn main() {
+}

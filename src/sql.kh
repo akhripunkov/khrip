@@ -709,6 +709,15 @@ fn sort_migrations() {
 // Миграция с CONCURRENTLY идёт вне транзакции: если сервер упадёт до записи о
 // ней, следующий старт выполнит её снова — поэтому один оператор и IF NOT EXISTS.
 fn sql_check_migration(m: Migration) {
+    for h in sql_dialect(m.sql) {
+        let msg = "migration " + m.n.to_str() + ": " + h.msg
+        if m.tok >= 0 {
+            error_tok(toks[m.tok], msg, h.fix)
+        } else {
+            report_at(files.len() - 1, 1, 1, msg, h.fix)
+        }
+        return
+    }
     var conc = false
     var guarded = false
     var stmts = 0
@@ -1159,9 +1168,186 @@ fn sql_prev_code(s: str, st: [int], i: int) -> int {
 
 // Правила текста запроса: привычки других баз и ошибки, которые PostgreSQL
 // пропустит молча (всё — ошибки с исправлением: предупреждений модель не видит).
+type SqlHabit {
+    msg: str
+    fix: str
+}
+
+// Привычки других диалектов (MySQL, SQLite, SQL Server): PostgreSQL их не
+// примет, а исправление известно заранее. Пусто — привычек нет.
+fn sql_dialect(s: str) -> [SqlHabit] {
+    var out: [SqlHabit] = []
+    let ws = sql_code_words(s)
+    let st = sql_states(s)
+    let n = s.len()
+    for i in 0..n {
+        if st[i] == 0 && s[i] == '`' {
+            out.push(SqlHabit { msg: "backticks quote names in MySQL; PostgreSQL does not know them", fix: "write the name as is, or in double quotes: \"order\"" })
+            return out
+        }
+        if st[i] == 0 && s[i] == '=' && i + 1 < n && s[i + 1] == '=' && (i == 0 || (s[i - 1] != '<' && s[i - 1] != '>' && s[i - 1] != '!' && s[i - 1] != ':')) {
+            out.push(SqlHabit { msg: "== is not SQL", fix: "a = b" })
+            return out
+        }
+    }
+    for i in 0..ws.len() {
+        let w = ws[i].w
+        var next = ""
+        if i + 1 < ws.len() {
+            next = ws[i + 1].w
+        }
+        var prev = ""
+        if i > 0 {
+            prev = ws[i - 1].w
+        }
+        // сразу после слова: «(» — вызов функции
+        var p = ws[i].at + w.len()
+        while p < n && sql_space(s[p]) {
+            p += 1
+        }
+        let fcall = p < n && s[p] == '('
+        let typed = sql_type_slot(s, ws[i].at)
+        var msg = ""
+        var fix = ""
+        if w == "insert" && next == "ignore" {
+            msg = "INSERT IGNORE is MySQL"
+            fix = "INSERT ... ON CONFLICT DO NOTHING (into T? to see whether a row was added)"
+        } else if w == "replace" && next == "into" && i == 0 {
+            msg = "REPLACE INTO is MySQL"
+            fix = "INSERT ... ON CONFLICT (key) DO UPDATE SET col = EXCLUDED.col"
+        } else if w == "duplicate" && prev == "on" && next == "key" {
+            msg = "ON DUPLICATE KEY UPDATE is MySQL"
+            fix = "ON CONFLICT (key) DO UPDATE SET col = EXCLUDED.col"
+        } else if w == "limit" && sql_limit_comma(s, p) {
+            msg = "LIMIT a, b is MySQL"
+            fix = "LIMIT b OFFSET a"
+        } else if w == "top" && prev == "select" {
+            msg = "SELECT TOP n is SQL Server"
+            fix = "... ORDER BY ... LIMIT n"
+        } else if fcall && (w == "ifnull" || w == "isnull" || w == "nvl") {
+            msg = w + "() is not PostgreSQL"
+            fix = "coalesce(a, b)"
+        } else if fcall && (w == "getdate" || w == "curdate" || w == "sysdate" || w == "getutcdate") {
+            msg = w + "() is not PostgreSQL"
+            fix = "now() (current_date for the date)"
+        } else if fcall && (w == "last_insert_id" || w == "lastval" || w == "scope_identity" || w == "last_insert_rowid") {
+            msg = w + "() can return an id from another table or request"
+            fix = "INSERT ... RETURNING id"
+        } else if fcall && w == "group_concat" {
+            msg = "group_concat() is MySQL"
+            fix = "string_agg(x, ',')"
+        } else if fcall && (w == "len" || w == "charindex" || w == "datediff") {
+            msg = w + "() is SQL Server"
+            fix = "length(s), strpos(s, sub), b - a (dates) or age(b, a)"
+        } else if w == "auto_increment" || w == "autoincrement" || (w == "identity" && fcall && prev != "as") {
+            msg = sql_upper(w) + " is not PostgreSQL"
+            fix = "id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY (or bigserial PRIMARY KEY)"
+        } else if typed && !fcall && (w == "datetime" || w == "datetime2") {
+            msg = "DATETIME is not a PostgreSQL type"
+            fix = "timestamptz"
+        } else if typed && (w == "tinyint" || w == "mediumint") {
+            msg = sql_upper(w) + " is not a PostgreSQL type"
+            fix = "boolean for flags, smallint or integer for numbers"
+        } else if typed && (w == "nvarchar" || w == "longtext" || w == "mediumtext") {
+            msg = sql_upper(w) + " is not a PostgreSQL type"
+            fix = "text"
+        } else if w == "unsigned" && (prev == "int" || prev == "integer" || prev == "bigint" || prev == "smallint" || prev == "tinyint") {
+            msg = "PostgreSQL has no unsigned numbers"
+            fix = "bigint with CHECK (col >= 0)"
+        } else if typed && !fcall && w == "money" {
+            msg = "money depends on the server locale and rounds"
+            fix = "bigint with the amount in cents"
+        }
+        if msg.len() > 0 {
+            out.push(SqlHabit { msg: msg, fix: fix })
+            return out
+        }
+    }
+    return out
+}
+
+// Слово с позиции at стоит на месте типа: после «::», в определении столбца
+// («(имя тип», «, имя тип», «ADD [COLUMN] имя тип») или после TYPE.
+fn sql_type_slot(s: str, at: int) -> bool {
+    var q = at - 1
+    while q >= 0 && sql_space(s[q]) {
+        q -= 1
+    }
+    if q < 0 {
+        return false
+    }
+    if s[q] == ':' {
+        return true
+    }
+    // предыдущее слово (или "имя")
+    let e = q
+    if s[q] == '"' {
+        q -= 1
+        while q >= 0 && s[q] != '"' {
+            q -= 1
+        }
+        q -= 1
+    } else {
+        while q >= 0 && is_ident_char(s[q]) {
+            q -= 1
+        }
+    }
+    if q == e {
+        return false
+    }
+    let b = buf_new(8)
+    for k in q + 1..e + 1 {
+        buf_byte(b, sql_lower(s[k]))
+    }
+    if buf_str(b) == "type" {
+        return true
+    }
+    while q >= 0 && sql_space(s[q]) {
+        q -= 1
+    }
+    if q >= 0 && (s[q] == '(' || s[q] == ',') {
+        return true
+    }
+    // ADD [COLUMN] имя тип
+    let e2 = q
+    while q >= 0 && is_ident_char(s[q]) {
+        q -= 1
+    }
+    let b2 = buf_new(8)
+    for k in q + 1..e2 + 1 {
+        buf_byte(b2, sql_lower(s[k]))
+    }
+    let w = buf_str(b2)
+    return w == "column" || w == "add"
+}
+
+// После LIMIT с позиции p: число или $n, затем запятая (LIMIT a, b из MySQL).
+fn sql_limit_comma(s: str, p0: int) -> bool {
+    var p = p0
+    let n = s.len()
+    if p < n && s[p] == '$' {
+        p += 1
+    }
+    let d = p
+    while p < n && is_digit(s[p]) {
+        p += 1
+    }
+    if p == d {
+        return false
+    }
+    while p < n && sql_space(s[p]) {
+        p += 1
+    }
+    return p < n && s[p] == ','
+}
+
 fn sql_rules(at: Token, s: str, shape: int) {
     let ws = sql_code_words(s)
     if ws.len() == 0 {
+        return
+    }
+    for h in sql_dialect(s) {
+        error_tok(at, h.msg, h.fix)
         return
     }
     let first = ws[0].w

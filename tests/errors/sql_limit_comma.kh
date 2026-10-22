@@ -1,0 +1,6 @@
+// expect: LIMIT a, b is MySQL
+// expect: LIMIT b OFFSET a
+type P { id: int }
+route GET "/p" (page: int) -> [P] {
+    return sql "SELECT id FROM products ORDER BY id LIMIT {(page - 1) * 20}, 20"
+}

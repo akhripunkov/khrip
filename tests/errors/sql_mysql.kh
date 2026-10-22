@@ -1,0 +1,7 @@
+// expect: INSERT IGNORE is MySQL
+// expect: INSERT ... ON CONFLICT DO NOTHING
+type Tag { name: str }
+route POST "/tags" (body: Tag) -> 204 {
+    sql "INSERT IGNORE INTO tags {body}"
+    return 204
+}
