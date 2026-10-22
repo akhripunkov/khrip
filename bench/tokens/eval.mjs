@@ -15,6 +15,7 @@ const langs = [
 const groups = [
   ['Настроечные задачи (язык дорабатывался на них)', ['shortener', 'bank', 'notes', 'ratelimit', 'catalog']],
   ['Отложенные задачи (язык не менялся)', ['inventory', 'polls', 'bookings']],
+  ['Задачи на PostgreSQL (v0.12)', ['ledger', 'shop', 'tracker']],
 ];
 const known = groups.flatMap(([, ts]) => ts);
 const extra = readdirSync(root).filter((t) => !known.includes(t)).sort();
