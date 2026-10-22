@@ -30,6 +30,8 @@ const SITE_COUNT = 96
 const SITE_FALLBACK = 104
 // таблица вариантов ORDER BY {o}: номер значения, число, пары (строка, место)
 const SITE_VARIANTS = 112
+// ключи строк для очереди повторов tx: число, пары («таблица.столбец», параметр)
+const SITE_KEYS = 120
 
 const SH_COUNT = 0
 const SH_ONE = 1
@@ -1330,6 +1332,10 @@ fn __db_run(site0: int, vals: int) -> int {
     let params = __db_params(site, vals)
     let sql: str = __cast(load64(site + SITE_SQL))
     let types: [int] = __cast(load64(site + SITE_FALLBACK))
+    let tc = load64(cx + CTX_PGHELD)
+    if tc != 0 && load64(site + SITE_KEYS) != 0 {
+        __db_note_keys(tc, site, params)
+    }
     var attempt = 0
     var res = __PgRes { cols: 0, rows: 0, data: buf_new(16), at: [], affected: 0, err: __PgErr {} }
     while true {
@@ -1455,7 +1461,41 @@ fn __db_tx_begin(id: int) -> int {
     }
     store64(c + PB_TXHDR, hl)
     store64(c + PB_TXID, id)
+    store64(c + PB_KEYS, 0)
     return jb
+}
+
+// Запрос в транзакции: ключи его строк — в набор попытки (по ним повтор встанет
+// в очередь). Строка горячая — её ждёт или держит повтор в этом процессе: первый
+// запрос попытки сначала встаёт в ту же очередь (BEGIN ещё не ушёл, снимок
+// возьмётся после ожидания), а запрос посреди попытки уступает — откат и
+// повтор в очереди, а не верный конфликт с тем, кто ждёт дольше.
+fn __db_note_keys(c: int, site: int, params: [str?]) {
+    let kt = load64(site + SITE_KEYS)
+    let held = c + PB_HELD
+    var hot = false
+    let mine = __alloc(8 + PG_KEYS * 8)
+    store64(mine, 0)
+    for i in 0..load64(kt) {
+        let no = load64(kt + 16 + 16 * i)
+        if no < params.len() {
+            if let v = params[no] {
+                let k = __pg_row_key(__cast(load64(kt + 8 + 16 * i)), v)
+                __pg_key_add(c + PB_KEYS, k)
+                __pg_key_add(mine, k)
+                hot = hot || (__pg_key_hot(k) && !__pg_key_has(held, k))
+            }
+        }
+    }
+    if !hot {
+        return
+    }
+    if load64(c + PB_BEGIN) != 0 && load64(held) == 0 {
+        __pg_hold(c, mine)
+        store64(c + PB_GATE, 1)
+    } else if load64(c + PB_TXJB) != 0 {
+        __db_tx_retry(__PgErr { code: "40001", message: "row is queued for a retry" })
+    }
 }
 
 fn __db_tx_unavailable(why: str) {
@@ -1543,28 +1583,42 @@ fn __db_tx_retry(e: __PgErr) {
         __db_tx_release(c)
         __db_tx_error(e)
     }
-    // Очередь повторов: проигравший конфликт блок ждёт своей очереди на
-    // сессионной advisory-блокировке своего места (во всех копиях сервера), а не
-    // бьётся снова вслепую. BEGIN — после блокировки: снимок уже свежий.
-    if load64(c + PB_TXLOCK) == 0 {
-        let key = 0x4B48520000000000 + load64(c + PB_TXID)
-        // разделяемую блокировку первой попытки — снять до исключительной
-        __pg_unlock_shared(c)
-        let le = __pg_simple(c, "select pg_advisory_lock({key})", load64(c + PB_TXDL))
+    // Очередь повторов: проигравший конфликт блок ждёт на сессионных
+    // advisory-блокировках строк, которых касалась попытка (во всех копиях
+    // сервера), а не бьётся снова вслепую. BEGIN — после блокировок: снимок уже
+    // свежий. Паузы нет: повторы за одну строку и так идут друг за другом.
+    // Строк не видно (нет WHERE col = {x}) — ключ всего блока tx.
+    let ka = c + PB_KEYS
+    let hk = c + PB_HELD
+    for i in 0..load64(hk) {
+        __pg_key_add(ka, load64(hk + 8 + i * 8))
+    }
+    if load64(ka) == 0 {
+        __pg_key_add(ka, 0x4B48520000000000 + load64(c + PB_TXID))
+    }
+    var fresh = false
+    for i in 0..load64(ka) {
+        fresh = fresh || !__pg_key_has(hk, load64(ka + 8 + i * 8))
+    }
+    if fresh {
+        // новые строки: снять прежние и взять все разом по порядку — так
+        // ожидающие не держат одно и не ждут другое по кругу
+        if load64(hk) > 0 {
+            let ue = __pg_simple(c, "select pg_advisory_unlock_all()", load64(c + PB_TXDL))
+            if ue.code.len() > 0 {
+                __db_tx_release(c)
+                __db_tx_error(ue)
+            }
+        }
+        __pg_hot_leave(c)
+        __pg_hold(c, ka)
+        let le = __pg_simple(c, __pg_lock_sql(c), load64(c + PB_TXDL))
         if le.code.len() > 0 {
             __db_tx_release(c)
             __db_tx_error(le)
         }
-        store64(c + PB_TXLOCK, key)
     }
-    // Паузы нет: повторяющиеся уже стоят в очереди друг за другом, а сон с
-    // блокировкой очереди задержал бы их всех. Проигрывает подряд (горячая
-    // строка): новые первые попытки этого места встают в очередь за ним, а не
-    // обгоняют его снова; одиночный ложный конфликт SERIALIZABLE очередь не
-    // включает
-    if n >= 2 {
-        __pg_queue_enter(c)
-    }
+    store64(ka, 0)
     __pg_tx_begin(c, PG_SERIALIZABLE)
     __longjmp(jb)
 }

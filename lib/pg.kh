@@ -35,22 +35,24 @@ const PB_TXJB = 112
 const PB_TXTRY = 120
 const PB_TXDL = 128
 const PB_TXHDR = 136
-// номер блока tx и ключ сессионной advisory-блокировки очереди повторов (0 — нет)
+// номер блока tx
 const PB_TXID = 144
-const PB_TXLOCK = 152
 // начало непрочитанного во входном буфере (сдвиг остатка — раз на чтение из сокета)
 const PB_ROFF = 160
 // место, чей подготовленный оператор устарел (номер + 1): перед новым Parse — Close
 const PB_STALE = 168
 // запрос отправлен, ответ ещё не дочитан: прерванное так соединение не годится
 const PB_INFLIGHT = 176
-// ячейка счётчика очереди повторов, в которую соединение встало (или 0)
-const PB_TXQ = 184
-// ключ разделяемой блокировки сессии, взятой первой попыткой в очереди (или 0)
-const PB_SHLOCK = 192
+// первая попытка на горячей строке: перед отложенным BEGIN взять блокировки PB_HELD
+const PB_GATE = 192
 // подготовленные запросы: SHA-256 текста (32 байта) и номер — по 40 байт
 const PB_STMT = 256
 const PG_STMTS = 200
+// очередь повторов tx: ключи строк, которых коснулась попытка, и ключи
+// сессионных advisory-блокировок, которые соединение держит (число, ключи)
+const PB_KEYS = 8256
+const PB_HELD = 8352
+const PG_KEYS = 11
 // подготовленные места sql (lib/db.kh): по биту на номер места, имя «s<номер>»
 const PB_SITES = 8448
 const PG_SITES = 63488
@@ -431,7 +433,7 @@ type __PgConn {
 }
 
 fn __pg_free(c: int) {
-    __pg_queue_leave(c)
+    __pg_hot_leave(c)
     let t = load64(c + PB_TLS)
     if t != 0 {
         __tls_close(t)
@@ -698,6 +700,25 @@ const PG_READ_ONLY = 8
 // первая попытка блока tx: чужую блокировку строки ждать не дольше 100 мс
 // (взаимоблокировку PostgreSQL замечает только через секунду), дальше — очередь
 const PG_SHORT_LOCKS = 16
+
+// Настройки транзакции — одним оператором сразу после BEGIN. SERIALIZABLE: без
+// последовательного просмотра — он ставит предикатную блокировку на всю таблицу,
+// и любая запись в неё конфликтует с транзакцией; на маленькой таблице
+// планировщик выбирает его даже для WHERE id = $1, и конфликты лавиной
+// откатывают все транзакции. Короткие блокировки первой попытки — lock_timeout.
+fn __pg_begin_settings(mode: int) -> str {
+    var parts: [str] = []
+    if mode & 7 == PG_SERIALIZABLE {
+        parts.push("set_config('enable_seqscan', 'off', true)")
+    }
+    if mode & PG_SHORT_LOCKS != 0 {
+        parts.push("set_config('lock_timeout', '100', true)")
+    }
+    if parts.len() == 0 {
+        return ""
+    }
+    return "select " + parts.join(", ")
+}
 
 fn __pg_begin_sql(mode: int) -> str {
     let lvl = mode & 7
@@ -1006,23 +1027,22 @@ fn __pg_query_at(c: int, site: int, sql: str, params: [str?], types: [int], fall
     // отложенный BEGIN — тем же пакетом и до Sync: если он не пройдёт, сервер
     // пропустит и сам запрос, вне транзакции тот не выполнится
     let begin = load64(c + PB_BEGIN)
-    // очередь повторов этого места не пуста (в этом процессе)
-    let queued = begin & PG_SHORT_LOCKS != 0 && __pg_queue != 0 && load64(__pg_queue + (load64(c + PB_TXID) & 4095) * 8) > 0
-    if queued {
-        // очередь: подождать повторяющегося на разделяемой блокировке сессии
-        // ДО BEGIN (своя неявная транзакция и свой Sync) — снимок транзакции
-        // возьмётся уже после ожидания; тем же пакетом, без лишнего обмена
-        let key = 0x4B48520000000000 + load64(c + PB_TXID)
-        __pg_put_plain(b, "select pg_advisory_lock_shared({key})")
+    // первая попытка на горячей строке: встать в очередь повторов ДО BEGIN
+    // (своя неявная транзакция и свой Sync) — снимок транзакции возьмётся уже
+    // после ожидания; тем же пакетом, без лишнего обмена
+    let gate = begin != 0 && load64(c + PB_GATE) != 0
+    if gate {
+        store64(c + PB_GATE, 0)
+        __pg_put_plain(b, __pg_lock_sql(c))
         let lat = __pg_begin(b, 'S')
         __pg_end(b, lat)
-        store64(c + PB_SHLOCK, key)
     }
     if begin != 0 {
         store64(c + PB_BEGIN, 0)
         __pg_put_plain(b, __pg_begin_sql(begin))
-        if begin & PG_SHORT_LOCKS != 0 {
-            __pg_put_plain(b, "set local lock_timeout = 100")
+        let set = __pg_begin_settings(begin)
+        if set.len() > 0 {
+            __pg_put_plain(b, set)
         }
     }
     if fresh {
@@ -1087,13 +1107,13 @@ fn __pg_query_at(c: int, site: int, sql: str, params: [str?], types: [int], fall
     var want = 1
     if begin != 0 {
         want = 2
-        if begin & PG_SHORT_LOCKS != 0 {
+        if __pg_begin_settings(begin).len() > 0 {
             want = 3
         }
     }
     // ответы блокировки очереди — до своего ReadyForQuery
     var skip_z = 0
-    if queued {
+    if gate {
         want += 1
         skip_z = 1
     }
@@ -1108,7 +1128,7 @@ fn __pg_query_at(c: int, site: int, sql: str, params: [str?], types: [int], fall
         if m.kind == '1' {
             ones += 1
         } else if m.kind == 'D' && done_cmds < prelude {
-            // строка служебного select pg_advisory_xact_lock_shared
+            // строка служебного select pg_advisory_lock
         } else if m.kind == 'D' {
             let ncols = __be16(m.p)
             res.cols = ncols
@@ -1355,11 +1375,25 @@ fn __pg_tx_end(c: int, commit: bool, deadline: int) -> __PgErr {
     // COMMIT и ROLLBACK — со своим запасом времени: бюджет блока мог кончиться,
     // а оборвать фиксацию на полпути — значит не знать, что с ней стало
     let grace = deadline.max(now_ms() + 5000)
+    // блокировки очереди повторов снимаются тем же пакетом; не прошёл COMMIT —
+    // остальное сервер пропускает, и блокировки остаются для повтора
+    let held = load64(c + PB_HELD) > 0
+    var unlock = ""
+    if held {
+        unlock = "; select pg_advisory_unlock_all()"
+    }
     if !commit {
-        return __pg_simple(c, "rollback", grace)
+        let re = __pg_simple(c, "rollback" + unlock, grace)
+        if held && re.code.len() == 0 {
+            __pg_hot_leave(c)
+        }
+        return re
     }
     let failed = load64(c + PB_TX) == 'E'
-    let e = __pg_simple(c, "commit", grace)
+    let e = __pg_simple(c, "commit" + unlock, grace)
+    if held && e.code.len() == 0 {
+        __pg_hot_leave(c)
+    }
     if e.code == "08006" || e.code == "57014" {
         // связь пропала после отправки COMMIT: зафиксировано или нет — неизвестно
         return __PgErr { code: "08007", message: "the connection was lost during COMMIT: the outcome is unknown" }
@@ -1395,50 +1429,103 @@ fn __pg_request_end() {
     __pg_release(c)
 }
 
-// Снять advisory-блокировку очереди повторов, если соединение её держит.
-// Счётчики очереди повторов по местам tx (4096 ячеек): пока повторяющиеся есть,
-// первые попытки того же места встают в очередь за ними. Заводятся при запуске.
-var __pg_queue: int = 0
+// Очередь повторов tx. Блок, проигравший конфликт, ждёт на сессионных
+// advisory-блокировках строк своей попытки (__db_tx_retry в lib/db.kh): повторы
+// за одну строку идут друг за другом во всех копиях сервера, за разные — вместе.
+// Счётчики по ключам (4096 ячеек) — сколько соединений процесса ждут или держат
+// ключ: первая попытка, чей первый запрос касается такой строки, встаёт в ту же
+// очередь до BEGIN, а не идёт на верный конфликт. Заводятся при запуске.
+var __pg_hot: int = 0
 
-// Снять разделяемую блокировку очереди, если первая попытка её брала.
-fn __pg_unlock_shared(c: int) {
-    let key = load64(c + PB_SHLOCK)
-    if key == 0 {
-        return
+// Ключ строки: «таблица.столбец» и значение параметра (текстом протокола).
+fn __pg_row_key(name: str, v: str) -> int {
+    var h = 5381
+    for i in 0..name.len() {
+        h = (h * 33 + name[i]) & 0xFFFFFFFFFFFF
     }
-    store64(c + PB_SHLOCK, 0)
-    let e = __pg_simple(c, "select pg_advisory_unlock_shared({key})", now_ms() + 5000)
-    if e.code.len() > 0 {
-        store64(c + PB_BROKEN, 1)
+    h = (h * 33 + '=') & 0xFFFFFFFFFFFF
+    for i in 0..v.len() {
+        h = (h * 33 + v[i]) & 0xFFFFFFFFFFFF
+    }
+    return 0x4B48000000000000 + h
+}
+
+fn __pg_key_has(area: int, k: int) -> bool {
+    for i in 0..load64(area) {
+        if load64(area + 8 + i * 8) == k {
+            return true
+        }
+    }
+    return false
+}
+
+// Добавить ключ в набор (число и до PG_KEYS ключей); в полный — не добавляется.
+fn __pg_key_add(area: int, k: int) {
+    let n = load64(area)
+    if n < PG_KEYS && !__pg_key_has(area, k) {
+        store64(area + 8 + n * 8, k)
+        store64(area, n + 1)
     }
 }
 
-fn __pg_queue_enter(c: int) {
-    if __pg_queue == 0 || load64(c + PB_TXQ) != 0 {
-        return
-    }
-    let cell = __pg_queue + (load64(c + PB_TXID) & 4095) * 8
-    __xadd(cell, 1)
-    store64(c + PB_TXQ, cell)
+// Строку ждёт или держит в очереди повторов соединение этого процесса.
+fn __pg_key_hot(k: int) -> bool {
+    return __pg_hot != 0 && load64(__pg_hot + (k & 4095) * 8) > 0
 }
 
-fn __pg_queue_leave(c: int) {
-    let cell = load64(c + PB_TXQ)
-    if cell != 0 {
-        store64(c + PB_TXQ, 0)
-        __xadd(cell, -1)
+// Ключи набора area — в PB_HELD по возрастанию (блокировки берутся везде в
+// одном порядке и не ждут друг друга по кругу) и в счётчики процесса.
+fn __pg_hold(c: int, area: int) {
+    let n = load64(area)
+    let h = c + PB_HELD
+    for i in 0..n {
+        let k = load64(area + 8 + i * 8)
+        var j = i
+        while j > 0 && load64(h + j * 8) > k {
+            store64(h + 8 + j * 8, load64(h + j * 8))
+            j -= 1
+        }
+        store64(h + 8 + j * 8, k)
+        if __pg_hot != 0 {
+            __xadd(__pg_hot + (k & 4095) * 8, 1)
+        }
+    }
+    store64(h, n)
+}
+
+// Один оператор, который берёт блокировки PB_HELD по порядку.
+fn __pg_lock_sql(c: int) -> str {
+    let b = buf_new(64)
+    buf_add(b, "select ")
+    for i in 0..load64(c + PB_HELD) {
+        if i > 0 {
+            buf_add(b, ", ")
+        }
+        buf_add(b, "pg_advisory_lock({load64(c + PB_HELD + 8 + i * 8)})")
+    }
+    return buf_str(b)
+}
+
+// Забыть ключи PB_HELD в счётчиках процесса.
+fn __pg_hot_leave(c: int) {
+    let n = load64(c + PB_HELD)
+    store64(c + PB_HELD, 0)
+    store64(c + PB_GATE, 0)
+    if __pg_hot != 0 {
+        for i in 0..n {
+            __xadd(__pg_hot + (load64(c + PB_HELD + 8 + i * 8) & 4095) * 8, -1)
+        }
     }
 }
 
+// Снять блокировки очереди повторов, если соединение их держит.
 fn __pg_unlock_tx(c: int) {
-    __pg_queue_leave(c)
-    __pg_unlock_shared(c)
-    let key = load64(c + PB_TXLOCK)
-    if key == 0 {
+    let n = load64(c + PB_HELD)
+    __pg_hot_leave(c)
+    if n == 0 {
         return
     }
-    store64(c + PB_TXLOCK, 0)
-    let e = __pg_simple(c, "select pg_advisory_unlock({key})", now_ms() + 5000)
+    let e = __pg_simple(c, "select pg_advisory_unlock_all()", now_ms() + 5000)
     if e.code.len() > 0 {
         store64(c + PB_BROKEN, 1)
     }
@@ -1700,8 +1787,8 @@ fn __pg_startup(testing: bool) -> int {
         return 0
     }
     __pg_url = u
-    if __pg_queue == 0 {
-        __pg_queue = __mmap(4096 * 8)
+    if __pg_hot == 0 {
+        __pg_hot = __mmap(4096 * 8)
     }
     let until = now_ms() + 60000
     var said = false

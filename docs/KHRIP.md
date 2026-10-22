@@ -253,19 +253,31 @@ tx {
 ```
 
 - `sql "..."` (or `` `...` `` for several lines) runs one statement; `{expr}` is
-  sent as a parameter, never as SQL text (`none` is NULL); `name ILIKE '%{q}%'`
-  matches q literally. The expected type picks the result: `T` one row, `T?` the
-  first row or none (also with `else` / `??`), `[T]` all rows; `T` is a struct
-  (columns by name) or one column's type. timestamptz/date → `str` (as
-  `time_iso`) or `int`; jsonb → any type; a nullable column needs `T?`.
+  sent as a parameter, never as SQL text (`none` is NULL, so compare an optional
+  as `({x} IS NULL OR col = {x})`); `IN ({list})` takes a list; `name ILIKE
+  '%{q}%'` matches q literally; `ORDER BY {o}` takes `o` made of string literals
+  (`const`, `if`, `match`).
+- The expected type picks the result: `T` one row, none → 404 (the route lists
+  `| 404`, or answer yourself: `let r: T = sql "..." else { return 401 }`); `T?`
+  one row or none, more is an error (add `LIMIT 1`); `[T]` all rows; no type:
+  rows changed. `T` is a struct (columns by name) or one column's type.
+  timestamptz/date → `str` (as `time_iso`) or `int`; jsonb → any type; a
+  nullable column needs `T?`.
+- `INSERT INTO t {v}` puts fields into columns of the same name (`none` → the
+  column default), `{[v]}` inserts a list in one statement; `SET {patch}` sets
+  only the fields the request sent. Duplicate allowed: `let r: T? = sql "INSERT
+  ... ON CONFLICT DO NOTHING RETURNING *"`.
 - `migration N` runs once, in order, when the server starts (`DATABASE_URL`);
   never edit one that ran: add the next number. At start the server checks every
   `sql` against the database and refuses to run with precise errors.
-- A failed statement ends the request: duplicate 409, missing foreign key 404,
-  CHECK, NOT NULL or a bad value 400, database down 503.
-- Statements commit one by one. `tx { }` is SERIALIZABLE and re-runs on a
-  conflict, so inside it no `fetch`, `sleep`, store or outer-variable changes; a
-  status from 400, `fail` or a panic rolls it back.
+- A failed statement ends the request: duplicate or CHECK 409, missing foreign
+  key 404, row still referenced 409, NOT NULL or a bad value 400, database down
+  or busy 503.
+- Outside `tx` each statement commits on its own, so in a route a write after
+  another statement (or in a loop) is an error: put them in `tx { }`. `tx` is
+  SERIALIZABLE and re-runs on a conflict, so inside it no `fetch`, `sleep`,
+  `call`, store or outer-variable changes; a status from 400, `fail` or a panic
+  rolls it back. `let t = tx { ...; value }` commits and gives the value.
 
 ## Tests
 
@@ -281,7 +293,8 @@ test "create user" {
 returns a `Response`. `expect cond` records a failure and continues; `a == b`
 failures show both sides; `expect r != none` stops the test when `r` is none, and
 after it `r` is a value: `let u: User? = from_json(r.body)`, `expect u != none`,
-`expect u.name == "Ann"`. Tests run in order and share store.
+`expect u.name == "Ann"`. Tests run in order and share store and the database
+(`KHRIP_TEST_DATABASE_URL`; khc test works in a temporary schema and drops it).
 
 ## Habits from other languages
 
@@ -290,4 +303,5 @@ after it `r` is a value: `let u: User? = from_json(r.body)`, `expect u != none`,
 `x.length x.size() x.Count` → `x.len()`; `let mut` → `var`;
 `switch` → `match`; `enum` → `type Role = A | B`; `cond ? a : b` → `if`;
 `try/catch`, `raise HTTPException` → optionals, `else`, `fail(status)`;
-`import` → not needed; `$1`, `?` in SQL → `{value}`; `BEGIN`/`COMMIT` → `tx { }`.
+`import` → not needed; `$1`, `?` in SQL → `{value}`; `BEGIN`/`COMMIT` → `tx { }`;
+catching a duplicate key → `ON CONFLICT DO NOTHING` into `T?`.

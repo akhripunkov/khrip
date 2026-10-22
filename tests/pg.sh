@@ -98,4 +98,38 @@ for src in tests/sqlcheck/*.kh; do
 	fi
 done
 
+# Очередь повторов tx под одновременными запросами: горячая строка и переводы
+# «прочитал — записал». Ни одного 503, счётчик равен числу ответов, деньги не
+# теряются и не появляются.
+race_port=$((PG_PORT + 1))
+"${as_pg[@]}" "$pg_bin/psql" -q -h "$pg_dir" -p "$PG_PORT" -U postgres -d postgres -c "create database t_race" >/dev/null 2>&1
+if ! "$KHC" -o "$tmp/pg/race" tests/pg/load/race.kh >"$tmp/pg/race.err" 2>&1; then
+	failed "tests/pg/load/race.kh" "не скомпилировалось:"$'\n'"$(cat "$tmp/pg/race.err")"
+else
+	DATABASE_URL="postgres://u_scram:pw-u_scram@127.0.0.1:$PG_PORT/t_race?sslmode=disable" PORT=$race_port THREADS=2 \
+		"$tmp/pg/race" 2>"$tmp/pg/race.log" &
+	race_pid=$!
+	for _ in $(seq 100); do
+		curl -s -o /dev/null "http://127.0.0.1:$race_port/total" && break
+		sleep 0.1
+	done
+	url=http://127.0.0.1:$race_port
+	seq 300 | xargs -P 32 -I{} curl -s -o /dev/null -w '%{http_code}\n' -X POST "$url/hit" >"$tmp/pg/race.hits"
+	for i in $(seq 300); do
+		a=$((RANDOM % 5 + 1)) b=$((RANDOM % 4 + 1))
+		((b >= a)) && b=$((b + 1))
+		echo "$url/move/$a/$b/$((RANDOM % 300 + 1))"
+	done | xargs -P 32 -I{} curl -s -o /dev/null -w '%{http_code}\n' -X POST {} >"$tmp/pg/race.moves"
+	total=$(curl -s "$url/total")
+	kill "$race_pid" 2>/dev/null
+	wait "$race_pid" 2>/dev/null
+	hits=$(grep -c '^200$' "$tmp/pg/race.hits")
+	bad=$(grep -cv '^20[04]$\|^409$' "$tmp/pg/race.moves")
+	if [[ $hits == 300 && $bad == 0 && $total == '{"n":300,"balance":5000}' ]]; then
+		pass=$((pass + 1))
+	else
+		failed "tests/pg/load/race.kh" "200 на /hit: $hits из 300, других ответов на /move: $bad, итог: $total"$'\n'"$(sort "$tmp/pg/race.hits" "$tmp/pg/race.moves" | uniq -c)"$'\n'"$(tail -5 "$tmp/pg/race.log")"
+	fi
+fi
+
 pg_stop

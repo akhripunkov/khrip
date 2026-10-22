@@ -1,0 +1,35 @@
+// Сервер для проверки очереди повторов tx под одновременными запросами
+// (tests/pg.sh): горячая строка и переводы между пятью счетами.
+migration 1 `
+CREATE TABLE counters (id bigint PRIMARY KEY, n bigint NOT NULL);
+INSERT INTO counters VALUES (1, 0);
+CREATE TABLE accounts (id bigint PRIMARY KEY, balance bigint NOT NULL CHECK (balance >= 0));
+INSERT INTO accounts SELECT g, 1000 FROM generate_series(1, 5) g;
+`
+type Counter { id: int, n: int }
+type Account { id: int, balance: int }
+type Total { n: int, balance: int }
+
+route POST "/hit" -> Counter | 404 {
+    return tx {
+        let c: Counter = sql "SELECT * FROM counters WHERE id = 1"
+        sql "UPDATE counters SET n = {c.n + 1} WHERE id = 1 RETURNING *"
+    }
+}
+
+route POST "/move/{a}/{b}/{amount}" (a: int, b: int, amount: int) -> 204 | 404 | 409 str {
+    tx {
+        let from: Account = sql "SELECT * FROM accounts WHERE id = {a}"
+        let to: Account = sql "SELECT * FROM accounts WHERE id = {b}"
+        if from.balance < amount {
+            return 409 "insufficient funds"
+        }
+        sql "UPDATE accounts SET balance = {from.balance - amount} WHERE id = {a}"
+        sql "UPDATE accounts SET balance = {to.balance + amount} WHERE id = {b}"
+    }
+    return 204
+}
+
+route GET "/total" -> Total {
+    return sql "SELECT (SELECT n FROM counters WHERE id = 1) AS n, (SELECT sum(balance)::bigint FROM accounts) AS balance"
+}

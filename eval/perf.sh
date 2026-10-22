@@ -36,11 +36,13 @@ trap '[[ -n $pid ]] && kill $pid 2>/dev/null; wait 2>/dev/null; rm -rf "$tmp"' E
 now_ms() { echo $(($(date +%s%N) / 1000000)); }
 status_kb() { awk -v k="$1:" '$1 == k {print $2}' "/proc/$pid/status"; }
 cpu_ticks() { awk '{print $14 + $15}' "/proc/$pid/stat"; }
-# процессор всех процессов PostgreSQL (сотые доли секунды)
+# процессор всех процессов PostgreSQL (сотые доли секунды); закрытые соединения
+# учтены в cutime/cstime главного процесса, который их дождался
 pg_ticks() {
-	local t=0 p
+	local t=0 p v
 	for p in $(pgrep -x postgres); do
-		t=$((t + $(awk '{print $14 + $15}' "/proc/$p/stat" 2>/dev/null || echo 0)))
+		v=$(awk '{print $14 + $15 + $16 + $17}' "/proc/$p/stat" 2>/dev/null)
+		t=$((t + ${v:-0}))
 	done
 	echo "$t"
 }

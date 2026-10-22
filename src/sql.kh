@@ -30,6 +30,8 @@ const PK_GIVEN = 7
 const SITE_WORDS = 24
 // слово места: таблица вариантов ORDER BY {o}
 const SITE_W_VARIANTS = 14
+// слово места: ключи строк для очереди повторов tx (sql_row_keys)
+const SITE_W_KEYS = 15
 // сколько вариантов ORDER BY {o} у одного запроса
 const SQL_MAX_ORDERS = 16
 
@@ -1717,8 +1719,125 @@ fn sql_site(at: Token, cur: str, nv: int, ps: [SqlParam], shape: int, inner: int
     desc_put(off, 6, const_str(files[at.file].path + ":" + at.line.to_str() + ":" + at.col.to_str()))
     desc_put(off, 7, const_str(sql_target_table(cur)))
     desc_put(off, 8, sql_sites.len())
+    let keys = sql_row_keys(cur, ps)
+    if keys.len() > 0 {
+        // число, затем пары («таблица.столбец», номер параметра с 0)
+        let kt = desc_reserve(1 + 2 * keys.len())
+        desc_put(kt, 0, keys.len())
+        for j in 0..keys.len() {
+            desc_put(kt, 1 + 2 * j, const_str(keys[j].name))
+            desc_put(kt, 2 + 2 * j, keys[j].no)
+        }
+        desc_put(off, SITE_W_KEYS, DATA_BASE + kt)
+    }
     sql_sites.push(DATA_BASE + off)
     return off
+}
+
+type SqlKey {
+    name: str
+    no: int
+}
+
+// Ключи строк для очереди повторов tx: для каждого «столбец = $n» в WHERE —
+// «таблица.столбец» и номер параметра. Повтор после конфликта ждёт на ключах
+// строк своей попытки: повторы за одну строку идут друг за другом, за разные —
+// вместе. Неточный ключ стоит только лишнего ожидания, поэтому разбор простой:
+// UPDATE, DELETE и SELECT из одной таблицы, сравнения до первого подзапроса.
+fn sql_row_keys(cur: str, ps: [SqlParam]) -> [SqlKey] {
+    var out: [SqlKey] = []
+    let ws = sql_code_words(cur)
+    if ws.len() < 2 {
+        return out
+    }
+    var table = ""
+    var where = -1
+    let w0 = ws[0].w
+    for x in ws {
+        if x.depth == 0 && x.w == "from" && w0 == "select" && table.len() == 0 {
+            table = sql_name_at(cur, x.at + 4)
+        }
+        if x.depth == 0 && x.w == "where" && where < 0 {
+            where = x.at + 5
+        }
+    }
+    if w0 == "update" {
+        var p = ws[0].at + 6
+        if ws[1].w == "only" {
+            p = ws[1].at + 4
+        }
+        table = sql_name_at(cur, p)
+    } else if w0 == "delete" && ws[1].w == "from" {
+        table = sql_name_at(cur, ws[1].at + 4)
+    }
+    if table.len() == 0 || where < 0 {
+        return out
+    }
+    // до первого подзапроса после WHERE
+    var stop = cur.len()
+    for x in ws {
+        if x.at > where && x.w == "select" && x.at < stop {
+            stop = x.at
+        }
+    }
+    let st = sql_states(cur)
+    var i = where
+    while i < stop {
+        if st[i] != 0 || cur[i] != '$' || i + 1 >= stop || !is_digit(cur[i + 1]) {
+            i += 1
+            continue
+        }
+        var j = i + 1
+        var no = 0
+        while j < stop && is_digit(cur[j]) {
+            no = no * 10 + cur[j] - '0'
+            j += 1
+        }
+        // перед $n: «=», а не <=, >=, !=, :=, ==
+        var k = i - 1
+        while k > where && sql_space(cur[k]) {
+            k -= 1
+        }
+        // столбец слева: col, "Col" или t.col (таблица — главная, псевдоним не
+        // разбираем)
+        var col = ""
+        let pc = cur[k - 1]
+        if cur[k] == '=' && pc != '<' && pc != '>' && pc != '!' && pc != ':' && pc != '=' {
+            k -= 1
+            while k > where && sql_space(cur[k]) {
+                k -= 1
+            }
+            let b = buf_new(16)
+            let e = k + 1
+            while k >= where && (is_ident_char(cur[k]) || cur[k] == '"') {
+                k -= 1
+            }
+            var q = k + 1
+            let quoted = q < e && cur[q] == '"'
+            while q < e {
+                if cur[q] != '"' {
+                    if quoted {
+                        buf_byte(b, cur[q])
+                    } else {
+                        buf_byte(b, sql_lower(cur[q]))
+                    }
+                }
+                q += 1
+            }
+            col = buf_str(b)
+        }
+        if col.len() > 0 && !is_digit(col[0]) && no >= 1 && no <= ps.len() && ps[no - 1].kind == PK_VAL {
+            var dup = false
+            for x in out {
+                dup = dup || (x.no == no - 1 && x.name == table + "." + col)
+            }
+            if !dup {
+                out.push(SqlKey { name: table + "." + col, no: no - 1 })
+            }
+        }
+        i = j
+    }
+    return out
 }
 
 // Слово w в коде запроса (вне строк, имён в кавычках и комментариев).
