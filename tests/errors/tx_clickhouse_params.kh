@@ -1,0 +1,9 @@
+// expect: ch_query_params inside tx runs again on every retry and holds a database connection
+route POST "/write" -> 204 {
+    let client = ChConfig { url: "http://localhost:8123/" }
+    tx {
+        sql "DELETE FROM events"
+        ch_query_params(client, "INSERT INTO events VALUES (\{id:Int64})", {"id": "1"})
+    }
+    return 204
+}

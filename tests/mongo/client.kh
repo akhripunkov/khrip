@@ -1,0 +1,178 @@
+type MongoTestRow {
+    _id: int, title: str, n: int, optional: str?
+}
+type MongoTestExtended {
+    _id: int
+    oid: BsonObjectId
+    date: BsonDate
+    blob: BsonBinary
+    decimal: BsonDecimal128
+    ts: BsonTimestamp
+    number: int
+    real: float
+}
+type MongoTypeNames {
+    oid: str, date: str, blob: str, decimal: str, ts: str, number: str, real: str
+    date_ms: int, oid_text: str, decimal_text: str, blob_size: int
+}
+var checks: int
+var failures: int
+
+fn verify(label: str, ok: bool) {
+    checks += 1
+    if !ok {
+        failures += 1
+        print("FAIL " + label)
+    }
+}
+
+fn result(label: str, r: MongoResult) {
+    verify(label + ": " + r.error, r.error == "")
+}
+
+fn main() -> int {
+    let uri = env("MONGODB_URI") ?? "mongodb://127.0.0.1:27017/khrip_test?directConnection=true"
+    let client = Mongo {
+        uri
+    }
+    let database = "khrip_test"
+    let collection = "khrip_" + now_ms().to_str() + "_" + random_str(8)
+    let ping = bson_new()
+    bson_int32(ping, "ping", 1)
+    let p = mongo_command(client, database, bson_finish(ping))
+    result("authenticated ping", p)
+    if p.error != "" {
+        return 1
+    }
+    var documents: [Bson] = []
+    for i in 0..25 {
+        documents.push(to_bson(MongoTestRow {
+            _id: i, title: "Привет {i}", n: i, optional: none
+        }))
+    }
+    result("bulk insert", mongo_insert(client, database, collection, documents))
+    let duplicate = mongo_insert(client, database, collection, [documents[0]])
+    verify("duplicate error preserved", duplicate.code == 11000 && duplicate.error != "" && !duplicate.unknown_outcome)
+    let empty = bson_finish(bson_new())
+    let cursor = mongo_find(client, database, collection, empty, 7)
+    verify("find first batch", cursor.error == "" && cursor.documents.len() == 7 && cursor.id != 0)
+    var total = 0
+    var sum = 0
+    while cursor.error == "" {
+        for doc in cursor.documents {
+            let row: MongoTestRow? = from_bson(doc)
+            verify("typed row", row != none)
+            if let value = row {
+                total += 1
+                sum += value.n
+            }
+        }
+        if !mongo_next(cursor) {
+            break
+        }
+    }
+    verify("getMore exhausts cursor", cursor.error == "" && cursor.id == 0 && total == 25 && sum == 300)
+    result("exhausted cursor close", mongo_close(cursor))
+    let early = mongo_find(client, database, collection, empty, 1)
+    verify("live cursor", early.id != 0)
+    result("killCursors", mongo_close(early))
+    verify("closed cursor", early.id == 0 && !mongo_next(early))
+    let bounded = mongo_find(client, database, collection, empty, 7, 0, 10)
+    verify("cursor byte budget closes server cursor", bounded.error.contains("max_bytes") && bounded.id == 0)
+    let filter = bson_new()
+    bson_int(filter, "_id", 4)
+    let increment = bson_new()
+    bson_int(increment, "n", 10)
+    let update = bson_new()
+    bson_doc(update, "$inc", bson_finish(increment))
+    let changed = mongo_update(client, database, collection, bson_finish(filter), bson_finish(update))
+    result("atomic update", changed)
+    verify("matched count", bson_get_int(changed.document, "n") == 1)
+    let one = mongo_find(client, database, collection, bson_finish(filter), 2, 1)
+    verify("updated row", one.documents.len() == 1 && bson_get_int(one.documents[0], "n") == 14)
+    result("close limited cursor", mongo_close(one))
+    let deleted = mongo_delete(client, database, collection, bson_finish(filter))
+    result("delete", deleted)
+    verify("deleted count", bson_get_int(deleted.document, "n") == 1)
+    let missing = mongo_find(client, database, collection, bson_finish(filter))
+    verify("empty result", missing.error == "" && missing.documents.len() == 0 && missing.id == 0)
+    // Pool reuse: this process should keep only one authenticated idle socket.
+    let pool = load64(__ctx() + CTX_MONGOPOOL)
+    var idle = 0
+    for i in 0..MONGO_POOL_SIZE {
+        if load64(pool + 8 + i * 8) != 0 {
+            idle += 1
+        }
+    }
+    verify("one reused authenticated connection", idle == 1 && load64(pool) == 0)
+    let u = __mongo_url(uri)
+    if u.auth {
+        // Reconstruct only test credentials, never print them.
+        let bad = Mongo {
+            uri: "mongodb://" + u.user + ":definitely_wrong@" + u.host + ":" + u.port.to_str() + "/khrip_test?authSource=" + u.auth_source + "&directConnection=true"
+        }
+        let denied = mongo_command(bad, database, bson_finish(ping))
+        verify("wrong credentials cannot borrow authenticated socket", denied.error != "" && !denied.unknown_outcome)
+        result("valid client after auth rejection", mongo_command(client, database, bson_finish(ping)))
+    }
+    let invalid = bson_new()
+    bson_int32(invalid, "thisCommandDoesNotExist", 1)
+    let invalid_result = mongo_command(client, database, bson_finish(invalid))
+    verify("server command error", invalid_result.error != "" && invalid_result.code == 59)
+    result("connection usable after command error", mongo_command(client, database, bson_finish(ping)))
+    let wc = bson_new()
+    bson_int32(wc, "w", 0)
+    let unacked = bson_new()
+    bson_str(unacked, "insert", collection)
+    bson_array(unacked, "documents", [documents[0]])
+    bson_doc(unacked, "writeConcern", bson_finish(wc))
+    let reject = mongo_command(client, database, bson_finish(unacked))
+    verify("unacknowledged write rejected before sending", reject.error.contains("unacknowledged") && !reject.unknown_outcome)
+    // MongoDB independently verifies wire types and values, not just a local
+    // encoder/decoder round trip which could hide symmetric codec mistakes.
+    let decimal_bytes = __alloc(16)
+    __unhex("01000000000000000000000000004030", decimal_bytes)
+    let extended = MongoTestExtended {
+        _id: 1000,
+        oid: BsonObjectId { hex: "0123456789abcdef01234567" },
+        date: BsonDate { milliseconds: -123456789 },
+        blob: BsonBinary { data: "\0abc", subtype: 128 },
+        decimal: BsonDecimal128 { bytes: __str_new(decimal_bytes, 16) },
+        ts: BsonTimestamp { increment: 4294967295, seconds: 4000000000 },
+        number: -9223372036854775807 - 1, real: 1.25
+    }
+    result("insert extended BSON types", mongo_insert(client, database, collection, [to_bson(extended)]))
+    let match_stage = to_bson({ "$match": { "_id": 1000 } })
+    let projection = to_bson({ "$project": {
+        "oid": { "$type": "$oid" }, "date": { "$type": "$date" },
+        "blob": { "$type": "$blob" }, "decimal": { "$type": "$decimal" },
+        "ts": { "$type": "$ts" }, "number": { "$type": "$number" },
+        "real": { "$type": "$real" }, "date_ms": { "$toLong": "$date" },
+        "oid_text": { "$toString": "$oid" }, "decimal_text": { "$toString": "$decimal" },
+        "blob_size": { "$binarySize": "$blob" }
+    } })
+    let aggregation = bson_new()
+    bson_str(aggregation, "aggregate", collection)
+    bson_array(aggregation, "pipeline", [match_stage, projection])
+    bson_doc(aggregation, "cursor", empty)
+    let types = mongo_cursor(client, database, collection, bson_finish(aggregation))
+    verify("aggregation cursor", types.error == "" && types.documents.len() == 1)
+    if types.documents.len() == 1 {
+        let names: MongoTypeNames? = from_bson(types.documents[0])
+        verify("server type projection decoded", names != none)
+        if let n = names {
+            verify("server BSON extended types", n.oid == "objectId" && n.date == "date" && n.blob == "binData" && n.decimal == "decimal" && n.ts == "timestamp")
+            verify("server BSON number types", n.number == "long" && n.real == "double")
+            verify("server BSON values", n.date_ms == -123456789 && n.oid_text == extended.oid.hex && n.decimal_text == "1" && n.blob_size == 4)
+        }
+    }
+    result("close aggregation", mongo_close(types))
+    let drop = bson_new()
+    bson_str(drop, "drop", collection)
+    result("drop test collection", mongo_command(client, database, bson_finish(drop)))
+    print("MongoDB integration: {checks} checks, {failures} failed")
+    if failures != 0 {
+        return 1
+    }
+    return 0
+}

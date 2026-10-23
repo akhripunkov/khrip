@@ -1,0 +1,103 @@
+type ChEvent {
+    id: int
+    name: str
+    active: bool
+    score: float
+    note: str?
+    tags: [str]
+    numbers: [int?]
+}
+
+fn need(ok: bool, label: str) {
+    if !ok {
+        eprint("FAIL " + label + ": " + ch_error())
+        exit(1)
+    }
+}
+
+fn successful(r: ChResult, label: str) {
+    if !r.ok {
+        eprint("FAIL " + label + " [" + r.status.to_str() + "]: " + r.error)
+        exit(1)
+    }
+}
+
+fn main() -> int {
+    let c = ChConfig {
+        url: env("CLICKHOUSE_URL") ?? "http://127.0.0.1:18123/",
+        database: env("CLICKHOUSE_DATABASE") ?? "khrip_test",
+        user: env("CLICKHOUSE_USER") ?? "khrip",
+        password: env("CLICKHOUSE_PASSWORD") ?? "test-only"
+    }
+    let table = "kh_events_" + random_str(12)
+    successful(ch_query(c, "CREATE TABLE " + table + " (id Int64, name String, active Bool, score Float64, note Nullable(String), tags Array(String), numbers Array(Nullable(Int64))) ENGINE=Memory"), "create")
+    let original = [
+        ChEvent { id: 1, name: "Привет\0\n\\", active: true, score: 2.5, note: none, tags: ["a", "", "б"], numbers: [1, none, -4] },
+        ChEvent { id: 2, name: "", active: false, score: -0.25, note: "", tags: [], numbers: [] }
+    ]
+    successful(ch_insert(c, table, ch_encode(original)), "binary insert")
+    let result = ch_query(c, "SELECT numbers,score,id,tags,name,note,active FROM " + table + " ORDER BY id")
+    successful(result, "binary select")
+    let actual: [ChEvent]? = ch_decode(result.body)
+    need(actual != none && to_json(actual ?? []) == to_json(original), "typed reordered columns")
+    let odd = "a'\\\t\n\r\0; DROP TABLE " + table
+    let bound = ch_query_params(c, "SELECT \{value:String} AS value", {"value": odd})
+    successful(bound, "bound parameter")
+    let text: [str]? = ch_decode(bound.body)
+    need((text ?? [""])[0] == odd, "parameters preserve bytes and cannot inject SQL")
+    let number = ch_query_params(c, "SELECT \{n:Int64} AS value", {"n": "-42"})
+    successful(number, "integer parameter")
+    let nums: [int]? = ch_decode(number.body)
+    need((nums ?? [0])[0] == -42, "integer parameter roundtrip")
+    let ints = ch_query(c, "SELECT toInt8(-128) AS value UNION ALL SELECT toInt8(127)")
+    successful(ints, "narrow integers")
+    let small: [int]? = ch_decode(ints.body)
+    need((small ?? []).contains(-128) && (small ?? []).contains(127), "signed integer extension")
+    let uints = ch_query(c, "SELECT toUInt64(18446744073709551615) AS value")
+    successful(uints, "UInt64 response")
+    let overflow: [int]? = ch_decode(uints.body)
+    need(overflow == none && ch_error().contains("does not fit"), "UInt64 overflow rejected")
+    let error = ch_query(c, "SELECT no_such_column FROM " + table)
+    need(!error.ok && error.status >= 400 && error.error.byte_len() > 0, "server error")
+    let late = ch_query(c, "SELECT throwIf(number=9) FROM numbers(10) SETTINGS max_block_size=1")
+    need(!late.ok, "late server error not reported as success")
+    let denied = ChConfig { ...c, password: "wrong-password" }
+    need(!ch_query(denied, "SELECT 1").ok, "authentication failure")
+    successful(ch_query(c, "SELECT 1"), "connection usable after errors")
+    let bounded = ChConfig { ...c, max_response_bytes: 100 }
+    let large = ch_query(bounded, "SELECT repeat('x', 1000) AS value")
+    need(!large.ok, "bounded response")
+    let timeout = ChConfig { ...c, timeout_ms: 100 }
+    let started = now_ms()
+    let slow = ch_query(timeout, "SELECT sleep(2) AS value")
+    need(!slow.ok && now_ms() - started < 1500, "deadline")
+    // A timeout never promises server cancellation. Cancel using the returned ID.
+    successful(ch_cancel(c, slow.query_id), "explicit cancellation")
+    let mismatched = "kh_wrong_" + random_str(12)
+    successful(ch_query(c, "CREATE TABLE " + mismatched + " (id Int32, name String, active Bool, score Float64, note Nullable(String), tags Array(String), numbers Array(Nullable(Int64))) ENGINE=Memory"), "create wrong schema")
+    need(!ch_insert(c, mismatched, ch_encode(original)).ok, "binary schema mismatch rejected")
+    successful(ch_query(c, "DROP TABLE " + mismatched), "drop wrong schema")
+    var batch: [ChEvent] = []
+    for i in 0..1000 {
+        batch.push(ChEvent { id: i + 3, name: "bulk", active: true, score: 1.25, note: none, tags: ["batch"], numbers: [] })
+    }
+    successful(ch_insert(c, table, ch_encode(batch)), "1000-row batch")
+    let totals = ch_query(c, "SELECT count() AS value FROM " + table)
+    successful(totals, "count")
+    let total: [int]? = ch_decode(totals.body)
+    need((total ?? [0])[0] == 1002, "bulk count")
+    need(!ch_insert(c, table + "; DROP TABLE anything", ch_encode(original)).ok, "identifier injection rejected")
+    successful(ch_query(c, "DROP TABLE " + table), "drop")
+    // Async inserts acknowledge a completed flush, not just an in-memory queue.
+    let async_table = "kh_async_" + random_str(12)
+    successful(ch_query(c, "CREATE TABLE " + async_table + " (value Int64) ENGINE=MergeTree ORDER BY value"), "create async table")
+    let async = ChConfig { ...c, async_insert: true }
+    successful(ch_insert(async, async_table, ch_encode([11,12,13])), "async insert waits for flush")
+    let persisted = ch_query(c, "SELECT count() AS value FROM " + async_table)
+    successful(persisted, "async count")
+    let count: [int]? = ch_decode(persisted.body)
+    need((count ?? [0])[0] == 3, "async rows visible immediately after acknowledgement")
+    successful(ch_query(c, "DROP TABLE " + async_table), "drop async table")
+    print("ClickHouse integration: ok")
+    return 0
+}

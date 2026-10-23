@@ -1,0 +1,61 @@
+type ChSample {
+    id: int
+    name: str
+    active: bool
+    score: float
+    maybe_score: float?
+    note: str?
+    tags: [str]
+    numbers: [int?]
+    flags: [bool]
+}
+
+fn require(ok: bool, label: str) {
+    if !ok {
+        eprint("FAIL " + label + ": " + ch_error())
+        exit(1)
+    }
+}
+
+fn raw_bytes(values: [int]) -> str {
+    let b = buf_new(values.len())
+    for v in values { buf_byte(b, v) }
+    return buf_str(b)
+}
+
+fn main() -> int {
+    let original = [
+        ChSample { id: -9223372036854775807 - 1, name: "Привет\0\n\\", active: true, score: 2.5, maybe_score: -3.125, note: none, tags: ["a", "", "б"], numbers: [1, none, -4], flags: [true, false, true] },
+        ChSample { id: 9223372036854775807, name: "", active: false, score: -0.25, maybe_score: none, note: "", tags: [], numbers: [], flags: [] }
+    ]
+    let body = ch_encode(original)
+    require(body.byte_len() > 0 && ch_error() == "", "encode")
+    let decoded: [ChSample]? = ch_decode(body)
+    require(decoded != none, "decode")
+    require(to_json(decoded ?? []) == to_json(original), "all supported types roundtrip")
+    let empty: [ChSample] = []
+    let empty_back: [ChSample]? = ch_decode(ch_encode(empty))
+    require(empty_back != none && (empty_back ?? []).len() == 0, "empty typed batch")
+    for n in 0..body.byte_len() {
+        let cut: [ChSample]? = ch_decode(body.byte_slice(0, n))
+        // Only a complete header or a complete row boundary is valid.
+        if cut != none {
+            let rows = cut ?? []
+            require(rows.len() < original.len(), "truncation did not invent rows")
+            require(ch_encode(rows) == body.byte_slice(0, n), "truncation accepts only row boundaries")
+        }
+    }
+    let wrong: [int]? = ch_decode(body)
+    require(wrong == none && ch_error().byte_len() > 0, "wrong result shape")
+    let scalar: [int]? = ch_decode(ch_encode([-4, 0, 9223372036854775807]))
+    require(to_json(scalar ?? []) == "[-4,0,9223372036854775807]", "scalar rows")
+    let boolean: [bool]? = ch_decode(ch_encode([true, false]))
+    require(to_json(boolean ?? []) == "[true,false]", "packed booleans")
+    // A forged length must be rejected before allocating or dereferencing it.
+    let huge: [int]? = ch_decode(raw_bytes([255,255,255,255,255,255,255,255,255,255]))
+    require(huge == none, "oversized varint")
+    let noncanonical: [int]? = ch_decode(raw_bytes([129,0]))
+    require(noncanonical == none, "noncanonical varint")
+    print("ClickHouse codec: ok")
+    return 0
+}

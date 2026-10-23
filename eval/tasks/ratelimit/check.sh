@@ -1,26 +1,90 @@
 #!/usr/bin/env bash
-# Проверка ограничения частоты; сервер запущен с WINDOW_SECONDS=2.
-. "$(dirname "$0")/../../lib.sh"
+# One checker process keeps requests inside the two-second window even under
+# amd64 emulation. Assertions and the server's window are unchanged.
+set -euo pipefail
+python3 - <<'PY'
+import concurrent.futures
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
 
-K=(-H 'X-API-Key: alpha')
-check "no key" 401 '' $U/api/ping
-check "limits idle" 200 '"key":"alpha" && "used":0 && "remaining":5 && "reset_in":0' $U/limits/alpha
-check "ping 1" 200 '"pong":true && "remaining":4' "${K[@]}" $U/api/ping
-check "ping 2" 200 '"remaining":3' "${K[@]}" $U/api/ping
-check "time" 200 '"time":'"$ISO" "${K[@]}" $U/api/time
-check "limits" 200 '"key":"alpha" && "used":3 && "remaining":2 && "reset_in":[12]' $U/limits/alpha
-check "ping 4" 200 '"remaining":1' "${K[@]}" $U/api/ping
-check "ping 5" 200 '"remaining":0' "${K[@]}" $U/api/ping
-check "ping 6" 429 'H:^retry-after: [12]$' "${K[@]}" $U/api/ping
-check "time 7" 429 'H:^retry-after: [12]$' "${K[@]}" $U/api/time
-check "limits full" 200 '"used":5 && "remaining":0' $U/limits/alpha
-check "other key" 200 '"remaining":4' -H 'X-API-Key: beta' $U/api/ping
-check "limits other" 200 '"key":"beta" && "used":1' $U/limits/beta
-sleep 2.2
-check "new window" 200 '"remaining":4' "${K[@]}" $U/api/ping
-check "limits new window" 200 '"used":1 && "remaining":4' $U/limits/alpha
-# Одновременно 20 запросов нового ключа — ровно 5 проходят.
-codes=$(seq 20 | xargs -P 20 -I{} curl -s -o /dev/null -w '%{http_code}\n' -H 'X-API-Key: gamma' $U/api/ping | sort | uniq -c | tr -s ' ' | tr '\n' ';')
-[[ "$codes" == " 5 200; 15 429;" ]] || { echo "FAIL concurrent requests: $codes"; fails=$((fails + 1)); }
-total=$((total + 1))
-finish
+url = os.environ.get("U", "http://127.0.0.1:8080")
+passed = 0
+total = 0
+
+
+def request(path, key=None):
+    headers = {} if key is None else {"X-API-Key": key}
+    req = urllib.request.Request(url + path, headers=headers)
+    try:
+        response = urllib.request.urlopen(req, timeout=10)
+    except urllib.error.HTTPError as error:
+        response = error
+    except (OSError, urllib.error.URLError) as error:
+        return 0, {}, {}, str(error)
+    with response:
+        text = response.read().decode("utf-8")
+        try:
+            body = json.loads(text)
+        except ValueError:
+            body = {}
+        return response.status, body, response.headers, text
+
+
+def check(name, path, status, predicate=lambda body, headers: True, key=None):
+    global passed, total
+    total += 1
+    actual, body, headers, text = request(path, key)
+    try:
+        valid = actual == status and predicate(body, headers)
+    except (KeyError, TypeError, ValueError):
+        valid = False
+    if valid:
+        passed += 1
+    else:
+        print(f"FAIL {name}: {actual} {text[:300]}")
+
+
+def remaining(n):
+    return lambda body, headers: body["remaining"] == n
+
+
+check("no key", "/api/ping", 401)
+check("limits idle", "/limits/alpha", 200,
+      lambda b, h: b["key"] == "alpha" and b["used"] == 0
+      and b["remaining"] == 5 and b["reset_in"] == 0)
+check("ping 1", "/api/ping", 200,
+      lambda b, h: b["pong"] is True and b["remaining"] == 4, "alpha")
+check("ping 2", "/api/ping", 200, remaining(3), "alpha")
+check("time", "/api/time", 200,
+      lambda b, h: re.fullmatch(r"20[0-9]{2}-[01][0-9]-[0-3][0-9]T[0-2][0-9]:[0-5][0-9]:[0-6][0-9](\.[0-9]+)?(Z|\+00:00)", b["time"]), "alpha")
+check("limits", "/limits/alpha", 200,
+      lambda b, h: b["key"] == "alpha" and b["used"] == 3
+      and b["remaining"] == 2 and b["reset_in"] in (1, 2))
+check("ping 4", "/api/ping", 200, remaining(1), "alpha")
+check("ping 5", "/api/ping", 200, remaining(0), "alpha")
+for name, path in (("ping 6", "/api/ping"), ("time 7", "/api/time")):
+    check(name, path, 429, lambda b, h: h.get("Retry-After") in ("1", "2"), "alpha")
+check("limits full", "/limits/alpha", 200,
+      lambda b, h: b["used"] == 5 and b["remaining"] == 0)
+check("other key", "/api/ping", 200, remaining(4), "beta")
+check("limits other", "/limits/beta", 200,
+      lambda b, h: b["key"] == "beta" and b["used"] == 1)
+time.sleep(2.2)
+check("new window", "/api/ping", 200, remaining(4), "alpha")
+check("limits new window", "/limits/alpha", 200,
+      lambda b, h: b["used"] == 1 and b["remaining"] == 4)
+with concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
+    codes = list(pool.map(lambda _: request("/api/ping", "gamma")[0], range(20)))
+total += 1
+if codes.count(200) == 5 and codes.count(429) == 15:
+    passed += 1
+else:
+    print(f"FAIL concurrent requests: {codes}")
+print(f"passed {passed}/{total}")
+sys.exit(0 if passed == total else 1)
+PY

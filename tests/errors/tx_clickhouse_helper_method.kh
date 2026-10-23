@@ -1,0 +1,12 @@
+// expect: publish() calls ch_query, and the tx block may run again after a conflict
+fn publish(client: ChConfig) {
+    client.ch_query("INSERT INTO events VALUES (1)")
+}
+route POST "/write" -> 204 {
+    let client = ChConfig { url: "http://localhost:8123/" }
+    tx {
+        sql "DELETE FROM events"
+        client.publish()
+    }
+    return 204
+}

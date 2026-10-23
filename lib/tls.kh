@@ -112,7 +112,15 @@ fn __tb_save(blk: int, off: int, b: Buf) {
 fn __fd_write_all(fd: int, p: int, n: int, deadline: int) -> bool {
     var off = 0
     while off < n {
-        let w = syscall(SYS_WRITE, fd, p + off, n - off)
+        if now_ms() >= deadline {
+            return false
+        }
+        // Все вызывающие передают сокеты. MSG_NOSIGNAL: закрытый peer должен
+        // вернуть ошибку, а не завершить CLI-программу сигналом SIGPIPE.
+        let w = syscall(SYS_SENDTO, fd, p + off, n - off, 0x4000, 0, 0)
+        if w == -4 { // EINTR
+            continue
+        }
         if w == -EAGAIN && __wait_fd(fd, EPOLLOUT, deadline) {
             continue
         }
@@ -540,6 +548,9 @@ fn __tls_fail(blk: int, msg: str) -> __TlsConn {
 
 // Освободить блок и его буферы (сокет закрывает вызывающий).
 fn __tls_free(blk: int) {
+    if load64(__ctx() + CTX_TLS_PENDING) == blk {
+        store64(__ctx() + CTX_TLS_PENDING, 0)
+    }
     let a = load64(blk + TB_IN)
     if a != 0 {
         syscall(SYS_MUNMAP, a, load64(blk + TB_IN + 16))
@@ -549,6 +560,15 @@ fn __tls_free(blk: int) {
         syscall(SYS_MUNMAP, p, load64(blk + TB_PLAIN + 16))
     }
     syscall(SYS_MUNMAP, blk, TLS_BLOCK)
+}
+
+// При panic вызывающий драйвер закрывает свой сокет; этот блок ещё не был
+// возвращён ему из __tls_connect и потому освобождается отдельным хуком.
+fn __tls_pending_cleanup() {
+    let blk = load64(__ctx() + CTX_TLS_PENDING)
+    if blk != 0 {
+        __tls_free(blk)
+    }
 }
 
 // Рукопожатие по соединённому сокету fd с сервером host.
@@ -566,6 +586,7 @@ const TLS_VERIFY_FULL = 2
 // То же, но корневые сертификаты — из файла roots ("" — системные).
 fn __tls_connect_roots(fd: int, host: str, port: int, roots: str, verify: int, deadline: int) -> __TlsConn {
     let blk = __mmap(TLS_BLOCK)
+    store64(__ctx() + CTX_TLS_PENDING, blk)
     store64(blk + TB_FD, fd)
     store64(blk + TB_PORT, port)
     __tb_save(blk, TB_IN, buf_mm(16384))
@@ -766,7 +787,9 @@ fn __tls_connect_roots(fd: int, host: str, port: int, roots: str, verify: int, d
     if h.msgs.len > 0 {
         return __tls_fail(blk, "unexpected handshake data")
     }
-    return __TlsConn { blk, err: "" }
+    let result = __TlsConn { blk, err: "" }
+    store64(__ctx() + CTX_TLS_PENDING, 0)
+    return result
 }
 
 // Что выбрал сервер в ServerHello (или HelloRetryRequest).
@@ -910,6 +933,11 @@ fn __tls_cert_verify(leaf: __Cert, m: __Rec, th: int, hs: int) -> bool {
 
 // Отправить данные по установленному соединению.
 fn __tls_write(blk: int, p: int, n: int, deadline: int) -> bool {
+    // A zero-byte write must not leave an extra TLS record after an HTTP body.
+    // A peer closing with that unread record can reset and truncate its reply.
+    if n == 0 {
+        return true
+    }
     return __tls_send(blk, 23, p, n, deadline)
 }
 

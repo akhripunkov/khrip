@@ -1,0 +1,22 @@
+type CodecLockRow { id: int, title: str }
+store codec_rows: [CodecLockRow]
+store codec_count: int
+
+route GET "/bson" -> int {
+    let encoded = to_bson(CodecLockRow { id: codec_count, title: "read" })
+    let decoded: CodecLockRow? = from_bson(encoded)
+    if decoded == none { return bson_error().byte_len() }
+    return (decoded ?? CodecLockRow { id: 0, title: "" }).id
+}
+
+route GET "/rowbinary" -> int {
+    let encoded = ch_encode(codec_rows)
+    let decoded: [CodecLockRow]? = ch_decode(encoded)
+    if decoded == none { return ch_error().byte_len() }
+    return (decoded ?? []).len()
+}
+
+route POST "/write" -> str {
+    codec_count += 1
+    return ch_encode(codec_rows)
+}

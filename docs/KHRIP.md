@@ -276,8 +276,19 @@ tx {
 - Outside `tx` each statement commits on its own, so in a route a write after
   another statement (or in a loop) is an error: put them in `tx { }`. `tx` is
   SERIALIZABLE and re-runs on a conflict, so inside it no `fetch`, `sleep`,
+  MongoDB or ClickHouse network operations,
   `call`, store or outer-variable changes; a status from 400, `fail` or a panic
   rolls it back. `let t = tx { ...; value }` commits and gives the value.
+
+## MongoDB and ClickHouse
+
+Direct library drivers use explicit `Mongo` / `ChConfig` values; multiple
+connections can coexist with PostgreSQL. Typed binary codecs: `to_bson(value)`
+→ `Bson`, `from_bson(doc)` → `T?`, `ch_encode(rows)` → `str`,
+`ch_decode(body)` → `[T]?`. Network operations return explicit result/error
+values and never automatically retry writes. See [DATABASES.md](DATABASES.md)
+for the API, supported types, limits and runnable examples. These adapters do
+not participate in PostgreSQL `tx`.
 
 ## Tests
 

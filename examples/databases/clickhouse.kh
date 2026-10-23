@@ -1,0 +1,29 @@
+// CLICKHOUSE_URL=http://host:8123 CLICKHOUSE_USER=default CLICKHOUSE_PASSWORD=...
+// build/khc run examples/databases/clickhouse.kh
+type Row { id: int, label: str }
+
+fn main() -> int {
+    let url = env("CLICKHOUSE_URL") else {
+        eprint("set CLICKHOUSE_URL")
+        return 1
+    }
+    let analytics = ChConfig {
+        url,
+        user: env("CLICKHOUSE_USER") ?? "default",
+        password: env("CLICKHOUSE_PASSWORD") ?? ""
+    }
+    let result = ch_query_params(analytics,
+        "SELECT number AS id, \{label:String} AS label FROM numbers(3)",
+        {"label": "hello"})
+    if !result.ok {
+        eprint(result.error)
+        return 1
+    }
+    let rows: [Row]? = ch_decode(result.body)
+    if rows == none {
+        eprint(ch_error())
+        return 1
+    }
+    print(to_json(rows ?? []))
+    return 0
+}

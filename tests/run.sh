@@ -15,6 +15,8 @@
 #   tests/coro.sh     — запросы, которые ждут (sleep, fetch), не держат поток;
 #   tests/tls.sh      — свой TLS 1.3: криптография, сертификаты, рукопожатия;
 #   tests/pg.sh       — клиент PostgreSQL на временном сервере;
+#   tests/mongo.sh, tests/clickhouse.sh — бинарные кодеки и драйверы;
+#                       реальные серверы задаются MONGODB_URI / CLICKHOUSE_URL;
 #   tests/weather.sh  — погодный бэкенд: fetch, every, сохранение store;
 #   eval/solutions/*/khrip — решения задач проверки проходят eval/run.sh.
 # Компилятор берётся из $KHC (по умолчанию build/khc).
@@ -156,6 +158,25 @@ fi
 if [[ -f tests/weather.sh ]] && command -v curl >/dev/null; then
 	# shellcheck source=tests/weather.sh
 	source tests/weather.sh
+fi
+
+# Отдельные процессы: сценарии драйверов владеют своими временными файлами
+# и trap. Без адресов БД выполняются проверки кодеков и повреждённого протокола.
+for driver in mongo clickhouse; do
+	if [[ "$driver" == clickhouse ]] && ! command -v python3 >/dev/null; then
+		echo "пропуск ClickHouse: нет python3 для проверки HTTP-протокола"
+		continue
+	fi
+	if KHC="$KHC" bash "tests/$driver.sh" >"$tmp/$driver.log" 2>&1; then
+		pass=$((pass + 1))
+	else
+		failed "$driver" "$(cat "$tmp/$driver.log")"
+	fi
+done
+if "$KHC" check tests/databases/codec_tx.kh >"$tmp/codec-tx.log" 2>&1; then
+	pass=$((pass + 1))
+else
+	failed "codecs inside tx" "$(cat "$tmp/codec-tx.log")"
 fi
 
 # Решения задач проверки (eval/) на Khrip проходят свои сценарии запросов.

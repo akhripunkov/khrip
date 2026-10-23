@@ -1,0 +1,18 @@
+// MONGODB_URI=mongodb://user:password@host/db?authSource=admin&directConnection=true
+// build/khc run examples/databases/mongo.kh
+type Ping { ping: int = 1 }
+
+fn main() -> int {
+    let uri = env("MONGODB_URI") else {
+        eprint("set MONGODB_URI")
+        return 1
+    }
+    let client = Mongo { uri }
+    let result = mongo_command(client, "admin", to_bson(Ping {}))
+    if result.error != "" {
+        eprint(result.error)
+        return 1
+    }
+    print("MongoDB: connected")
+    return 0
+}

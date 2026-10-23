@@ -61,20 +61,28 @@ const CTX_CORO = 120
 const CTX_PGHELD = 128
 // поля, которые пришли в JSON явным null (lib/api.kh): map[адрес структуры, биты] или 0
 const CTX_JNULLS = 136
+// Незавершённые операции внешних драйверов: свои у каждой сопрограммы.
+// Хуки __db_end закрывают их до освобождения арены, в том числе после panic.
+const CTX_MONGOHELD = 144
+const CTX_CHHELD = 152
+// TLS ещё не передан драйверу: освобождается при panic в рукопожатии.
+const CTX_TLS_PENDING = 160
 // слова [8, CTX_CO_END) — свои у каждой сопрограммы: при переключении они
 // сохраняются и загружаются (CTX_SELF и всё дальше — общие для потока)
-const CTX_CO_END = 144
+const CTX_CO_END = 168
 // свободные соединения fetch этого потока (lib/fetch.kh) или 0
-const CTX_POOL = 144
+const CTX_POOL = 256
 // проверенные цепочки сертификатов этого потока (lib/x509.kh) или 0
-const CTX_VCACHE = 152
+const CTX_VCACHE = 264
 // соединения с базой этого потока (lib/pg.kh) или 0
-const CTX_PGPOOL = 160
+const CTX_PGPOOL = 272
 // поток уже в панике из-за памяти: остаток арены (запас) — на её обработку
-const CTX_MEMPANIC = 168
+const CTX_MEMPANIC = 280
+// Пул MongoDB общий для потока; байты 192..255 оставлены системным вызовам.
+const CTX_MONGOPOOL = 288
 // запас в конце арены для ответа 500 и журнала после исчерпания памяти
 const ARENA_RESERVE = 16777216
-const CTX_SIZE = 256
+const CTX_SIZE = 512
 
 const CHUNK = 1048576
 const BIG = 262144

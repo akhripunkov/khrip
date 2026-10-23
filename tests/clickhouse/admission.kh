@@ -1,0 +1,25 @@
+type AdmissionResult { ok: bool, unknown: bool, error: str }
+
+route GET "/ready" -> str { return "ready" }
+
+route GET "/active" -> int { return load64(__ctx() + CTX_CHACTIVE) }
+
+route GET "/run/{mode}" (mode: str, timeout_ms: int = 5000) -> AdmissionResult {
+    let config = ChConfig {
+        url: (env("CH_MOCK_URL") ?? "http://127.0.0.1:18371") + "/" + mode,
+        timeout_ms,
+        max_inflight: 2
+    }
+    let r = ch_query(config, "SELECT 1")
+    return AdmissionResult { ok: r.ok, unknown: r.unknown_outcome, error: r.error }
+}
+
+route POST "/fault/{mode}" (mode: int) -> int | 409 str {
+    let guard = __DbHttp { c: -1, tag: 0, deadline: now_ms() + 5000, input: buf_new(16) }
+    store64(__ctx() + CTX_CHHELD, __cast(guard))
+    if !__dh_acquire(guard, 2) { fail(500, "test admission timed out") }
+    sleep(5)
+    if mode == 0 { fail(409, "lease released after fail") }
+    let values = [1]
+    return values[mode]
+}

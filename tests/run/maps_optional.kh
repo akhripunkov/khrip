@@ -1,0 +1,32 @@
+fn check(ok: bool, label: str) {
+    if !ok {
+        eprint("FAIL " + label)
+        exit(1)
+    }
+}
+
+fn main() {
+    let ints: map[str, int?] = { "one": 4, "empty": none }
+    check((ints["one"] ?? 0) == 4, "optional int index")
+    check((ints.get("one") ?? 0) == 4, "optional int get")
+    check(ints["empty"] == none && ints["missing"] == none, "stored none and missing")
+    check(ints.has("empty") && !ints.has("missing"), "presence remains explicit")
+    check((ints.remove("one") ?? 0) == 4 && !ints.has("one"), "optional int remove")
+    check(ints.remove("empty") == none && !ints.has("empty"), "remove stored none")
+
+    let floats: map[str, float?] = { "value": 4.5, "empty": none }
+    check((floats["value"] ?? 0.0) == 4.5, "optional float index")
+    check((floats.get("value") ?? 0.0) == 4.5, "optional float get")
+    check((floats.remove("value") ?? 0.0) == 4.5, "optional float remove")
+
+    let strings: map[str, str?] = { "value": "hello", "empty": none }
+    check((strings["value"] ?? "") == "hello", "optional str index")
+    check((strings.get("value") ?? "") == "hello", "optional str get")
+    check((strings.remove("value") ?? "") == "hello", "optional str remove")
+
+    let flags: map[int, bool?] = { 1: false, 2: true, 3: none }
+    check(!(flags[1] ?? true) && (flags.get(2) ?? false), "optional bool values")
+    check(flags.remove(3) == none && !flags.has(3), "optional bool none")
+    check(!(flags.remove(1) ?? true), "remove false")
+    print("optional map values: index, get and remove preserve values")
+}

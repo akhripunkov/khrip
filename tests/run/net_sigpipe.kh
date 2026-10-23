@@ -1,0 +1,19 @@
+fn main() -> int {
+    // ChResult requests the networking library even in a CLI program.
+    let unused = ChResult {}
+    let pair = __alloc(8)
+    // socketpair(AF_UNIX, SOCK_STREAM, 0, pair)
+    if syscall(53, 1, 1, 0, pair) != 0 {
+        return 1
+    }
+    let sender = load32(pair)
+    syscall(3, load32(pair + 4))
+    let data = "closed peer"
+    let sent = __fd_write_all(sender, __str_ptr(data), data.byte_len(), now_ms() + 1000)
+    syscall(3, sender)
+    if sent {
+        return 1
+    }
+    print("closed socket returns an error without SIGPIPE")
+    return 0
+}

@@ -1,0 +1,9 @@
+// expect: ch_query inside tx: the block may run again after a conflict
+route POST "/write" -> 204 {
+    let client = ChConfig { url: "http://localhost:8123/" }
+    tx {
+        sql "DELETE FROM events"
+        client.ch_query("INSERT INTO events VALUES (1)")
+    }
+    return 204
+}

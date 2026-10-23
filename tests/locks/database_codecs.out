@@ -1,0 +1,3 @@
+GET /bson: read
+GET /rowbinary: read
+POST /write: write
