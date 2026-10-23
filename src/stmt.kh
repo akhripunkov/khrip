@@ -821,7 +821,11 @@ fn assign_index(t: int) {
         return
     }
     if k == K_STR {
-        error_tok(at, "strings are immutable", "build a new string, e.g. s[..i] + \"x\" + s[i + 1..]")
+        if system_code(at) {
+            error_tok(at, "strings are immutable", "build a new string, e.g. s.byte_slice(0, i) + \"x\" + s.byte_slice(i + 1, s.byte_len())")
+        } else {
+            error_tok(at, "strings are immutable", "build a new string, e.g. s[..i] + \"x\" + s[i + 1..]")
+        }
     } else if k != K_LIST && t != ty_err {
         error_tok(at, ty_name(t) + " cannot be indexed", "")
     }

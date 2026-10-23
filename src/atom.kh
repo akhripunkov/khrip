@@ -757,9 +757,13 @@ fn field_load(t: int, nt: Token) -> int {
         return ty_err
     }
     if tkind(t) != K_STRUCT {
-        var hint = method_hint(nt.text)
+        let bytes = tkind(t) == K_STR && system_code(nt)
+        var hint = method_hint(nt.text, bytes)
         if nt.text == "len" {
             hint = "use .len()"
+            if bytes {
+                hint = "use .byte_len()"
+            }
         }
         error_tok(nt, ty_name(t) + " has no field '" + nt.text + "'", hint)
         return ty_err
@@ -1686,6 +1690,25 @@ fn system_str_method(nt: Token) {
     }
 }
 
+// Байтовый API у str — встроенные методы v0.13, и s.имя(...) вызывает метод,
+// даже если в программе есть fn имя(s: str, ...). До v0.13 такой вызов шёл
+// в функцию программы: вместо тихой замены — ошибка. (s.byte(i) и прочие
+// методы str были встроенными и раньше: их вызов не изменился.)
+fn byte_api_shadow(rt: int, nt: Token) {
+    let name = nt.text
+    if name != "byte_len" && name != "byte_slice" && name != "byte_find" && name != "byte_find_from" && name != "ascii_lower" && name != "ascii_upper" && name != "ascii_trim" {
+        return
+    }
+    let uf = func_find(name)
+    if uf >= 0 && !funcs[uf].is_lib && funcs[uf].params.len() > 0 && assignable(rt, funcs[uf].params[0].ty) {
+        var args = "(s)"
+        if funcs[uf].params.len() > 1 {
+            args = "(s, ...)"
+        }
+        error_tok(nt, "s." + name + "() is the built-in str method, not your fn " + name, "call your function as " + name + args + ", or rename it")
+    }
+}
+
 fn skip_call_args() {
     let close = matching_close(pos)
     pos = close
@@ -1713,8 +1736,11 @@ fn parse_method(rt: int, nt: Token) -> int {
         skip_call_args()
         return ty_err
     }
-    if k == K_STR && system_code(nt) {
-        system_str_method(nt)
+    if k == K_STR {
+        if system_code(nt) {
+            system_str_method(nt)
+        }
+        byte_api_shadow(rt, nt)
     }
     if k == K_FLOAT && name == "to_int" && kind_at(pos + 1) == ')' {
         advance()
@@ -1790,7 +1816,7 @@ fn parse_method(rt: int, nt: Token) -> int {
         }
     }
     if fi < 0 {
-        var hint = method_hint(name)
+        var hint = method_hint(name, k == K_STR && system_code(nt))
         if hint.byte_len() == 0 {
             let uf = func_find(name)
             if uf >= 0 && funcs[uf].params.len() > 0 {
@@ -1933,7 +1959,7 @@ fn parse_map_method(rt: int, nt: Token) -> int {
         emit_call(rt_func("__map_clear"))
         return ty_void
     }
-    var hint = method_hint(name)
+    var hint = method_hint(name, false)
     error_tok(nt, ty_name(rt) + " has no method '" + name + "'", hint)
     return ty_err
 }

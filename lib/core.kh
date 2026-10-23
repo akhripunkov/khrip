@@ -506,21 +506,25 @@ fn __str_slice(self: str, from: int, to: int) -> str {
     return __str_new(__str_ptr(self) + a, b - a)
 }
 
-// Первое вхождение sub с байта from: индекс байта или -1.
+// Первое вхождение sub с байта from: индекс байта или -1. Отрицательное from —
+// с начала строки (как у срезов).
 fn __str_byte_find_from(self: str, sub: str, from: int) -> int {
     let n = __str_len(self)
     let m = __str_len(sub)
     let p = __str_ptr(self)
     let q = __str_ptr(sub)
+    var i = from
+    if i < 0 {
+        i = 0
+    }
     if m == 0 {
-        if from <= n {
-            return from
+        if i <= n {
+            return i
         }
         return -1
     }
     // сравнение целиком — только там, где совпал первый байт
     let first = load8(q)
-    var i = from
     let last = n - m
     while i <= last {
         if load8(p + i) == first && __memeq(p + i + 1, q + 1, m - 1) {

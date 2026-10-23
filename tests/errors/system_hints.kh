@@ -1,0 +1,25 @@
+// flags: --system
+// expect: hint: use .byte_len()
+// expect: hint: use .byte_find(sub), it returns int?
+// expect: hint: use .ascii_upper()
+// expect: hint: use .ascii_lower()
+// expect: hint: use .ascii_trim()
+// expect: hint: use s.byte_slice(from, to)
+// expect: hint: build a new string, e.g. s.byte_slice(0, i) + "x" + s.byte_slice(i + 1, s.byte_len())
+// expect: [int] has no method 'size'
+// expect: 9 errors
+// В системном коде подсказки называют байтовые формы (у списков — .len()).
+fn main() {
+    var s = "abc"
+    let a = s.length()
+    let b = s.indexOf("b")
+    let c = s.toUpperCase()
+    let d = s.toLowerCase()
+    let e = s.strip()
+    let f = s.substring(0, 1)
+    let g = s.len
+    s[0] = 'x'
+    let xs = [1, 2]
+    let n = xs.size()
+    print(n)
+}

@@ -854,16 +854,35 @@ fn lex_range(end: int) {
                 lex_error("unterminated character literal", start)
                 return
             }
+            if lx_text.byte(lx_p) == '\n' {
+                // перевод строки считает основной цикл
+                lex_error("unterminated character literal", start)
+                add_tok(T_INT, 0, start, 1)
+                continue
+            }
             let v = lex_char(end)
             if v >= 0x80 && system_file(lx_file) {
-                // в системном коде символ — один байт ASCII
-                var bytes = ""
-                var q = start + 1
-                while q < end && q < start + 5 && lx_text.byte(q) >= 0x80 {
+                // в системном коде символ — один байт ASCII; в сообщении — байты
+                // первого символа (длина по ведущему байту), если он в литерале один
+                var w = 1
+                if v >= 0xC2 && v <= 0xDF {
+                    w = 2
+                } else if v >= 0xE0 && v <= 0xEF {
+                    w = 3
+                } else if v >= 0xF0 && v <= 0xF4 {
+                    w = 4
+                }
+                var bytes = " " + hex_byte(v)
+                var q = start + 2
+                while q < end && q < start + 1 + w && lx_text.byte(q) >= 0x80 && lx_text.byte(q) < 0xC0 {
                     bytes += " " + hex_byte(lx_text.byte(q))
                     q += 1
                 }
-                lex_error("non-ASCII character literal in system code: write its UTF-8 bytes as numbers:" + bytes, start)
+                if q < end && lx_text.byte(q) == '\'' {
+                    lex_error("non-ASCII character literal in system code: write its UTF-8 bytes as numbers:" + bytes, start)
+                } else {
+                    lex_error("character literal must contain exactly one character; use \"...\" for strings", start)
+                }
                 while lx_p < end && lx_text.byte(lx_p) != '\'' && lx_text.byte(lx_p) != '\n' {
                     lx_p += 1
                 }
@@ -873,7 +892,10 @@ fn lex_range(end: int) {
                     lx_p += 1
                 }
             }
-            lx_p += 1
+            // закрывающая кавычка; на переводе строки — стоп: его считает основной цикл
+            if lx_p < end && lx_text.byte(lx_p) == '\'' {
+                lx_p += 1
+            }
             add_tok(T_INT, v, start, lx_p - start)
             continue
         }

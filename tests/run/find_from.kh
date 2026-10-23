@@ -1,0 +1,13 @@
+// find_from с отрицательным началом ищет с начала строки (как срезы),
+// за концом строки — не находит.
+
+fn main() {
+    let s = read_file("tests/run/find_from.kh") ?? ""
+    let t = s[..8]
+    print(t.find_from("f", -5))
+    print(t.find_from("", -3))
+    print(t.find_from("find", 1))
+    print(t.find_from("", 9))
+    print("abcabc".find_from("c", -100))
+    print("abcabc".find_from("c", 3))
+}

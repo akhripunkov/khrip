@@ -178,9 +178,13 @@ fn name_hint(name: str) -> str {
     return ""
 }
 
-// Подсказка для неизвестного метода по имени.
-fn method_hint(name: str) -> str {
+// Подсказка для неизвестного метода по имени. bytes — получатель str в
+// системном коде: там подсказка называет байтовую форму (system_str_method).
+fn method_hint(name: str, bytes: bool) -> str {
     if name == "length" || name == "size" || name == "count" || name == "Count" || name == "Length" || name == "len_" {
+        if bytes {
+            return "use .byte_len()"
+        }
         return "use .len()"
     }
     if name == "append" || name == "add" || name == "push_back" || name == "Add" {
@@ -199,15 +203,27 @@ fn method_hint(name: str) -> str {
         return "use .ends_with(suffix)"
     }
     if name == "indexOf" || name == "IndexOf" || name == "index" {
+        if bytes {
+            return "use .byte_find(sub), it returns int?"
+        }
         return "use .find(sub), it returns int?"
     }
     if name == "toUpperCase" || name == "ToUpper" || name == "toUpper" {
+        if bytes {
+            return "use .ascii_upper()"
+        }
         return "use .upper()"
     }
     if name == "toLowerCase" || name == "ToLower" || name == "toLower" {
+        if bytes {
+            return "use .ascii_lower()"
+        }
         return "use .lower()"
     }
     if name == "strip" || name == "Trim" {
+        if bytes {
+            return "use .ascii_trim()"
+        }
         return "use .trim()"
     }
     if name == "parse" || name == "parseInt" || name == "atoi" || name == "Atoi" || name == "toInt" {
@@ -220,6 +236,9 @@ fn method_hint(name: str) -> str {
         return "use .remove(key) for maps, .remove_at(i) for lists"
     }
     if name == "substring" || name == "substr" || name == "Substring" {
+        if bytes {
+            return "use s.byte_slice(from, to)"
+        }
         return "use s[from..to]"
     }
     return ""
