@@ -1174,6 +1174,35 @@ fn emit_to_str(t: int, at: Token) -> bool {
 }
 
 fn builtin_args(n: int, at: Token, name: str) -> int {
+    return builtin_args_d(n, at, name, false)
+}
+
+// Аргументы встроенной функции → регистры regs по порядку: из стека, а
+// простые значения — прямо в регистр (как у вызова, push_arg).
+fn builtin_regs(n: int, at: Token, name: str, regs: [int]) -> int {
+    let got = builtin_args_d(n, at, name, true)
+    let base = arg_kind.len() - got
+    var i = got - 1
+    while i >= 0 {
+        if arg_kind[base + i] < 0 && i < regs.len() {
+            emit_pop(regs[i])
+        }
+        i -= 1
+    }
+    i = 0
+    while i < got {
+        if arg_kind[base + i] >= 0 && i < regs.len() {
+            op_kind = arg_kind[base + i]
+            op_val = arg_val[base + i]
+            load_operand(regs[i])
+        }
+        i += 1
+    }
+    args_done(got)
+    return got
+}
+
+fn builtin_args_d(n: int, at: Token, name: str, defer: bool) -> int {
     let saved = no_struct
     no_struct = false
     var got = 0
@@ -1183,7 +1212,7 @@ fn builtin_args(n: int, at: Token, name: str) -> int {
         if t != ty_int && t != ty_err {
             error_tok(a, name + " takes int arguments, found " + ty_name(t), "")
         }
-        emit_push(RAX)
+        push_arg(defer)
         got += 1
         if kind() == ',' {
             advance()
@@ -1318,22 +1347,7 @@ fn parse_builtin(t: Token, w: int) -> int {
     }
     if name == "syscall" {
         advance()
-        let n = builtin_args(-1, t, name)
-        var i = n - 1
-        while i >= 0 {
-            if i == 0 {
-                emit_pop(RAX)
-            } else if i == 4 {
-                emit_pop(R10)
-            } else if i == 5 {
-                emit_pop(R8)
-            } else if i == 6 {
-                emit_pop(R9)
-            } else {
-                emit_pop(arg_reg(i - 1))
-            }
-            i -= 1
-        }
+        builtin_regs(-1, t, name, [RAX, RDI, RSI, RDX, R10, R8, R9])
         emit8(0x0F)
         emit8(0x05)
         return ty_int
@@ -1456,13 +1470,10 @@ fn parse_builtin(t: Token, w: int) -> int {
     if name == "__simd_find_byte" || name == "__simd_find_json" || name == "__simd_find_crlf2" {
         advance()
         if name == "__simd_find_byte" {
-            builtin_args(3, t, name)
-            emit_pop(RDX)
+            builtin_regs(3, t, name, [RDI, RSI, RDX])
         } else {
-            builtin_args(2, t, name)
+            builtin_regs(2, t, name, [RDI, RSI])
         }
-        emit_pop(RSI)
-        emit_pop(RDI)
         if name == "__simd_find_byte" {
             emit_simd_find_byte()
         } else if name == "__simd_find_json" {
@@ -1475,13 +1486,10 @@ fn parse_builtin(t: Token, w: int) -> int {
     if name == "__simd_utf8_scan" || name == "__simd_utf8_skip" || name == "__simd_utf8_seek" || name == "__simd_find_json_hi" {
         advance()
         if name == "__simd_utf8_skip" || name == "__simd_utf8_seek" {
-            builtin_args(3, t, name)
-            emit_pop(RDX)
+            builtin_regs(3, t, name, [RDI, RSI, RDX])
         } else {
-            builtin_args(2, t, name)
+            builtin_regs(2, t, name, [RDI, RSI])
         }
-        emit_pop(RSI)
-        emit_pop(RDI)
         if name == "__simd_utf8_scan" {
             emit_simd_utf8_scan()
         } else if name == "__simd_utf8_skip" {
@@ -1495,11 +1503,7 @@ fn parse_builtin(t: Token, w: int) -> int {
     }
     if name == "__simd_case" {
         advance()
-        builtin_args(4, t, name)
-        emit_pop(RCX)
-        emit_pop(RDX)
-        emit_pop(RSI)
-        emit_pop(RDI)
+        builtin_regs(4, t, name, [RDI, RSI, RDX, RCX])
         emit_simd_case()
         return ty_int
     }
@@ -1748,10 +1752,7 @@ fn parse_builtin(t: Token, w: int) -> int {
     if name == "__memset" {
         // rep stosb: rdi = куда, al = байт, rcx = сколько
         advance()
-        builtin_args(3, t, name)
-        emit_pop(RCX)
-        emit_pop(RAX)
-        emit_pop(RDI)
+        builtin_regs(3, t, name, [RDI, RAX, RCX])
         emit8(0xF3)
         emit8(0xAA)
         return ty_void
@@ -1759,10 +1760,7 @@ fn parse_builtin(t: Token, w: int) -> int {
     if name == "__memcpy" {
         // rep movsb: rdi = куда, rsi = откуда, rcx = сколько
         advance()
-        builtin_args(3, t, name)
-        emit_pop(RCX)
-        emit_pop(RSI)
-        emit_pop(RDI)
+        builtin_regs(3, t, name, [RDI, RSI, RCX])
         emit8(0xF3)
         emit8(0xA4)
         return ty_void

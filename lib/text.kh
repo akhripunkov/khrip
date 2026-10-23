@@ -747,6 +747,80 @@ fn __strc_off(b: int, e: int, p: int, n: int, k: int) -> int {
     return off
 }
 
+// s[i] вразнобой по правильной строке (p, n) с индексом (запись e): опора —
+// точка индекса (не дальше 63 символов) или курсор записи, если с него ближе
+// (вперёд — i − ck, назад — 8·(ck − i)); строка правильная, и пропуск точен.
+// Курсор — сразу на следующий символ: тот, с которого шли, иначе второй, если
+// он не нужен, иначе ближний. → смещение символа i или -1, если опора испорчена
+// (тогда — общий путь, он её сбросит).
+fn __strc_at_ix(b: int, e: int, p: int, n: int, i: int) -> int {
+    let x = b + 8 * e
+    var ak = i & ~63
+    var ab = load64(load64(x + STRC_IX) + 8 * (i >> 6))
+    var cost = i - ak
+    var from = -1
+    let k0 = load64(x + STRC_CK)
+    let k1 = load64(x + STRC_CK + STRC_CUR)
+    if cost > 0 && k0 >= 0 {
+        var d = 8 * (k0 - i)
+        if k0 <= i {
+            d = i - k0
+        }
+        if d < cost {
+            ak = k0
+            ab = load64(x + STRC_CB)
+            cost = d
+            from = 0
+        }
+    }
+    if cost > 0 && k1 >= 0 {
+        var d = 8 * (k1 - i)
+        if k1 <= i {
+            d = i - k1
+        }
+        if d < cost {
+            ak = k1
+            ab = load64(x + STRC_CB + STRC_CUR)
+            from = 1
+        }
+    }
+    if ab < 0 || ab >= n || (load8(p + ab) & 0xC0) == 0x80 {
+        return -1
+    }
+    var o = ab
+    if i >= ak {
+        o = ab + __utf8_skip(p + ab, n - ab, i - ak)
+    } else {
+        // назад: символ начинается с байта не 10xxxxxx
+        var j = ak
+        while j > i && o > 0 {
+            o -= 1
+            while o > 0 && (load8(p + o) & 0xC0) == 0x80 {
+                o -= 1
+            }
+            j -= 1
+        }
+        __strc_add(ab - o)
+    }
+    let w = __tx_lead_width(load8(p + o))
+    if o >= n || w == 0 || o + w > n {
+        return -1
+    }
+    if o + w < n {
+        if from < 0 {
+            from = 0
+            if k1 < 0 || (k1 - i).abs() < (k0 - i).abs() {
+                from = 1
+            }
+        }
+        let y = x + STRC_CUR * from
+        store64(y + STRC_CK, i + 1)
+        store64(y + STRC_CB, o + w)
+        store64(b + STRC_LAST, 8 * e + STRC_CUR * from + 1)
+    }
+    return o
+}
+
 // Смещение символа k строки (p, n) без кэша: проверка начала строки и пропуск —
 // одним проходом, на неправильном начале — обход по правилу Go.
 fn __tx_seek(p: int, n: int, k: int) -> int {
@@ -978,71 +1052,10 @@ fn __text_at(self: str, i: int) -> str {
         e = __strc_key(b, p, n)
         if e >= 0 {
             let x0 = b + 8 * e
-            let ix = load64(x0 + STRC_IX)
-            if ix != 0 && load64(x0 + STRC_VUP) == n && i < load64(x0 + STRC_CNT) - 1 {
-                // вразнобой по правильной строке с индексом: опора — точка индекса
-                // (не дальше 63 символов) или курсор записи, если с него ближе
-                // (вперёд — i − ck, назад — 8·(ck − i)); строка правильная, и
-                // пропуск точен. Курсор — сразу на следующий символ: тот, с
-                // которого шли, иначе второй, если он не нужен, иначе ближний.
-                var ak = i & ~63
-                var ab = load64(ix + 8 * (i >> 6))
-                var cost = i - ak
-                var from = -1
-                var c = 0
-                var y0 = x0
-                while c < 2 && cost > 0 {
-                    let ck = load64(y0 + STRC_CK)
-                    if ck >= 0 {
-                        var d = 8 * (ck - i)
-                        if ck <= i {
-                            d = i - ck
-                        }
-                        if d < cost {
-                            ak = ck
-                            ab = load64(y0 + STRC_CB)
-                            cost = d
-                            from = c
-                        }
-                    }
-                    c += 1
-                    y0 += STRC_CUR
-                }
-                // опора проверяется: внутри строки и не внутри символа (иначе —
-                // общий путь, он её сбросит)
-                if ab >= 0 && ab < n && (load8(p + ab) & 0xC0) != 0x80 {
-                    var o = ab
-                    if i >= ak {
-                        o = ab + __utf8_skip(p + ab, n - ab, i - ak)
-                    } else {
-                        var j = ak
-                        while j > i && o > 0 {
-                            o -= 1
-                            while o > 0 && (load8(p + o) & 0xC0) == 0x80 {
-                                o -= 1
-                            }
-                            j -= 1
-                        }
-                        __strc_add(ab - o)
-                    }
-                    let w = __tx_lead_width(load8(p + o))
-                    if o < n && w > 0 && o + w <= n {
-                        if o + w < n {
-                            var u = from
-                            if u < 0 {
-                                let k1 = load64(x0 + STRC_CK + STRC_CUR)
-                                u = 0
-                                if k1 < 0 || (k1 - i).abs() < (load64(x0 + STRC_CK) - i).abs() {
-                                    u = 1
-                                }
-                            }
-                            let y1 = x0 + STRC_CUR * u
-                            store64(y1 + STRC_CK, i + 1)
-                            store64(y1 + STRC_CB, o + w)
-                            store64(b + STRC_LAST, 8 * e + STRC_CUR * u + 1)
-                        }
-                        return __tx_char(p, o, w)
-                    }
+            if load64(x0 + STRC_IX) != 0 && load64(x0 + STRC_VUP) == n && i < load64(x0 + STRC_CNT) - 1 {
+                let o = __strc_at_ix(b, e, p, n, i)
+                if o >= 0 {
+                    return __tx_char(p, o, __tx_lead_width(load8(p + o)))
                 }
             }
             off = __strc_off(b, e, p, n, i)
