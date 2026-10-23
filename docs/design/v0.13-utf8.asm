@@ -494,7 +494,15 @@ kh_utf8_skip:
     sub rdx, r9
     add rax, 32
     jmp .blk
-.in:                            ; the k-th lead is in this block: drop k-1 lowest bits
+.in:                            ; the k-th lead is in this block
+    cmp byte [__simd_level], 3
+    jb .clr0
+    lea r8, [rdx-1]             ; level 3 (fast PDEP): bit k-1 deposited into the mask
+    xor r9d, r9d                ; lands on the k-th lowest lead
+    bts r9, r8
+    pdep rcx, r9, rcx
+    jmp .bit
+.clr0:                          ; otherwise drop k-1 lowest bits one by one
     dec rdx
     jz .bit
 .clr:
@@ -645,7 +653,15 @@ kh_utf8_seek:
     lea r8d, [r11+1]
     jmp .last
 .found:
-    ; drop the rdx lowest leads; the next one starts character k
+    ; drop the rdx lowest leads; the next one starts character k (level 3:
+    ; bit rdx deposited into the mask with PDEP lands on that lead)
+    cmp byte [__simd_level], 3
+    jb .clr0
+    xor r8d, r8d
+    bts r8, rdx
+    pdep rcx, r8, rcx
+    jmp .bit
+.clr0:
     test rdx, rdx
     jz .bit
 .clr:

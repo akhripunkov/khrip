@@ -1085,35 +1085,35 @@ fn __text_at(self: str, i: int) -> str {
         let y = b + t
         let x = b + (t & (STRC_CUR - 1))
         if t >= 0 && load64(x + STRC_KP) == p && load64(x + STRC_KN) == n {
-            var o = -1
-            var w = 0
+            var co = -1
+            var cw = 0
             if load64(y + STRC_CK) == i {
-                o = load64(y + STRC_CB)
+                co = load64(y + STRC_CB)
                 let vup = load64(x + STRC_VUP)
-                if o >= 0 && o < vup && vup <= n {
-                    w = __tx_lead_width(load8(p + o))
-                    if w > 0 && o + w <= vup {
-                        if o + w < n {
+                if co >= 0 && co < vup && vup <= n {
+                    cw = __tx_lead_width(load8(p + co))
+                    if cw > 0 && co + cw <= vup {
+                        if co + cw < n {
                             store64(y + STRC_CK, i + 1)
-                            store64(y + STRC_CB, o + w)
+                            store64(y + STRC_CB, co + cw)
                         }
                     } else {
-                        o = -1
+                        co = -1
                     }
                 } else {
-                    o = -1
+                    co = -1
                 }
             } else if load64(x + STRC_IX) != 0 && load64(x + STRC_VUP) == n && i < load64(x + STRC_CNT) - 1 {
-                o = __strc_at_ix(b, x, p, n, i)
-                if o >= 0 {
-                    w = __tx_lead_width(load8(p + o))
+                co = __strc_at_ix(b, x, p, n, i)
+                if co >= 0 {
+                    cw = __tx_lead_width(load8(p + co))
                 }
             }
-            if o >= 0 {
+            if co >= 0 {
                 let clock = load64(b + STRC_CLOCK) + 1
                 store64(b + STRC_CLOCK, clock)
                 store64(x + STRC_USE, clock)
-                return __tx_char(p, o, w)
+                return __tx_char(p, co, cw)
             }
         }
         // то же у лёгкого места, если строка правильная целиком
@@ -1155,19 +1155,19 @@ fn __text_at(self: str, i: int) -> str {
     if e >= 0 {
         // курсор — на следующий символ; правильный символ сразу за vup
         // продлевает правильную часть
-        let x = b + 8 * e
-        if load64(x + STRC_VUP) == off && (w > 1 || load8(p + off) < 0x80) {
-            store64(x + STRC_VUP, off + w)
+        let xe = b + 8 * e
+        if load64(xe + STRC_VUP) == off && (w > 1 || load8(p + off) < 0x80) {
+            store64(xe + STRC_VUP, off + w)
         }
         if off + w < n {
             __strc_move(b, p, n, i + 1, off + w)
         }
     } else if b != 0 && off + w < n {
         // курсор лёгкого места — на следующий символ (если место не стало записью)
-        let z = -e
-        if load64(z) == p && load64(z + 8) == n {
-            store64(z + 24, i + 1)
-            store64(z + 32, off + w)
+        let zl = -e
+        if load64(zl) == p && load64(zl + 8) == n {
+            store64(zl + 24, i + 1)
+            store64(zl + 32, off + w)
         }
     }
     return __tx_char(p, off, w)

@@ -481,20 +481,25 @@ fn emit_simd_utf8_scan() {
 fn emit_simd_utf8_skip() {
     // xor eax, eax; test rdx, rdx; jz .r; mov eax, 1 — символ 0 начинается в
     // байте 0, ведущие байты ищутся в [1, n)
-    emit_hex("31 C0 48 85 D2 0F 84 89 00 00 00 B8 01 00 00 00")
+    emit_hex("31 C0 48 85 D2 0F 84 A5 00 00 00 B8 01 00 00 00")
     // cmp byte [__simd_level], 2; jb .s
     emit_level_cmp(2)
-    emit_hex("72 56")
+    emit_hex("72 72")
     // ymm1 = -65: b > -65 со знаком — b не 10xxxxxx
     emit_hex("B9 BF BF BF BF C5 F9 6E C9 C4 E2 7D 58 C9")
     // .blk: lea rcx, [rax + 32]; cmp rcx, rsi; ja .t; vmovdqu ymm0, [rdi + rax];
     // vpcmpgtb ymm0, ymm0, ymm1; vpmovmskb ecx, ymm0; popcnt r9d, ecx; cmp r9, rdx; jae .in;
     // sub rdx, r9; add rax, 32; jmp .blk
-    emit_hex("48 8D 48 20 48 39 F1 77 3C C5 FE 6F 04 07")
+    emit_hex("48 8D 48 20 48 39 F1 77 58 C5 FE 6F 04 07")
     emit_hex("C5 FD 64 C1 C5 FD D7 C8 F3 44 0F B8 C9 49 39 D1 73 09")
     emit_hex("4C 29 CA 48 83 C0 20 EB D7")
-    // .in: нужный ведущий байт в этом блоке — сбросить k - 1 младших битов маски:
-    // dec rdx; jz .bit; .clr: lea r8d, [rcx - 1]; and ecx, r8d; dec rdx; jnz .clr
+    // .in: нужный ведущий байт в этом блоке. На уровне 3 (быстрый PDEP) бит k - 1,
+    // разложенный по маске, ложится ровно на него: cmp byte [__simd_level], 3;
+    // jb .clr0; lea r8, [rdx - 1]; xor r9d, r9d; bts r9, r8; pdep rcx, r9, rcx; jmp .bit
+    emit_level_cmp(3)
+    emit_hex("72 12 4C 8D 42 FF 45 31 C9 4D 0F AB C1 C4 E2 B3 F5 C9 EB 11")
+    // .clr0: иначе сбросить k - 1 младших битов маски по одному: dec rdx; jz .bit;
+    // .clr: lea r8d, [rcx - 1]; and ecx, r8d; dec rdx; jnz .clr
     emit_hex("48 FF CA 74 0C 44 8D 41 FF 44 21 C1 48 FF CA 75 F4")
     // .bit: bsf ecx, ecx; add rax, rcx; vzeroupper; jmp .r; .t: vzeroupper
     emit_hex("0F BC C9 48 01 C8 C5 F8 77 EB 27 C5 F8 77")
@@ -520,7 +525,7 @@ fn emit_simd_utf8_seek() {
     let t = utf8_consts()
     // xor eax, eax; test rdx, rdx; jz .done (k = 0: смещение 0, проверять нечего);
     // push rbp; mov rbp, rsp; sub rsp, 64; and rsp, -32 — блок для хвоста
-    emit_hex("31 C0 48 85 D2 0F 84 C5 02 00 00 55 48 89 E5 48 83 EC 40 48 83 E4 E0")
+    emit_hex("31 C0 48 85 D2 0F 84 DD 02 00 00 55 48 89 E5 48 83 EC 40 48 83 E4 E0")
     // vpxor xmm7, xmm7, xmm7; vpxor xmm6, xmm6, xmm6; vpxor xmm8, xmm8, xmm8
     emit_hex("C5 C1 EF FF C5 C9 EF F6 C4 41 39 EF C0")
     // константы — как в __simd_utf8_scan
@@ -578,8 +583,13 @@ fn emit_simd_utf8_seek() {
     emit_hex("44 89 D9 41 B8 01 00 00 00 41 D3 E0 41 FF C8 C5 2D 64 C8 C4 C1 7D D7 C9 F7 D1")
     emit_hex("44 09 D1 44 21 C1 F3 44 0F B8 C9 49 39 D1 77 09")
     // символа k нет: mov rax, rsi; lea r8d, [r11 + 1] — проверить и нуль за хвостом; jmp .last
-    emit_hex("48 89 F0 45 8D 43 01 EB 1B")
-    // .found: сбросить rdx младших ведущих: test rdx, rdx; jz .bit;
+    emit_hex("48 89 F0 45 8D 43 01 EB 33")
+    // .found: символ k начинается со следующего ведущего за rdx младшими. На
+    // уровне 3 — PDEP, как в __simd_utf8_skip: cmp byte [__simd_level], 3; jb .clr0;
+    // xor r8d, r8d; bts r8, rdx; pdep rcx, r8, rcx; jmp .bit
+    emit_level_cmp(3)
+    emit_hex("72 0E 45 31 C0 49 0F AB D0 C4 E2 BB F5 C9 EB 11")
+    // .clr0: иначе сбросить их по одному: test rdx, rdx; jz .bit;
     // .clr: lea r8d, [rcx - 1]; and ecx, r8d; dec rdx; jnz .clr;
     // .bit: bsf ecx, ecx; add rax, rcx; lea r8d, [rcx + 1]
     emit_hex("48 85 D2 74 0C 44 8D 41 FF 44 21 C1 48 FF CA 75 F4 0F BC C9 48 01 C8 44 8D 41 01")
@@ -817,6 +827,23 @@ fn emit_cpu_avx2() {
     patch_here(done)
     // pop rbx
     emit8(0x5B)
+}
+
+// __cpu_pdep(): есть ли BMI2 с быстрым PDEP — у Intel всегда (3 такта с
+// Haswell), у AMD — с Zen 3 (семейство 19h): до него PDEP микрокодом и медленнее
+// побитового цикла. → уровень SIMD 3 (lib/rt.kh).
+fn emit_cpu_pdep() {
+    // push rbx; xor eax, eax; cpuid; cmp eax, 7; jb .no; mov r8d, ebx (производитель);
+    // mov eax, 1; cpuid; mov r9d, eax (семейство); mov eax, 7; xor ecx, ecx; cpuid;
+    // test ebx, 1 << 8 (BMI2); jz .no
+    emit_hex("53 31 C0 0F A2 83 F8 07 72 48 41 89 D8 B8 01 00 00 00 0F A2 41 89 C1")
+    emit_hex("B8 07 00 00 00 31 C9 0F A2 F7 C3 00 01 00 00 74 2A")
+    // cmp r8d, "Genu"; je .yes; cmp r8d, "Auth"; jne .no; расширенное семейство:
+    // shr r9d, 20; and r9d, 0xFF; cmp r9d, 0Ah; jb .no
+    emit_hex("41 81 F8 47 65 6E 75 74 1A 41 81 F8 41 75 74 68 75 18")
+    emit_hex("41 C1 E9 14 41 81 E1 FF 00 00 00 41 83 F9 0A 72 07")
+    // .yes: mov eax, 1; jmp .done; .no: xor eax, eax; .done: pop rbx
+    emit_hex("B8 01 00 00 00 EB 02 31 C0 5B")
 }
 
 // ---- SHA-256 на инструкциях SHA-NI ----
