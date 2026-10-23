@@ -1,9 +1,10 @@
 ok    valid text and surrogate pairs
 ok    unpaired surrogates
 ok    invalid UTF-8 bytes in a body
+ok    long strings: the high-bit flag in every block
 ok    BOM and NUL
 ok    from_json is strict: none and json_error()
 ok    error excerpts are whole characters
 ok    str parameters must be valid UTF-8
 ok    to_json never writes invalid UTF-8
-8 tests: 8 passed, 0 failed
+9 tests: 9 passed, 0 failed

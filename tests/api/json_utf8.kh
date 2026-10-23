@@ -96,6 +96,24 @@ test "invalid UTF-8 bytes in a body" {
     expect (call POST "/counts" `{"а":1,"б":2}`).body == "2"
 }
 
+test "long strings: the high-bit flag in every block" {
+    // поиск идёт блоками по 32 байта: неправильный байт у границ блоков и в
+    // хвосте строки в 100 байтов, в строке без экранирования и с ним
+    let ascii = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    let text = ascii + ascii
+    for at in [0, 31, 32, 33, 63, 64, 95, 99] {
+        let bad = text.byte_slice(0, at) + raw([0xFF]) + text.byte_slice(at, 99)
+        expect (call POST "/notes" note(bad)).status == 400
+        expect (call POST "/notes" note(`\n` + bad)).status == 400
+        expect (call POST "/notes" note(bad + `\t`)).status == 400
+        let good = text.byte_slice(0, at) + "ж" + text.byte_slice(at, 98)
+        expect (call POST "/notes" note(good)).status == 201
+        expect (call POST "/notes" note(`\n` + good + `\t`)).status == 201
+        expect to_json(bad) == "\"" + text.byte_slice(0, at) + "�" + text.byte_slice(at, 99) + "\""
+        expect to_json(good) == "\"" + good + "\""
+    }
+}
+
 test "BOM and NUL" {
     let r = call POST "/notes" raw([0xEF, 0xBB, 0xBF]) + note("бом")
     expect r.status == 201
