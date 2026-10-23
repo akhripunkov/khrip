@@ -776,24 +776,6 @@ fn __jd_hex4(j: __Json) -> int {
     return v
 }
 
-fn __buf_utf8(b: Buf, cp: int) {
-    if cp < 0x80 {
-        buf_byte(b, cp)
-    } else if cp < 0x800 {
-        buf_byte(b, 0xC0 | (cp >> 6))
-        buf_byte(b, 0x80 | (cp & 63))
-    } else if cp < 0x10000 {
-        buf_byte(b, 0xE0 | (cp >> 12))
-        buf_byte(b, 0x80 | ((cp >> 6) & 63))
-        buf_byte(b, 0x80 | (cp & 63))
-    } else {
-        buf_byte(b, 0xF0 | (cp >> 18))
-        buf_byte(b, 0x80 | ((cp >> 12) & 63))
-        buf_byte(b, 0x80 | ((cp >> 6) & 63))
-        buf_byte(b, 0x80 | (cp & 63))
-    }
-}
-
 // Строка: без экранирования — без копирования (ссылка на входные байты).
 fn __jd_str(j: __Json, at: str) -> str {
     if __jd_peek(j) != '"' {
@@ -855,7 +837,7 @@ fn __jd_str(j: __Json, at: str) -> str {
                     cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
                 }
             }
-            __buf_utf8(b, cp)
+            buf_utf8(b, cp)
         } else {
             __jd_fail(j, at, "bad escape in a string")
             return ""
@@ -1767,5 +1749,7 @@ fn __call(method: str, target: str, body: int, d: int, headers: int) -> Response
     let used = load64(c + CTX_PTR) - mark
     __memset(mark, 0, used)
     store64(c + CTX_PTR, mark)
+    // строки запроса умерли, а их адреса займут новые: кэш строк — заново
+    __strc_clear()
     return Response { status: w.status, body: buf_str(w.body), headers: __header_map(buf_str(w.extra)) }
 }

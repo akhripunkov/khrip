@@ -59,6 +59,8 @@ var barrier: int
 var last_push: int
 var strlit_addr: [int]
 var const_strs: StrMap = smap_new()
+// Таблицы __data_hex по тексту: одинаковый текст — одна таблица.
+var data_hexes: StrMap = smap_new()
 
 fn emit_init() {
     code = __mmap(CODE_MAX)
@@ -68,6 +70,8 @@ fn emit_init() {
     last_push = -1
     barrier = 0
     const_strs = smap_new()
+    data_hexes = smap_new()
+    utf8_tab = 0
 }
 
 fn emit8(b: int) {
@@ -381,5 +385,34 @@ fn const_str(s: str) -> int {
     }
     let addr = data_str(s)
     smap_put(const_strs, s, addr)
+    return addr
+}
+
+// Таблица __data_hex: байты из шестнадцатеричного текста («0F C0 …», пробелы не
+// в счёт) — в DATA с выравниванием на 8 → адрес или -1, если в тексте не пары
+// шестнадцатеричных цифр. Функцию с таблицей могут встроить много раз, а таблица
+// остаётся одна.
+fn data_hex_table(s: str) -> int {
+    let a = smap_get(data_hexes, s)
+    if a >= 0 {
+        return a
+    }
+    var digits = 0
+    for i in 0..s.byte_len() {
+        let c = s.byte(i)
+        if c != ' ' {
+            if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+                return -1
+            }
+            digits += 1
+        }
+    }
+    if digits % 2 != 0 {
+        return -1
+    }
+    data_align()
+    let addr = DATA_BASE + data_len
+    data_hex(s)
+    smap_put(data_hexes, s, addr)
     return addr
 }

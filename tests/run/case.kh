@@ -1,0 +1,134 @@
+// Регистр и классы символов (lib/text.kh, таблицы lib/text_tables.kh): простое
+// отображение Unicode, как в Go и C#. Ё/ё, Σ → σ без конечной сигмы, Ł, Ğ,
+// İ → i, ß без изменений, ẞ → ß, ǅ, грузинский мтаврули U+1C90 ↔ U+10D0,
+// чероки U+13A0 → U+AB70, дезерет (4 байта), знак Кельвина → k, ſ → S,
+// ɐ → Ɐ (растёт из 2 байт в 3); слова по 8 байт ASCII вперемешку с другими
+// символами и неправильные байты (копируются как есть). Если менять нечего,
+// lower/upper возвращают ту же строку (тот же заголовок). В конце — все
+// отображения и \w таблиц сворачиваются в число; ожидаемые числа посчитаны по
+// UnicodeData.txt 17.0.0 отдельно от генератора (tools/unicode_tables.kh).
+// env: KHRIP_SIMD=0 KHRIP_STRCACHE=off
+// env: KHRIP_SIMD=0
+// env: KHRIP_SIMD=0 KHRIP_STRCACHE=stress
+// env: KHRIP_STRCACHE=off
+// env:
+// env: KHRIP_STRCACHE=stress
+
+fn show(s: str) {
+    let lo = __text_lower(s)
+    let up = __text_upper(s)
+    var note = ""
+    if __text_len(lo) != __text_len(s) || __text_len(up) != __text_len(s) {
+        note = "  (length changed!)"
+    }
+    print("{s} → lower {lo}, upper {up}" + note)
+}
+
+fn same(s: str) -> str {
+    let hs: int = __cast(s)
+    let lo: int = __cast(__text_lower(s))
+    let up: int = __cast(__text_upper(s))
+    return "lower {lo == hs}, upper {up == hs}"
+}
+
+fn hex_bytes(s: str) -> str {
+    var r = ""
+    for i in 0..s.byte_len() {
+        if i > 0 {
+            r += " "
+        }
+        r += s.byte(i).to_str()
+    }
+    return r
+}
+
+fn utf8(cp: int) -> str {
+    let b = buf_new(4)
+    buf_utf8(b, cp)
+    return buf_str(b)
+}
+
+fn main() -> int {
+    show("ЁЖИК ёжик")
+    show("ΟΔΟΣ ς")
+    show("Łódź ł")
+    show("Ğ ğ")
+    show("İstanbul ı")
+    show("Straße")
+    show("ẞ")
+    show("ǅ Ǆ ǆ")
+    show(utf8(0x1C90) + " " + utf8(0x10D0))
+    show(utf8(0x13A0) + " " + utf8(0xAB70))
+    show(utf8(0x10400) + " " + utf8(0x10428))
+    show(utf8(0x212A) + " k K")
+    show("ſ")
+    show("ɐ " + utf8(0x2C6F))
+    show("ÉCOLE Ёж")
+    show("Hello, WORLD! Привет, МИР! hello, world? 12345678 ABCDEFGH abcdefgh")
+    show("ascii only: The Quick Brown Fox Jumps Over The Lazy Dog 0123456789")
+
+    // ɐ растёт: 2 байта → 3
+    let grown = __text_upper("ɐɐɐɐ")
+    print("ɐɐɐɐ upper: {grown.byte_len()} bytes, {__text_len(grown)} characters")
+    // неправильные байты — как есть
+    let b = buf_new(8)
+    for x in [65, 66, 0xFF, 0xD0, 99, 0xD0, 0x96, 0xE2, 0x82] {
+        buf_byte(b, x)
+    }
+    let raw = buf_str(b)
+    print("invalid bytes lower: {hex_bytes(__text_lower(raw))}")
+    print("invalid bytes upper: {hex_bytes(__text_upper(raw))}")
+
+    // без изменений — та же строка
+    print("уже строчные: " + same("уже строчные, ß и ǆ"))
+    print("ЗАГЛАВНЫЕ Ё: " + same("ЗАГЛАВНЫЕ Ё"))
+    print("123 !? —: " + same("123 !? — 😀"))
+    print("empty: " + same(""))
+
+    // классы символов
+    var words = ""
+    for cp in [0x44F, 0x5F, 0x663, 0x301, 0xB7, 0x200B, 0xA0, 0x3000, 0x4E2D, 0x1F600, 0xE0100, 0x10FFFF, 0x2D] {
+        words += " {__cp_is_word(cp)}"
+    }
+    print("\\w я _ ٣ U+0301 · ZWSP NBSP U+3000 中 😀 U+E0100 U+10FFFF -:" + words)
+    var spaces = ""
+    for cp in [0x20, 0x9, 0xB, 0x85, 0xA0, 0x1680, 0x2000, 0x200A, 0x200B, 0x2028, 0x202F, 0x205F, 0x3000, 0xFEFF, 0x1C] {
+        spaces += " {__cp_is_space(cp)}"
+    }
+    print("space SP HT VT U+0085 NBSP U+1680 U+2000 U+200A ZWSP U+2028 U+202F U+205F U+3000 BOM U+001C:" + spaces)
+
+    // все отображения и \w таблиц — свёрткой
+    let m = 1000000007
+    var h = 0
+    var nl = 0
+    var nu = 0
+    for cp in 0..0x110000 {
+        let l = __case_map(cp, false)
+        let u = __case_map(cp, true)
+        if l != cp {
+            nl += 1
+        }
+        if u != cp {
+            nu += 1
+        }
+        if l != cp || u != cp {
+            h = (h * 31 + (cp & 0x1FFFFF)) % m
+            h = (h * 31 + ((l - cp) & 0x1FFFFF)) % m
+            h = (h * 31 + ((u - cp) & 0x1FFFFF)) % m
+        }
+    }
+    print("case mappings: lower {nl}, upper {nu}, hash {h} (UCD 17.0.0: 1488, 1505, 406996107)")
+    var hw = 0
+    var nw = 0
+    for cp in 0..0x110000 {
+        if __cp_is_word(cp) {
+            nw += 1
+            hw = (hw * 31 + cp) % m
+        }
+    }
+    print("\\w: {nw} code points, hash {hw} (UCD 17.0.0: 148995, 60541432)")
+    if nl != 1488 || nu != 1505 || h != 406996107 || nw != 148995 || hw != 60541432 {
+        return 1
+    }
+    return 0
+}

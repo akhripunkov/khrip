@@ -18,6 +18,7 @@ fn __entry(sp: int) {
 }
 
 // ---- SIMD: 2 — AVX2, 1 — SSE2, 0 — побайтно (KHRIP_SIMD может понизить) ----
+// Здесь же — режим кэша строк (KHRIP_STRCACHE).
 
 var __simd_level: int
 // SHA-256 инструкциями процессора (SHA-NI); KHRIP_SIMD=0 выключает
@@ -36,6 +37,14 @@ fn __simd_init() {
     }
     __simd_level = lvl
     __simd_sha = lvl > 0 && __cpu_sha()
+    // кэш строк (lib/text.kh): off — без него, stress — проверочный режим
+    if let m = env("KHRIP_STRCACHE") {
+        if m == "off" {
+            __strc_mode = STRC_OFF
+        } else if m == "stress" {
+            __strc_mode = STRC_STRESS
+        }
+    }
 }
 
 // Индекс первого байта b в [p, p + n) или n.
@@ -46,6 +55,12 @@ fn __find_byte(p: int, n: int, b: int) -> int {
 // Индекс первого '"', '\\' или управляющего байта или n.
 fn __find_json_special(p: int, n: int) -> int {
     return __simd_find_json(p, n)
+}
+
+// То же | 1 << 62, если до этого места встретился байт >= 0x80 (строку
+// тогда нужно проверить на UTF-8).
+fn __find_json_hi(p: int, n: int) -> int {
+    return __simd_find_json_hi(p, n)
 }
 
 // Индекс начала «\r\n\r\n» или n.
@@ -377,6 +392,40 @@ fn __store_unlock() {
         syscall(SYS_FUTEX, rw + 16, FUTEX_WAKE_PRIVATE, 0x7FFFFFFF, 0, 0, 0)
     }
     __mutex_unlock(rw)
+}
+
+// ---- Постоянная память ----
+// Неизменяемые данные на всё время процесса (таблица символов, программы
+// регулярных выражений): куски по 64 КБ из mmap, блок от 16 КБ — свой mmap.
+// Память обнулена. Выделитель потока (CTX_PTR) не переключается, поэтому паника
+// не может оставить его переключённым. В блоке __store_rw: [48] — замок,
+// [56] — текущий кусок; первое слово куска — его свободное место.
+const PERM_CHUNK = 65536
+const PERM_BIG = 16384
+
+fn __perm_alloc(n: int) -> int {
+    if n >= PERM_BIG {
+        return __mmap(n)
+    }
+    let size = (n + 15) & ~15
+    __store_rw_init()
+    let lock = __store_rw + 48
+    __mutex_lock(lock)
+    var c = load64(__store_rw + 56)
+    if c == 0 || load64(c) + size > c + PERM_CHUNK {
+        // без __mmap: его паника оставила бы замок закрытым
+        c = syscall(SYS_MMAP, 0, PERM_CHUNK, 3, 0x22, -1, 0)
+        if c < 0 {
+            __mutex_unlock(lock)
+            __panic(PANIC_MEMORY, "mmap")
+        }
+        store64(c, c + 16)
+        store64(__store_rw + 56, c)
+    }
+    let p = load64(c)
+    store64(c, p + size)
+    __mutex_unlock(lock)
+    return p
 }
 
 // ---- Арены ----

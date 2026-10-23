@@ -55,7 +55,7 @@ EVAL_PG=${EVAL_PG:-postgres://postgres:khrip@127.0.0.1:5432/postgres?sslmode=dis
 PSQL=${PSQL:-$(command -v psql || ls /usr/lib/postgresql/*/bin/psql 2>/dev/null | sort -V | tail -1)}
 
 db_reset() {
-	local name=eval_$1
+	local name=${EVAL_DB_PREFIX:-eval_}$1
 	"$PSQL" -q "$EVAL_PG" -c "set client_min_messages = warning" -c "drop database if exists $name with (force)" -c "create database $name" >/dev/null || return 1
 	local base=${EVAL_PG%%\?*}
 	export DATABASE_URL=${base%/*}/$name?sslmode=disable

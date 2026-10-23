@@ -1,0 +1,65 @@
+// Кэш строк и call: после запроса call откатывает память теста назад
+// (lib/api.kh, __call), и следующие строки ложатся по тем же адресам. Маршрут
+// строит строку из 300 символов кириллицы (600 байт), узнаёт её длину и символ —
+// кэш запоминает их по адресу и длине байтов — и возвращает адрес. Тест кладёт
+// по этому адресу другую строку в 600 байт (600 символов ASCII) и спрашивает
+// то же самое. Без __strc_clear после отката ответ взялся бы из кэша от первой
+// строки (проверено вручную: тест тогда падает).
+
+route GET "/text" -> str {
+    // отступ: ответ, который call соберёт после отката, не дотянется до строки
+    buf_new(65536)
+    let b = buf_new(600)
+    for i in 0..300 {
+        buf_utf8(b, 0x430 + i % 32)
+    }
+    let s = buf_str(b)
+    return "{__str_ptr(s)} {__text_len(s)} {__text_at(s, 299)}"
+}
+
+test "call rewinds memory, the string cache starts over" {
+    for round in 0..3 {
+        let parts = (call GET "/text").body.split(" ")
+        expect parts.len() == 3
+        expect parts[1] == "300"
+        expect parts[2] == "л"
+        // память строки маршрута свободна: занять всё до неё и положить туда
+        // другие 600 байт
+        let at = parts[0].to_int() ?? 0
+        let free = load64(__ctx() + 8)
+        expect at >= free
+        if at > free {
+            __alloc(at - free)
+        }
+        let q = __alloc(601)
+        expect q == at
+        for i in 0..300 {
+            store8(q + 2 * i, 97 + i % 26)
+            store8(q + 2 * i + 1, 65 + i % 26)
+        }
+        let s = __str_new(q, 600)
+        expect __text_len(s) == 600
+        expect __text_at(s, 299) == "T"
+    }
+}
+
+// Сборка мусора store может отдать память строки другой строке; тогда она
+// увеличивает __store_epoch, и кэш очищается. Здесь байты строки меняются на
+// месте (так делает только этот тест) — и ответ верен лишь с новым номером.
+test "a new store epoch clears the string cache" {
+    let q = __alloc(601)
+    for i in 0..300 {
+        store8(q + 2 * i, 0xD0)
+        store8(q + 2 * i + 1, 0xB0 + i % 16)
+    }
+    let s = __str_new(q, 600)
+    expect __text_len(s) == 300
+    expect __text_at(s, 299) == "л"
+    for i in 0..600 {
+        store8(q + i, 97 + i % 26)
+    }
+    __store_epoch += 1
+    expect __text_len(s) == 600
+    expect __text_at(s, 299) == "n"
+}
+

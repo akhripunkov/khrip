@@ -1,0 +1,3 @@
+ok    call rewinds memory, the string cache starts over
+ok    a new store epoch clears the string cache
+2 tests: 2 passed, 0 failed

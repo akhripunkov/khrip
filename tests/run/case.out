@@ -1,0 +1,28 @@
+ЁЖИК ёжик → lower ёжик ёжик, upper ЁЖИК ЁЖИК
+ΟΔΟΣ ς → lower οδοσ ς, upper ΟΔΟΣ Σ
+Łódź ł → lower łódź ł, upper ŁÓDŹ Ł
+Ğ ğ → lower ğ ğ, upper Ğ Ğ
+İstanbul ı → lower istanbul ı, upper İSTANBUL I
+Straße → lower straße, upper STRAßE
+ẞ → lower ß, upper ẞ
+ǅ Ǆ ǆ → lower ǆ ǆ ǆ, upper Ǆ Ǆ Ǆ
+Ა ა → lower ა ა, upper Ა Ა
+Ꭰ ꭰ → lower ꭰ ꭰ, upper Ꭰ Ꭰ
+𐐀 𐐨 → lower 𐐨 𐐨, upper 𐐀 𐐀
+K k K → lower k k k, upper K K K
+ſ → lower ſ, upper S
+ɐ Ɐ → lower ɐ ɐ, upper Ɐ Ɐ
+ÉCOLE Ёж → lower école ёж, upper ÉCOLE ЁЖ
+Hello, WORLD! Привет, МИР! hello, world? 12345678 ABCDEFGH abcdefgh → lower hello, world! привет, мир! hello, world? 12345678 abcdefgh abcdefgh, upper HELLO, WORLD! ПРИВЕТ, МИР! HELLO, WORLD? 12345678 ABCDEFGH ABCDEFGH
+ascii only: The Quick Brown Fox Jumps Over The Lazy Dog 0123456789 → lower ascii only: the quick brown fox jumps over the lazy dog 0123456789, upper ASCII ONLY: THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG 0123456789
+ɐɐɐɐ upper: 12 bytes, 4 characters
+invalid bytes lower: 97 98 255 208 99 208 182 226 130
+invalid bytes upper: 65 66 255 208 67 208 150 226 130
+уже строчные: lower true, upper false
+ЗАГЛАВНЫЕ Ё: lower false, upper true
+123 !? —: lower true, upper true
+empty: lower true, upper true
+\w я _ ٣ U+0301 · ZWSP NBSP U+3000 中 😀 U+E0100 U+10FFFF -: true true true true false false false false true false true false false
+space SP HT VT U+0085 NBSP U+1680 U+2000 U+200A ZWSP U+2028 U+202F U+205F U+3000 BOM U+001C: true true true true true true true true false true true true true false false
+case mappings: lower 1488, upper 1505, hash 406996107 (UCD 17.0.0: 1488, 1505, 406996107)
+\w: 148995 code points, hash 60541432 (UCD 17.0.0: 148995, 60541432)

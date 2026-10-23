@@ -1,0 +1,3 @@
+strings: 10001 (valid 3334, with invalid bytes 3333, cut and joined 3333, longer than 256 bytes 449)
+bytes: 898513, characters: 491528
+checks: 2449370, mismatches: 0
