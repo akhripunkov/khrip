@@ -2,9 +2,9 @@
 // expect: add | 404 to the route, or answer yourself: let row: T = sql ... else { return 401 }
 type User { id: int, name: str }
 type Login { name: str }
-fn find(name: str) -> User {
+fn find_user(name: str) -> User {
     return sql "SELECT id, name FROM users WHERE name = {name}"
 }
 route POST "/login" (body: Login) -> User | 401 {
-    return find(body.name)
+    return find_user(body.name)
 }
