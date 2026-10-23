@@ -1,0 +1,4 @@
+// expect: unknown connection metrics
+migration metrics 1 `CREATE TABLE hits (ts DateTime) ENGINE = MergeTree ORDER BY ts`
+fn main() {
+}

@@ -1,0 +1,40 @@
+// Проверки при запуске (§7.3): все ошибки сразу, с местом в исходнике, затем
+// выход с кодом 1. Таблицы создаёт tests/chdb.sh.
+type S12Row { id: int }
+type S13Row { id: int, note: str? }
+type S14Row { id: int, amount: int }
+type S21Row { id: int }
+type Level = Debug | Info | Trace
+type S24Row { id: int, level: Level }
+type MatRow { id: int, twice: int }
+type Missing { id: int }
+type Views { views: str }
+type PageRow { page: str, avg_ms: float }
+type Ts64 { ts: int }
+type N { n: int }
+type Maybe { n: int }
+
+table s12: S12Row
+table s13: S13Row
+table s14: S14Row
+table s21: S21Row
+table s24: S24Row
+table mat: MatRow
+table nope: Missing
+
+fn main() {
+    s21.insert([S21Row { id: 1 }], Insert { dedup: "k" })
+    let a: [Views] = ch "SELECT count() AS views FROM s12"
+    let b: [PageRow] = ch "SELECT toString(id) AS page FROM s12"
+    let c: [Ts64] = ch "SELECT now64(3) AS ts"
+    let from = 0
+    let d: [N] = ch "SELECT count() AS n FROM s12 WHERE toDate(ts) >= {from}"
+    let s = "x"
+    let e: [N] = ch "SELECT CAST({s} AS Enum8('a' = 1)) = 'a' AS n"
+    let f: [N] = ch "SELECT count() AS n FROM missing_table"
+    let g: [Maybe] = ch "SELECT max(toNullable(id)) AS n FROM s12"
+    ch "ALTER TABLE gone DELETE WHERE id = 1"
+    ch "ALTER TABLE s12 DELETE WHERE idd < {from}"
+    let w: int = ch "INSERT INTO s12 SELECT nope, now() FROM numbers(1)"
+    print(a.len() + b.len() + c.len() + d.len() + e.len() + f.len() + g.len() + w)
+}

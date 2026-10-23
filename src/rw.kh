@@ -333,7 +333,10 @@ fn rw_scan(fi: int, callees: [int]) -> bool {
         } else if k == T_IDENT && toks[i + 1].kind == '(' {
             let name = t.text
             let after_dot = toks[i - 1].kind == '.'
-            if after_dot && rw_mutating(name) {
+            // t.insert(rows) таблицы ClickHouse store не трогает (§8.3)
+            let ch_table = after_dot && toks[i - 2].kind == T_IDENT && toks[i - 3].kind != '.' && ch_table_sym(toks[i - 2].text) >= 0
+            if ch_table {
+            } else if after_dot && rw_mutating(name) {
                 if !rw_fresh_at(i - 2, rw_recv_start(i - 2), body, end, 0) {
                     return true
                 }

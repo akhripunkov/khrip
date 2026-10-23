@@ -1,0 +1,62 @@
+// Таблицы ClickHouse (§2.8, §4.7, §4.8): migration ch, вставки в настоящие
+// типы столбцов, none → DEFAULT, Insert { dedup } с окном дедупликации,
+// async_insert, DbResult, пустая вставка, чтение назад в секундах.
+migration ch 1 `
+CREATE TABLE hits (ts DateTime, day Date DEFAULT toDate(ts), user_id UInt64, page LowCardinality(String),
+    ms Float32, amount Decimal(12, 2), level Enum8('Debug' = 1, 'Info' = 2), note String DEFAULT 'none',
+    tags Array(String), attrs Map(String, UInt16), ip IPv4, uid UUID, at DateTime64(3))
+ENGINE = MergeTree ORDER BY (page, ts) SETTINGS non_replicated_deduplication_window = 100;
+# вторая таблица — в той же миграции, отдельным оператором
+CREATE TABLE queue (id UInt64, body String) ENGINE = MergeTree ORDER BY id
+`
+
+type Level = Debug | Info
+type Hit { ts: int, user_id: int, page: str, ms: float, amount: str, level: Level, note: str?, tags: [str], attrs: map[str, int], ip: str, uid: str, at: str }
+type HitIn { ts: int, user_id: int, page: str, ms: float, amount: str, level: Level, tags: [str], attrs: map[str, int], ip: str, uid: str, at: str }
+type Back { ts: str, day: str, user_id: int, page: str, ms: float, amount: str, level: Level, note: str, tags: [str], attrs: map[str, int], ip: str, uid: str, at: str }
+type Job { id: int, body: str }
+
+table hits: Hit
+table queue: Job { async_insert }
+
+fn count_hits() -> int {
+    return ch "SELECT count() FROM hits"
+}
+
+fn main() {
+    let rows = [
+        Hit { ts: 1792782805, user_id: 7, page: "/", ms: 1.5, amount: "12.30", level: Info, note: none, tags: ["a"], attrs: {"k": 7}, ip: "10.0.0.1", uid: "61f0c404-5cb3-11e7-907b-a6006ad3dba0", at: "2026-10-24T05:13:25.250Z" },
+        Hit { ts: 1792700000, user_id: 8, page: "/b", ms: 0.25, amount: "-0.05", level: Debug, note: "seen", tags: [], attrs: {}, ip: "192.168.1.2", uid: "00000000-0000-0000-0000-00000000000f", at: "2026-10-22T20:13:20Z" }
+    ]
+    print("inserted " + hits.insert(rows).to_str())
+    // повтор с тем же ключом хранится один раз
+    hits.insert([HitIn { ts: 1792600000, user_id: 9, page: "/c", ms: 2.0, amount: "1", level: Info, tags: ["x", "y"], attrs: {"a": 1, "b": 2}, ip: "1.2.3.4", uid: "00000000-0000-0000-0000-000000000001", at: "2026-10-21T16:26:40.001Z" }], Insert { dedup: "batch-1" })
+    hits.insert([HitIn { ts: 1792600000, user_id: 9, page: "/c", ms: 2.0, amount: "1", level: Info, tags: ["x", "y"], attrs: {"a": 1, "b": 2}, ip: "1.2.3.4", uid: "00000000-0000-0000-0000-000000000001", at: "2026-10-21T16:26:40.001Z" }], Insert { dedup: "batch-1" })
+    print("rows " + count_hits().to_str())
+    let back: [Back] = ch "SELECT toString(ts) AS ts, toString(day) AS day, user_id, page, ms, amount, level, note, tags, attrs, toString(ip) AS ip, toString(uid) AS uid, toString(at) AS at FROM hits ORDER BY ts"
+    for b in back {
+        print(to_json(b))
+    }
+    // значения, которые столбец не примет, — 400 до отправки
+    let r: DbResult = hits.insert([Hit { ...rows[0], user_id: -1 }])
+    print(to_json(r))
+    let r2: DbResult = hits.insert(Hit { ...rows[0], amount: "1.005" })
+    print(r2.ok.to_str() + " " + r2.status.to_str() + " " + r2.error)
+    let r3: DbResult = hits.insert(Hit { ...rows[0], ip: "300.1.1.1" })
+    print(r3.error)
+    let r4: DbResult = hits.insert(Hit { ...rows[0], at: "yesterday" })
+    print(r4.error)
+    print("rows " + count_hits().to_str())
+    // async_insert: ответ — после сброса буфера
+    queue.insert([Job { id: 1, body: "x" }, Job { id: 2, body: "y" }])
+    let queued: int = ch "SELECT count() FROM queue"
+    print("queue " + queued.to_str())
+    let empty: [Job] = []
+    print("empty " + queue.insert(empty).to_str())
+    let m: DbResult = ch "ALTER TABLE queue DELETE WHERE id = 1"
+    print("mutation " + m.ok.to_str())
+    let left: int = ch "SELECT count() FROM queue"
+    print("queue " + left.to_str())
+    let copied: int = ch "INSERT INTO queue SELECT id + 10, body FROM queue"
+    print("copied " + copied.to_str())
+}

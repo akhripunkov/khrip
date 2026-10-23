@@ -1188,7 +1188,11 @@ fn __db_start_here() {
         exit(1)
     }
     __pg_free(c)
-    // ./app migrate — шаг выкладки: миграции и проверка запросов, без сервера
+}
+
+// ./app migrate — шаг выкладки: миграции и проверки всех баз (PostgreSQL,
+// ClickHouse), без сервера. Вызывается после всех запусков (__db_init).
+fn __db_migrate_done() {
     let a = args()
     if a.len() > 1 && a[1] == "migrate" {
         eprint("khrip: the database is up to date")

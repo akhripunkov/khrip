@@ -1,0 +1,3 @@
+POST /visits: read
+GET /pages: read
+POST /seen: write

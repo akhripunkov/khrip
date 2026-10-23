@@ -1,0 +1,24 @@
+// P3 из docs/design/v0.13-drivers.md §11.2 (с migration ch 1 на настоящей схеме).
+migration ch 1 `CREATE TABLE events (ts DateTime, user_id UInt64, page LowCardinality(String), ms Float32)
+    ENGINE = MergeTree ORDER BY (page, ts)`
+
+type EventIn { user_id: int, page: str, ms: float }
+type Event { ts: int, user_id: int, page: str, ms: float }
+type PageStat { page: str, views: int, users: int, avg_ms: float }
+type Inserted { inserted: int }
+
+table events: Event
+
+route POST "/events" (body: [EventIn]) -> 202 Inserted | 400 str {
+    if body.len() == 0 || body.len() > 10000 {
+        return 400 "send 1..10000 events"
+    }
+    let t = now()
+    return 202 Inserted { inserted: events.insert(body.map(e => Event { ts: t, ...e })) }
+}
+
+route GET "/stats/pages" (from: int, to: int, limit: int = 10) -> [PageStat] {
+    return ch `SELECT page, count() AS views, uniq(user_id) AS users, avg(ms) AS avg_ms
+        FROM events WHERE ts >= {from} AND ts < {to}
+        GROUP BY page ORDER BY views DESC LIMIT {limit}`
+}

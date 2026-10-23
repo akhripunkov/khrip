@@ -1,0 +1,5 @@
+// expect: table hits at "analytics.hits": a table name without a database
+type Hit { ts: int }
+table hits: Hit at "analytics.hits"
+fn main() {
+}

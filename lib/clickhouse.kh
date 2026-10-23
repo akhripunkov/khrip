@@ -4177,15 +4177,17 @@ fn __ch_tinsert_sql(table: str, names: [str], types: [str], via_input: bool) -> 
         cols.push(__ch_quote_name(name))
     }
     let head = "INSERT INTO " + __ch_quote_name(table) + " (" + cols.join(", ") + ")"
+    // перевод строки отделяет FORMAT от данных: иначе первый байт заголовка
+    // (число столбцов, например 12 — \f) сервер прочёл бы как пробел
     if !via_input {
-        return head + " FORMAT RowBinaryWithNamesAndTypes"
+        return head + " FORMAT RowBinaryWithNamesAndTypes\n"
     }
     var structure: [str] = []
     for i in 0..names.len() {
         structure.push(cols[i] + " " + types[i])
     }
     let text = structure.join(", ").replace("\\", "\\\\").replace("'", "\\'")
-    return head + " SELECT " + cols.join(", ") + " FROM input('" + text + "') FORMAT RowBinaryWithNamesAndTypes"
+    return head + " SELECT " + cols.join(", ") + " FROM input('" + text + "') FORMAT RowBinaryWithNamesAndTypes\n"
 }
 
 // Заголовок RowBinaryWithNamesAndTypes.

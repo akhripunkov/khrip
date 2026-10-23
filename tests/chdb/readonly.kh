@@ -1,0 +1,8 @@
+// Пользователь с readonly=1 читает (без настроек: С4) — запуск проходит.
+type N { n: int }
+
+fn main() {
+    let n: int = ch "SELECT count() FROM ro_data"
+    let rows: [N] = ch "SELECT toInt64(x) AS n FROM ro_data ORDER BY x"
+    print(n.to_str() + " " + rows.len().to_str())
+}

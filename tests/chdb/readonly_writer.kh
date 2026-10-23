@@ -1,0 +1,7 @@
+// S20: пользователь с readonly=1, а программа пишет.
+type Row { x: int }
+table ro_data: Row
+
+fn main() {
+    ro_data.insert([Row { x: 1 }])
+}

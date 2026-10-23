@@ -1,0 +1,9 @@
+// S22: миграция, у которой падает второй оператор из трёх.
+migration ch 1 `CREATE TABLE m1 (id UInt64) ENGINE = MergeTree ORDER BY id;
+CREATE TABLE m1 (id UInt64) ENGINE = MergeTree ORDER BY id;
+SELECT 1`
+
+fn main() {
+    let n: int = ch "SELECT count() FROM m1"
+    print(n)
+}

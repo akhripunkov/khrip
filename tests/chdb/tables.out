@@ -1,0 +1,15 @@
+inserted 2
+rows 3
+{"ts":"2026-10-21 16:26:40","day":"2026-10-21","user_id":9,"page":"/c","ms":2,"amount":"1.00","level":"Info","note":"none","tags":["x","y"],"attrs":{"a":1,"b":2},"ip":"1.2.3.4","uid":"00000000-0000-0000-0000-000000000001","at":"2026-10-21 16:26:40.001"}
+{"ts":"2026-10-22 20:13:20","day":"2026-10-22","user_id":8,"page":"/b","ms":0.25,"amount":"-0.05","level":"Debug","note":"seen","tags":[],"attrs":{},"ip":"192.168.1.2","uid":"00000000-0000-0000-0000-00000000000f","at":"2026-10-22 20:13:20.000"}
+{"ts":"2026-10-23 19:13:25","day":"2026-10-23","user_id":7,"page":"/","ms":1.5,"amount":"12.30","level":"Info","note":"none","tags":["a"],"attrs":{"k":7},"ip":"10.0.0.1","uid":"61f0c404-5cb3-11e7-907b-a6006ad3dba0","at":"2026-10-24 05:13:25.250"}
+{"ok":false,"status":400,"code":0,"error":"bad value: hits.user_id: -1 is out of range for UInt64","unknown_outcome":false,"count":0,"modified":0,"upserted":false,"failed":[]}
+false 400 bad value: hits.amount: '1.005' has more than 2 decimal places
+bad value: hits.ip: '300.1.1.1' is not an IPv4 address
+bad value: hits.at: 'yesterday' is not an ISO 8601 date and time for DateTime64(3)
+rows 3
+queue 2
+empty 0
+mutation true
+queue 1
+copied 1

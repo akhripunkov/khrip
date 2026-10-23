@@ -288,6 +288,7 @@ fn main() -> int {
     let stores_fn = gen_func("__init_stores", ty_void)
     prescan(1)
     prescan(2)
+    ch_tables_check()
     sort_migrations()
     api_mode = routes.len() > 0 || tests.len() > 0 || everies.len() > 0 || test_mode
     check_api()

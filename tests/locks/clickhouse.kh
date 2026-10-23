@@ -1,0 +1,23 @@
+// ch "..." и t.insert store не трогают: маршрут, который store только читает,
+// идёт под разделяемой блокировкой (§8.3).
+type Visit { ts: int, page: str }
+type PageCount { page: str, n: int }
+
+table visits: Visit
+store seen: int
+
+route POST "/visits" (body: Visit) -> 201 {
+    visits.insert(body)
+    return 201
+}
+
+route GET "/pages" -> [PageCount] {
+    let n = seen
+    return ch "SELECT page, count() AS n FROM visits WHERE ts > {n} GROUP BY page ORDER BY page"
+}
+
+route POST "/seen" -> 204 {
+    seen += 1
+    visits.insert([Visit { ts: seen, page: "/" }])
+    return 204
+}

@@ -41,9 +41,28 @@ type ChTable {
     server: str
     ty: int
     conn: int
+    // in ИМЯ: соединение (разрешается после прескана, ch_tables_check)
+    conn_name: str
+    conn_tok: int
     async_insert: bool
     tok: int
+    // есть вставки с Insert { dedup } (S21 при запуске)
+    dedup: bool
 }
+
+// migration ch N `...` / migration ИМЯ N `...`: операторы — по одному на запрос.
+type ChMigration {
+    conn: int
+    conn_name: str
+    n: int
+    text: str
+    stmts: [str]
+    tok: int
+}
+
+var ch_migs: [ChMigration]
+// места вставки t.insert (смещения в данных)
+var ch_inserts: [int]
 
 var ch_tables: [ChTable]
 
@@ -161,12 +180,375 @@ fn ch_finish() {
         }
         desc_put(ct, 3 + 4 * i, const_str(c.expr))
     }
+    // таблицы: имя, имя на сервере, соединение, описание строки, async_insert,
+    // место, есть Insert {}, слово для запуска
+    let tt = desc_reserve(1 + 8 * ch_tables.len())
+    desc_put(tt, 0, ch_tables.len())
+    for i in 0..ch_tables.len() {
+        let t = ch_tables[i]
+        let at = toks[t.tok]
+        desc_put(tt, 1 + 8 * i, const_str(t.name))
+        desc_put(tt, 2 + 8 * i, const_str(t.server))
+        desc_put(tt, 3 + 8 * i, t.conn)
+        if tkind(t.ty) == K_STRUCT {
+            desc_put(tt, 4 + 8 * i, type_desc(t.ty))
+        }
+        if t.async_insert {
+            desc_put(tt, 5 + 8 * i, 1)
+        }
+        desc_put(tt, 6 + 8 * i, const_str(files[at.file].path + ":" + at.line.to_str() + ":" + at.col.to_str()))
+        if t.dedup {
+            desc_put(tt, 7 + 8 * i, 1)
+        }
+    }
+    // миграции по возрастанию номера: соединение, номер, текст, операторы, место
+    var order: [int] = []
+    for k in 0..ch_migs.len() {
+        order.push(k)
+        var j = order.len() - 1
+        while j > 0 && (ch_migs[order[j - 1]].conn > ch_migs[k].conn || (ch_migs[order[j - 1]].conn == ch_migs[k].conn && ch_migs[order[j - 1]].n > ch_migs[k].n)) {
+            order[j] = order[j - 1]
+            order[j - 1] = k
+            j -= 1
+        }
+    }
+    let mt = desc_reserve(1 + 5 * ch_migs.len())
+    desc_put(mt, 0, ch_migs.len())
+    for k in 0..order.len() {
+        let m = ch_migs[order[k]]
+        let at = toks[m.tok]
+        let sts = desc_reserve(1 + m.stmts.len())
+        desc_put(sts, 0, m.stmts.len())
+        for j in 0..m.stmts.len() {
+            desc_put(sts, 1 + j, const_str(m.stmts[j]))
+        }
+        desc_put(mt, 1 + 5 * k, m.conn)
+        desc_put(mt, 2 + 5 * k, m.n)
+        desc_put(mt, 3 + 5 * k, const_str(m.text))
+        desc_put(mt, 4 + 5 * k, DATA_BASE + sts)
+        desc_put(mt, 5 + 5 * k, const_str(files[at.file].path + ":" + at.line.to_str() + ":" + at.col.to_str()))
+    }
+    let it = desc_reserve(1 + ch_inserts.len())
+    desc_put(it, 0, ch_inserts.len())
+    for i in 0..ch_inserts.len() {
+        desc_put(it, 1 + i, ch_inserts[i])
+    }
     desc_put(ch_root_off, 0, DATA_BASE + st)
     desc_put(ch_root_off, 1, DATA_BASE + ct)
+    desc_put(ch_root_off, 2, DATA_BASE + tt)
+    desc_put(ch_root_off, 3, DATA_BASE + mt)
+    desc_put(ch_root_off, 4, DATA_BASE + it)
 }
 
-// t.insert(rows [, Insert { dedup }]) — шаг 2.
+// ---- table ИМЯ: ТИП [in СОЕДИНЕНИЕ] [at "имя"] [{ async_insert }] ----
+// → лексема за объявлением.
+fn prescan_ch_table() -> int {
+    ch_conns_init()
+    let kw = tok()
+    advance()
+    let name_at = pos
+    let name = tok()
+    advance()
+    advance()
+    let ty = parse_type()
+    var conn_name = ""
+    var conn_tok = -1
+    var server = name.text
+    var async_insert = false
+    if kind() == T_IN && kind_at(pos + 1) == T_IDENT && toks[pos].line == kw.line {
+        advance()
+        conn_tok = pos
+        conn_name = tok().text
+        advance()
+    }
+    if kind() == T_IDENT && tok().text == "at" && kind_at(pos + 1) == T_STR && toks[pos].line == kw.line {
+        advance()
+        let st = tok()
+        server = strlits[st.val]
+        advance()
+        if !is_plain_name(server) {
+            error_tok(st, "table " + name.text + " at \"" + server + "\": a table name without a database", "another database is another connection: clickhouse NAME = env(\"NAME_CLICKHOUSE_URL\"), then table " + name.text + ": T in NAME")
+        }
+    }
+    if kind() == '\{' && toks[pos].line == kw.line {
+        advance()
+        while kind() != '}' && kind() != T_EOF {
+            let item = tok()
+            if item.kind == T_IDENT && item.text == "async_insert" {
+                async_insert = true
+            } else {
+                error_tok(item, "unknown item in the table block: " + tok_show(item), "the table block takes async_insert")
+            }
+            advance()
+        }
+        if kind() == '}' {
+            advance()
+        }
+    }
+    ch_tables.push(ChTable { name: name.text, server: server, ty: ty, conn: 0, conn_name: conn_name, conn_tok: conn_tok, async_insert: async_insert, tok: name_at, dedup: false })
+    sym_add(name.text, SK_TABLE, ch_tables.len() - 1, name)
+    return pos
+}
+
+// Имя без базы и кавычек: буквы, цифры, _.
+fn is_plain_name(s: str) -> bool {
+    if s.byte_len() == 0 || is_digit(s.byte(0)) {
+        return false
+    }
+    for i in 0..s.byte_len() {
+        if !is_ident_char(s.byte(i)) {
+            return false
+        }
+    }
+    return true
+}
+
+// migration ch N `...` или migration ИМЯ N `...` → лексема за объявлением.
+fn prescan_ch_migration() -> int {
+    ch_conns_init()
+    let at = pos
+    advance()
+    let conn_t = tok()
+    advance()
+    let nt = tok()
+    advance()
+    let st = tok()
+    if st.kind != T_STR {
+        error_tok(st, "migration " + conn_t.text + " " + nt.val.to_str() + " needs its SQL in a string", "migration " + conn_t.text + " " + nt.val.to_str() + " `CREATE TABLE ...`")
+        return pos
+    }
+    advance()
+    var conn_name = conn_t.text
+    if conn_name == "ch" {
+        conn_name = ""
+    }
+    if nt.val < 1 {
+        error_tok(nt, "migration numbers start at 1", "")
+        return pos
+    }
+    for m in ch_migs {
+        if m.conn_name == conn_name && m.n == nt.val {
+            error_tok(nt, "two migrations " + conn_t.text + " numbered " + nt.val.to_str(), "give the newer one the next number")
+            return pos
+        }
+    }
+    let text = strlits[st.val]
+    // операторы — по ; вне строк и комментариев ClickHouse
+    sql_ch = true
+    let states = sql_states(text)
+    sql_ch = false
+    var stmts: [str] = []
+    var from = 0
+    for i in 0..text.byte_len() + 1 {
+        if i == text.byte_len() || (states[i] == 0 && text.byte(i) == ';') {
+            let part = text.byte_slice(from, i).ascii_trim()
+            if part.byte_len() > 0 {
+                stmts.push(part)
+            }
+            from = i + 1
+        }
+    }
+    if stmts.len() == 0 {
+        error_tok(st, "migration " + conn_t.text + " " + nt.val.to_str() + " is empty", "")
+        return pos
+    }
+    ch_migs.push(ChMigration { conn: 0, conn_name: conn_name, n: nt.val, text: text, stmts: stmts, tok: at })
+    return pos
+}
+
+// После прескана (поля структур известны): соединения таблиц и миграций,
+// типы строк таблиц (E-D12).
+fn ch_tables_check() {
+    ch_conns_init()
+    for i in 0..ch_tables.len() {
+        let t = ch_tables[i]
+        if t.conn_name.byte_len() > 0 {
+            let ci = ch_conn_find(t.conn_name)
+            if ci < 0 {
+                error_tok(toks[t.conn_tok], "unknown connection " + t.conn_name, "declare it: clickhouse " + t.conn_name + " = env(\"" + sql_upper(t.conn_name) + "_CLICKHOUSE_URL\")")
+            } else {
+                ch_tables[i].conn = ci
+            }
+        }
+        if tkind(t.ty) != K_STRUCT {
+            if tkind(t.ty) == K_SUM {
+                error_tok(toks[t.tok], "a ClickHouse table holds a struct type; " + ty_name(t.ty) + " is a variant type", "wrap it: type Row \{ kind: " + ty_name(t.ty) + ", ... }")
+            } else if t.ty != ty_err {
+                error_tok(toks[t.tok], "a ClickHouse table holds a struct type, not " + ty_name(t.ty), "type Row \{ ts: int, page: str }")
+            }
+            continue
+        }
+        for f in structs[types[t.ty].a].fields {
+            if !ch_row_field_ok(f.ty, 0) {
+                error_tok(toks[t.tok], "a ClickHouse row holds int, float, bool, str, enums, lists, maps and optionals; " + ty_name(t.ty) + "." + f.name + " is " + ty_name(f.ty), "flatten it, or store JSON text in a str")
+            }
+        }
+    }
+    for k in 0..ch_migs.len() {
+        let m = ch_migs[k]
+        if m.conn_name.byte_len() > 0 {
+            let ci = ch_conn_find(m.conn_name)
+            if ci < 0 {
+                error_tok(toks[m.tok + 1], "unknown connection " + m.conn_name, "declare it: clickhouse " + m.conn_name + " = env(\"" + sql_upper(m.conn_name) + "_CLICKHOUSE_URL\")")
+            } else {
+                ch_migs[k].conn = ci
+            }
+        }
+    }
+}
+
+fn ch_row_field_ok(t: int, depth: int) -> bool {
+    let k = tkind(t)
+    if k == K_INT || k == K_FLOAT || k == K_BOOL || k == K_STR || is_enum(t) {
+        return true
+    }
+    if depth > 4 {
+        return false
+    }
+    if k == K_OPT || k == K_LIST {
+        return ch_row_field_ok(types[t].a, depth + 1)
+    }
+    if k == K_MAP {
+        return ch_row_field_ok(types[t].a, depth + 1) && ch_row_field_ok(types[t].b, depth + 1)
+    }
+    return false
+}
+
+// ---- t.insert(rows [, Insert { dedup: key }]) ----
+// rows — [S] или S, где S — тип таблицы или структура из части его полей.
+// Результат: число отправленных строк (int) или DbResult.
 fn parse_table_method(t: Token, ti: int, w: int) -> int {
-    error_tok(t, "ClickHouse tables are not supported yet", "")
-    return ty_err
+    let tb = ch_tables[ti]
+    advance()
+    let mt = tok()
+    if mt.kind != T_IDENT {
+        syntax_error(mt, "expected a method after " + t.text + ".", "")
+        return ty_err
+    }
+    advance()
+    if mt.text != "insert" || kind() != '(' {
+        var hint = t.text + ".insert(rows) writes rows; read them with ch \"SELECT ... FROM " + tb.server + "\""
+        error_tok(mt, "ClickHouse tables have no method " + mt.text, hint)
+        if kind() == '(' {
+            pos = matching_close(pos) + 1
+        }
+        return ty_err
+    }
+    if in_global_init {
+        error_tok(t, t.text + ".insert in the initial value of a global runs before the database is connected", "compute it in main, a route or an every task")
+    }
+    if tx_depth > 0 && !files[t.file].is_lib {
+        error_tok(t, t.text + ".insert inside tx: the block may run again after a conflict, and ClickHouse is not part of it", "call it before or after the tx block")
+    }
+    advance()
+    let at = tok()
+    var want = ty_err
+    if kind() == '[' && kind_at(pos + 1) == ']' {
+        want = ty_list(tb.ty)
+    }
+    let saved = no_struct
+    no_struct = false
+    let rt = parse_expr(want)
+    no_struct = saved
+    emit_push(RAX)
+    var single = false
+    var row = ty_err
+    if tkind(rt) == K_STRUCT {
+        single = true
+        row = rt
+    } else if tkind(rt) == K_LIST && tkind(ty_elem(rt)) == K_STRUCT {
+        row = ty_elem(rt)
+    } else if rt != ty_err {
+        error_tok(at, t.text + ".insert takes rows of " + ty_name(tb.ty) + " (or a struct of some of its fields), not " + ty_name(rt), "")
+    }
+    if row != ty_err && tkind(tb.ty) == K_STRUCT && row != tb.ty {
+        let tf = structs[types[tb.ty].a]
+        for f in structs[types[row].a].fields {
+            let j = field_find(types[tb.ty].a, f.name)
+            if j < 0 {
+                error_tok(at, ty_name(row) + "." + f.name + " is not a field of " + ty_name(tb.ty), "")
+            } else if tf.fields[j].ty != f.ty {
+                error_tok(at, ty_name(row) + "." + f.name + " is " + ty_name(f.ty) + ", but " + ty_name(tb.ty) + "." + f.name + " is " + ty_name(tf.fields[j].ty), "")
+            }
+        }
+    }
+    var dedup = false
+    if kind() == ',' {
+        advance()
+        let ot = tok()
+        let si = struct_find("Insert")
+        if ot.kind != T_IDENT || ot.text != "Insert" || kind_at(pos + 1) != '\{' || si < 0 {
+            error_tok(ot, "options are written in place: Insert \{ dedup: key }", "")
+        }
+        let saved2 = no_struct
+        no_struct = false
+        var it = ty_err
+        if si >= 0 {
+            it = ty_struct(si)
+        }
+        let ot2 = parse_expr(it)
+        no_struct = saved2
+        coerce(ot2, it, ot)
+        dedup = true
+        ch_tables[ti].dedup = true
+    } else {
+        emit_mov_imm(RAX, 0)
+    }
+    emit_push(RAX)
+    expect_tok(')')
+    let explicit = is_db_result(w)
+    // место вставки: таблица, описание строки, одна строка?, место в исходнике,
+    // явная форма, есть Insert {}; план — при запуске
+    let off = desc_reserve(8)
+    desc_put(off, 0, ti)
+    if row != ty_err {
+        desc_put(off, 1, type_desc(row))
+    }
+    if single {
+        desc_put(off, 2, 1)
+    }
+    desc_put(off, 3, const_str(files[t.file].path + ":" + t.line.to_str() + ":" + t.col.to_str()))
+    if explicit {
+        desc_put(off, 4, 1)
+    }
+    if dedup {
+        desc_put(off, 5, 1)
+    }
+    ch_inserts.push(DATA_BASE + off)
+    ch_root()
+    emit_mov_imm(RDI, DATA_BASE + off)
+    emit_mov_rr(RSI, RSP)
+    emit_call(rt_func("__chdb_insert"))
+    emit_alu_imm(0, RSP, 16)
+    last_was_call = true
+    if explicit {
+        return w
+    }
+    return ty_int
+}
+
+// let r: DbResult = ... — r должен быть проверен (E-M32): в теле функции дальше
+// есть r.ok, r.status, r.code, r.error, r.unknown_outcome или r целиком.
+fn db_result_check(name: Token) {
+    if cur_fn < 0 {
+        return
+    }
+    let end = funcs[cur_fn].body_end
+    var i = pos
+    while i < end {
+        let t = toks[i]
+        if t.kind == T_IDENT && t.text == name.text && toks[i - 1].kind != '.' {
+            if kind_at(i + 1) == '.' && kind_at(i + 2) == T_IDENT {
+                let f = toks[i + 2].text
+                if f == "ok" || f == "status" || f == "code" || f == "error" || f == "unknown_outcome" {
+                    return
+                }
+            } else if kind_at(i + 1) != '=' && kind_at(i + 1) != ':' {
+                return
+            }
+        }
+        i += 1
+    }
+    let x = name.text
+    error_tok(name, x + " is never checked, so the failures it holds are ignored", "read " + x + ".ok (or " + x + ".status); reading only " + x + ".count is not a check — or drop \": DbResult\" to let failures end the request")
 }

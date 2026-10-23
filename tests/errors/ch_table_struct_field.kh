@@ -1,0 +1,8 @@
+// expect: a ClickHouse row holds int, float, bool, str, enums, lists, maps and optionals; Row.meta is Meta
+// expect: flatten it, or store JSON text in a str
+type Meta { a: int }
+type Row { id: int, meta: Meta }
+table rows: Row
+fn main() {
+    rows.insert(Row { id: 1, meta: Meta { a: 1 } })
+}

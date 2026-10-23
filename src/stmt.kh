@@ -351,6 +351,9 @@ fn parse_let() {
     var w = ty_err
     if t >= 0 {
         w = t
+        if is_db_result(t) {
+            db_result_check(name)
+        }
     }
     // набор строк-литералов, которые может принять неизменяемая локальная
     let saved_on = lit_on

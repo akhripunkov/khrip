@@ -1,0 +1,7 @@
+// expect: events.insert takes rows of Event (or a struct of some of its fields), not [int]
+type Event { ts: int, page: str }
+table events: Event
+fn main() {
+    let ids = [1, 2]
+    events.insert(ids)
+}

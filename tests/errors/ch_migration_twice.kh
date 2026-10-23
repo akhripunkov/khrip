@@ -1,0 +1,5 @@
+// expect: two migrations ch numbered 1
+migration ch 1 `CREATE TABLE a (ts DateTime) ENGINE = MergeTree ORDER BY ts`
+migration ch 1 `CREATE TABLE b (ts DateTime) ENGINE = MergeTree ORDER BY ts`
+fn main() {
+}

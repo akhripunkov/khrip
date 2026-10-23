@@ -2761,7 +2761,6 @@ fn parse_ch(w: int) -> int {
     if shape == SH_ONE && kind == CHK_ROWS && !sql_one_row(cur) {
         sql_note_404(at)
     }
-    sql_ch = false
     var sites: [int] = []
     var offs: [int] = []
     for text in texts {
@@ -2769,6 +2768,7 @@ fn parse_ch(w: int) -> int {
         offs.push(off)
         sites.push(DATA_BASE + off)
     }
+    sql_ch = false
     if order_lits.len() > 0 {
         let vt = desc_reserve(2 + 2 * order_lits.len())
         desc_put(vt, 0, order_vi)
@@ -2861,8 +2861,34 @@ fn ch_site(at: Token, cur: str, nv: int, ps: [SqlParam], pnames: [str], shape: i
         desc_put(off, 11, 1)
     }
     desc_put(off, 12, const_str(ch_main_table(cur)))
+    desc_put(off, 15, const_str(ch_check_query(cur, kind)))
     ch_sites.push(DATA_BASE + off)
     return off
+}
+
+// Запрос для проверки при запуске (DESCRIBE TABLE (...)) оператора без строк:
+// у INSERT ... SELECT — его SELECT; у мутации и DELETE FROM — SELECT 1 FROM t
+// WHERE условие (так сервер проверит имена и типы условия, ничего не меняя).
+// "" — только EXPLAIN AST.
+fn ch_check_query(s: str, kind: int) -> str {
+    let ws = sql_code_words(s)
+    if kind == CHK_INSERT_SELECT {
+        for x in ws {
+            if x.depth == 0 && (x.w == "select" || x.w == "with") {
+                return s.byte_slice(x.at, s.byte_len())
+            }
+        }
+        return ""
+    }
+    if kind == CHK_MUTATION || (kind == CHK_STATEMENT && ws.len() > 0 && ws[0].w == "delete") {
+        let table = ch_main_table(s)
+        for x in ws {
+            if x.depth == 0 && x.w == "where" && table.byte_len() > 0 {
+                return "SELECT 1 FROM " + table + " WHERE " + s.byte_slice(x.at + 5, s.byte_len())
+            }
+        }
+    }
+    return ""
 }
 
 // Таблица оператора (INSERT INTO t, ALTER TABLE t, DELETE FROM t, TRUNCATE t,
