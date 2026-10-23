@@ -1,0 +1,300 @@
+0: ok
+1: ok
+2: ok
+3: ok
+4: ok
+5: ok
+6: ok
+7: ok
+8: ok
+9: ok
+10: ok
+11: ok
+12: ok
+13: ok
+14: ok
+15: ok
+16: ok
+17: ok
+18: ok
+19: ok
+20: ok
+21: ok
+22: ok
+23: ok
+24: ok
+25: ok
+26: ok
+27: ok
+28: ok
+29: ok
+30: ok
+31: ok
+32: ok
+33: ok
+34: ok
+35: ok
+36: ok
+37: ok
+38: ok
+39: ok
+40: ok
+41: ok
+42: ok
+43: ok
+44: ok
+45: ok
+46: ok
+47: ok
+48: ok
+49: ok
+50: ok
+51: ok
+52: ok
+53: ok
+54: ok
+55: ok
+56: ok
+57: ok
+58: ok
+59: ok
+60: ok
+61: ok
+62: ok
+63: ok
+64: ok
+65: ok
+66: ok
+67: ok
+68: ok
+69: ok
+70: ok
+71: ok
+72: ok
+73: ok
+74: ok
+75: ok
+76: ok
+77: ok
+78: ok
+79: ok
+80: ok
+81: ok
+82: ok
+83: ok
+84: ok
+85: ok
+86: ok
+87: ok
+88: ok
+89: ok
+90: ok
+91: ok
+92: ok
+93: ok
+94: ok
+95: ok
+96: ok
+97: ok
+98: ok
+99: ok
+100: ok
+101: ok
+102: ok
+103: ok
+104: ok
+105: ok
+106: ok
+107: ok
+108: ok
+109: ok
+110: ok
+111: ok
+112: ok
+113: ok
+114: ok
+115: ok
+116: ok
+117: ok
+118: ok
+119: ok
+120: ok
+121: ok
+122: ok
+123: ok
+124: ok
+125: ok
+126: ok
+127: ok
+128: ok
+129: ok
+130: ok
+131: ok
+132: ok
+133: ok
+134: ok
+135: ok
+136: ok
+137: ok
+138: ok
+139: ok
+140: ok
+141: ok
+142: ok
+143: ok
+144: ok
+145: ok
+146: ok
+147: ok
+148: ok
+149: ok
+150: ok
+151: ok
+152: ok
+153: ok
+154: ok
+155: ok
+156: ok
+157: ok
+158: ok
+159: ok
+160: ok
+161: ok
+162: ok
+163: ok
+164: ok
+165: ok
+166: ok
+167: ok
+168: ok
+169: ok
+170: ok
+171: ok
+172: ok
+173: ok
+174: ok
+175: unclosed ( at position 0
+176: unexpected ) at position 0
+177: unexpected ) at position 1
+178: unclosed ( at position 0
+179: unclosed ( at position 0
+180: unexpected ) at position 3
+181: unexpected ) at position 1
+182: unexpected ) at position 2
+183: unexpected ) at position 2
+184: unclosed [ at position 0
+185: unclosed [ at position 0
+186: unclosed [ at position 0
+187: unclosed [ at position 0
+188: unclosed [ at position 0
+189: unclosed [ at position 0
+190: bad range in [] at position 1
+191: bad range in [] at position 1
+192: bad range in [] at position 1
+193: bad range in [] at position 1
+194: nothing to repeat at position 0
+195: nothing to repeat at position 0
+196: nothing to repeat at position 0
+197: nothing to repeat at position 0
+198: nothing to repeat at position 0
+199: nothing to repeat at position 2
+200: nothing to repeat at position 1
+201: nothing to repeat at position 3
+202: nothing to repeat at position 2
+203: nested repetition at position 2
+204: nested repetition at position 2
+205: nested repetition at position 2
+206: nested repetition at position 3
+207: nested repetition at position 3
+208: nested repetition at position 4
+209: nested repetition at position 4
+210: nested repetition at position 2
+211: nested repetition at position 6
+212: nested repetition at position 3
+213: bad {n,m} at position 1
+214: bad {n,m} at position 1
+215: bad {n,m} at position 1
+216: bad {n,m} at position 1
+217: bad {n,m} at position 1
+218: bad {n,m} at position 1
+219: bad {n,m} at position 1
+220: bad {n,m} at position 1
+221: bad {n,m} at position 1
+222: bad {n,m} at position 1
+223: bad {n,m} at position 1
+224: pattern ends with \ at position 0
+225: pattern ends with \ at position 1
+226: pattern ends with \ at position 1
+227: pattern ends with \ at position 2
+228: pattern ends with \ at position 3
+229: \b is not supported at position 0
+230: \B is not supported at position 0
+231: \A is not supported at position 0
+232: \z is not supported at position 0
+233: \Z is not supported at position 0
+234: \G is not supported at position 0
+235: backreferences are not supported at position 0
+236: backreferences are not supported at position 0
+237: unknown escape \0 at position 0
+238: backreferences are not supported at position 0
+239: \p{...} is not supported at position 0
+240: \p{...} is not supported at position 0
+241: \P{...} is not supported at position 0
+242: unknown escape \y at position 0
+243: unknown escape \e at position 0
+244: unknown escape \a at position 0
+245: unknown escape \Q at position 0
+246: unknown escape \u at position 0
+247: unknown escape \U at position 0
+248: unknown escape \é at position 0
+249: unknown escape \я at position 0
+250: bad \x escape at position 0
+251: bad \x escape at position 0
+252: bad \x escape at position 0
+253: bad \x escape at position 0
+254: bad \x escape at position 0
+255: bad \x escape at position 0
+256: bad \x escape at position 0
+257: unknown escape \c at position 0
+258: unknown escape \h at position 0
+259: unknown escape \k at position 0
+260: \b is not supported at position 1
+261: backreferences are not supported at position 1
+262: \p{...} is not supported at position 1
+263: unknown escape \y at position 1
+264: [:name:] classes are not supported at position 1
+265: [:name:] classes are not supported at position 2
+266: bad range in [] at position 1
+267: bad \x escape at position 1
+268: bad \x escape at position 1
+269: (?i) is not supported at position 0
+270: (?i) is not supported at position 0
+271: (?i) is not supported at position 0
+272: this (? group is not supported at position 0
+273: this (? group is not supported at position 0
+274: (?i) is not supported at position 0
+275: (?i) is not supported at position 0
+276: (?i) is not supported at position 0
+277: lookaround is not supported at position 0
+278: lookaround is not supported at position 0
+279: lookaround is not supported at position 0
+280: lookaround is not supported at position 0
+281: named groups are not supported at position 0
+282: named groups are not supported at position 0
+283: named groups are not supported at position 0
+284: named groups are not supported at position 0
+285: this (? group is not supported at position 0
+286: this (? group is not supported at position 0
+287: this (? group is not supported at position 0
+288: this (? group is not supported at position 0
+289: this (? group is not supported at position 0
+290: pattern is too large at position 0
+291: pattern is too large at position 0
+292: pattern is too large at position 0
+293: unclosed ( at position 2
+294: nested repetition at position 7
+295: bad {n,m} at position 1
+296: unclosed [ at position 2
+297: (?i) is not supported at position 1
+298: ok
+299: pattern nests too deeply at position 1000

@@ -1796,6 +1796,9 @@ fn parse_method(rt: int, nt: Token) -> int {
             system_str_method(nt)
         }
         byte_api_shadow(rt, nt)
+        if name == "matches" {
+            return parse_matches(nt)
+        }
     }
     if k == K_FLOAT && name == "to_int" && kind_at(pos + 1) == ')' {
         advance()
