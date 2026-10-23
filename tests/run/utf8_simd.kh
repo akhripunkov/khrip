@@ -1,6 +1,7 @@
 // Примитивы UTF-8 рантайма (src/simd.kh) дают тот же ответ, что и простые ссылки
 // на Khrip: проверка со счётом символов (__utf8_scan), пропуск k символов
-// (__utf8_skip) и поиск для JSON со старшими байтами (__find_json_hi). Путь
+// (__utf8_skip), пропуск с проверкой начала строки (__utf8_seek) и поиск для
+// JSON со старшими байтами (__find_json_hi). Путь
 // выбирает рантайм: tests/run.sh запускает тест при каждом KHRIP_SIMD ниже, а вывод
 // один и тот же. Буферы стоят и у конца страницы, за которой — PROT_NONE.
 // env: KHRIP_SIMD=0
@@ -89,6 +90,15 @@ fn ref_skip(p: int, n: int, k: int) -> int {
     return n
 }
 
+// Смещение символа k, если начало строки до него правильное, иначе -1.
+fn ref_seek(p: int, n: int, k: int) -> int {
+    let off = ref_skip(p, n, k)
+    if ref_scan(p, off) >= 0 {
+        return off
+    }
+    return -1
+}
+
 fn ref_json_hi(p: int, n: int) -> int {
     var hi = 0
     for i in 0..n {
@@ -135,6 +145,7 @@ fn check_all(p: int, n: int) {
     for k in [0, 1, m / 2, m - 1, m, m + 1] {
         if k >= 0 {
             report("skip", p, n, __utf8_skip(p, n, k), ref_skip(p, n, k))
+            report("seek", p, n, __utf8_seek(p, n, k), ref_seek(p, n, k))
         }
     }
     report("json", p, n, __find_json_hi(p, n), ref_json_hi(p, n))
@@ -150,6 +161,8 @@ fn check_one(p: int, n: int) {
     check_scan(p, n)
     let k = ref_leads(p, n) - 1
     report("skip", p, n, __utf8_skip(p, n, k), ref_skip(p, n, k))
+    report("seek", p, n, __utf8_seek(p, n, k), ref_seek(p, n, k))
+    report("seek", p, n, __utf8_seek(p, n, k + 1), ref_seek(p, n, k + 1))
     report("json", p, n, __find_json_hi(p, n), ref_json_hi(p, n))
 }
 

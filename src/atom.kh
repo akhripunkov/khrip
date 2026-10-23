@@ -1310,9 +1310,9 @@ fn parse_builtin(t: Token, w: int) -> int {
         }
         return ty_int
     }
-    if name == "__simd_utf8_scan" || name == "__simd_utf8_skip" || name == "__simd_find_json_hi" {
+    if name == "__simd_utf8_scan" || name == "__simd_utf8_skip" || name == "__simd_utf8_seek" || name == "__simd_find_json_hi" {
         advance()
-        if name == "__simd_utf8_skip" {
+        if name == "__simd_utf8_skip" || name == "__simd_utf8_seek" {
             builtin_args(3, t, name)
             emit_pop(RDX)
         } else {
@@ -1324,6 +1324,8 @@ fn parse_builtin(t: Token, w: int) -> int {
             emit_simd_utf8_scan()
         } else if name == "__simd_utf8_skip" {
             emit_simd_utf8_skip()
+        } else if name == "__simd_utf8_seek" {
+            emit_simd_utf8_seek()
         } else {
             emit_simd_find_json_hi()
         }

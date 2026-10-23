@@ -620,14 +620,23 @@ fn __tx_seek(p: int, n: int, k: int) -> int {
 }
 
 // Смещение символа k (k >= 0) по первым байтам, если [0, смещение) — правильный
-// UTF-8 (а если символов не больше k — вся строка), иначе -1. Одним проходом:
-// проверка идёт только до найденного символа.
+// UTF-8 (а если символов не больше k — вся строка), иначе -1. С AVX2 — одним
+// проходом (проверка идёт только до найденного символа), без него — пропуском и
+// проверкой.
 fn __utf8_seek(p: int, n: int, k: int) -> int {
-    let off = __simd_utf8_skip(p, n, k)
-    __strc_add(off)
-    if __simd_utf8_scan(p, off) >= 0 {
-        return off
+    if __simd_level < 2 {
+        let off = __utf8_skip(p, n, k)
+        if __utf8_scan(p, off) >= 0 {
+            return off
+        }
+        return -1
     }
+    let r = __simd_utf8_seek(p, n, k)
+    if r >= 0 {
+        __strc_add(r)
+        return r
+    }
+    __strc_add(-1 - r)
     return -1
 }
 

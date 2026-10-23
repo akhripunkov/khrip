@@ -506,6 +506,98 @@ fn emit_simd_utf8_skip() {
     emit_hex("48 89 F0")
 }
 
+// __simd_utf8_seek(адрес, длина, k): смещение начала символа k (k >= 0) по
+// правилу ведущих байтов (n, если символов не больше k), если [p, p + смещение) —
+// правильный UTF-8 (при смещении n — вся строка), иначе -1 - смещение. Один
+// проход вместо __simd_utf8_scan и __simd_utf8_skip: блоки по 32 байта
+// проверяются (как в __simd_utf8_scan, без счёта) только до блока с символом k,
+// а в нём ошибки таблиц берутся лишь до байта смещения включительно — ошибка в
+// этом байте значит, что символ перед ним не закончен. Только AVX2: при
+// __simd_level < 2 обёртка (lib/text.kh, __utf8_seek) берёт пропуск и проверку.
+// Хвост — как у __simd_utf8_scan, а ведущие байты в нём — только среди r
+// настоящих; если символа k нет, проверяется и первый нуль за ними.
+fn emit_simd_utf8_seek() {
+    let t = utf8_consts()
+    // xor eax, eax; test rdx, rdx; jz .done (k = 0: смещение 0, проверять нечего);
+    // push rbp; mov rbp, rsp; sub rsp, 64; and rsp, -32 — блок для хвоста
+    emit_hex("31 C0 48 85 D2 0F 84 C5 02 00 00 55 48 89 E5 48 83 EC 40 48 83 E4 E0")
+    // vpxor xmm7, xmm7, xmm7; vpxor xmm6, xmm6, xmm6; vpxor xmm8, xmm8, xmm8
+    emit_hex("C5 C1 EF FF C5 C9 EF F6 C4 41 39 EF C0")
+    // константы — как в __simd_utf8_scan
+    emit_abs("C5 FE 6F 2C 25", t)
+    emit_abs("C5 7E 6F 14 25", t + 32)
+    emit_abs("C5 7E 6F 1C 25", t + 64)
+    emit_abs("C5 7E 6F 24 25", t + 96)
+    emit_abs("C5 7E 6F 2C 25", t + 128)
+    emit_abs("C5 7E 6F 34 25", t + 160)
+    emit_abs("C5 7E 6F 3C 25", t + 192)
+    emit_abs("C5 FE 6F 24 25", t + 224)
+    // mov r10d, 1 — байт 0 начинает символ 0, даже если он 10xxxxxx
+    emit_hex("41 BA 01 00 00 00")
+    // .blk: lea rcx, [rax + 32]; cmp rcx, rsi; ja .tail; vmovdqu ymm0, [rdi + rax];
+    // ведущие байты блока: vpcmpgtb ymm9, ymm10, ymm0; vpmovmskb ecx, ymm9; not ecx;
+    // or ecx, r10d; xor r10d, r10d; popcnt r9d, ecx; cmp r9, rdx; ja .found
+    // (символ k — в этом блоке); sub rdx, r9
+    emit_hex("48 8D 48 20 48 39 F1 0F 87 B4 00 00 00 C5 FE 6F 04 07 C5 2D 64 C8")
+    emit_hex("C4 C1 7D D7 C9 F7 D1 44 09 D1 45 31 D2 F3 44 0F B8 C9 49 39 D1")
+    emit_hex("0F 87 7F 01 00 00 4C 29 CA")
+    // проверка блока без счёта: ASCII — vpmovmskb ecx, ymm0; test ecx, ecx; jnz .full;
+    // vpor ymm7, ymm7, ymm8; vpxor xmm8, xmm8, xmm8; vmovdqa ymm6, ymm0; jmp .next
+    emit_hex("C5 FD D7 C8 85 C9 75 10 C4 C1 45 EB F8 C4 41 39 EF C0 C5 FD 6F F0 EB 6C")
+    // .full: таблицы Keiser–Lemire, как в utf8_block; vpor ymm7, ymm7, ymm2
+    emit_hex("C4 E3 4D 46 C8 21 C4 E3 7D 0F D1 0F C5 E5 71 D2 04 C5 E5 DB DD C4 E2 25 00 DB")
+    emit_hex("C5 ED DB D5 C4 E2 1D 00 D2 C5 E5 DB DA C5 ED 71 D0 04 C5 ED DB D5")
+    emit_hex("C4 E2 15 00 D2 C5 E5 DB DA C4 E3 7D 0F D1 0E C4 E3 7D 0F C9 0D C4 C1 6D D8 D6")
+    emit_hex("C4 C1 75 D8 CF C5 ED EB D1 C5 ED DB D4 C5 ED EF D3 C5 C5 EB FA")
+    // vpsubusb ymm8, ymm0, [MAXV]; vmovdqa ymm6, ymm0
+    emit_abs("C5 7D D8 04 25", t + 320)
+    emit_hex("C5 FD 6F F0")
+    // .next: add rax, 32; jmp .blk
+    emit_hex("48 83 C0 20 E9 3F FF FF FF")
+    // .tail: r11 = n - rax (rdx занят k); r9 = rdi + rax; vpxor xmm0, xmm0, xmm0;
+    // test r11, r11; jz .tblk; чтение 32 байт не выходит за страницу, если
+    // (r9 & 4095) <= 4064, иначе ja .slowtail
+    emit_hex("49 89 F3 49 29 C3 4C 8D 0C 07 C5 F9 EF C0 4D 85 DB 0F 84 A5 00 00 00 44 89 C9")
+    emit_hex("81 E1 FF 0F 00 00 81 F9 E0 0F 00 00 77 16")
+    // lea rcx, [маска + 32]; sub rcx, r11; vmovdqu ymm0, [r9]; vpand ymm0, ymm0, [rcx]; jmp .tblk
+    emit_abs("48 8D 0C 25", t + 288)
+    emit_hex("4C 29 D9 C4 C1 7E 6F 01 C5 FD DB 01 EB 7E")
+    // .slowtail: копия хвоста в обнулённый блок на стеке, как в __simd_utf8_scan
+    // (длина — в r11, второй кусок — через r8)
+    emit_hex("C5 FD 7F 04 24 49 83 FB 10 72 1A C4 C1 7A 6F 09 C4 81 7A 6F 54 19 F0")
+    emit_hex("C5 FA 7F 0C 24 C4 A1 7A 7F 54 1C F0 EB 54")
+    emit_hex("49 83 FB 08 72 13 49 8B 09 4F 8B 44 19 F8 48 89 0C 24 4E 89 44 1C F8 EB 3B")
+    emit_hex("49 83 FB 04 72 12 41 8B 09 47 8B 44 19 FC 89 0C 24 46 89 44 1C FC EB 23")
+    emit_hex("49 83 FB 02 72 16 41 0F B7 09 47 0F B7 44 19 FE 66 89 0C 24 66 46 89 44 1C FE EB 07")
+    emit_hex("41 0F B6 09 88 0C 24")
+    // .tdo: vmovdqa ymm0, [rsp]
+    emit_hex("C5 FD 6F 04 24")
+    // .tblk: ведущие байты среди r11 настоящих: mov ecx, r11d; mov r8d, 1; shl r8d, cl;
+    // dec r8d; vpcmpgtb ymm9, ymm10, ymm0; vpmovmskb ecx, ymm9; not ecx; or ecx, r10d;
+    // and ecx, r8d; popcnt r9d, ecx; cmp r9, rdx; ja .found
+    emit_hex("44 89 D9 41 B8 01 00 00 00 41 D3 E0 41 FF C8 C5 2D 64 C8 C4 C1 7D D7 C9 F7 D1")
+    emit_hex("44 09 D1 44 21 C1 F3 44 0F B8 C9 49 39 D1 77 09")
+    // символа k нет: mov rax, rsi; lea r8d, [r11 + 1] — проверить и нуль за хвостом; jmp .last
+    emit_hex("48 89 F0 45 8D 43 01 EB 1B")
+    // .found: сбросить rdx младших ведущих: test rdx, rdx; jz .bit;
+    // .clr: lea r8d, [rcx - 1]; and ecx, r8d; dec rdx; jnz .clr;
+    // .bit: bsf ecx, ecx; add rax, rcx; lea r8d, [rcx + 1]
+    emit_hex("48 85 D2 74 0C 44 8D 41 FF 44 21 C1 48 FF CA 75 F4 0F BC C9 48 01 C8 44 8D 41 01")
+    // .last: ymm9 — маска первых r8 байтов (1–32): lea rcx, [маска + 32]; sub rcx, r8;
+    // vmovdqu ymm9, [rcx]
+    emit_abs("48 8D 0C 25", t + 288)
+    emit_hex("4C 29 C1 C5 7E 6F 09")
+    // проверка последнего блока: ASCII — vpor ymm7, ymm7, ymm8 (символ перед блоком
+    // не закончен); иначе таблицы, а их ошибки — vpand ymm2, ymm2, ymm9
+    emit_hex("C5 FD D7 C8 85 C9 75 07 C4 C1 45 EB F8 EB 64")
+    emit_hex("C4 E3 4D 46 C8 21 C4 E3 7D 0F D1 0F C5 E5 71 D2 04 C5 E5 DB DD C4 E2 25 00 DB")
+    emit_hex("C5 ED DB D5 C4 E2 1D 00 D2 C5 E5 DB DA C5 ED 71 D0 04 C5 ED DB D5")
+    emit_hex("C4 E2 15 00 D2 C5 E5 DB DA C4 E3 7D 0F D1 0E C4 E3 7D 0F C9 0D C4 C1 6D D8 D6")
+    emit_hex("C4 C1 75 D8 CF C5 ED EB D1 C5 ED DB D4 C5 ED EF D3 C4 C1 6D DB D1 C5 C5 EB FA")
+    // vptest ymm7, ymm7; vzeroupper; mov rsp, rbp; pop rbp; jz .done; not rax (-1 - смещение); .done
+    emit_hex("C4 E2 7D 17 FF C5 F8 77 48 89 EC 5D 74 03 48 F7 D0")
+}
+
 // __simd_find_json_hi(адрес, длина): то же, что __simd_find_json, и ещё бит 62
 // результата — был ли до найденного места байт >= 0x80 (тогда строку JSON нужно
 // проверить на UTF-8). Маска старших битов копится в r9d; в блоке с находкой —

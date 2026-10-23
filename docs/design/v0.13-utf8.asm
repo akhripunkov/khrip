@@ -9,7 +9,8 @@
 ; tests/run/utf8_simd.kh checks the result at KHRIP_SIMD=0, 1 and 2.
 ;
 ; Sources (v0.13-utf8.md, section 4.1): scan3.asm (fused validate+count, AVX2),
-; utf8.asm (skip, SKIP_SCALAR, VALID_SCALAR) and emit_simd_find_json. Changes:
+; utf8.asm (skip, SKIP_SCALAR, VALID_SCALAR) and emit_simd_find_json; seek
+; (validate the prefix + skip in one pass, AVX2) was added later. Changes:
 ;   - constants are loaded with vmovdqu [abs] (no RIP-relative addressing in khc);
 ;   - dispatch on __simd_level: 2 = AVX2, else the scalar/SWAR path
 ;     (find_json_hi keeps all three paths of find_json: AVX2, SSE2, bytewise);
@@ -20,7 +21,11 @@
 ; 0 mismatches (4M random buffers at a page end / page start / mid-page, every
 ; 3-byte value at offsets 0, 7, 14, 21, 28-39, F0-F4 x continuation x all x
 ; sampled 4-byte sequences at offsets 28-32; scan and skip at levels 0 and 2,
-; find_json_hi at 0, 1 and 2).
+; find_json_hi at 0, 1 and 2). kh_utf8_seek: 594,181,761 checks against
+; ref_skip + ref_scan of the prefix, 0 mismatches (random buffers of 0-299
+; bytes at a page end / page start / mid-page with every k or a sample of k;
+; every 1- and 2-byte sequence at offsets 0, 1, 29-33, 61-63 on an ASCII and a
+; Cyrillic background; every 3-byte sequence at offsets 0, 30, 31, 32).
 ; Calling convention: rdi = p, rsi = n, rdx = k; result in rax; clobbers only
 ; rax rcx rdx rsi rdi r8-r11 ymm0-ymm15 (rbp is pushed and restored); no calls.
 default abs
@@ -46,7 +51,7 @@ MAXV: times 29 db 255
       db 0xEF, 0xDF, 0xBF
 
 section .text
-global kh_utf8_scan, kh_utf8_skip, kh_find_json_hi
+global kh_utf8_scan, kh_utf8_skip, kh_utf8_seek, kh_find_json_hi
 
 %define H8 0x8080808080808080
 
@@ -87,6 +92,51 @@ global kh_utf8_scan, kh_utf8_skip, kh_find_json_hi
     ; "this block ends inside a character": last byte >= C0, or 2nd-last >= E0, or 3rd-last >= F0
     vpsubusb ymm8, ymm0, [MAXV]
     vmovdqa ymm6, ymm0
+%%done:
+%endmacro
+
+; BLOCK without counting (for kh_utf8_seek): ymm0 = block, ymm6 = previous block,
+; ymm7 |= errors, ymm8 = "previous block ended inside a character"; with %1 = 1
+; (the last block) the table errors count only where ymm9 = FF, and the state
+; for a next block is not kept
+%macro VBLOCK 1
+    vpmovmskb ecx, ymm0
+    test ecx, ecx
+    jnz %%full
+    vpor ymm7, ymm7, ymm8       ; ASCII block right after an unfinished character
+%if %1 == 0
+    vpxor xmm8, xmm8, xmm8
+    vmovdqa ymm6, ymm0
+%endif
+    jmp %%done
+%%full:
+    vperm2i128 ymm1, ymm6, ymm0, 0x21
+    vpalignr ymm2, ymm0, ymm1, 15        ; prev1
+    vpsrlw ymm3, ymm2, 4
+    vpand ymm3, ymm3, ymm5
+    vpshufb ymm3, ymm11, ymm3            ; byte_1_high
+    vpand ymm2, ymm2, ymm5
+    vpshufb ymm2, ymm12, ymm2            ; byte_1_low
+    vpand ymm3, ymm3, ymm2
+    vpsrlw ymm2, ymm0, 4
+    vpand ymm2, ymm2, ymm5
+    vpshufb ymm2, ymm13, ymm2            ; byte_2_high
+    vpand ymm3, ymm3, ymm2
+    vpalignr ymm2, ymm0, ymm1, 14        ; prev2
+    vpalignr ymm1, ymm0, ymm1, 13        ; prev3
+    vpsubusb ymm2, ymm2, ymm14           ; prev2 >= 0xE0 -> bit 7
+    vpsubusb ymm1, ymm1, ymm15           ; prev3 >= 0xF0 -> bit 7
+    vpor ymm2, ymm2, ymm1
+    vpand ymm2, ymm2, ymm4               ; keep bit 7
+    vpxor ymm2, ymm2, ymm3
+%if %1 == 1
+    vpand ymm2, ymm2, ymm9
+    vpor ymm7, ymm7, ymm2
+%else
+    vpor ymm7, ymm7, ymm2
+    vpsubusb ymm8, ymm0, [MAXV]
+    vmovdqa ymm6, ymm0
+%endif
 %%done:
 %endmacro
 
@@ -345,6 +395,152 @@ kh_utf8_skip:
 .end:
     mov rax, rsi
 .r:
+    ret
+
+; byte offset where lead-rule character k starts (k >= 0; n if there are <= k
+; characters) if [p, p+offset) is well-formed (for offset n: all of [p, p+n)),
+; else -1 - offset. One pass instead of scan + skip: blocks are validated only
+; up to the block of character k, and there the table errors count only up to
+; the offset byte inclusive (an error at that byte means the character before it
+; is unfinished). AVX2 only: below level 2 the caller (lib/text.kh,
+; __utf8_seek) uses skip and scan.
+kh_utf8_seek:
+    xor eax, eax
+    test rdx, rdx
+    jz .done
+    push rbp
+    mov rbp, rsp
+    sub rsp, 64
+    and rsp, -32
+    vpxor xmm7, xmm7, xmm7
+    vpxor xmm6, xmm6, xmm6
+    vpxor xmm8, xmm8, xmm8
+    vmovdqu ymm5, [C0F]
+    vmovdqu ymm10, [CC0]
+    vmovdqu ymm11, [T1]
+    vmovdqu ymm12, [T2]
+    vmovdqu ymm13, [T3]
+    vmovdqu ymm14, [C60]
+    vmovdqu ymm15, [C70]
+    vmovdqu ymm4, [C80]
+    mov r10d, 1                 ; byte 0 starts character 0 even if it is 10xxxxxx
+.blk:
+    lea rcx, [rax+32]
+    cmp rcx, rsi
+    ja .tail
+    vmovdqu ymm0, [rdi+rax]
+    vpcmpgtb ymm9, ymm10, ymm0  ; -64 > b (signed): b in 0x80..0xBF
+    vpmovmskb ecx, ymm9
+    not ecx
+    or ecx, r10d                ; leads of the block
+    xor r10d, r10d
+    popcnt r9d, ecx
+    cmp r9, rdx
+    ja .found                   ; character k starts in this block
+    sub rdx, r9
+    VBLOCK 0
+    add rax, 32
+    jmp .blk
+.tail:
+    ; r = n - rax bytes (0..31), as in kh_utf8_scan, but r is in r11 (rdx = k)
+    mov r11, rsi
+    sub r11, rax
+    lea r9, [rdi+rax]
+    vpxor xmm0, xmm0, xmm0
+    test r11, r11
+    jz .tblk
+    mov ecx, r9d
+    and ecx, 4095
+    cmp ecx, 4064
+    ja .slowtail
+    lea rcx, [MASKT+32]
+    sub rcx, r11
+    vmovdqu ymm0, [r9]
+    vpand ymm0, ymm0, [rcx]
+    jmp .tblk
+.slowtail:
+    vmovdqa [rsp], ymm0
+    cmp r11, 16
+    jb .t8
+    vmovdqu xmm1, [r9]
+    vmovdqu xmm2, [r9+r11-16]
+    vmovdqu [rsp], xmm1
+    vmovdqu [rsp+r11-16], xmm2
+    jmp .tdo
+.t8:
+    cmp r11, 8
+    jb .t4
+    mov rcx, [r9]
+    mov r8, [r9+r11-8]
+    mov [rsp], rcx
+    mov [rsp+r11-8], r8
+    jmp .tdo
+.t4:
+    cmp r11, 4
+    jb .t2
+    mov ecx, [r9]
+    mov r8d, [r9+r11-4]
+    mov [rsp], ecx
+    mov [rsp+r11-4], r8d
+    jmp .tdo
+.t2:
+    cmp r11, 2
+    jb .t1
+    movzx ecx, word [r9]
+    movzx r8d, word [r9+r11-2]
+    mov [rsp], cx
+    mov [rsp+r11-2], r8w
+    jmp .tdo
+.t1:
+    movzx ecx, byte [r9]
+    mov [rsp], cl
+.tdo:
+    vmovdqa ymm0, [rsp]
+.tblk:
+    ; leads among the r real bytes
+    mov ecx, r11d
+    mov r8d, 1
+    shl r8d, cl
+    dec r8d
+    vpcmpgtb ymm9, ymm10, ymm0
+    vpmovmskb ecx, ymm9
+    not ecx
+    or ecx, r10d
+    and ecx, r8d
+    popcnt r9d, ecx
+    cmp r9, rdx
+    ja .found
+    ; no character k: offset n; check the real bytes and the first zero after
+    ; them (it closes an unfinished character)
+    mov rax, rsi
+    lea r8d, [r11+1]
+    jmp .last
+.found:
+    ; drop the rdx lowest leads; the next one starts character k
+    test rdx, rdx
+    jz .bit
+.clr:
+    lea r8d, [rcx-1]
+    and ecx, r8d
+    dec rdx
+    jnz .clr
+.bit:
+    bsf ecx, ecx
+    add rax, rcx
+    lea r8d, [rcx+1]
+.last:
+    ; the block in ymm0, table errors only in its first r8 bytes (1..32)
+    lea rcx, [MASKT+32]
+    sub rcx, r8
+    vmovdqu ymm9, [rcx]
+    VBLOCK 1
+    vptest ymm7, ymm7
+    vzeroupper
+    mov rsp, rbp
+    pop rbp
+    jz .done
+    not rax
+.done:
     ret
 
 ; first '"', '\\' or byte < 0x20 (or n) | (any byte >= 0x80 before it) << 62
