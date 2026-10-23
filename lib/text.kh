@@ -853,7 +853,11 @@ fn __strc_at_ix(b: int, x: int, p: int, n: int, i: int) -> int {
     }
     var o = ab
     if i >= ak {
-        o = ab + __utf8_skip(p + ab, n - ab, i - ak)
+        // пропуск — прямо здесь, без обёртки __utf8_skip (это самый частый путь
+        // s[i] вразнобой)
+        let r = __simd_utf8_skip(p + ab, n - ab, i - ak)
+        __strc_add(r)
+        o = ab + r
     } else {
         o = __utf8_back(p, ab, ak - i)
     }
