@@ -6,6 +6,9 @@
 #                       (пустой «// env:» — запуск как есть), и вывод у всех
 #                       один: так тесты строк идут без кэша строк, с ним и в
 #                       проверочном режиме (KHRIP_STRCACHE), с SIMD и без;
+#                       «// build-env: ИМЯ=значение» — окружение компилятора
+#                       (KHRIP_GC_VERIFY=1 включает в программу проверки
+#                       сборщика);
 #   tests/errors/*.kh — не должны компилироваться; вывод компилятора должен
 #                       содержать каждую строку «// expect: ...»; ключи
 #                       компилятора — из «// flags: ...»;
@@ -27,7 +30,8 @@
 #   eval/solutions/*/khrip — решения задач проверки проходят eval/run.sh.
 # Компилятор берётся из $KHC (по умолчанию build/khc). С KHRIP_GC_VERIFY=1 в
 # окружении проверки сборщика идут во всех программах набора (tests/api без
-# них — только первый проход).
+# них — только первый проход); с KHRIP_GC_VERIFY=fast — те же проверки, но
+# выделение из store идёт и быстрым путём.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -46,7 +50,9 @@ for src in tests/run/*.kh; do
 	name=$(basename "$src" .kh)
 	want_exit=$(sed -n 's|^// exit: *||p' "$src" | head -1)
 	want_exit=${want_exit:-0}
-	if ! "$KHC" -o "$tmp/$name" "$src" >"$tmp/$name.err" 2>&1; then
+	build_env=$(sed -n 's|^// build-env: *||p' "$src" | head -1)
+	# shellcheck disable=SC2086
+	if ! env $build_env "$KHC" -o "$tmp/$name" "$src" >"$tmp/$name.err" 2>&1; then
 		failed "$src" "не скомпилировалось:"$'\n'"$(cat "$tmp/$name.err")"
 		continue
 	fi
@@ -98,19 +104,20 @@ for src in tests/api/*.kh; do
 	pass=$((pass + 1))
 done
 
-# KHRIP_GC_VERIFY=1: после загрузки store и после каждого теста каждый
-# указатель его графа — в STORE или DATA, на начало выделенного объекта, с битом
-# PTRB, а куча согласована (lib/gc.kh); вывод тестов тот же, плюс строка
-# проверки после загрузки.
+# KHRIP_GC_VERIFY=1 (или fast, если набор идёт с ним): после загрузки store и
+# после каждого теста каждый указатель его графа — в STORE или DATA, на начало
+# выделенного объекта, а каждое поле-ссылка — с битом PTRB, и куча согласована
+# (lib/gc_verify.kh); вывод тестов тот же, плюс строка проверки после загрузки.
+verify=${KHRIP_GC_VERIFY:-1}
 for src in tests/api/*.kh; do
 	name=$(basename "$src" .kh)
-	KHRIP_GC_VERIFY=1 "$KHC" test "$src" >"$tmp/$name.vout" 2>&1
+	KHRIP_GC_VERIFY=$verify "$KHC" test "$src" >"$tmp/$name.vout" 2>&1
 	if [[ $(grep -c '^khrip: gc verify (boot): [0-9]* roots, [0-9]* objects in STORE, every pointer in STORE or DATA$' "$tmp/$name.vout") != 1 ]]; then
-		failed "$src (KHRIP_GC_VERIFY=1)" "нет строки проверки графа после загрузки:"$'\n'"$(cat "$tmp/$name.vout")"
+		failed "$src (KHRIP_GC_VERIFY=$verify)" "нет строки проверки графа после загрузки:"$'\n'"$(cat "$tmp/$name.vout")"
 		continue
 	fi
 	if ! grep -v '^khrip: gc verify (boot): ' "$tmp/$name.vout" | diff -u "tests/api/$name.out" - >"$tmp/$name.diff"; then
-		failed "$src (KHRIP_GC_VERIFY=1)" "вывод тестов отличается от ожидаемого"
+		failed "$src (KHRIP_GC_VERIFY=$verify)" "вывод тестов отличается от ожидаемого"
 		cat "$tmp/$name.diff"
 		continue
 	fi
@@ -134,16 +141,41 @@ done
 
 # Системный код: строки в нём — байты (s.byte_len(), s.byte(i), s.byte_slice).
 # --all-lib проверяет все функции библиотеки, а не только вызванные программой:
-# с API (crud.kh) и без него — вместе с исходниками компилятора в режиме --system.
-if "$KHC" check --all-lib tests/api/crud.kh >"$tmp/alllib.txt" 2>&1; then
+# с API (crud.kh; с проверками сборщика и без) и без него — вместе с исходниками
+# компилятора в режиме --system.
+if env -u KHRIP_GC_VERIFY "$KHC" check --all-lib tests/api/crud.kh >"$tmp/alllib.txt" 2>&1; then
 	pass=$((pass + 1))
 else
 	failed "khc check --all-lib tests/api/crud.kh" "$(cat "$tmp/alllib.txt")"
+fi
+# с проверками сборщика (lib/gc_verify.kh вместо заглушек lib/gc_noverify.kh)
+if KHRIP_GC_VERIFY=1 "$KHC" check --all-lib tests/api/crud.kh >"$tmp/alllib.txt" 2>&1; then
+	pass=$((pass + 1))
+else
+	failed "KHRIP_GC_VERIFY=1 khc check --all-lib tests/api/crud.kh" "$(cat "$tmp/alllib.txt")"
 fi
 if "$KHC" check --system --all-lib src/*.kh >"$tmp/alllib.txt" 2>&1; then
 	pass=$((pass + 1))
 else
 	failed "khc check --system --all-lib src/*.kh" "$(cat "$tmp/alllib.txt")"
+fi
+
+# Программа без store не несёт кода кучи store (lib/nostore.kh вместо
+# lib/gc.kh), а без KHRIP_GC_VERIFY при сборке программа со store — кода
+# проверок сборщика (lib/gc_noverify.kh вместо lib/gc_verify.kh).
+for src in tests/run/arith.kh tests/run/net_sigpipe.kh; do
+	env -u KHRIP_GC_VERIFY "$KHC" --sizes -o "$tmp/nostore" "$src" >"$tmp/nostore.txt" 2>&1
+	if grep -E ' (__salloc|__pmode_|__gc_|__span_|__ph_|__store_mut)' "$tmp/nostore.txt" >"$tmp/nostore.bad"; then
+		failed "$src" "код store в программе без store:"$'\n'"$(cat "$tmp/nostore.bad")"
+	else
+		pass=$((pass + 1))
+	fi
+done
+env -u KHRIP_GC_VERIFY "$KHC" --sizes -o "$tmp/store" tests/api/crud.kh >"$tmp/store.txt" 2>&1
+if grep -E ' (__gcv_|__gc_verify_graph|__gc_verify_heap|__ph_check|__ph_selftest)' "$tmp/store.txt" >"$tmp/store.bad"; then
+	failed "tests/api/crud.kh" "проверки сборщика без KHRIP_GC_VERIFY:"$'\n'"$(cat "$tmp/store.bad")"
+else
+	pass=$((pass + 1))
 fi
 
 # __data_hex (есть только в библиотеке): литерал — пары шестнадцатеричных цифр,

@@ -251,11 +251,17 @@ fn main() -> int {
             return 2
         }
     }
+    // токены файлов программы — [user_tok_from, user_tok_to): они идут после
+    // токенов библиотеки
     var fi = 0
     while fi < files.len() {
+        if !files[fi].is_lib && user_tok_from < 0 {
+            user_tok_from = toks.len()
+        }
         lex_file(fi)
         fi += 1
     }
+    user_tok_to = toks.len()
     uses_db = scan_uses_db()
     load_migration_files(inputs[0])
     // библиотека API — только программам с route, test, store, JSON или базой
@@ -270,15 +276,29 @@ fn main() -> int {
     }
     // куча store (lib/gc.kh) — только программам со store и тестам; остальным —
     // её заглушки (lib/nostore.kh): ядро ссылается на кучу, но без store в неё
-    // не попадает
-    var heap_lib = "nostore.kh"
+    // не попадает. Проверки сборщика (lib/gc_verify.kh) — тестам и программам,
+    // которые собирают с KHRIP_GC_VERIFY в окружении, иначе их заглушки;
+    // самопроверка кучки страниц (lib/gc_test.kh) — только тестам.
+    var heap_libs: [str] = []
     if test_mode || uses_store() {
-        heap_lib = "gc.kh"
+        heap_libs.push("gc.kh")
+        if test_mode || gc_verify_wanted() {
+            heap_libs.push("gc_verify.kh")
+        } else {
+            heap_libs.push("gc_noverify.kh")
+        }
+        if test_mode {
+            heap_libs.push("gc_test.kh")
+        }
+    } else {
+        heap_libs.push("nostore.kh")
     }
-    if !load_file(lib + "/" + heap_lib, true) {
-        return 2
+    for name in heap_libs {
+        if !load_file(lib + "/" + name, true) {
+            return 2
+        }
+        lex_file(files.len() - 1)
     }
-    lex_file(files.len() - 1)
     lx_file = files.len() - 1
     add_tok_text(T_EOF, 0, "", lx_p)
     let init_fn = gen_func("__init_globals", ty_void)

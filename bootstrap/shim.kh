@@ -33,8 +33,19 @@ fn __salloc(n: int, kind: int, mask: int) -> int {
     return 0
 }
 
-fn __gc_kind_of(p: int) -> int {
-    return K_PTRS
+fn __salloc_for(h: int, n: int, kind: int, mask: int) -> int {
+    exit(101)
+    return 0
+}
+
+fn __store_mut(h: int) {
+}
+
+fn __store_panic() {
+}
+
+fn __store_for(h: int) -> bool {
+    return false
 }
 
 // Точка входа: загрузчик вызывает её после инициализации глобальных переменных.

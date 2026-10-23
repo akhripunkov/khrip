@@ -109,14 +109,26 @@ fn uses_api() -> bool {
     return false
 }
 
+// Токены файлов программы (не библиотеки): [user_tok_from, user_tok_to).
+var user_tok_from: int = -1
+var user_tok_to: int
+
 // Есть ли в программе store: ей нужна куча store (lib/gc.kh).
 fn uses_store() -> bool {
-    for t in toks {
-        if t.kind == T_STORE && !files[t.file].is_lib {
+    var i = user_tok_from
+    while i >= 0 && i < user_tok_to {
+        if toks[i].kind == T_STORE {
             return true
         }
+        i += 1
     }
     return false
+}
+
+// Проверки сборщика в программе: KHRIP_GC_VERIFY=1 или fast при сборке.
+fn gc_verify_wanted() -> bool {
+    let v = env("KHRIP_GC_VERIFY") ?? ""
+    return v == "1" || v == "fast"
 }
 
 // Расширения подключают библиотеку и в обычных CLI-программах без route.

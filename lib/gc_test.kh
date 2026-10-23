@@ -1,0 +1,116 @@
+// Самопроверка кучки страниц store (lib/gc.kh) против простой модели. Только
+// для khc test (src/main.kh): tests/api/gc_pageheap.kh.
+
+// Случайные взятия и возвраты (ops штук, зерно seed) на отдельной кучке против
+// простой модели: массив байтов «страница занята» и первая подходящая серия
+// перебором. Сравниваются каждый ответ, граница занятых, грязные страницы, а
+// каждые 64 операции — карта free и дерево. → "" или первое расхождение.
+fn __ph_selftest(seed: int, ops: int) -> str {
+    let max = 65536
+    let ph = __mmap(128)
+    let fr = __mmap(max >> 3)
+    let dt = __mmap(max >> 3)
+    let rl = __mmap(max >> 3)
+    let tr = __mmap((max >> 1) + 64)
+    // модель: занята ли страница, грязна ли она
+    let used = __mmap(max)
+    let dirty = __mmap(max)
+    __ph_init(ph, fr, dt, rl, tr, 64, max, false)
+    var runs: [int] = []
+    var hw = 0
+    var x = seed * 0x2545F4914F6CDD1D + 1
+    var err = ""
+    var op = 0
+    while op < ops && err.byte_len() == 0 {
+        x = x ^ (x << 13)
+        x = x ^ ((x >> 7) & 0x1FFFFFFFFFFFFFF)
+        x = x ^ (x << 17)
+        let r = (x >> 8) & 0xFFFFFFFFFF
+        if runs.len() == 0 || (r % 100 < 55 && runs.len() < 512) {
+            var np = 1 + (r >> 7) % 8
+            if r % 10 == 0 {
+                np = 1 + (r >> 7) % 64
+            } else if r % 33 == 1 {
+                np = 65 + (r >> 7) % 300
+            }
+            let want = __ph_model_fit(used, max, np)
+            let got = __ph_find(ph, np)
+            if got != want {
+                err = "op {op}: {np} pages at {got}, the model says {want}"
+            } else if got >= 0 {
+                var wd = false
+                for p in got..got + np {
+                    wd = wd || load8(dirty + p) != 0
+                    store8(used + p, 1)
+                }
+                if __ph_take(ph, got, np) != wd {
+                    err = "op {op}: dirty pages at {got} not reported"
+                }
+                runs.push(got)
+                runs.push(np)
+                if got + np > hw {
+                    hw = got + np
+                }
+            }
+        } else {
+            let k = ((r >> 7) % (runs.len() / 2)) * 2
+            let pg = runs[k]
+            let np = runs[k + 1]
+            runs[k] = runs[runs.len() - 2]
+            runs[k + 1] = runs[runs.len() - 1]
+            runs.pop()
+            runs.pop()
+            __ph_free(ph, pg, np)
+            for p in pg..pg + np {
+                store8(used + p, 0)
+                store8(dirty + p, 1)
+            }
+            while hw > 0 && load8(used + hw - 1) == 0 {
+                hw -= 1
+            }
+        }
+        if err.byte_len() == 0 && load64(ph + PH_HW) != hw {
+            err = "op {op}: high-water mark {load64(ph + PH_HW)}, the model says {hw}"
+        }
+        if err.byte_len() == 0 && (op % 64 == 0 || op == ops - 1) {
+            err = __ph_check(ph)
+            let cap = load64(ph + PH_CAP)
+            var p = 0
+            while p < cap && err.byte_len() == 0 {
+                let free = ((load64(fr + ((p >> 6) << 3)) >> (p & 63)) & 1) != 0
+                let dirt = ((load64(dt + ((p >> 6) << 3)) >> (p & 63)) & 1) != 0
+                if free == (load8(used + p) != 0) || dirt != (load8(dirty + p) != 0) {
+                    err = "op {op}: page {p} differs from the model"
+                }
+                p += 1
+            }
+        }
+        op += 1
+    }
+    syscall(SYS_MUNMAP, ph, 128)
+    syscall(SYS_MUNMAP, fr, max >> 3)
+    syscall(SYS_MUNMAP, dt, max >> 3)
+    syscall(SYS_MUNMAP, rl, max >> 3)
+    syscall(SYS_MUNMAP, tr, (max >> 1) + 64)
+    syscall(SYS_MUNMAP, used, max)
+    syscall(SYS_MUNMAP, dirty, max)
+    return err
+}
+
+// Модель: первая серия из np незанятых страниц перебором или −1.
+fn __ph_model_fit(used: int, max: int, np: int) -> int {
+    var run = 0
+    var p = 0
+    while p < max {
+        if load8(used + p) == 0 {
+            run += 1
+            if run == np {
+                return p + 1 - np
+            }
+        } else {
+            run = 0
+        }
+        p += 1
+    }
+    return -1
+}

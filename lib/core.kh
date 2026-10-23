@@ -138,6 +138,9 @@ const COMMIT = 4194304
 const K_NOSCAN = 0
 const K_PTRS = 1
 const K_MASK = 2
+// новый массив списка h (__list_grow): вид его нынешнего массива — [int]
+// остаётся без ссылок
+const K_LIST_DATA = 3
 
 // ---- Паники ----
 
@@ -189,6 +192,12 @@ fn __alloc_trim(p: int, old: int, new: int) {
     }
 }
 
+// Память кончилась и на панику: сообщить без выделений и выйти.
+fn __oom_exit(text: str) {
+    syscall(1, 2, __str_ptr(text), __str_len(text))
+    syscall(231, 101)
+}
+
 fn __alloc_slow(c: int, size: int) -> int {
     if load64(c + CTX_PSAVE_PTR) != 0 {
         // идёт выделение из store (__pmode_on): объект — в куче store; вид
@@ -198,30 +207,31 @@ fn __alloc_slow(c: int, size: int) -> int {
     let p = load64(c + CTX_PTR)
     if __in_arena(p) {
         // арена: зарезервированная область подключается кусками
-        var limit = load64(c + CTX_ARENA) + __arena_size(load64(c + CTX_ARENA))
-        if load64(c + CTX_MEMPANIC) == 0 {
+        let a = load64(c + CTX_ARENA)
+        let aend = a + __arena_size(a)
+        let mp = load64(c + CTX_MEMPANIC)
+        var limit = aend
+        if mp == 0 {
             limit -= ARENA_RESERVE
         }
         let end = load64(c + CTX_END)
         var new_end = (p + size + COMMIT - 1) & ~(COMMIT - 1)
         if new_end > limit {
-            if load64(c + CTX_MEMPANIC) == 0 {
+            if mp == 0 {
                 // запрос исчерпал свою память: паника (500), а запас — на неё
                 store64(c + CTX_MEMPANIC, 1)
                 __panic(PANIC_MEMORY, "region")
             }
             // исчерпан и запас: без выделений сообщить и выйти (иначе паника
             // выделяет память, снова паникует — и так до переполнения стека)
-            let fixed = "panic: out of memory: the request used all of its 1 GB arena\n"
-            syscall(1, 2, __str_ptr(fixed), __str_len(fixed))
-            syscall(231, 101)
+            __oom_exit("panic: out of memory: the request used all of its 1 GB arena\n")
         }
         // подключено до CTX_ARENA_END (у арены с MAP_NORESERVE — вся); кусками
         // подключается до new_end и ещё ARENA_PANIC сверх
         let committed = load64(c + CTX_ARENA_END)
         var top = new_end + ARENA_PANIC
-        if top > load64(c + CTX_ARENA) + __arena_size(load64(c + CTX_ARENA)) {
-            top = load64(c + CTX_ARENA) + __arena_size(load64(c + CTX_ARENA))
+        if top > aend {
+            top = aend
         }
         if top > committed {
             if syscall(10, committed, top - committed, 3) < 0 {
@@ -229,14 +239,12 @@ fn __alloc_slow(c: int, size: int) -> int {
                 // готовым текстом, без выделений (иначе её текст снова попросил
                 // бы память и снова паниковал — до переполнения стека), а
                 // подключённый запас — на её обработку
-                if load64(c + CTX_MEMPANIC) == 0 && committed > end {
+                if mp == 0 && committed > end {
                     store64(c + CTX_MEMPANIC, 2)
                     store64(c + CTX_END, committed)
                     __panic(PANIC_MEMORY, "mprotect")
                 }
-                let fixed = "panic: out of memory: the system refused memory for the request\n"
-                syscall(1, 2, __str_ptr(fixed), __str_len(fixed))
-                syscall(231, 101)
+                __oom_exit("panic: out of memory: the system refused memory for the request\n")
             }
             store64(c + CTX_ARENA_END, top)
         }
@@ -285,18 +293,13 @@ fn __alloc_for(h: int, n: int) -> int {
     return __alloc_for_k(h, n, K_PTRS, 0)
 }
 
-// То же с видом объекта для кучи store (kind, mask — как у __salloc).
+// То же с видом объекта для кучи store (kind, mask — как у __salloc). Объект
+// store растёт только в store, и всё, что выделяется в режиме store, — тоже
+// (__salloc_for, lib/gc.kh).
 fn __alloc_for_k(h: int, n: int, kind: int, mask: int) -> int {
     let c = __ctx()
-    if load64(c + CTX_PSAVE_PTR) != 0 {
-        // выделение уже идёт из store
-        return __salloc(n, kind, mask)
-    }
-    if __in_store(h) {
-        __pmode_on()
-        let p = __salloc(n, kind, mask)
-        __pmode_off()
-        return p
+    if __store_for(h) {
+        return __salloc_for(h, n, kind, mask)
     }
     if __in_arena(load64(c + CTX_PTR)) && !__in_arena(h) {
         return __alloc_heap(n)
@@ -349,7 +352,8 @@ fn __alloc_heap(n: int) -> int {
 // живут в обычной памяти, и копировать их некуда.
 var __gc_ready: bool
 // Идёт разметка сборщика (шаг 6 docs/design/v0.13-store-gc.md): новые объекты
-// store сразу помечены. Пока сборщика нет — всегда 0.
+// store сразу помечены. Меняет её только __gc_set_marking (lib/gc.kh): вместе
+// с ней — и признак общего пути выделения __gc_slow. Пока сборщика нет — 0.
 var __gc_marking: int
 // Номер сборки мусора store: сборщик увеличивает его под исключительной
 // блокировкой, и кэши строк (lib/text.kh) с другим номером очищаются — их
@@ -389,19 +393,8 @@ fn __pmode_off() {
     store64(c + CTX_PSAVE_PTR, 0)
 }
 
-// Изменение контейнера h (список, словарь): у контейнера в store — только под
-// исключительной блокировкой. Иначе маршрут, который компилятор счёл
-// читающим (src/rw.kh), менял бы store одновременно с другими читателями и
-// (шаг 6) с разметкой сборщика: лучше ответ 500, чем гонка.
-fn __store_mut(h: int) {
-    if (h >> 40) == (STORE_REGION >> 40) && load64(__ctx() + CTX_STORE_HELD) != 1 {
-        __store_mut_slow()
-    }
-}
-
-fn __store_mut_slow() {
-    __panic_msg("internal: store changed without the exclusive store lock")
-}
+// Изменяющие операции контейнеров начинаются с __store_mut(h) (lib/gc.kh;
+// в программах без store — пустая, lib/nostore.kh).
 
 // Блокировка store (__store_lock, __store_unlock) — в lib/rt.kh: ей нужны
 // атомарные операции.
@@ -549,14 +542,10 @@ fn __panic_text(kind: int) -> str {
 
 // Паника: текст запоминается в контексте; внутри запроса или теста управление
 // возвращается в рантайм (__panic_recover), иначе программа завершается.
-// Паника с готовым текстом. Текст паники, начатой во время копирования в
-// store (__pmode_on), строится уже в арене: выделение из store кончается, —
-// иначе паника из-за нехватки памяти store паниковала бы снова на своём тексте,
-// а текст лежал бы в store, где на него не ссылается ни один корень.
+// Паника с готовым текстом. Паника, начатая во время выделения из store,
+// сначала выходит из него (__store_panic, gc.kh): её текст строится в арене.
 fn __panic_msg(text: str) {
-    if load64(__ctx() + CTX_PSAVE_PTR) != 0 {
-        __pmode_off()
-    }
+    __store_panic()
     let msg = "panic: " + text
     let mh: int = __cast(msg)
     store64(__ctx() + CTX_PANIC, mh)
@@ -566,9 +555,7 @@ fn __panic_msg(text: str) {
 }
 
 fn __panic(kind: int, at: str) {
-    if load64(__ctx() + CTX_PSAVE_PTR) != 0 {
-        __pmode_off()
-    }
+    __store_panic()
     let mp = load64(__ctx() + CTX_MEMPANIC)
     if kind == PANIC_MEMORY && mp != 0 {
         // память кончилась: текст без выделений, и не исчерпать запас повторно
@@ -1255,11 +1242,7 @@ fn __list_grow(h: int, need: int) {
     }
     let es = load64(h + 24)
     // новый массив списка в store — того же вида, что старый ([int] — без ссылок)
-    var kind = K_PTRS
-    if __in_store(h) {
-        kind = __gc_kind_of(load64(h))
-    }
-    let data = __alloc_for_k(h, cap * es, kind, 0)
+    let data = __alloc_for_k(h, cap * es, K_LIST_DATA, 0)
     __memcpy(data, load64(h), load64(h + 8) * es)
     store64(h, data)
     store64(h + 16, cap)

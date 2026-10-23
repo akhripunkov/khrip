@@ -1,0 +1,6 @@
+khrip: gc verify (test): 1 roots, 1 objects in STORE, every pointer in STORE or DATA
+ok    a rewound span reuses a freed slot and zeroes it
+khrip: gc verify (test): 1 roots, 1 objects in STORE, every pointer in STORE or DATA
+ok    an empty span gives its pages back to the page heap
+ok    allocation during marking is marked
+khrip: gc verify: marking is on, but allocation takes the fast path (set it with __gc_set_marking)

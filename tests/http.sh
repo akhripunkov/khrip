@@ -228,7 +228,8 @@ bs_stop() {
 	kill -TERM "$bs_pid"
 	wait "$bs_pid" 2>/dev/null
 }
-if "$KHC" -o "$tmp/boot_store" tests/load/boot_store.kh >"$tmp/boot_store.err" 2>&1; then
+# проверки сборщика — в программе, только если её собирают с KHRIP_GC_VERIFY
+if KHRIP_GC_VERIFY=1 "$KHC" -o "$tmp/boot_store" tests/load/boot_store.kh >"$tmp/boot_store.err" 2>&1; then
 	cp tests/load/boot_store.v012.json "$tmp/v012.json"
 	bs_start "$tmp/v012.json"
 	r=$(curl -s "$bs_url/summary")
@@ -263,7 +264,9 @@ fi
 # Память кончилась (tests/load/oom_store.kh, RLIMIT_DATA 200 МБ): и в арене
 # запроса, и в куче store (паника посреди копирования в store) — ответ 500, а
 # сервер отвечает дальше. Раньше паника из-за отказа в памяти строила свой
-# текст в той же памяти и падала с переполнением стека.
+# текст в той же памяти и падала с переполнением стека. С KHRIP_GC_VERIFY
+# проверке графа после запроса памяти не хватает: она прекращается с
+# предупреждением, а не валит сервер.
 oom_port=$((HTTP_PORT + 6))
 if "$KHC" -o "$tmp/oom_store" tests/load/oom_store.kh >"$tmp/oom_store.err" 2>&1; then
 	(

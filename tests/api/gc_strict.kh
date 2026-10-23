@@ -1,0 +1,25 @@
+// Проверка графа (KHRIP_GC_VERIFY, lib/gc_verify.kh): у слова, где по типу
+// лежит ссылка, бит PTRB есть, что бы в нём ни лежало сейчас. Поле T? с none
+// без бита прошло бы проверку, а ссылку, которую запишут туда потом, сборщик
+// не увидел бы.
+
+type Point { x: int, y: int }
+
+type Opts { a: int, b: Point? }
+
+store opts: [Opts]
+
+test "a reference field holding none has its pointer bit" {
+    opts.push(Opts { a: 1, b: none })
+    __gc_verify_graph("test")
+}
+
+test "a reference field without its pointer bit stops the program, even holding none" {
+    let it: int = __cast(opts[0])
+    // поле b — слово 1
+    let b = (it + 8 - STORE_REGION) >> 3
+    let a = GC_PTRB + (b >> 6) * 8
+    store64(a, load64(a) & ~(1 << (b & 63)))
+    __gc_verify_graph("test")
+    expect false
+}
