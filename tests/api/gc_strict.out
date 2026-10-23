@@ -1,0 +1,3 @@
+khrip: gc verify (test): 1 roots, 2 objects in STORE, every pointer in STORE or DATA
+ok    a reference field holding none has its pointer bit
+khrip: gc verify (test): root 0 ([Opts]) reaches a reference slot without its pointer bit at 0x100000002008

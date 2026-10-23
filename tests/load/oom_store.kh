@@ -1,0 +1,28 @@
+// Память кончилась (tests/http.sh, под ulimit -d): ответ 500, а сервер живёт
+// дальше. POST /arena выделяет в арене запроса мелкими кусками, пока система
+// не откажет в следующем (арена тогда подключается кусками, и на ответ 500
+// остаётся подключённый запас ARENA_PANIC); POST /store кладёт строки в store,
+// пока система не откажет куче store, — паника посреди копирования в store,
+// её текст строится уже в арене (lib/core.kh, __panic).
+
+store keep: [str]
+
+route POST "/arena" -> int {
+    var n = 0
+    while true {
+        let t = "x".repeat(40)
+        n += t.byte_len()
+    }
+    return n
+}
+
+route POST "/store" -> int {
+    while true {
+        keep.push("y".repeat(40))
+    }
+    return keep.len()
+}
+
+route GET "/count" -> int {
+    return keep.len()
+}

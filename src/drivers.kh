@@ -155,16 +155,6 @@ fn driver_names_check() {
     }
 }
 
-// Первая лексема программы: пока подключены только библиотеки ядра, файлы
-// программы лексированы после них, и обходить их лексемы незачем.
-fn first_own_tok() -> int {
-    var i = toks.len()
-    while i > 0 && !files[toks[i - 1].file].is_lib {
-        i -= 1
-    }
-    return i
-}
-
 // Имена, которые программа объявляет сама: fn, type, var, const и store на
 // верхнем уровне её файлов (→ индекс лексемы имени).
 fn own_top_names(from: int) -> StrMap {
@@ -213,7 +203,8 @@ fn name_use_at(i: int) -> bool {
 // библиотека API подключается и без драйверов; тогда с all подключаются все
 // драйверы (khc check --all-lib проверяет и не вызванные функции библиотек).
 fn driver_libs(lib: str, api: bool, all: bool) -> [str] {
-    let first = first_own_tok()
+    // лексемы программы идут после библиотек ядра: [user_tok_from, user_tok_to)
+    let first = user_tok_from
     let own = own_top_names(first)
     // имена программы, похожие на имена драйверов: 1 — вызов, 2 — иное (3 — оба)
     let wanted = smap_new()

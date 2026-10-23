@@ -1,0 +1,74 @@
+// Помощники уборки и разметки (lib/gc.kh) для шагов 5 и 6 проекта
+// docs/design/v0.13-store-gc.md — уже сейчас и с проверкой: спан, где после
+// уборки остались объекты, ищет слоты с начала и обнуляет их (__span_rewind);
+// пустой спан отдаёт страницы кучке, сняв свои биты и записи карты страниц
+// (__span_free); разметку включает только __gc_set_marking — вместе с общим
+// путём выделения, который ставит бит MARK. Уборку здесь изображает тест: он
+// снимает биты START и PTRB освобождённого слота, как снимет их уборка.
+
+store keep: [int]
+
+fn ptrb(p: int) -> bool {
+    let b = (p - STORE_REGION) >> 3
+    return ((load64(GC_PTRB + (b >> 6) * 8) >> (b & 63)) & 1) != 0
+}
+
+test "a rewound span reuses a freed slot and zeroes it" {
+    keep.push(1)
+    // класс 6912 байт: семь объектов в спане из шести страниц
+    let a = __salloc(6900, K_PTRS, 0)
+    let b = __salloc(6900, K_PTRS, 0)
+    let s = __gc_span_of(a)
+    expect __gc_span_of(b) == s
+    store64(a, 77)
+    store64(a + 6800, 78)
+    let es = __gc_obj_size(a)
+    let g = (a - STORE_REGION) >> 4
+    let w = GC_START + (g >> 6) * 8
+    store64(w, load64(w) & ~(1 << (g & 63)))
+    __bits_put(GC_PTRB, (a - STORE_REGION) >> 3, ((a - STORE_REGION) >> 3) + es / 8, false)
+    __heap_live -= es
+    __span_rewind(s)
+    let c = __salloc(6900, K_PTRS, 0)
+    expect c == a
+    expect load64(a) == 0
+    expect load64(a + 6800) == 0
+    expect ptrb(a)
+    let d = __salloc(6900, K_PTRS, 0)
+    expect d == b + es
+    __gc_verify_graph("test")
+}
+
+test "an empty span gives its pages back to the page heap" {
+    keep.push(2)
+    let big = __salloc(40000, K_PTRS, 0)
+    store64(big, 5)
+    let s = __gc_span_of(big)
+    __heap_live -= __gc_obj_size(big)
+    __span_free(s)
+    expect __gc_obj_of(big) == 0
+    expect !ptrb(big)
+    __gc_verify_graph("test")
+    let again = __salloc(40000, K_PTRS, 0)
+    expect again == big
+    expect load64(big) == 0
+    expect ptrb(big)
+}
+
+test "allocation during marking is marked" {
+    keep.push(3)
+    __gc_set_marking(true)
+    let m = __salloc(48, K_NOSCAN, 0)
+    expect __gc_bit(GC_MARK, m)
+    __gc_set_marking(false)
+    let f = __salloc(48, K_NOSCAN, 0)
+    expect !__gc_bit(GC_MARK, f)
+}
+
+test "marking switched on past __gc_set_marking stops the program" {
+    keep.push(4)
+    __gc_marking = 1
+    __gc_slow = false
+    __gc_verify_graph("test")
+    expect false
+}

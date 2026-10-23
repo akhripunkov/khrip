@@ -1,0 +1,573 @@
+// Проверки сборщика store (KHRIP_GC_VERIFY, docs/design/v0.13-store-gc.md
+// §8.7): граф store от корней и куча после загрузки и после каждого запроса,
+// задачи и теста, который держал store монопольно; владелец метаданных (I5) и
+// нули нового слота при выделении общим путём; дерево кучки страниц каждые 1024
+// операции. Файл подключается к программе со store, только если её собирают с
+// KHRIP_GC_VERIFY в окружении, и к khc test (src/main.kh); иначе — заглушки
+// lib/gc_noverify.kh, и кода проверок в программе нет.
+
+// KHRIP_GC_VERIFY=1: проверки, и каждое выделение — общим путём (с проверками
+// владельца и нулей); =fast: те же проверки, но быстрый путь выделения
+// остаётся — так проверяется и он.
+fn __gc_verify_init() {
+    if let v = env("KHRIP_GC_VERIFY") {
+        __gc_verify = v == "1" || v == "fast"
+        __gc_verify_slow = v == "1"
+    }
+    __gc_slow_update()
+}
+
+// KHRIP_GC_VERIFY: каждые 1024 операции — дерево против карты.
+fn __ph_tick(ph: int) {
+    if __gc_verify {
+        let n = load64(ph + PH_OPS) + 1
+        store64(ph + PH_OPS, n)
+        if (n & 1023) == 0 {
+            let e = __ph_check(ph)
+            if e.byte_len() > 0 {
+                __gc_fatal(e)
+            }
+        }
+    }
+}
+
+// Дерево и граница занятых против карты free: "" или что не так.
+fn __ph_check(ph: int) -> str {
+    let t = load64(ph + PH_TREE)
+    let fr = load64(ph + PH_FREE)
+    let cap = load64(ph + PH_CAP)
+    let nl = cap >> 6
+    for j in 0..nl {
+        let w = load64(fr + (j << 3))
+        var pre = 64
+        var suf = 64
+        var best = 64
+        if w != -1 {
+            pre = __ctz(~w)
+            suf = __clz(~w)
+            best = __run_max(w)
+        }
+        let x = t + ((nl + j) << 4)
+        if load64(x) != (pre | (suf << 32)) || load64(x + 8) != best {
+            return "page heap: leaf {j} does not match the free map"
+        }
+    }
+    // узлы — по уже проверенным детям
+    var lo = nl >> 1
+    var cs = 64
+    while lo >= 1 {
+        for i in lo..lo * 2 {
+            let l = t + (i << 5)
+            let lpre = load64(l) & 0xFFFFFFFF
+            let lsuf = load64(l) >> 32
+            let rpre = load64(l + 16) & 0xFFFFFFFF
+            let rsuf = load64(l + 16) >> 32
+            var pre = lpre
+            if lpre == cs {
+                pre = cs + rpre
+            }
+            var suf = rsuf
+            if rsuf == cs {
+                suf = cs + lsuf
+            }
+            var best = load64(l + 8)
+            if load64(l + 24) > best {
+                best = load64(l + 24)
+            }
+            if lsuf + rpre > best {
+                best = lsuf + rpre
+            }
+            if load64(t + (i << 4)) != (pre | (suf << 32)) || load64(t + (i << 4) + 8) != best {
+                return "page heap: node {i} does not match its children"
+            }
+        }
+        lo = lo >> 1
+        cs = cs * 2
+    }
+    let hw = load64(ph + PH_HW)
+    if hw > cap || __bits_any(fr, hw, cap, false) {
+        return "page heap: a page above the high-water mark {hw} is taken"
+    }
+    if hw > 0 && __bits_any(fr, hw - 1, hw, true) {
+        return "page heap: the high-water mark {hw} is above a free page"
+    }
+    return ""
+}
+
+// Число единиц в слове (SWAR).
+fn __popcount(x: int) -> int {
+    var v = x - ((x >> 1) & 0x5555555555555555)
+    v = (v & 0x3333333333333333) + ((v >> 2) & 0x3333333333333333)
+    v = (v + (v >> 4)) & 0x0F0F0F0F0F0F0F0F
+    return ((v * 0x0101010101010101) >> 56) & 0xFF
+}
+
+// I5: метаданные кучи меняет только владелец мьютекса писателей — тот, кто
+// держит store монопольно (запрос, задача, тест, загрузка).
+fn __gc_check_owner() {
+    if load64(__ctx() + CTX_STORE_HELD) != 1 || load64(__store_rw) == 0 {
+        __gc_fatal("the store heap changed without the writers' lock (I5)")
+    }
+    __gc_check_slow()
+}
+
+// Пока идёт разметка, выделение — только общим путём: быстрый путь не ставит
+// бит MARK, и новый объект ушёл бы в уборку живым. Разметку включает и
+// выключает только __gc_set_marking.
+fn __gc_check_slow() {
+    if __gc_marking != 0 && !__gc_slow {
+        __gc_fatal("marking is on, but allocation takes the fast path (set it with __gc_set_marking)")
+    }
+}
+
+// Новый слот — нули: в свободную память никто не писал.
+fn __gc_check_zero(p: int, n: int) {
+    var i = 0
+    while i < n {
+        if load64(p + i) != 0 {
+            __gc_fatal("a free slot at " + __gc_hex(p) + " was written")
+        }
+        i += 8
+    }
+}
+
+// Конец запроса, задачи или теста под исключительной блокировкой: граф и куча
+// store снова проверяются (молча, если всё верно).
+fn __gc_verify_release() {
+    if __gc_verify && load64(__ctx() + CTX_STORE_HELD) == 1 {
+        __gc_check_slow()
+        __gc_verify_run("request", false)
+    }
+}
+
+// Проверка графа и кучи со строкой об итоге.
+fn __gc_verify_graph(when: str) {
+    __gc_verify_run(when, true)
+}
+
+// Обход store от корней (__gc_roots(): [n, (адрес глобальной, описание её
+// типа) × n], src/api.kh, gc_root_table) по описаниям типов: каждый указатель
+// графа — 0, адрес в DATA или в выделенном объекте STORE (I1: ни арены, ни
+// обычной памяти потока, ни свободных слотов); ссылка на объект — его начало
+// (у варианта — начало + 8); у каждого слова объекта store, где лежит ссылка
+// на другой объект store, стоит бит PTRB, а спан объекта — не NOSCAN (иначе
+// сборщик не увидел бы ссылку). Объекты в DATA — литералы, варианты без полей,
+// ячейки значений по умолчанию — не обходятся: их не освобождают и не
+// копируют. Без рекурсии (список в миллион звеньев — не миллион кадров): стек
+// пар (значение, описание) и множество пройденных адресов (общие объекты и
+// циклы обходятся один раз) — в своих кусках mmap, они возвращаются системе в
+// конце; память store, арены и потока проверка не меняет (кроме сообщений).
+// Перед обходом — куча (__gc_verify_heap).
+//
+// Состояние (кусок mmap): [0] стек, [8] пар в нём, [16] его размер в парах,
+// [24] множество (открытая адресация, 0 — пусто), [32] адресов в нём, [40] его
+// размер, [48] номер корня, от которого идёт обход (−1 — проверка кучи), [56] 1,
+// если системе не хватило памяти на стек или множество: тогда обход
+// прекращается с предупреждением — проверка не валит программу, которая сама
+// пережила нехватку памяти (ответ 500 после отказа памяти store).
+fn __gc_verify_run(when: str, loud: bool) {
+    let roots = __gc_roots()
+    let n = load64(roots)
+    let st = syscall(SYS_MMAP, 0, 64, 3, 0x22, -1, 0)
+    if st < 0 {
+        eprint("khrip: gc verify ({when}): skipped, no memory for the check")
+        return
+    }
+    store64(st, __gcv_map(st, 1024 * 16))
+    store64(st + 16, 1024)
+    store64(st + 24, __gcv_map(st, 4096 * 8))
+    store64(st + 40, 4096)
+    store64(st + 48, -1)
+    __gc_verify_heap(st, when)
+    for i in 0..n {
+        if load64(st + 56) != 0 {
+            break
+        }
+        store64(st + 48, i)
+        __gcv_push(st, load64(load64(roots + 8 + i * 16)), load64(roots + 16 + i * 16))
+        while load64(st + 8) > 0 && load64(st + 56) == 0 {
+            let k = load64(st + 8) - 1
+            store64(st + 8, k)
+            let e = load64(st) + k * 16
+            __gcv_visit(st, when, load64(e), load64(e + 8))
+        }
+    }
+    let objs = load64(st + 32)
+    let short = load64(st + 56) != 0
+    if load64(st) != 0 {
+        syscall(SYS_MUNMAP, load64(st), load64(st + 16) * 16)
+    }
+    if load64(st + 24) != 0 {
+        syscall(SYS_MUNMAP, load64(st + 24), load64(st + 40) * 8)
+    }
+    syscall(SYS_MUNMAP, st, 64)
+    if short {
+        eprint("khrip: gc verify ({when}): stopped after {objs} objects, no memory for the walk")
+    } else if loud {
+        eprint("khrip: gc verify ({when}): {n} roots, {objs} objects in STORE, every pointer in STORE or DATA")
+    }
+}
+
+// Память обхода: кусок mmap или 0, если система не дала, — тогда обход
+// прекращается ([56] состояния).
+fn __gcv_map(st: int, size: int) -> int {
+    let p = syscall(SYS_MMAP, 0, size, 3, 0x22, -1, 0)
+    if p < 0 {
+        store64(st + 56, 1)
+        return 0
+    }
+    return p
+}
+
+// Куча: дерево кучки страниц; у каждой занятой страницы — спан, записи спанов
+// согласованы с картой страниц и таблицей классов; биты START — только в
+// началах слотов; у свободных слотов и спанов NOSCAN биты PTRB — нули; сумма
+// размеров выделенных объектов — __heap_live.
+fn __gc_verify_heap(st: int, when: str) {
+    __gc_check_slow()
+    let ph = __gc_ph
+    let e = __ph_check(ph)
+    if e.byte_len() > 0 {
+        __gcv_fail(st, when, e)
+    }
+    let fr = load64(ph + PH_FREE)
+    let hw = load64(ph + PH_HW)
+    var live = 0
+    var pg = 0
+    while pg < hw {
+        let pm = load32(GC_PAGEMAP + (pg << 2))
+        if ((load64(fr + ((pg >> 6) << 3)) >> (pg & 63)) & 1) != 0 {
+            if pm != 0 {
+                __gcv_fail(st, when, "free page {pg} belongs to a span")
+            }
+            pg += 1
+            continue
+        }
+        if pm != pg + 1 {
+            __gcv_fail(st, when, "page {pg} is taken but does not start a span")
+        }
+        live += __gcv_span(st, when, pg)
+        let np = load64(GC_SPANS + (pg << 6) + S_INFO) & 0xFFFFFFFF
+        pg += np
+    }
+    if live != __heap_live {
+        __gcv_fail(st, when, "objects take {live} bytes, but the heap counts {__heap_live}")
+    }
+}
+
+// Спан с первой страницей pg → байт в его выделенных объектах.
+fn __gcv_span(st: int, when: str, pg: int) -> int {
+    let s = GC_SPANS + (pg << 6)
+    let base = STORE_REGION + (pg << GC_PAGE_SHIFT)
+    let info = load64(s + S_INFO)
+    let np = info & 0xFFFFFFFF
+    let sc = (info >> 32) & 0xFFFF
+    let fl = info >> 48
+    let fr = load64(__gc_ph + PH_FREE)
+    if load64(s + S_BASE) != base || (fl & F_INUSE) == 0 || np < 1 || pg + np > load64(__gc_ph + PH_HW) {
+        __gcv_fail(st, when, "span at page {pg}: a broken record")
+    }
+    for i in 1..np {
+        if load32(GC_PAGEMAP + ((pg + i) << 2)) != pg + 1 || __bits_any(fr, pg + i, pg + i + 1, true) {
+            __gcv_fail(st, when, "span at page {pg}: page {pg + i} is not its own")
+        }
+    }
+    // все биты START спана: слова [g0, g0 + np · 8)
+    let g0 = (base - STORE_REGION) >> 4
+    var bits = 0
+    for j in 0..np * 8 {
+        bits += __popcount(load64(GC_START + ((g0 >> 6) << 3) + (j << 3)))
+    }
+    let noscan = (fl & F_NOSCAN) != 0
+    if noscan && __bits_any(GC_PTRB, (base - STORE_REGION) >> 3, ((base - STORE_REGION) >> 3) + np * 1024, true) {
+        __gcv_fail(st, when, "span at page {pg}: NOSCAN, but pointer bits are set")
+    }
+    if (fl & F_LARGE) != 0 {
+        if sc != 0 || load64(s + S_SIZE) != np << GC_PAGE_SHIFT || load64(s + S_MAGIC) != 1 << 32 || load64(s + S_FAST) != 0 || bits > 1 || (bits == 1 && !__gc_bit(GC_START, base)) {
+            __gcv_fail(st, when, "large span at page {pg}: a broken record")
+        }
+        return bits * (np << GC_PAGE_SHIFT)
+    }
+    let c = sc >> 1
+    let es = load64(s + S_SIZE)
+    let ne = load64(s + S_MAGIC) >> 32
+    let lim = base + ne * es
+    let fi = load64(s + S_FREE)
+    let fast = load64(s + S_FAST)
+    if c < 1 || c > GC_CLASSES || es != load64(__gc_tab + 1024 + c * 8) || np != load64(__gc_tab + 2048 + c * 8) || ne != (np << GC_PAGE_SHIFT) / es || lim != base + ne * es || fi < base || fi > lim || (fi - base) % es != 0 || noscan != ((sc & 1) != 0) || (fast != 0 && (fast != lim || (fl & F_NEEDZERO) != 0)) {
+        __gcv_fail(st, when, "span at page {pg}: a broken record")
+    }
+    var objs = 0
+    for i in 0..ne {
+        let p = base + i * es
+        if __gc_bit(GC_START, p) {
+            objs += 1
+        } else if !noscan && __bits_any(GC_PTRB, (p - STORE_REGION) >> 3, ((p - STORE_REGION) >> 3) + (es >> 3), true) {
+            __gcv_fail(st, when, "a free slot at " + __gc_hex(p) + " has pointer bits")
+        }
+    }
+    if objs != bits {
+        __gcv_fail(st, when, "span at page {pg}: START bits outside the starts of slots")
+    }
+    return objs * es
+}
+
+// Значение v с описанием d: проверить его адрес, а у объекта в store — и его
+// внутренние указатели, ссылки — в стек. У каждого слова объекта, где по типу
+// лежит ссылка, — бит PTRB, что бы в нём ни лежало сейчас (none, свободное
+// место списка или словаря): ссылку туда запишут потом, не трогая PTRB.
+fn __gcv_visit(st: int, when: str, v: int, d: int) {
+    var t = d
+    // T? ссылки — то же слово, что и сама ссылка (none — 0)
+    while load64(t) == D_OPT && !__is_scalar(load64(t + 8)) {
+        t = load64(t + 8)
+    }
+    let k = load64(t)
+    if k == D_INT || k == D_BOOL || k == D_FLOAT || v == 0 {
+        return
+    }
+    __gcv_ptr(st, when, v, "a value", true)
+    if __in_data(v) || !__gcv_first(st, v) {
+        return
+    }
+    if k == D_STR {
+        let len = load64(v + 8)
+        if len > 0 {
+            let p = load64(v)
+            __gcv_ptr(st, when, p, "string bytes", false)
+            __gcv_word(st, when, v)
+            if __in_store(p) && __gc_obj_of(p) + __gc_obj_size(__gc_obj_of(p)) < p + len {
+                __gcv_fail(st, when, "string bytes at " + __gc_hex(p) + " run past their object")
+            }
+        }
+        return
+    }
+    if k == D_LIST {
+        let data = load64(v)
+        __gcv_ptr(st, when, data, "list data", true)
+        __gcv_slot(st, when, v)
+        let ed = load64(t + 8)
+        if !__is_scalar(ed) {
+            let n = load64(v + 8)
+            for i in 0..n {
+                __gcv_child(st, when, data + i * 8, ed)
+            }
+            for i in n..load64(v + 16) {
+                __gcv_slot(st, when, data + i * 8)
+            }
+        }
+        return
+    }
+    if k == D_MAP {
+        // записи по порядку: keys [0], vals [16], alive [24] — списки; слоты [32]
+        let keys = load64(v)
+        let vals = load64(v + 16)
+        let alive = load64(v + 24)
+        __gcv_ptr(st, when, keys, "map keys", true)
+        __gcv_ptr(st, when, vals, "map values", true)
+        __gcv_ptr(st, when, alive, "map entries", true)
+        __gcv_ptr(st, when, load64(v + 32), "map slots", true)
+        __gcv_ptr(st, when, load64(keys), "map keys data", true)
+        __gcv_ptr(st, when, load64(vals), "map values data", true)
+        __gcv_ptr(st, when, load64(alive), "map entries data", true)
+        __gcv_slot(st, when, v)
+        __gcv_slot(st, when, v + 16)
+        __gcv_slot(st, when, v + 24)
+        __gcv_slot(st, when, v + 32)
+        __gcv_slot(st, when, keys)
+        __gcv_slot(st, when, vals)
+        __gcv_slot(st, when, alive)
+        let kd = load64(t + 8)
+        let vd = load64(t + 16)
+        let n = load64(keys + 8)
+        // свободное место массивов: туда запишут ключи и значения-ссылки
+        if !__is_scalar(kd) {
+            for i in n..load64(keys + 16) {
+                __gcv_slot(st, when, load64(keys) + i * 8)
+            }
+        }
+        if !__is_scalar(vd) {
+            for i in n..load64(vals + 16) {
+                __gcv_slot(st, when, load64(vals) + i * 8)
+            }
+        }
+        for i in 0..n {
+            if __word_at(alive, i) != 0 {
+                if !__is_scalar(kd) {
+                    __gcv_child(st, when, load64(keys) + i * 8, kd)
+                }
+                if !__is_scalar(vd) {
+                    __gcv_child(st, when, load64(vals) + i * 8, vd)
+                }
+            }
+        }
+        return
+    }
+    var sd = t
+    if k == D_SUM {
+        let e = __variant_entry(t, v)
+        if e == 0 {
+            __gcv_fail(st, when, "a variant with an unknown tag at " + __gc_hex(v))
+        }
+        sd = load64(e + 8)
+    } else if k != D_STRUCT {
+        // ячейка int?, bool? или float?
+        return
+    }
+    let nf = load64(sd + 8)
+    for i in 0..nf {
+        let fd = __field_desc(sd, i)
+        if !__is_scalar(fd) {
+            __gcv_child(st, when, v + i * 8, fd)
+        }
+    }
+}
+
+// Ссылка в слове slot объекта (описание d): бит PTRB слова, затем — в стек.
+fn __gcv_child(st: int, when: str, slot: int, d: int) {
+    __gcv_slot(st, when, slot)
+    __gcv_push(st, load64(slot), d)
+}
+
+// Слово slot объекта store, где по типу лежит ссылка: у него бит PTRB, а спан
+// объекта — не NOSCAN, что бы в слове ни лежало.
+fn __gcv_slot(st: int, when: str, slot: int) {
+    if !__in_store(slot) {
+        return
+    }
+    if (((load64(__gc_span_of(slot) + S_INFO) >> 48) & F_NOSCAN) != 0) || ((load64(((slot >> 9) << 3) + GC_PTRB_P) >> ((slot >> 3) & 63)) & 1) == 0 {
+        __gcv_fail(st, when, "a reference slot without its pointer bit at " + __gc_hex(slot))
+    }
+}
+
+// Слово slot объекта store ссылается на другой объект store: у слова есть бит
+// PTRB, а спан объекта — не NOSCAN (ссылка на свой же объект — байты строки в
+// её заголовке — не нужна сборщику). Так проверяется заголовок строки: его
+// байты бывают и в том же объекте.
+fn __gcv_word(st: int, when: str, slot: int) {
+    let v = load64(slot)
+    if !__in_store(slot) || !__in_store(v) {
+        return
+    }
+    let so = __gc_obj_of(slot)
+    if so != 0 && so == __gc_obj_of(v) {
+        return
+    }
+    if (((load64(__gc_span_of(slot) + S_INFO) >> 48) & F_NOSCAN) != 0) || ((load64(GC_PTRB + (((slot - STORE_REGION) >> 9) << 3)) >> (((slot - STORE_REGION) >> 3) & 63)) & 1) == 0 {
+        __gcv_fail(st, when, "a store pointer without its pointer bit at " + __gc_hex(slot))
+    }
+}
+
+// Указатель p — в DATA или в выделенном объекте STORE; exact — на его начало
+// (у варианта — на начало + 8).
+fn __gcv_ptr(st: int, when: str, p: int, what: str, exact: bool) {
+    if __in_data(p) {
+        return
+    }
+    if !__in_store(p) {
+        __gcv_fail(st, when, what + " at " + __gc_hex(p) + ", outside STORE and DATA")
+    }
+    let o = __gc_obj_of(p)
+    if o == 0 {
+        __gcv_fail(st, when, what + " at " + __gc_hex(p) + ", outside the objects of STORE")
+    }
+    if exact && p != o && p != o + 8 {
+        __gcv_fail(st, when, what + " at " + __gc_hex(p) + ", inside the object at " + __gc_hex(o))
+    }
+}
+
+fn __gcv_fail(st: int, when: str, what: str) {
+    let i = load64(st + 48)
+    if i < 0 {
+        eprint("khrip: gc verify ({when}): the store heap: {what}")
+    } else {
+        let d = load64(__gc_roots() + 16 + i * 16)
+        eprint("khrip: gc verify ({when}): root {i} ({__desc_name(d)}) reaches {what}")
+    }
+    exit(101)
+}
+
+fn __gc_hex(x: int) -> str {
+    let digits = "0123456789abcdef"
+    var r = ""
+    var sh = 60
+    while sh >= 0 {
+        let h = (x >> sh) & 15
+        if h != 0 || r.byte_len() > 0 || sh == 0 {
+            r += digits.byte_slice(h, h + 1)
+        }
+        sh -= 4
+    }
+    return "0x" + r
+}
+
+fn __gcv_push(st: int, v: int, d: int) {
+    let n = load64(st + 8)
+    let cap = load64(st + 16)
+    if load64(st + 56) != 0 {
+        return
+    }
+    if n == cap {
+        let s = __gcv_map(st, cap * 2 * 16)
+        if s == 0 {
+            return
+        }
+        __memcpy(s, load64(st), n * 16)
+        syscall(SYS_MUNMAP, load64(st), cap * 16)
+        store64(st, s)
+        store64(st + 16, cap * 2)
+    }
+    let e = load64(st) + n * 16
+    store64(e, v)
+    store64(e + 8, d)
+    store64(st + 8, n + 1)
+}
+
+// Первая встреча с адресом p: true и p — в множестве; false — уже был.
+fn __gcv_first(st: int, p: int) -> bool {
+    var cap = load64(st + 40)
+    if load64(st + 56) != 0 {
+        return false
+    }
+    if (load64(st + 32) + 1) * 2 > cap {
+        // множество вдвое больше
+        let old = load64(st + 24)
+        let t = __gcv_map(st, cap * 2 * 8)
+        if t == 0 {
+            return false
+        }
+        for i in 0..cap {
+            let k = load64(old + i * 8)
+            if k != 0 {
+                __gcv_place(t, cap * 2, k)
+            }
+        }
+        syscall(SYS_MUNMAP, old, cap * 8)
+        cap *= 2
+        store64(st + 24, t)
+        store64(st + 40, cap)
+    }
+    let t = load64(st + 24)
+    var i = __addr_hash(p) & (cap - 1)
+    while true {
+        let k = load64(t + i * 8)
+        if k == p {
+            return false
+        }
+        if k == 0 {
+            store64(t + i * 8, p)
+            store64(st + 32, load64(st + 32) + 1)
+            return true
+        }
+        i = (i + 1) & (cap - 1)
+    }
+    return false
+}
+
+fn __gcv_place(t: int, cap: int, p: int) {
+    var i = __addr_hash(p) & (cap - 1)
+    while load64(t + i * 8) != 0 {
+        i = (i + 1) & (cap - 1)
+    }
+    store64(t + i * 8, p)
+}

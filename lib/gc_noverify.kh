@@ -1,0 +1,25 @@
+// Заглушки проверок сборщика store для программ, собранных без
+// KHRIP_GC_VERIFY (src/main.kh выбирает между этим файлом и lib/gc_verify.kh):
+// куча store ссылается на проверки, но в такой программе их кода нет.
+
+// KHRIP_GC_VERIFY при запуске, а программа собрана без него: проверять нечем.
+fn __gc_verify_init() {
+    if env("KHRIP_GC_VERIFY") != none {
+        eprint("khrip: KHRIP_GC_VERIFY is ignored: build the program with KHRIP_GC_VERIFY set to include the checks")
+    }
+}
+
+fn __ph_tick(ph: int) {
+}
+
+fn __gc_check_owner() {
+}
+
+fn __gc_check_zero(p: int, n: int) {
+}
+
+fn __gc_verify_release() {
+}
+
+fn __gc_verify_graph(when: str) {
+}
