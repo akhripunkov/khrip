@@ -9,7 +9,7 @@ var inline_rets: [int]
 // lib/text.kh).
 const SLICE_END = 0x7FFFFFFFFFFFFFFF
 // Позиция сразу за последним символьным литералом, который стал str: для
-// подсказки «n == 'a'» к 'a' == n с int n (compare_hint).
+// подсказки «n == 'a'» к 'a' == n с int n (char_compare_hint).
 var char_lit_end: int
 
 fn parse_atom() -> int {
@@ -1654,19 +1654,18 @@ fn parse_builtin(t: Token, w: int) -> int {
         let a = tok()
         let ai = pos
         let t1 = parse_expr(ty_err)
-        let lit = ai
-        let whole = pos == ai + 1
+        // аргумент из одного токена может быть литералом
+        var lit = -1
+        if pos == ai + 1 {
+            lit = ai
+        }
         expect_tok(')')
         let k = tkind(t1)
         if k == K_STR {
             system_str_error(t, "len(str)", "s.byte_len()")
         }
         if k == K_STR && !system_code(t) {
-            if whole {
-                emit_text_len(lit)
-            } else {
-                emit_text_len(-1)
-            }
+            emit_text_len(lit)
             return ty_int
         }
         if k == K_STR || k == K_LIST || k == K_MAP {

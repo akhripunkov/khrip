@@ -9,4 +9,7 @@ jtest "kept count" "len(j) == 20"
 check "kept stats" 200 '' $U/stats/categories
 jtest "kept revenue" "j[0] == {'category': 'Toys', 'products': 1, 'units_sold': 20, 'revenue': 20000}"
 check "new category" 201 '"name":"Books"' "${J[@]}" -X POST $U/categories -d '{"name":"Books"}'
+# длина — в символах: 30 букв кириллицы — 60 байт
+cyr=$(printf 'я%.0s' $(seq 30))
+check "cyrillic category" 201 "\"name\":\"$cyr\"" "${J[@]}" -X POST $U/categories -d "{\"name\":\"$cyr\"}"
 finish

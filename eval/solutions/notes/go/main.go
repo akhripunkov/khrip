@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 type User struct {
@@ -55,7 +56,7 @@ type credentials struct {
 
 func register(w http.ResponseWriter, r *http.Request) {
 	var c credentials
-	if err := json.NewDecoder(r.Body).Decode(&c); err != nil || len(c.Username) < 3 || len(c.Username) > 32 || len(c.Password) < 8 {
+	if err := json.NewDecoder(r.Body).Decode(&c); err != nil || utf8.RuneCountInString(c.Username) < 3 || utf8.RuneCountInString(c.Username) > 32 || utf8.RuneCountInString(c.Password) < 8 {
 		http.Error(w, "username must be 3-32 characters, password at least 8", http.StatusBadRequest)
 		return
 	}

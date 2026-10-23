@@ -155,6 +155,16 @@ fn path_name_ok(s: str) -> bool {
     return true
 }
 
+// В s только байты ASCII?
+fn is_ascii(s: str) -> bool {
+    for i in 0..s.byte_len() {
+        if s.byte(i) >= 0x80 {
+            return false
+        }
+    }
+    return true
+}
+
 // Сегменты пути "/users/{id}" → ["users", "{id}"].
 fn route_segments(path: str, at: Token) -> [str] {
     var segs: [str] = []
@@ -173,6 +183,10 @@ fn route_segments(path: str, at: Token) -> [str] {
                 }
             } else if seg.contains("\{") || seg.contains("}") || seg.contains(" ") || seg.contains("?") {
                 error_tok(at, "bad path segment '" + seg + "'", "a segment is either text or a parameter like \{id}")
+            } else if !is_ascii(seg) {
+                // клиенты шлют такой путь в %XX, а сегменты-текст сравниваются как есть;
+                // параметр пути раскодируется
+                error_tok(at, "write the route path in ASCII", "clients send '" + seg + "' percent-encoded; use an ASCII name or a parameter like \{name}")
             }
             segs.push(seg)
             start = i + 1
