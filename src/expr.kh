@@ -449,7 +449,7 @@ fn peek_simple(level: int) -> bool {
     if tighter_follows(level, kind_at(pos + 1)) {
         return false
     }
-    if t.kind == T_INT && fits_i32(t.val) {
+    if t.kind == T_INT {
         op_kind = OPK_IMM
         op_val = t.val
         op_ty = ty_int
@@ -482,7 +482,7 @@ fn peek_simple(level: int) -> bool {
             return true
         }
         let s = sym_find(t.text)
-        if s >= 0 && sym_kind(s) == SK_CONST && consts[sym_idx(s)].ty == ty_int && fits_i32(consts[sym_idx(s)].val) {
+        if s >= 0 && sym_kind(s) == SK_CONST && consts[sym_idx(s)].ty == ty_int {
             op_kind = OPK_IMM
             op_val = consts[sym_idx(s)].val
             op_ty = ty_int
@@ -601,7 +601,13 @@ var addreg_reg: int
 
 fn emit_alu_operand(rr: int, mr: int, ext: int) {
     if op_kind == OPK_IMM {
-        emit_alu_imm(ext, RAX, op_val)
+        if fits_i32(op_val) {
+            emit_alu_imm(ext, RAX, op_val)
+        } else {
+            // число больше 32 битов — через rcx
+            emit_mov_imm(RCX, op_val)
+            emit_rr(rr, RCX, RAX)
+        }
         return
     }
     let l = locals[op_val]
@@ -737,6 +743,11 @@ fn emit_mul_imm(v: int, at: Token) {
         }
         return
     }
+    if !fits_i32(v) {
+        emit_mov_imm(RCX, v)
+        emit_arith_rcx('*', at)
+        return
+    }
     emit8(0x48)
     emit8(0x69)
     emit8(0xC0)
@@ -801,15 +812,13 @@ fn arith_rhs(op: int, level: int, at: Token) {
     if peek_simple(level) && is_int_like(op_ty) {
         advance()
         // число op число — при компиляции (без деления: там паники)
-        if op_kind == OPK_IMM && simple_kind == OPK_IMM && op != '/' && op != '%' {
+        if op_kind == OPK_IMM && simple_kind == OPK_IMM && op != '/' && op != '%' && fits_i32(op_val) && fits_i32(simple_val) {
             let r = op_val
             if take_simple() {
                 let v = fold_int(op, op_val, r)
                 let p = code_len
                 emit_mov_imm(RAX, v)
-                if fits_i32(v) {
-                    note_simple(OPK_IMM, v, p)
-                }
+                note_simple(OPK_IMM, v, p)
                 return
             }
             op_kind = OPK_IMM
@@ -1307,7 +1316,9 @@ fn parse_unary() -> int {
                 emit_mov_imm(RAX, __int_to_f64_bits(0 - v))
                 return parse_postfix(ty_float, at)
             }
+            let p = code_len
             emit_mov_imm(RAX, -v)
+            note_simple(OPK_IMM, -v, p)
             int_lit_end = pos
             return parse_postfix(ty_int, at)
         }

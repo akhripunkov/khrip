@@ -245,7 +245,24 @@ var addimm_end: int = -1
 var addimm_val: int
 
 // Арифметика с непосредственным операндом: ext — номер операции в группе 0x81.
+// add/sub rax, число сразу за другим (без меток между ними) — одно сложение:
+// x + 8 + 16 — add rax, 24 (проверка переполнения в коде программы стоит после
+// каждого сложения, так что подряд они идут только там, где её нет).
 fn emit_alu_imm(ext: int, dst: int, v: int) {
+    if dst == RAX && (ext == 0 || ext == 5) && addimm_end == code_len && addimm_at >= barrier {
+        var s = addimm_val + v
+        if ext == 5 {
+            s = addimm_val - v
+        }
+        if fits_i32(s) && fits_i32(v) {
+            code_rollback(addimm_at)
+            addimm_at = code_len
+            addimm_val = s
+            emit_alu_imm_raw(0, RAX, s)
+            addimm_end = code_len
+            return
+        }
+    }
     if dst == RAX && (ext == 0 || ext == 5) {
         addimm_at = code_len
         addimm_val = v
@@ -341,6 +358,20 @@ fn emit_mem_index(op: int, reg: int, base: int, index: int, disp: int, w: bool) 
     } else if md == 0x80 {
         emit32(disp)
     }
+}
+
+// Операция группы 0x81 над qword [base + disp] с числом (v — 32 бита).
+fn emit_mem_imm(ext: int, base: int, disp: int, v: int) {
+    emit8(0x48 | (base >> 3))
+    if v >= -128 && v <= 127 {
+        emit8(0x83)
+        emit_modrm_mem(ext, base, disp)
+        emit8(v & 255)
+        return
+    }
+    emit8(0x81)
+    emit_modrm_mem(ext, base, disp)
+    emit32(v & 0xFFFFFFFF)
 }
 
 fn emit_alu_imm_raw(ext: int, dst: int, v: int) {

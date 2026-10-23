@@ -19,9 +19,7 @@ fn parse_atom() -> int {
         }
         let at = code_len
         emit_mov_imm(RAX, t.val)
-        if fits_i32(t.val) {
-            note_simple(OPK_IMM, t.val, at)
-        }
+        note_simple(OPK_IMM, t.val, at)
         int_lit_end = pos
         return ty_int
     }
@@ -196,7 +194,7 @@ fn parse_ident(w: int) -> int {
             let c = consts[sym_idx(s)]
             let at = code_len
             emit_mov_imm(RAX, c.val)
-            if c.ty == ty_int && fits_i32(c.val) {
+            if c.ty == ty_int {
                 note_simple(OPK_IMM, c.val, at)
             }
             return c.ty
@@ -1092,7 +1090,12 @@ fn inline_call(fi: int, n: int, deferred: bool) {
     while i >= 0 {
         if !deferred || arg_kind[base + i] < 0 {
             emit_pop(RAX)
+            // значение ещё в rax: чтение параметра сразу за записью не нужно
+            stored_at = code_len
             emit_store(RBP, slots[i], RAX)
+            stored_end = code_len
+            stored_reg = -1
+            stored_off = slots[i]
         }
         i -= 1
     }
@@ -1298,6 +1301,19 @@ fn parse_store(t: Token, name: str) -> int {
         return ty_void
     }
     var src = RAX
+    // значение — число: mov [адрес], число (без rax)
+    var imm = false
+    var iv = 0
+    if simple_kind == OPK_IMM && (name == "store8" || fits_i32(simple_val)) {
+        let k0 = op_kind
+        let v0 = op_val
+        if take_simple() {
+            imm = true
+            iv = op_val
+        }
+        op_kind = k0
+        op_val = v0
+    }
     if base < 0 {
         if deferred {
             op_kind = lk
@@ -1308,7 +1324,15 @@ fn parse_store(t: Token, name: str) -> int {
         }
         base = RCX
     }
-    if name == "store8" {
+    if imm {
+        if name == "store8" {
+            emit_mem_sized(0xC6, 0, base, disp, false)
+            emit8(iv & 255)
+        } else {
+            emit_mem_sized(0xC7, 0, base, disp, name == "store64")
+            emit32(iv & 0xFFFFFFFF)
+        }
+    } else if name == "store8" {
         emit_mem_sized(0x88, src, base, disp, false)
     } else if name == "store32" {
         emit_mem_sized(0x89, src, base, disp, false)

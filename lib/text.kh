@@ -32,6 +32,11 @@ const STRC_MEMO = 40
 const STRC_LNEXT = 48
 const STRC_LLAST = 56
 const STRC_LMRU = 64
+const STRC_MIDFULL = 72
+// факты последней средней строки, у которой нет места: kp, kn, факты
+const STRC_FKP = 80
+const STRC_FKN = 88
+const STRC_FF = 96
 // лёгкие места: по STRC_LW байт с STRC_LIGHT
 const STRC_LIGHT = 128
 const STRC_LIGHT_N = 4
@@ -116,8 +121,11 @@ fn __strc_add(n: int) {
 //       которую последней нашёл __strc_key, [40] память фактов или 0 (ниже),
 //       [48] следующее лёгкое место, [56] адрес лёгкого места − блок + 1, курсор
 //       которого передвинул последний поиск, [64] адрес − блок лёгкого места,
-//       которое последним нашёл __strc_key (0 — никакого), [128] лёгкие места
-//       (ниже);
+//       которое последним нашёл __strc_key (0 — никакого), [72] 1 — у строки
+//       короче STRC_BIG байт может быть запись (иначе такую ищут только в лёгких
+//       местах), [80] [88] [96] — ключ и факты последней средней строки без
+//       лёгкого места (её длину узнали, а места она ещё не заняла), [128]
+//       лёгкие места (ниже);
 //   kp, kn — ключ (kp = 0 — запись свободна);
 //   cnt    — число символов + 1 (0 — неизвестно);
 //   vup    — [0, vup) — правильный UTF-8, vup — граница символа;
@@ -127,7 +135,8 @@ fn __strc_add(n: int) {
 //            пока он не нужен. Два курсора — для двух указателей (палиндром).
 //
 // Лёгкие места: строка короче STRC_BIG байт записи сразу не получает — её ключ
-// ложится в одно из STRC_LIGHT_N лёгких мест по кругу: [0] kp, [8] kn, [16]
+// ложится в лёгкое место: их STRC_LIGHT_N, по два на бит хеша ключа, в паре —
+// по очереди (новый ключ вытесняет не тот, что положили последним): [0] kp, [8] kn, [16]
 // факты (число символов + 1 | STRC_VALID, если правильна вся строка; 0 —
 // неизвестно), [24] ck, [32] cb — один курсор, [40] far. Обращение через лёгкое
 // место — без записи: от курсора, если он не дальше цели, иначе от начала;
@@ -136,7 +145,9 @@ fn __strc_add(n: int) {
 // раз (длина, символ, срез многих разных полей), этого хватает, и запись — поиск
 // места, вытеснение, второй курсор — ей не нужна. Второй дальний переход
 // (больше STRC_LFAR символов от опоры: два указателя, вразнобой) делает место
-// записью (__strc_promote) с его фактами и курсором.
+// записью (__strc_promote) с его фактами и курсором. Длине курсор не нужен:
+// len() места не занимает, а факты кладёт в слова [80]–[96] блока, откуда их
+// возьмёт место, если строку потом спросят о символе.
 //
 // Память фактов: дальние переходы (far) и индекс (ix) длинной строки
 // переживают вытеснение её записи. Без неё строка, которую вытесняют между
@@ -306,27 +317,38 @@ fn __strc_remember(b: int, e: int, p: int, n: int) {
     store64(z, p)
 }
 
+// Пара лёгких мест ключа (p, n): номер первого (0 или 2) — по старшему биту хеша.
+fn __strc_light_pair(p: int, n: int) -> int {
+    return 2 * (((p ^ (n << 24)) * 0x7F4A7C159E3779B1) >> 63 & 1)
+}
+
 // Лёгкое место ключа (p, n) (адрес) или 0.
 fn __strc_light_find(b: int, p: int, n: int) -> int {
-    var z = b + STRC_LIGHT
-    let end = z + STRC_LW * STRC_LIGHT_N
-    while z < end {
-        if load64(z) == p && load64(z + 8) == n {
-            return z
-        }
-        z += STRC_LW
+    let z = b + STRC_LIGHT + STRC_LW * __strc_light_pair(p, n)
+    if load64(z) == p && load64(z + 8) == n {
+        return z
+    }
+    if load64(z + STRC_LW) == p && load64(z + STRC_LW + 8) == n {
+        return z + STRC_LW
     }
     return 0
 }
 
-// Ключ (p, n) — в следующее лёгкое место: факты неизвестны, курсор — на начале.
-// → адрес места.
+// Ключ (p, n) — в лёгкое место своей пары, которое занимали раньше другого:
+// факты неизвестны, курсор — на начале. → адрес места.
 fn __strc_light_new(b: int, p: int, n: int) -> int {
-    let i = load64(b + STRC_LNEXT) & (STRC_LIGHT_N - 1)
-    store64(b + STRC_LNEXT, i + 1)
+    let h = __strc_light_pair(p, n)
+    // бит h слова STRC_LNEXT — какое место пары следующее
+    let bits = load64(b + STRC_LNEXT)
+    let i = h + ((bits >> h) & 1)
+    store64(b + STRC_LNEXT, bits ^ (1 << h))
     let z = b + STRC_LIGHT + STRC_LW * i
     store64(z, 0)
-    store64(z + 16, 0)
+    var f = 0
+    if load64(b + STRC_FKP) == p && load64(b + STRC_FKN) == n {
+        f = load64(b + STRC_FF)
+    }
+    store64(z + 16, f)
     store64(z + 24, 0)
     store64(z + 32, 0)
     store64(z + 40, 0)
@@ -438,6 +460,7 @@ fn __strc_promote(b: int, z: int, p: int, n: int) {
     if e < 0 {
         e = old
     }
+    store64(b + STRC_MIDFULL, 1)
     __strc_init(b, e, p, n, z)
     store64(b + STRC_LLAST, 0)
     store64(b + STRC_MRU, e + 1)
@@ -465,12 +488,43 @@ fn __strc_drop(b: int, e: int) {
     store64(x + STRC_KP, 0)
 }
 
+// Для длины: как __strc_key, но средней строке без лёгкого места его не
+// заводит — ответ -1 (факты — в словах [80]–[96]).
+fn __strc_key_len(b: int, p: int, n: int) -> int {
+    if n < STRC_BIG && load64(b + STRC_MIDFULL) == 0 && __strc_mode != STRC_STRESS {
+        let z0 = b + STRC_LIGHT + STRC_LW * __strc_light_pair(p, n)
+        if load64(z0) == p && load64(z0 + 8) == n {
+            return -z0
+        }
+        let z1 = z0 + STRC_LW
+        if load64(z1) == p && load64(z1 + 8) == n {
+            return -z1
+        }
+        return -1
+    }
+    return __strc_key(b, p, n)
+}
+
 // Запись ключа (p, n) с проверенными фактами: та, что нашлась в прошлый раз,
 // иначе __strc_find. Отрицательный ответ -z — у ключа лёгкое место z.
 fn __strc_key(b: int, p: int, n: int) -> int {
     var e = load64(b + STRC_MRU) - 1
     var x = b + 8 * e
     if e < 0 || load64(x + STRC_KP) != p || load64(x + STRC_KN) != n {
+        if n < STRC_BIG && load64(b + STRC_MIDFULL) == 0 && __strc_mode != STRC_STRESS {
+            // у средних строк записей нет: только лёгкие места (как
+            // __strc_light_find и __strc_light_new, без вызовов)
+            let h = __strc_light_pair(p, n)
+            let z0 = b + STRC_LIGHT + STRC_LW * h
+            if load64(z0) == p && load64(z0 + 8) == n {
+                return -z0
+            }
+            let z1 = z0 + STRC_LW
+            if load64(z1) == p && load64(z1 + 8) == n {
+                return -z1
+            }
+            return -__strc_light_new(b, p, n)
+        }
         // лёгкое место, которое нашлось в прошлый раз
         let lz = load64(b + STRC_LMRU)
         let z = b + lz
@@ -536,6 +590,9 @@ fn __strc_find(b: int, p: int, n: int) -> int {
     }
     if e < 0 {
         e = old
+    }
+    if n < STRC_BIG {
+        store64(b + STRC_MIDFULL, 1)
     }
     __strc_init(b, e, p, n, 0)
     store64(b + STRC_MRU, e + 1)
@@ -726,16 +783,7 @@ fn __strc_off(b: int, e: int, p: int, n: int, k: int) -> int {
     if k >= ak {
         off = __strc_fwd(b, e, p, n, ak, ab, k)
     } else {
-        // назад: в правильной части символ начинается с байта не 10xxxxxx
-        var j = ak
-        while j > k && off > 0 {
-            off -= 1
-            while off > 0 && (load8(p + off) & 0xC0) == 0x80 {
-                off -= 1
-            }
-            j -= 1
-        }
-        __strc_add(ab - off)
+        off = __utf8_back(p, ab, ak - k)
     }
     if off < n {
         if from >= 0 {
@@ -747,20 +795,36 @@ fn __strc_off(b: int, e: int, p: int, n: int, k: int) -> int {
     return off
 }
 
-// s[i] вразнобой по правильной строке (p, n) с индексом (запись e): опора —
-// точка индекса (не дальше 63 символов) или курсор записи, если с него ближе
-// (вперёд — i − ck, назад — 8·(ck − i)); строка правильная, и пропуск точен.
-// Курсор — сразу на следующий символ: тот, с которого шли, иначе второй, если
-// он не нужен, иначе ближний. → смещение символа i или -1, если опора испорчена
-// (тогда — общий путь, он её сбросит).
-fn __strc_at_ix(b: int, e: int, p: int, n: int, i: int) -> int {
-    let x = b + 8 * e
+// Начало символа на j символов раньше символа в байте o строки p (в правильной
+// части): символ начинается с байта не 10xxxxxx. Отдельно — чтобы цикл не
+// забирал регистры у вызывающих.
+fn __utf8_back(p: int, o0: int, j0: int) -> int {
+    var o = o0
+    var j = j0
+    while j > 0 && o > 0 {
+        o -= 1
+        while o > 0 && (load8(p + o) & 0xC0) == 0x80 {
+            o -= 1
+        }
+        j -= 1
+    }
+    __strc_add(o0 - o)
+    return o
+}
+
+// s[i] вразнобой по правильной строке (p, n) с индексом (запись x — её адрес
+// b + 8·e): опора — точка индекса (не дальше 63 символов) или курсор записи,
+// если с него ближе (вперёд — i − ck, назад — 8·(ck − i)); строка правильная, и
+// пропуск точен. Курсор — сразу на следующий символ: тот, с которого шли, иначе
+// второй, если он не нужен, иначе ближний. → смещение символа i или -1, если
+// опора испорчена (тогда — общий путь, он её сбросит).
+fn __strc_at_ix(b: int, x: int, p: int, n: int, i: int) -> int {
     var ak = i & ~63
     var ab = load64(load64(x + STRC_IX) + 8 * (i >> 6))
     var cost = i - ak
     var from = -1
     let k0 = load64(x + STRC_CK)
-    let k1 = load64(x + STRC_CK + STRC_CUR)
+    let k1 = load64(x + (STRC_CK + STRC_CUR))
     if cost > 0 && k0 >= 0 {
         var d = 8 * (k0 - i)
         if k0 <= i {
@@ -780,7 +844,7 @@ fn __strc_at_ix(b: int, e: int, p: int, n: int, i: int) -> int {
         }
         if d < cost {
             ak = k1
-            ab = load64(x + STRC_CB + STRC_CUR)
+            ab = load64(x + (STRC_CB + STRC_CUR))
             from = 1
         }
     }
@@ -791,19 +855,13 @@ fn __strc_at_ix(b: int, e: int, p: int, n: int, i: int) -> int {
     if i >= ak {
         o = ab + __utf8_skip(p + ab, n - ab, i - ak)
     } else {
-        // назад: символ начинается с байта не 10xxxxxx
-        var j = ak
-        while j > i && o > 0 {
-            o -= 1
-            while o > 0 && (load8(p + o) & 0xC0) == 0x80 {
-                o -= 1
-            }
-            j -= 1
-        }
-        __strc_add(ab - o)
+        o = __utf8_back(p, ab, ak - i)
+    }
+    if o >= n {
+        return -1
     }
     let w = __tx_lead_width(load8(p + o))
-    if o >= n || w == 0 || o + w > n {
+    if w == 0 || o + w > n {
         return -1
     }
     if o + w < n {
@@ -816,7 +874,7 @@ fn __strc_at_ix(b: int, e: int, p: int, n: int, i: int) -> int {
         let y = x + STRC_CUR * from
         store64(y + STRC_CK, i + 1)
         store64(y + STRC_CB, o + w)
-        store64(b + STRC_LAST, 8 * e + STRC_CUR * from + 1)
+        store64(b + STRC_LAST, y - b + 1)
     }
     return o
 }
@@ -969,23 +1027,32 @@ fn __text_len(self: str) -> int {
     let n = __str_len(self)
     let b = __strc_for(n)
     if b != 0 {
-        let e = __strc_key(b, p, n)
+        let e = __strc_key_len(b, p, n)
         if e >= 0 {
             return __strc_count(b, e, p, n)
         }
-        // лёгкое место: факты оттуда или одним проходом — туда
-        let z = -e
-        let c1 = __strc_light_cnt(load64(z + 16), n)
+        // факты — из лёгкого места или из слов [80]–[96], иначе одним проходом —
+        // туда же
+        var fa = b + STRC_FF
+        if e != -1 {
+            fa = 16 - e
+        } else if load64(b + STRC_FKP) != p || load64(b + STRC_FKN) != n {
+            store64(b + STRC_FKP, 0)
+            store64(b + STRC_FF, 0)
+            store64(b + STRC_FKN, n)
+            store64(b + STRC_FKP, p)
+        }
+        let c1 = __strc_light_cnt(load64(fa), n)
         if c1 != 0 {
             return c1 - 1
         }
         let c = __utf8_scan(p, n)
         if c >= 0 {
-            store64(z + 16, (c + 1) | STRC_VALID)
+            store64(fa, (c + 1) | STRC_VALID)
             return c
         }
         let g = __tx_go_count(p, n)
-        store64(z + 16, g + 1)
+        store64(fa, g + 1)
         return g
     }
     let c = __utf8_scan(p, n)
@@ -1006,31 +1073,47 @@ fn __text_at(self: str, i: int) -> str {
     var e = -1
     var off = 0
     if b != 0 {
-        // проход по порядку: курсор прошлого поиска — ровно на i, в известной
-        // правильной части. Там граница символа — байт не 10xxxxxx, а ширина —
-        // по первому байту; курсор сразу — на следующий символ (как дальше
-        // делают __strc_off и __strc_move, только без них)
+        // запись прошлого поиска. Проход по порядку: её курсор — ровно на i, в
+        // известной правильной части. Там граница символа — байт не 10xxxxxx, а
+        // ширина — по первому байту; курсор сразу — на следующий символ (как
+        // дальше делают __strc_off и __strc_move, только без них). Другой
+        // символ правильной строки с индексом — сразу через индекс, без
+        // __strc_key
         let t = load64(b + STRC_LAST) - 1
         // y — курсор t (его поля — по адресам y + STRC_CK, y + STRC_CB), x — его
         // запись: её поле f — по адресу x + f
         let y = b + t
         let x = b + (t & (STRC_CUR - 1))
-        if t >= 0 && load64(y + STRC_CK) == i && load64(x + STRC_KP) == p && load64(x + STRC_KN) == n {
-            let o = load64(y + STRC_CB)
-            let vup = load64(x + STRC_VUP)
-            if o >= 0 && o < vup && vup <= n {
-                let c0 = load8(p + o)
-                let w = __tx_lead_width(c0)
-                if w > 0 && o + w <= vup {
-                    let clock = load64(b + STRC_CLOCK) + 1
-                    store64(b + STRC_CLOCK, clock)
-                    store64(x + STRC_USE, clock)
-                    if o + w < n {
-                        store64(y + STRC_CK, i + 1)
-                        store64(y + STRC_CB, o + w)
+        if t >= 0 && load64(x + STRC_KP) == p && load64(x + STRC_KN) == n {
+            var o = -1
+            var w = 0
+            if load64(y + STRC_CK) == i {
+                o = load64(y + STRC_CB)
+                let vup = load64(x + STRC_VUP)
+                if o >= 0 && o < vup && vup <= n {
+                    w = __tx_lead_width(load8(p + o))
+                    if w > 0 && o + w <= vup {
+                        if o + w < n {
+                            store64(y + STRC_CK, i + 1)
+                            store64(y + STRC_CB, o + w)
+                        }
+                    } else {
+                        o = -1
                     }
-                    return __tx_char(p, o, w)
+                } else {
+                    o = -1
                 }
+            } else if load64(x + STRC_IX) != 0 && load64(x + STRC_VUP) == n && i < load64(x + STRC_CNT) - 1 {
+                o = __strc_at_ix(b, x, p, n, i)
+                if o >= 0 {
+                    w = __tx_lead_width(load8(p + o))
+                }
+            }
+            if o >= 0 {
+                let clock = load64(b + STRC_CLOCK) + 1
+                store64(b + STRC_CLOCK, clock)
+                store64(x + STRC_USE, clock)
+                return __tx_char(p, o, w)
             }
         }
         // то же у лёгкого места, если строка правильная целиком
@@ -1053,7 +1136,7 @@ fn __text_at(self: str, i: int) -> str {
         if e >= 0 {
             let x0 = b + 8 * e
             if load64(x0 + STRC_IX) != 0 && load64(x0 + STRC_VUP) == n && i < load64(x0 + STRC_CNT) - 1 {
-                let o = __strc_at_ix(b, e, p, n, i)
+                let o = __strc_at_ix(b, x0, p, n, i)
                 if o >= 0 {
                     return __tx_char(p, o, __tx_lead_width(load8(p + o)))
                 }
