@@ -72,6 +72,9 @@ fn main() -> int {
         user: env("CLICKHOUSE_USER") ?? "khrip",
         password: env("CLICKHOUSE_PASSWORD") ?? "test-only"
     }
+    // база тестов (CLICKHOUSE_DATABASE, по умолчанию khrip_test) создаётся
+    // здесь, а не стендом tests/databases/run.sh
+    successful(ch_query_params(ChConfig { ...c, database: "default" }, "CREATE DATABASE IF NOT EXISTS \{d:Identifier}", {"d": c.database}), "create database")
     let table = "kh_events_" + random_str(12)
     successful(ch_query_params(c, "CREATE TABLE \{t:Identifier} (id Int64, name String, active Bool, score Float64, note Nullable(String), tags Array(String), numbers Array(Nullable(Int64))) ENGINE=Memory", {"t": table}), "create")
     let original = [

@@ -147,4 +147,6 @@ if __name__ == "__main__":
         context.minimum_version = ssl.TLSVersion.TLSv1_3
         context.load_cert_chain(sys.argv[2] + "/chain_ec.pem", sys.argv[2] + "/leaf.key")
         server.socket = context.wrap_socket(server.socket, server_side=True)
+    # tests/clickhouse.sh ждёт эту строку: порт открыт и TLS уже настроен
+    print("ready", flush=True)
     server.serve_forever()

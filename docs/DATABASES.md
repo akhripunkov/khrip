@@ -4,10 +4,27 @@
 остаются статическими Linux x86-64 ELF без libc, внешнего драйвера и отдельного
 процесса-посредника. Неиспользуемые функции не попадают в исполняемый файл.
 
+Библиотека драйвера подключается, только если программа пользуется её именем:
+функцией, типом или константой (`mongo_find`, `Mongo`, `bson_new`, `ChConfig`,
+...) или встроенной функцией (`to_bson`, `from_bson`, `ch_encode`, `ch_decode`).
+Имя сравнивается точно и после разрешения: своё имя программы — её собственное.
+Поэтому программа со своей `type Mongo` или `fn ch_query` компилируется, а
+программа без драйверов не платит за них ни размером, ни временем компиляции.
+Если программа пользуется драйвером и объявляет то же имя, что и он, ошибка
+указывает на объявление в программе: `'Mongo' is also a name of the MongoDB
+driver (lib/mongo.kh), which this program uses`.
+
 Подключения задаются значениями `Mongo` и `ChConfig`: одна программа может
 обращаться к нескольким базам, в том числе одновременно с PostgreSQL.
 Ожидание сети использует сопрограммы рантайма; блокировка `store` отпускается
 на время операции. Значения `store` после такого вызова следует читать заново.
+Маршрут, который `store` только читает, берёт разделяемую блокировку и с
+драйверами (`khc check --locks`): сетевые вызовы, разбор и чтение BSON её не
+меняют. Построители `bson_*`, `mongo_next` и `mongo_close` меняют свой первый
+аргумент; это запись, только если аргумент может быть из `store`. Новый
+построитель (`bson_new()`), курсор (`mongo_find`, `mongo_find_with`,
+`mongo_cursor`) в локальной переменной и параметр типа `BsonBuilder` или
+`MongoCursor` (в `store` их не положить) — не из `store`.
 
 Это первая реализация драйверов с явно ограниченными возможностями. Она не
 обещает совместимости со всем API официальных MongoDB/ClickHouse-драйверов.
@@ -20,7 +37,8 @@
 ## MongoDB
 
 Протокол OP_MSG, BSON, SCRAM-SHA-256, TLS 1.3 с проверкой сертификата и имени
-сервера. Поддерживается MongoDB 6+ через один прямой IPv4-адрес или DNS-имя.
+сервера (`tls=true`, свой CA — `tlsCAFile`). Поддерживается MongoDB 6+ через
+один прямой IPv4-адрес или DNS-имя.
 Реплика требует
 `directConnection=true` и подключения к текущему primary. Автоматического поиска
 primary, DNS SRV, клиентских сессий, транзакций и retryable writes пока нет.
@@ -114,7 +132,13 @@ let update = bson_new()
 bson_doc(update, "$set", bson_finish(fields))
 let changed = mongo_update(primary, "app", "events",
     bson_finish(filter), bson_finish(update))
+if changed.error != "" {
+    eprint(changed.error)
+}
 ```
+
+Результат записи проверяйте всегда: вызов без проверки компилируется, а ошибка
+(дубликат ключа, отказ в доступе, обрыв) тогда пропадает молча.
 
 Поля читают `bson_get_int`, `bson_get_float`, `bson_get_str`, `bson_get_bool`,
 `bson_get_doc`, `bson_get_binary` (результат `T?`) и `bson_get_array` (`[Bson]?`:
@@ -145,8 +169,11 @@ let changed = mongo_update(primary, "app", "events",
 ```khrip
 let recent = mongo_find_with(primary, "app", "events", to_bson({ "user": user_id }),
     MongoFindOptions { sort: to_bson({ "ts": -1 }), limit: 20 })
-mongo_create_indexes(primary, "app", "users",
+let indexed = mongo_create_indexes(primary, "app", "users",
     [MongoIndex { keys: to_bson({ "email": 1 }), unique: true }])
+if indexed.error != "" {
+    eprint(indexed.error)
+}
 ```
 
 У курсора есть `documents: [Bson]`, `id`, `error`, `code`, `ns`. Сначала обработайте
@@ -226,8 +253,17 @@ maxBsonObjectSize + 16 КиБ (документы плюс обёртка кур
   неизвестные имена.
 
 Пароль SCRAM пока должен состоять из печатных ASCII-символов: Unicode SASLprep
-не реализован. TLS требует сервера, поддерживающего TLS 1.3. Компрессия
-протокола не реализована.
+не реализован. TLS требует сервера, поддерживающего TLS 1.3. mongod 7+ с
+`tlsCAFile` в каждом рукопожатии просит сертификат клиента
+(CertificateRequest); своего сертификата у Khrip нет, и он отвечает пустым, как
+велит RFC 8446. Сервер с `--tlsAllowConnectionsWithoutCertificates` (или
+`net.tls.allowConnectionsWithoutCertificates`) такого клиента пускает. mongod,
+которому сертификат клиента обязателен, закрывает соединение сразу после
+рукопожатия, и ошибка называет вероятную причину: `MongoDB closed the TLS
+connection before answering: the server may require a client certificate ...`;
+сервер, который отвечает alert, даёт `tls: the server rejected TLS: certificate
+required`. Клиентских сертификатов (взаимного TLS, X.509-аутентификации) нет.
+Компрессия протокола не реализована.
 
 ## ClickHouse
 
@@ -383,6 +419,10 @@ Tuple, Map, IPv4/IPv6 и другие типы приводите в запро�
 Блокировки соединений и дескрипторы незавершённых операций хранятся отдельно
 для каждой сопрограммы. При `panic` или `fail` активное соединение закрывается
 до освобождения арены запроса. Пулы и их сетевые буферы живут вне арены.
+Сначала идут очистки, которые не ждут сеть: MongoDB, ClickHouse и
+недостроенное соединение TLS (оно освобождается и в программе, где есть
+только `fetch`); последним — откат открытой транзакции PostgreSQL, который
+ждёт сервер до 5 с.
 
 ## Проверка
 
@@ -403,8 +443,21 @@ bash tests/databases/runtime.sh
 после `fail`/`panic` на одном и двух потоках; ему нужны оба адреса БД.
 Настоящие подключения
 проверяются при заданных `MONGODB_URI` и `CLICKHOUSE_URL` (также
-`CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`). Используйте отдельную тестовую базу:
-сценарии создают и удаляют временные коллекции/таблицы.
+`CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`; база ClickHouse — `CLICKHOUSE_DATABASE`,
+по умолчанию `khrip_test`, тесты создают её сами). Используйте отдельную
+тестовую базу: сценарии создают и удаляют временные коллекции/таблицы.
+
+TLS к настоящему mongod проверяет `tests/mongo/tls.sh` (его запускает
+`tests/mongo.sh`): контейнер с `--tlsMode requireTLS`, своим CA и
+`--tlsAllowConnectionsWithoutCertificates`, 200 команд по одному соединению,
+вставка и чтение 2000 документов, отказ при чужом CA; второй контейнер — без
+этого ключа, ошибка должна назвать сертификат клиента. Ему нужен docker и образ
+MongoDB (`MONGODB_TEST_IMAGE`, иначе `mongo:8.0` или
+`mirror.gcr.io/library/mongo:8.0`); без них сценарий пишет строку `SKIP`.
+
+`tests/run.sh` запускает все три сценария (`runtime.sh` — когда заданы оба
+адреса) и печатает их строки `SKIP`: пропуск настоящих серверов виден в
+итоге, а не только в журнале.
 
 Воспроизводимый запуск на Linux и macOS с Docker:
 
@@ -415,8 +468,21 @@ bash tests/databases/run.sh --all
 
 Сценарий создаёт отдельную сеть, серверы с аутентификацией и Linux amd64
 контейнер компилятора. Порты хоста и постоянные тома не используются. Версии
-образов закреплены digest; есть переопределения `MONGODB_TEST_IMAGE` и
-`CLICKHOUSE_TEST_IMAGE`. Контейнеры и сеть удаляются после завершения.
+образов закреплены digest; есть переопределения `MONGODB_TEST_IMAGE`,
+`CLICKHOUSE_TEST_IMAGE` и `KHRIP_TEST_BASE_IMAGE` (база контейнера компилятора),
+а `KHRIP_TEST_REGISTRY=mirror.gcr.io` берёт все три образа из другого реестра с
+теми же digest — когда Docker Hub ограничивает скачивания. Контейнеры и сеть
+удаляются после завершения.
+
+С `--host` контейнера компилятора нет: проверки идут на этой машине (нужны
+nasm, python3, openssl, curl; для `--all` — PostgreSQL), а серверы открывают
+порты на 127.0.0.1, которые выбирает docker. Так стенд работает и там, где
+контейнеру не скачать пакеты. Предел открытых файлов ClickHouse — не выше
+жёсткого предела машины (`CLICKHOUSE_TEST_NOFILE`).
+
+```sh
+KHRIP_TEST_REGISTRY=mirror.gcr.io bash tests/databases/run.sh --host
+```
 
 Минимальные запускаемые примеры — [MongoDB](../examples/databases/mongo.kh)
 и [ClickHouse](../examples/databases/clickhouse.kh).

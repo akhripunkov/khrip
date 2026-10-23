@@ -1,0 +1,82 @@
+// Маршруты с драйверами: построители BSON, сетевые вызовы MongoDB и
+// ClickHouse (на время ожидания они отпускают блокировку store) и курсор —
+// read, пока маршрут store только читает. Функции, которые меняют свой
+// аргумент (bson_* построители, mongo_next, mongo_close), — запись, если
+// аргумент может быть из store; свежий построитель или курсор, а также
+// параметр типа BsonBuilder или MongoCursor (в store их не положить) — нет.
+
+type Event {
+    id: int, page: str
+}
+
+store events: [Event] = []
+store hits: int = 0
+store client: Mongo = Mongo { uri: "mongodb://127.0.0.1:27017/app" }
+store ch: ChConfig = ChConfig { url: "http://127.0.0.1:8123/" }
+
+// GET читает store и спрашивает ClickHouse
+route GET "/clickhouse" -> int | 503 str {
+    let r = ch_query_params(ch, "SELECT count() FROM events WHERE id > \{n:Int64}", {"n": hits.to_str()})
+    let w = ch_insert(ch, "events", ch_encode(events))
+    if !r.ok || !w.ok {
+        return 503 r.error + w.error
+    }
+    return r.body.byte_len()
+}
+
+route GET "/builders" -> int {
+    let b = bson_new()
+    bson_str(b, "page", "/a")
+    bson_int(b, "hits", hits)
+    b.bson_bool("ok", true)
+    let n = bson_get_int(bson_finish(b), "hits") ?? 0
+    return n
+}
+
+route GET "/mongo" -> int {
+    let filter = bson_new()
+    bson_int(filter, "n", hits)
+    let r = mongo_command(client, "app", bson_finish(filter))
+    let c = mongo_find(client, "app", "events", to_bson({"n": hits}))
+    var n = c.documents.len()
+    while c.id != 0 && mongo_next(c) {
+        n += c.documents.len()
+    }
+    mongo_close(c)
+    let m = client.mongo_find("app", "events", r.document)
+    m.mongo_close()
+    return n + (bson_get_int(r.document, "n") ?? 0)
+}
+
+// помощники с параметрами BsonBuilder и MongoCursor ничего в store не меняют
+fn add_page(b: BsonBuilder, page: str) {
+    bson_str(b, "page", page)
+}
+
+fn drain(c: MongoCursor) -> int {
+    var n = 0
+    while mongo_next(c) {
+        n += c.documents.len()
+    }
+    return n
+}
+
+route GET "/helpers" -> int {
+    let b = bson_new()
+    add_page(b, "/x")
+    return drain(mongo_find(client, "app", "events", bson_finish(b)))
+}
+
+// курсор не свежий: элемент списка — для анализа значение может быть из store
+fn first_next(cs: [MongoCursor]) -> bool {
+    return mongo_next(cs[0])
+}
+
+route GET "/cursor-list" -> bool {
+    return first_next([mongo_find(client, "app", "events", to_bson({"n": 1}))])
+}
+
+route POST "/count" -> int {
+    hits += 1
+    return hits
+}

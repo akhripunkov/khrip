@@ -90,6 +90,13 @@ handshake "HelloRetryRequest: P-256 вместо X25519" "^200 TLS_" -tls1_3 "${
 handshake "просроченный сертификат сервера" "expired" -tls1_3 -cert leafexpired.pem -key leaf.key -cert_chain inter.pem
 handshake "сервер только с TLS 1.2" "protocol version" -tls1_2 "${ec[@]}"
 handshake "нет общей группы" "handshake failure" -tls1_3 "${ec[@]}" -groups X448
+# CertificateRequest (так всегда делает mongod 7+ с tlsCAFile): клиент без
+# сертификата отвечает пустым Certificate перед Finished, сервер решает сам
+handshake "CertificateRequest: пустой Certificate" "^200 TLS_AES_128_GCM_SHA256$" -tls1_3 "${ec[@]}" -verify 1 -CAfile root.pem \
+	-ciphersuites TLS_AES_128_GCM_SHA256
+handshake "CertificateRequest с SHA-384 и HelloRetryRequest" "^200 TLS_AES_256_GCM_SHA384$" -tls1_3 "${ec[@]}" -verify 1 \
+	-ciphersuites TLS_AES_256_GCM_SHA384 -groups P-256
+handshake "сервер требует сертификат клиента" "certificate required" -tls1_3 "${ec[@]}" -Verify 1
 
 # KeyUpdate от сервера посреди соединения: s_server по команде «K» из stdin
 mkfifo "$tls_dir/ku"

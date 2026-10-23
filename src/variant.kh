@@ -602,9 +602,10 @@ fn parse_lambda_method(rt: int, nt: Token) -> int {
                 exits.push(emit_jmp())
                 rtype = ty_bool
             } else {
-                // find: первый подходящий элемент
+                // find: первый подходящий элемент. Необязательный элемент (T?)
+                // уже значение или none: T?? — тот же T?, без второй коробки
                 emit_load_local(x)
-                if !is_ref(et) {
+                if !is_ref(et) && tkind(et) != K_OPT {
                     emit_box()
                 }
                 emit_store_local(res)

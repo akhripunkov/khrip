@@ -17,7 +17,7 @@ fn runtime_mongo() -> Mongo {
 fn runtime_ch() -> ChConfig {
     return ChConfig {
         url: env("CLICKHOUSE_URL") ?? "http://clickhouse:8123/",
-        database: "khrip_test",
+        database: env("CLICKHOUSE_DATABASE") ?? "khrip_test",
         user: env("CLICKHOUSE_USER") ?? "khrip",
         password: env("CLICKHOUSE_PASSWORD") ?? "khrip_database_test_password"
     }
@@ -36,6 +36,9 @@ fn runtime_check_ch(r: ChResult) {
 route GET "/ready" -> str { return "ready" }
 
 route POST "/init" -> 204 {
+    // база ClickHouse — своя (CLICKHOUSE_DATABASE): создаётся, если её нет
+    let c = runtime_ch()
+    runtime_check_ch(ch_query_params(ChConfig { ...c, database: "default" }, "CREATE DATABASE IF NOT EXISTS \{d:Identifier}", {"d": c.database}))
     runtime_check_ch(ch_query_params(runtime_ch(), "CREATE TABLE \{t:Identifier} (id Int64, value String) ENGINE=Memory", {"t": runtime_name()}))
     return 204
 }

@@ -914,6 +914,10 @@ fn __mongo_send(c: int, wire: str, request: int, deadline: int, limit: int) -> M
         let read = __link_read(tls, handle, b, deadline)
         __mongo_save(c, b)
         if read <= 0 {
+            // alert сервера после рукопожатия (например, нужен сертификат клиента)
+            if tls != 0 && __tls_alert(tls) != "" {
+                return __mongo_failure("MongoDB connection closed: tls: " + __tls_alert(tls) + "; outcome unknown", true)
+            }
             return __mongo_failure("MongoDB connection closed or timed out; outcome unknown", true)
         }
     }
@@ -1102,6 +1106,12 @@ fn __mongo_connect(c: int, u: __MongoUrl, deadline: int) -> str {
     bson_doc(hello, "client", bson_finish(client))
     let r = __mongo_exchange(c, "admin", bson_finish(hello), deadline, 1048576)
     if r.error != "" {
+        // mongod, которому сертификат клиента обязателен, принимает пустой
+        // Certificate и закрывает соединение без alert TLS, не ответив на hello
+        let tls = load64(c + MB_TLS)
+        if tls != 0 && __tls_cert_requested(tls) && r.error.starts_with("MongoDB connection closed or timed out") {
+            return "MongoDB closed the TLS connection before answering: the server may require a client certificate, which Khrip does not send (allow clients without one: net.tls.allowConnectionsWithoutCertificates)"
+        }
         return r.error
     }
     if (__bson_get_int(r.document, "maxWireVersion", false) ?? 0) < 17 {

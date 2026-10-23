@@ -1,0 +1,104 @@
+// TLS к настоящему mongod (tests/mongo/tls.sh). Сервер запущен с
+// --tlsMode requireTLS и --tlsCAFile, поэтому в каждом рукопожатии присылает
+// CertificateRequest; с tlsAllowConnectionsWithoutCertificates он пускает
+// клиента без сертификата (пустой Certificate, RFC 8446 4.4.2) — В7.
+// Адреса: MONGO_TLS_URI (свой CA), MONGO_TLS_FOREIGN (чужой CA) и
+// MONGO_TLS_STRICT (сервер без tlsAllowConnectionsWithoutCertificates).
+
+type TlsRow {
+    _id: int, s: str
+}
+
+var checks: int
+var failures: int
+
+fn verify(label: str, ok: bool) {
+    checks += 1
+    if !ok {
+        failures += 1
+        print("FAIL " + label)
+    }
+}
+
+// Соединений, открытых сервером с его запуска (serverStatus).
+fn created(client: Mongo) -> int {
+    let status = bson_new()
+    bson_int32(status, "serverStatus", 1)
+    let r = mongo_command(client, "admin", bson_finish(status))
+    let connections = bson_get_doc(r.document, "connections") ?? bson_finish(bson_new())
+    return bson_get_int(connections, "totalCreated") ?? -1
+}
+
+fn main() -> int {
+    let client = Mongo {
+        uri: env("MONGO_TLS_URI") ?? ""
+    }
+    let ping = bson_new()
+    bson_int32(ping, "ping", 1)
+    let command = bson_finish(ping)
+    let first = mongo_command(client, "admin", command)
+    verify("ping over TLS: " + first.error, first.error == "")
+    if first.error != "" {
+        print("MongoDB TLS: {checks} checks, {failures} failed")
+        return 1
+    }
+    // одно соединение из пула на все команды: рукопожатие было один раз
+    let before = created(client)
+    var errors = 0
+    for i in 0..200 {
+        if mongo_command(client, "admin", command).error != "" {
+            errors += 1
+        }
+    }
+    let after = created(client)
+    verify("200 pings: {errors} errors", errors == 0)
+    verify("200 pings: {after - before} new connections", before > 0 && after == before)
+    // данные больше одной записи TLS в обе стороны
+    let collection = "tls_" + now_ms().to_str() + "_" + random_str(6)
+    var documents: [Bson] = []
+    for i in 0..2000 {
+        documents.push(to_bson(TlsRow {
+            _id: i, s: "строка {i} " + "x".repeat(40)
+        }))
+    }
+    let inserted = mongo_insert(client, "khrip_tls", collection, documents)
+    verify("insert 2000: " + inserted.error, inserted.error == "" && bson_get_int(inserted.document, "n") == 2000)
+    let cursor = mongo_find(client, "khrip_tls", collection, to_bson({"s": to_bson({"$exists": true})}), 500)
+    var seen = 0
+    var sum = 0
+    while true {
+        for d in cursor.documents {
+            let row: TlsRow? = from_bson(d)
+            if let r = row {
+                seen += 1
+                sum += r._id
+            }
+        }
+        if cursor.id == 0 || !mongo_next(cursor) {
+            break
+        }
+    }
+    verify("find 2000: {seen} rows, error '{cursor.error}'", seen == 2000 && sum == 1999000 && cursor.error == "")
+    let drop = bson_new()
+    bson_str(drop, "drop", collection)
+    let dropped = mongo_command(client, "khrip_tls", bson_finish(drop))
+    verify("drop: " + dropped.error, dropped.error == "")
+    // чужой CA: сертификат сервера не проверяется — отказ до отправки команд
+    let foreign = Mongo {
+        uri: env("MONGO_TLS_FOREIGN") ?? ""
+    }
+    let rejected = mongo_command(foreign, "admin", command)
+    verify("foreign CA is rejected: " + rejected.error, rejected.error.byte_find("not signed by a trusted authority") != none && !rejected.unknown_outcome)
+    // сертификат клиента обязателен: mongod закрывает соединение без alert TLS,
+    // ошибка называет причину
+    let strict = Mongo {
+        uri: env("MONGO_TLS_STRICT") ?? ""
+    }
+    let refused = mongo_command(strict, "admin", command)
+    verify("a required client certificate is named: " + refused.error, refused.error.byte_find("client certificate") != none && !refused.unknown_outcome)
+    print("MongoDB TLS (requireTLS, CertificateRequest): {checks} checks, {failures} failed")
+    if failures > 0 {
+        return 1
+    }
+    return 0
+}

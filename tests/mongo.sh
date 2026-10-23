@@ -24,6 +24,8 @@ fi
 python3 tests/mongo/pool.py "$mongo_tmp/pool"
 "$KHC" -o "$mongo_tmp/wire-client" tests/mongo/wire_client.kh
 python3 tests/mongo/wire_peer.py "$mongo_tmp/wire-client"
+# TLS к настоящему mongod в своём контейнере (В7); без docker — строка SKIP.
+KHC="$KHC" bash tests/mongo/tls.sh
 if [[ -z ${MONGODB_URI:-} ]]; then
     echo 'SKIP MongoDB integration: set MONGODB_URI or run tests/databases/run.sh'
     exit 0

@@ -795,9 +795,17 @@ fn __http_exchange(url: __Url, request: str, method: str) -> Response {
         }
         if b.len > 0 || !reused || !__idempotent(method) || now_ms() >= deadline {
             if b.len == 0 {
+                // alert сервера после рукопожатия — до закрытия, оно освобождает блок
+                var alert = ""
+                if tag != 0 {
+                    alert = __tls_alert(c)
+                }
                 __link_close(tag, c)
                 if !sent {
                     return __fetch_fail("connection closed while sending")
+                }
+                if alert != "" {
+                    return __fetch_fail("tls: " + alert)
                 }
                 if failed {
                     return __fetch_fail("timeout or connection error")

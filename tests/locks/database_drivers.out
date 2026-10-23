@@ -1,0 +1,6 @@
+GET /clickhouse: read
+GET /builders: read
+GET /mongo: read
+GET /helpers: read
+GET /cursor-list: write
+POST /count: write

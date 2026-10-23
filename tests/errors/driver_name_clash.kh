@@ -1,0 +1,13 @@
+// Своё имя, совпавшее с именем подключённого драйвера: ошибка у объявления
+// в программе, а не «already defined» внутри библиотеки.
+// expect: driver_name_clash.kh:6:6: error: 'Mongo' is also a name of the MongoDB driver (lib/mongo.kh), which this program uses
+// expect: rename yours, e.g. 'MyMongo'
+// expect: 1 error
+type Mongo {
+    uri: str
+}
+
+fn main() {
+    let r = mongo_command(Mongo { uri: "x" }, "admin", bson_finish(bson_new()))
+    print(r.error)
+}

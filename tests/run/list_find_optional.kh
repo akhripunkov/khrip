@@ -1,0 +1,37 @@
+// find у списка необязательных значений [T?] возвращает сам элемент (T?), а
+// не коробку с ним: раньше [int?] давал адрес, [str?] — пустую строку,
+// [float?] — мусор. Элемент none и «не нашлось» оба дают none.
+
+type Item {
+    name: str
+    score: int?
+}
+
+fn main() {
+    let ints: [int?] = [none, 3, 7, none, -5]
+    let i = ints.find(x => (x ?? 0) > 5)
+    print("int? {i ?? -1}")
+    print("int? missing: {(ints.find(x => (x ?? 0) > 100) ?? -1)}")
+    print("int? none element: {ints.find(x => x == none) == none}")
+    let neg = ints.find(x => (x ?? 0) < 0) ?? 0
+    print("int? negative: {neg}")
+
+    let strs: [str?] = ["", none, "hello", "мир"]
+    let s = strs.find(x => (x ?? "").byte_len() > 4) ?? "?"
+    print("str? {s} {s.byte_len()}")
+    let ru = strs.find(x => (x ?? "").starts_with("м")) ?? "?"
+    print("str? {ru}")
+
+    let floats: [float?] = [none, 0.5, 2.5]
+    let f = floats.find(x => (x ?? 0.0) > 1.0) ?? -1.0
+    print("float? {f}")
+
+    let bools: [bool?] = [none, false, true]
+    print("bool? {(bools.find(x => x != none) ?? true)}")
+    print("bool? true: {(bools.find(x => x == true) ?? false)}")
+
+    // поле с необязательным значением — через map
+    let items = [Item { name: "a", score: none }, Item { name: "b", score: 9 }]
+    let scores = items.map(it => it.score)
+    print("map then find: {scores.find(x => x != none) ?? 0}")
+}

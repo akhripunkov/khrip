@@ -1,8 +1,236 @@
 // Типизированные бинарные кодеки драйверов. Сеть остаётся в библиотеке;
 // компилятор передаёт ей то же описание типа, которое использует JSON.
 
+// ---- Какие библиотеки драйверов нужны программе ----
+// Драйвер подключается, только если программа пользуется его именем: именем
+// верхнего уровня библиотеки (fn, type, const, var — берутся из её текста,
+// без разбора) или встроенной функцией драйвера (to_bson, ch_decode, ...).
+// Имена сравниваются точно и после разрешения: имя, которое программа
+// объявляет сама, — её собственное. Поэтому своя type Mongo или fn ch_query в
+// программе без драйверов не конфликтует с библиотекой, а программа без
+// драйверов не платит за них ни временем компиляции, ни размером.
+
+type DriverLib {
+    file: str
+    title: str
+    // имена верхнего уровня библиотеки и встроенные функции драйвера
+    names: StrMap
+    used: bool
+}
+
+// Подключены ли библиотеки: lib/bson.kh, lib/mongo.kh, lib/clickhouse.kh
+// (с ней lib/db_http.kh).
+var drv_bson: bool
+var drv_mongo: bool
+var drv_ch: bool
+// Имена программы, которые совпали с именами подключённого драйвера: ошибка
+// у объявления в программе, и дальше компиляция не идёт — библиотека
+// разбиралась бы с чужими типами и функциями.
+var drv_clash: StrMap = smap_new()
+
+// Слово w в тексте с байта at.
+fn word_at(text: str, at: int, w: str) -> bool {
+    if at + w.byte_len() > text.byte_len() {
+        return false
+    }
+    var i = 0
+    while i < w.byte_len() {
+        if text.byte(at + i) != w.byte(i) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// Начало следующей строки после байта at: по 8 байт за шаг, остаток — по
+// байту. Половины слова — меньше 2^32, поэтому вычитание не переполняет int, а
+// проверка «есть ли нулевой байт» в половине ^ '\n'×4 — точная.
+fn next_line(p: int, at: int, n: int) -> int {
+    var i = at
+    while i + 8 <= n {
+        let w = load64(p + i)
+        let lo = (w & 0xFFFFFFFF) ^ 0x0A0A0A0A
+        let hi = ((w >> 32) & 0xFFFFFFFF) ^ 0x0A0A0A0A
+        if ((((lo - 0x01010101) & ~lo) | ((hi - 0x01010101) & ~hi)) & 0x80808080) != 0 {
+            break
+        }
+        i += 8
+    }
+    while i < n && load8(p + i) != '\n' {
+        i += 1
+    }
+    return i + 1
+}
+
+// Имена верхнего уровня: строки библиотеки, которые начинаются с объявления.
+// Текст библиотек — около 240 КБ, поэтому строки проходятся быстро, а
+// разбирается только начало строки.
+fn driver_lib_names(text: str, names: StrMap) {
+    let n = text.byte_len()
+    let p = __str_ptr(text)
+    var at = 0
+    while at < n {
+        var skip = 0
+        let c = text.byte(at)
+        if c == 'f' && word_at(text, at, "fn ") {
+            skip = 3
+        } else if c == 'v' && word_at(text, at, "var ") {
+            skip = 4
+        } else if c == 't' && word_at(text, at, "type ") {
+            skip = 5
+        } else if (c == 'c' && word_at(text, at, "const ")) || (c == 's' && word_at(text, at, "store ")) {
+            skip = 6
+        }
+        if skip > 0 {
+            var e = at + skip
+            while e < n && is_ident_char(text.byte(e)) {
+                e += 1
+            }
+            if e > at + skip {
+                smap_put(names, text.byte_slice(at + skip, e), 1)
+            }
+        }
+        at = next_line(p, at, n)
+    }
+}
+
+fn driver_lib(lib: str, file: str, title: str, builtins: [str]) -> DriverLib {
+    let names = smap_new()
+    for b in builtins {
+        smap_put(names, b, 1)
+    }
+    driver_lib_names(read_file(lib + "/" + file) ?? "", names)
+    return DriverLib { file: file, title: title, names: names, used: false }
+}
+
+// Первая лексема программы: пока подключены только библиотеки ядра, файлы
+// программы лексированы после них, и обходить их лексемы незачем.
+fn first_own_tok() -> int {
+    var i = toks.len()
+    while i > 0 && !files[toks[i - 1].file].is_lib {
+        i -= 1
+    }
+    return i
+}
+
+// Имена, которые программа объявляет сама: fn, type, var, const и store на
+// верхнем уровне её файлов (→ индекс лексемы имени).
+fn own_top_names(from: int) -> StrMap {
+    let own = smap_new()
+    var depth = 0
+    var file = -1
+    var i = from
+    while i < toks.len() {
+        let t = toks[i]
+        if !files[t.file].is_lib {
+            if t.file != file {
+                file = t.file
+                depth = 0
+            }
+            let k = t.kind
+            if k == '\{' {
+                depth += 1
+            } else if k == '}' {
+                depth -= 1
+            } else if depth == 0 && (k == T_FN || k == T_TYPE || k == T_VAR || k == T_CONST || k == T_STORE) && kind_at(i + 1) == T_IDENT {
+                smap_put(own, toks[i + 1].text, i + 1)
+            }
+        }
+        i += 1
+    }
+    return own
+}
+
+// Лексема i программы ссылается на имя (а не объявляет его и не поле): не
+// после fn/type/let/var/const/store/for, не «имя:» (поле, параметр, поле
+// литерала) и не «.поле» (но «.функция(» — вызов в форме метода).
+fn name_use_at(i: int) -> bool {
+    if i > 0 {
+        let p = toks[i - 1].kind
+        if p == T_FN || p == T_TYPE || p == T_LET || p == T_VAR || p == T_CONST || p == T_STORE || p == T_FOR {
+            return false
+        }
+        if p == '.' && kind_at(i + 1) != '(' {
+            return false
+        }
+    }
+    return kind_at(i + 1) != ':'
+}
+
+// Библиотеки драйверов, которые нужны программе, в порядке загрузки. api —
+// библиотека API подключается и без драйверов; тогда с all подключаются все
+// драйверы (khc check --all-lib проверяет и не вызванные функции библиотек).
+fn driver_libs(lib: str, api: bool, all: bool) -> [str] {
+    var libs: [DriverLib] = []
+    libs.push(driver_lib(lib, "bson.kh", "MongoDB", ["to_bson", "from_bson"]))
+    libs.push(driver_lib(lib, "mongo.kh", "MongoDB", []))
+    libs.push(driver_lib(lib, "clickhouse.kh", "ClickHouse", ["ch_encode", "ch_decode"]))
+    let first = first_own_tok()
+    let own = own_top_names(first)
+    var i = first
+    while i < toks.len() {
+        let t = toks[i]
+        if t.kind == T_IDENT && !files[t.file].is_lib && smap_get(own, t.text) < 0 && name_use_at(i) {
+            for d in libs {
+                if !d.used && smap_get(d.names, t.text) >= 0 {
+                    d.used = true
+                }
+            }
+        }
+        i += 1
+    }
+    if all && (api || libs[0].used || libs[1].used || libs[2].used) {
+        for d in libs {
+            d.used = true
+        }
+    }
+    // MongoDB строит команды из BSON
+    if libs[1].used {
+        libs[0].used = true
+    }
+    drv_bson = libs[0].used
+    drv_mongo = libs[1].used
+    drv_ch = libs[2].used
+    // своё имя программы, совпавшее с именем подключённого драйвера, — ошибка
+    // у объявления в программе (а не «already defined» внутри библиотеки)
+    var k = 0
+    while k < own.keys.len() {
+        let name = own.keys[k]
+        for d in libs {
+            if d.used && smap_get(d.names, name) >= 0 && smap_get(drv_clash, name) < 0 {
+                smap_put(drv_clash, name, 1)
+                var other = "my_" + name
+                if name.byte(0) >= 'A' && name.byte(0) <= 'Z' {
+                    other = "My" + name
+                }
+                error_tok(toks[own.vals[k]], "'" + name + "' is also a name of the " + d.title + " driver (lib/" + d.file + "), which this program uses", "rename yours, e.g. '" + other + "'")
+            }
+        }
+        k += 1
+    }
+    var out: [str] = []
+    if drv_bson {
+        out.push("bson.kh")
+    }
+    if drv_mongo {
+        out.push("mongo.kh")
+    }
+    if drv_ch {
+        out.push("db_http.kh")
+        out.push("clickhouse.kh")
+    }
+    return out
+}
+
+// Сетевой вызов драйвера (нельзя внутри tx): имя функции библиотеки, а не
+// своя функция программы с тем же именем.
 fn driver_io(name: str) -> bool {
-    return name == "mongo_command" || name == "mongo_insert" || name == "mongo_update" || name == "mongo_delete" || name == "mongo_cursor" || name == "mongo_find" || name == "mongo_find_with" || name == "mongo_create_indexes" || name == "mongo_next" || name == "mongo_close" || name == "ch_query" || name == "ch_query_params" || name == "ch_insert" || name == "ch_cancel"
+    if !(name == "mongo_command" || name == "mongo_insert" || name == "mongo_update" || name == "mongo_delete" || name == "mongo_cursor" || name == "mongo_find" || name == "mongo_find_with" || name == "mongo_create_indexes" || name == "mongo_next" || name == "mongo_close" || name == "ch_query" || name == "ch_query_params" || name == "ch_insert" || name == "ch_cancel") {
+        return false
+    }
+    let fi = func_find(name)
+    return fi >= 0 && funcs[fi].is_lib
 }
 
 // Запрос ch_query и ch_query_params — строковый литерал (без интерполяции), const

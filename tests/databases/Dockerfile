@@ -1,4 +1,7 @@
-FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
+# tests/databases/run.sh передаёт образ с реестром из KHRIP_TEST_REGISTRY
+# (например, mirror.gcr.io); дайджест тот же.
+ARG BASE=debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
+FROM ${BASE}
 
 # Khrip emits Linux x86-64 ELF files and bootstraps from NASM. The database
 # servers run in their own containers; PostgreSQL is only for the existing

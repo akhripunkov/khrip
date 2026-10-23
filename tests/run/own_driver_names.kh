@@ -1,0 +1,25 @@
+// Имена драйверов в программе без драйверов: своя type Mongo, fn ch_query и
+// fn to_bson. Драйверы подключаются по точным именам после разрешения, а эти
+// имена программа объявляет сама — библиотеки драйверов не подключаются и с
+// ними не конфликтуют.
+
+type Mongo {
+    uri: str
+}
+
+const MB_FD = 3
+
+fn ch_query(m: Mongo, q: str) -> str {
+    return m.uri + ": " + q
+}
+
+fn to_bson(x: int) -> int {
+    return x * 2
+}
+
+fn main() {
+    let m = Mongo { uri: "mem" }
+    let ch_count = MB_FD
+    print(ch_query(m, "SELECT {to_bson(21)}"))
+    print(m.ch_query("count {ch_count}"))
+}

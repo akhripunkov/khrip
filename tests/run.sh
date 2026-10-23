@@ -19,8 +19,11 @@
 #   tests/coro.sh     — запросы, которые ждут (sleep, fetch), не держат поток;
 #   tests/tls.sh      — свой TLS 1.3: криптография, сертификаты, рукопожатия;
 #   tests/pg.sh       — клиент PostgreSQL на временном сервере;
-#   tests/mongo.sh, tests/clickhouse.sh — бинарные кодеки и драйверы;
-#                       реальные серверы задаются MONGODB_URI / CLICKHOUSE_URL;
+#   tests/mongo.sh, tests/clickhouse.sh, tests/databases/runtime.sh —
+#                       бинарные кодеки и драйверы; реальные серверы задаются
+#                       MONGODB_URI / CLICKHOUSE_URL (CLICKHOUSE_DATABASE —
+#                       база тестов, по умолчанию khrip_test), mongod с TLS
+#                       запускается в docker; пропуски печатаются строками SKIP;
 #   tests/weather.sh  — погодный бэкенд: fetch, every, сохранение store;
 #   eval/solutions/*/khrip — решения задач проверки проходят eval/run.sh.
 # Компилятор берётся из $KHC (по умолчанию build/khc).
@@ -123,6 +126,19 @@ else
 	failed "khc check --system --all-lib src/*.kh" "$(cat "$tmp/alllib.txt")"
 fi
 
+# Раскладка контекста потока: все слова CTX_* объявлены в одной таблице
+# lib/core.kh, смещения не повторяются и не заходят в буферы системных
+# вызовов (слова 192–223 и 232–239).
+ctx_words=$(sed -n 's/^const CTX_[A-Z_]* = \([0-9][0-9]*\)$/\1/p' lib/core.kh)
+ctx_other=$(grep -l '^const CTX_' lib/*.kh | grep -v '^lib/core.kh$')
+ctx_dup=$(sort -n <<<"$ctx_words" | uniq -d)
+ctx_scratch=$(awk '($1 >= 192 && $1 < 224) || ($1 >= 232 && $1 < 240)' <<<"$ctx_words")
+if [[ -z "$ctx_other$ctx_dup$ctx_scratch" ]]; then
+	pass=$((pass + 1))
+else
+	failed "раскладка ctx" "вне lib/core.kh: $ctx_other; повторы: $ctx_dup; в буферах системных вызовов: $ctx_scratch"
+fi
+
 # __data_hex (есть только в библиотеке): литерал — пары шестнадцатеричных цифр,
 # пробелы — только между парами. Проверяется на копии библиотеки с двумя
 # функциями: правильные литералы проходят, у неправильных — по ошибке на каждый.
@@ -173,6 +189,30 @@ for src in tests/locks/*.kh; do
 	pass=$((pass + 1))
 done
 
+# Библиотеки драйверов — только программам, которые пользуются их именами:
+# в сервере со своими type Mongo, fn ch_query и store ch_total нет ни одной
+# функции драйверов и TLS, в CLI-программе — и библиотеки API.
+if "$KHC" --sizes -o "$tmp/own_api" tests/api/own_driver_names.kh >"$tmp/own_api.sizes" 2>&1 &&
+	"$KHC" --sizes -o "$tmp/own_cli" tests/run/own_driver_names.kh >"$tmp/own_cli.sizes" 2>&1 &&
+	! grep -qE ' __(bson|mongo|ch|dh|tls)_' "$tmp/own_api.sizes" "$tmp/own_cli.sizes" &&
+	! grep -qE ' __(json|reply|dispatch)' "$tmp/own_cli.sizes"; then
+	pass=$((pass + 1))
+else
+	failed "драйверы по точным именам" "в программе без драйверов есть их код:"$'\n'"$(grep -E ' __(bson|mongo|ch|dh|tls|json|reply|dispatch)' "$tmp/own_api.sizes" "$tmp/own_cli.sizes" | head)"
+fi
+
+# Конец запроса (__db_end, src/api.kh gen_db): очистки без сети — MongoDB,
+# ClickHouse, TLS — раньше отката PostgreSQL, который ждёт сервер до 5 с; хук
+# TLS есть и в программе только с fetch. Хуки маленькие и встраиваются, в
+# --sizes их не видно, поэтому проверяется текст генератора.
+db_end=$(sed -n '/^fn gen_db(/,/^}/p' src/api.kh | grep -o '__[a-z_]*_\(request_end\|request_cleanup\|pending_cleanup\)' | tr '\n' ' ')
+if [[ "$db_end" == "__mongo_request_end __ch_request_cleanup __tls_pending_cleanup __pg_request_end " ]] &&
+	sed -n '/^fn gen_db(/,/^}/p' src/api.kh | grep -B1 '__tls_pending_cleanup' | grep -q 'uses_fetch()'; then
+	pass=$((pass + 1))
+else
+	failed "очистки конца запроса" "порядок в gen_db: $db_end; хук TLS нужен и программе только с fetch"
+fi
+
 if [[ -f tests/http.sh ]]; then
 	# shellcheck source=tests/http.sh
 	source tests/http.sh
@@ -199,16 +239,20 @@ if [[ -f tests/weather.sh ]] && command -v curl >/dev/null; then
 fi
 
 # Отдельные процессы: сценарии драйверов владеют своими временными файлами
-# и trap. Без адресов БД выполняются проверки кодеков и повреждённого протокола.
-for driver in mongo clickhouse; do
-	if [[ "$driver" == clickhouse ]] && ! command -v python3 >/dev/null; then
-		echo "пропуск ClickHouse: нет python3 для проверки HTTP-протокола"
+# и trap. Без адресов БД выполняются проверки кодеков и повреждённого протокола;
+# что пропущено (настоящие серверы, контейнер с TLS), видно по строкам SKIP.
+# Общий сценарий обоих драйверов в одном сервере (tests/databases/runtime.sh)
+# — когда заданы оба адреса.
+for driver in mongo clickhouse databases/runtime; do
+	if ! command -v python3 >/dev/null; then
+		echo "SKIP $driver: нет python3 для mock-серверов"
 		continue
 	fi
-	if KHC="$KHC" bash "tests/$driver.sh" >"$tmp/$driver.log" 2>&1; then
+	if KHC="$KHC" bash "tests/$driver.sh" >"$tmp/driver.log" 2>&1; then
 		pass=$((pass + 1))
+		grep '^SKIP' "$tmp/driver.log"
 	else
-		failed "$driver" "$(cat "$tmp/$driver.log")"
+		failed "$driver" "$(cat "$tmp/driver.log")"
 	fi
 done
 if "$KHC" check tests/databases/codec_tx.kh >"$tmp/codec-tx.log" 2>&1; then

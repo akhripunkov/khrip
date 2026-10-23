@@ -1,12 +1,16 @@
 // expect: publish() calls mongo_insert, and the tx block may run again after a conflict
-fn publish() {
+fn publish() -> str {
     let client = Mongo { uri: "mongodb://localhost/test" }
-    mongo_insert(client, "test", "events", [bson_finish(bson_new())])
+    let r = mongo_insert(client, "test", "events", [bson_finish(bson_new())])
+    return r.error
 }
 route POST "/write" -> 204 {
     tx {
         sql "DELETE FROM events"
-        publish()
+        let error = publish()
+        if error != "" {
+            fail(503, error)
+        }
     }
     return 204
 }

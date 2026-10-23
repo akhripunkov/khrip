@@ -89,10 +89,6 @@ fn api_lib_files() -> [str] {
     names.push("tls.kh")
     names.push("pg.kh")
     names.push("db.kh")
-    names.push("bson.kh")
-    names.push("mongo.kh")
-    names.push("db_http.kh")
-    names.push("clickhouse.kh")
     return names
 }
 
@@ -102,21 +98,17 @@ fn uses_api() -> bool {
         if t.kind == T_ROUTE || t.kind == T_TEST || t.kind == T_STORE || t.kind == T_SQL {
             return true
         }
-        if t.kind == T_IDENT && (t.text == "to_json" || t.text == "from_json" || t.text == "fetch" || t.text == "every" || t.text == "migration" || t.text.starts_with("__pg_") || database_api_name(t.text)) {
+        if t.kind == T_IDENT && (t.text == "to_json" || t.text == "from_json" || t.text == "fetch" || t.text == "every" || t.text == "migration" || t.text.starts_with("__pg_")) {
             return true
         }
     }
     return false
 }
 
-// Расширения подключают библиотеку и в обычных CLI-программах без route.
-fn database_api_name(name: str) -> bool {
-    return name == "to_bson" || name == "from_bson" || name == "object_id" || name.starts_with("bson_") || name.starts_with("Bson") || name.starts_with("mongo_") || name.starts_with("Mongo") || name.starts_with("ch_") || name == "ChConfig" || name == "ChResult"
-}
-
-fn uses_driver(prefix: str) -> bool {
+// Программа сама зовёт fetch: тогда в конце запроса нужен хук TLS.
+fn uses_fetch() -> bool {
     for t in toks {
-        if !files[t.file].is_lib && t.kind == T_IDENT && t.text.starts_with(prefix) {
+        if !files[t.file].is_lib && t.kind == T_IDENT && t.text == "fetch" {
             return true
         }
     }
@@ -1524,8 +1516,11 @@ fn gen_json_float(b: Buf) {
     }
 }
 
-// Хуки завершения запроса вызывают только используемые драйверы; остальные
-// функции библиотек не попадают в бинарник.
+// Хуки завершения запроса вызывают только подключённые драйверы; остальные
+// функции библиотек не попадают в бинарник. Сначала — очистки без сети и
+// ожидания (MongoDB, ClickHouse, недостроенное соединение TLS), последним —
+// PostgreSQL: откат открытой транзакции ждёт сервер до 5 с. Хук TLS нужен
+// всем, кто открывает TLS: PostgreSQL, драйверам и fetch.
 fn gen_db(b: Buf) {
     if uses_db {
         buf_add(b, "fn __db_init() \{\n    __db_start()\n}\n\nfn __db_done() \{\n    __db_test_done()\n}\n\n")
@@ -1533,17 +1528,17 @@ fn gen_db(b: Buf) {
         buf_add(b, "fn __db_init() \{\n}\n\nfn __db_done() \{\n}\n\n")
     }
     buf_add(b, "fn __db_end() \{\n")
-    if uses_db {
-        buf_add(b, "    __pg_request_end()\n")
-    }
-    if uses_driver("mongo_") {
+    if drv_mongo {
         buf_add(b, "    __mongo_request_end()\n")
     }
-    if uses_driver("ch_") {
+    if drv_ch {
         buf_add(b, "    __ch_request_cleanup()\n")
     }
-    if uses_db || uses_driver("mongo_") || uses_driver("ch_") {
+    if uses_db || drv_mongo || drv_ch || uses_fetch() {
         buf_add(b, "    __tls_pending_cleanup()\n")
+    }
+    if uses_db {
+        buf_add(b, "    __pg_request_end()\n")
     }
     buf_add(b, "}\n\n")
 }

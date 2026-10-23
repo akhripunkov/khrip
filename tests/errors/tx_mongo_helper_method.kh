@@ -1,12 +1,15 @@
 // expect: publish() calls mongo_delete, and the tx block may run again after a conflict
-fn publish(client: Mongo) {
-    client.mongo_delete("test", "events", bson_finish(bson_new()))
+fn publish(client: Mongo) -> str {
+    return client.mongo_delete("test", "events", bson_finish(bson_new())).error
 }
 route POST "/write" -> 204 {
     let client = Mongo { uri: "mongodb://localhost/test" }
     tx {
         sql "DELETE FROM events"
-        client.publish()
+        let error = client.publish()
+        if error != "" {
+            fail(503, error)
+        }
     }
     return 204
 }

@@ -1224,7 +1224,9 @@ fn parse_builtin(t: Token, w: int) -> int {
         emit_to_str(t1, a)
         return ty_str
     }
-    if name == "to_bson" || name == "from_bson" || name == "ch_encode" || name == "ch_decode" {
+    // встроенные функции драйвера — только когда он подключён: иначе это
+    // своя функция программы с тем же именем
+    if ((name == "to_bson" || name == "from_bson") && drv_bson) || ((name == "ch_encode" || name == "ch_decode") && drv_ch) {
         return parse_database_builtin(t, w)
     }
     if name == "to_json" {
@@ -1674,7 +1676,9 @@ fn parse_call(t: Token, w: int) -> int {
         tx_arg_check(t, fi, 0)
     }
     // текущая лексема — первый аргумент, перед ней — (
-    driver_query_check(t, pos - 1, 1)
+    if f.is_lib {
+        driver_query_check(t, pos - 1, 1)
+    }
     let n = compile_args(f.params, 0, ty_err, ty_err, ty_err, name, t)
     if n != f.params.len() {
         emit_alu_imm(0, RSP, n * 8)

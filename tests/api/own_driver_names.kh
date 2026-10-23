@@ -1,0 +1,30 @@
+// Сервер со своими type Mongo и fn ch_query и с store ch_total: драйверы не
+// подключаются (их имена программа объявляет сама), в конце запроса нет их
+// очисток. tests/run.sh проверяет ещё, что в бинарнике нет функций драйверов.
+
+type Mongo {
+    uri: str
+}
+
+type Q {
+    q: str
+}
+
+store ch_total: int = 0
+store links: [Mongo] = []
+
+fn ch_query(q: str) -> int {
+    return q.byte_len()
+}
+
+route POST "/q" (body: Q) -> int {
+    ch_total += ch_query(body.q)
+    links.push(Mongo { uri: body.q })
+    return ch_total
+}
+
+test "own names" {
+    expect (call POST "/q" Q { q: "abc" }).body == "3"
+    expect (call POST "/q" Q { q: "de" }).body == "5"
+    expect links.len() == 2
+}

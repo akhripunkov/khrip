@@ -1,0 +1,31 @@
+// Свои функции программы с именами функций драйверов — не драйверы (драйверы
+// подключаются по точным именам после разрешения): внутри tx их можно звать,
+// а своя ch_query принимает и строку с подстановкой.
+
+migration 1 `
+CREATE TABLE events (id bigint PRIMARY KEY, n integer NOT NULL);
+`
+
+fn mongo_insert(n: int) -> int {
+    return n + 1
+}
+
+fn ch_query(q: str) -> int {
+    return q.byte_len()
+}
+
+route POST "/events/{id}" (id: int) -> int {
+    let k = ch_query("event {id}")
+    tx {
+        let n = mongo_insert(k)
+        sql "UPDATE events SET n = {n} WHERE id = {id}"
+    }
+    return k
+}
+
+test "own functions with driver names" {
+    sql "INSERT INTO events (id, n) VALUES (1, 0)"
+    expect (call POST "/events/1").body == "7"
+    let n: int? = sql "SELECT n FROM events WHERE id = 1"
+    expect n == 8
+}

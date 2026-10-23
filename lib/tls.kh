@@ -18,6 +18,8 @@ const TB_RSEQ = 24
 const TB_WSEQ = 32
 const TB_CLOSED = 40
 const TB_PORT = 48
+// код alert, которым сервер оборвал соединение после рукопожатия (0 — нет)
+const TB_ALERT = 56
 const TB_RIV = 64
 const TB_WIV = 80
 const TB_RSEC = 96
@@ -30,6 +32,8 @@ const TB_WGH = 704
 const TB_IN = 736
 // расшифрованные данные приложения: данные, длина, ёмкость, прочитано
 const TB_PLAIN = 760
+// 1 — сервер просил сертификат клиента (CertificateRequest), а ушёл пустой
+const TB_CERTREQ = 792
 const TB_HOSTLEN = 800
 const TB_HOST = 808
 
@@ -375,6 +379,7 @@ fn __tls_alert_text(code: int) -> str {
         71 => "insufficient security"
         80 => "internal error"
         112 => "unrecognized name"
+        116 => "certificate required (the server accepts only clients with a certificate)"
         120 => "no application protocol"
         _ => "alert {code}"
     }
@@ -697,12 +702,45 @@ fn __tls_connect_roots(fd: int, host: str, port: int, roots: str, verify: int, d
         return __tls_fail(blk, "expected EncryptedExtensions")
     }
     __tr_add(h, ee)
-    // Certificate
-    let cm = __hs_next(h) else {
+    // Certificate; перед ним сервер может попросить сертификат клиента
+    let cm1 = __hs_next(h) else {
         return __tls_fail(blk, h.err)
     }
+    var cm = cm1
+    // контекст CertificateRequest (-1 — сервер сертификат не просил)
+    var creq_at = -1
+    var creq_len = 0
+    if cm1.kind == 13 {
+        // CertificateRequest (RFC 8446, 4.3.2). Своего сертификата у клиента
+        // нет: перед Finished он ответит пустым Certificate с тем же
+        // контекстом (4.4.2), а решает сервер — mongod с
+        // tlsAllowConnectionsWithoutCertificates, s_server -verify пускают.
+        let cr = __Rd { p: cm1.p + 4, end: cm1.p + cm1.n, ok: true }
+        creq_len = __rd_u8(cr)
+        creq_at = __rd_skip(cr, creq_len)
+        let elen = __rd_u16(cr)
+        let ext = __rd_skip(cr, elen)
+        if !cr.ok || cr.p != cr.end || elen < 2 {
+            return __tls_fail(blk, "bad CertificateRequest")
+        }
+        // каждое расширение — тип, длина и тело в границах списка
+        let ex = __Rd { p: ext, end: ext + elen, ok: true }
+        while ex.ok && ex.p < ex.end {
+            __rd_u16(ex)
+            __rd_skip(ex, __rd_u16(ex))
+        }
+        if !ex.ok {
+            return __tls_fail(blk, "bad CertificateRequest")
+        }
+        __tr_add(h, cm1)
+        store64(blk + TB_CERTREQ, 1)
+        let cm2 = __hs_next(h) else {
+            return __tls_fail(blk, h.err)
+        }
+        cm = cm2
+    }
     if cm.kind == 13 {
-        return __tls_fail(blk, "the server asks for a client certificate")
+        return __tls_fail(blk, "the server asks for a client certificate twice")
     }
     if cm.kind != 11 {
         return __tls_fail(blk, "expected Certificate")
@@ -772,12 +810,34 @@ fn __tls_connect_roots(fd: int, host: str, port: int, roots: str, verify: int, d
     if !__fd_write_all(fd, ccs, 6, deadline) {
         return __tls_fail(blk, "cannot send Finished")
     }
+    // Finished клиента подписывает переписку вместе с его Certificate
+    var thf = th4
+    if creq_at >= 0 {
+        // пустой Certificate: контекст запроса и список сертификатов нулевой длины
+        let cc = __alloc(8 + creq_len)
+        let body = 1 + creq_len + 3
+        store8(cc, 11)
+        store8(cc + 1, body >> 16)
+        store8(cc + 2, (body >> 8) & 255)
+        store8(cc + 3, body & 255)
+        store8(cc + 4, creq_len)
+        __memcpy(cc + 5, creq_at, creq_len)
+        store8(cc + 5 + creq_len, 0)
+        store8(cc + 6 + creq_len, 0)
+        store8(cc + 7 + creq_len, 0)
+        if !__tls_send(blk, 22, cc, 8 + creq_len, deadline) {
+            return __tls_fail(blk, "cannot send Certificate")
+        }
+        __hash_update(h.tr, cc, 8 + creq_len)
+        thf = __alloc(64)
+        __tr_hash(h, thf)
+    }
     let cfk = __alloc(64)
     __hkdf_label(hs, c_hs, "finished", 0, 0, cfk, hs)
     let cf = __alloc(4 + hs)
     store8(cf, 20)
     store8(cf + 3, hs)
-    __hmac(hs, cfk, hs, th4, hs, cf + 4)
+    __hmac(hs, cfk, hs, thf, hs, cf + 4)
     if !__tls_send(blk, 22, cf, 4 + hs, deadline) {
         return __tls_fail(blk, "cannot send Finished")
     }
@@ -965,10 +1025,14 @@ fn __tls_read(blk: int, b: Buf, deadline: int) -> int {
             continue
         }
         if pt.kind == 21 {
-            // close_notify — обычный конец, остальное — ошибка
+            // close_notify — обычный конец, остальное — ошибка; её код
+            // запоминается для текста (__tls_alert)
             if pt.n >= 2 && load8(pt.p + 1) == 0 {
                 store64(blk + TB_CLOSED, 1)
                 return 0
+            }
+            if pt.n >= 2 {
+                store64(blk + TB_ALERT, load8(pt.p + 1))
             }
             return -1
         }
@@ -1016,6 +1080,23 @@ fn __tls_post_handshake(blk: int, pt: __Rec, deadline: int) -> bool {
         at += 4 + len
     }
     return at == pt.n
+}
+
+// Почему сервер оборвал соединение после рукопожатия: текст alert или "".
+// Сертификат клиента TLS 1.3 сервер проверяет уже после Finished клиента,
+// поэтому отказ (certificate_required) приходит первым ответом на данные.
+fn __tls_alert(blk: int) -> str {
+    let code = load64(blk + TB_ALERT)
+    if code == 0 {
+        return ""
+    }
+    return __tls_alert_text(code)
+}
+
+// Сервер просил сертификат клиента и получил пустой. mongod, которому
+// сертификат обязателен, после этого закрывает соединение без alert.
+fn __tls_cert_requested(blk: int) -> bool {
+    return load64(blk + TB_CERTREQ) != 0
 }
 
 // Вежливо закрыть: close_notify (если получится сразу) и освободить блок.
