@@ -867,13 +867,19 @@ fn __rx_add(code: int, st: int, list: int, cnt: int, pc: int) -> int {
 
 // Строка s целиком подходит под программу prog (__rx_freeze)? Состояние
 // исполнения — блок в текущей памяти; после него обнуляется и возвращается
-// (__alloc_trim), так что matches в цикле не растит арену запроса.
+// (__alloc_trim), так что matches в цикле не растит арену запроса. Большой
+// блок вне арены __alloc берёт отдельным mmap — его возвращает munmap.
 fn __rx_exec(prog: int, s: str) -> bool {
     let size = 16 + 32 * load64(prog)
     let st = __alloc(size)
+    let bumped = load64(__ctx() + CTX_PTR) == st + ((size + 15) & ~15)
     let ok = __rx_run(prog, st, s)
-    __memset(st, 0, size)
-    __alloc_trim(st, size, 0)
+    if bumped {
+        __memset(st, 0, size)
+        __alloc_trim(st, size, 0)
+    } else {
+        syscall(SYS_MUNMAP, st, size)
+    }
     return ok
 }
 
