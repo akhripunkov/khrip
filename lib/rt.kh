@@ -17,7 +17,8 @@ fn __entry(sp: int) {
     exit(__main())
 }
 
-// ---- SIMD: 2 — AVX2, 1 — SSE2, 0 — побайтно (KHRIP_SIMD может понизить) ----
+// ---- SIMD: 3 — AVX2 и быстрый PDEP, 2 — AVX2, 1 — SSE2, 0 — побайтно
+// (KHRIP_SIMD может понизить) ----
 // Здесь же — режим кэша строк (KHRIP_STRCACHE).
 
 var __simd_level: int
@@ -28,6 +29,9 @@ fn __simd_init() {
     var lvl = 1
     if __cpu_avx2() {
         lvl = 2
+        if __cpu_pdep() {
+            lvl = 3
+        }
     }
     if let s = env("KHRIP_SIMD") {
         let v = s.to_int() ?? lvl

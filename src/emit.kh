@@ -72,6 +72,7 @@ fn emit_init() {
     const_strs = smap_new()
     data_hexes = smap_new()
     utf8_tab = 0
+    case_tab = 0
 }
 
 fn emit8(b: int) {
@@ -168,15 +169,32 @@ fn emit_mov_rr(dst: int, src: int) {
     }
 }
 
-// op reg, [base + disp32] или [base + disp32], reg — по коду операции.
+// op reg, [base + disp] или [base + disp], reg — по коду операции.
 fn emit_mem(op: int, reg: int, base: int, disp: int) {
     emit8(rex_w(reg, base))
     emit8(op)
-    emit8(0x80 | ((reg & 7) << 3) | (base & 7))
+    emit_modrm_mem(reg, base, disp)
+}
+
+// ModRM (и SIB для rsp, r12) операнда [base + disp]: без смещения, со смещением
+// в байт или в 4 байта — самое короткое (у rbp и r13 смещение есть всегда).
+fn emit_modrm_mem(reg: int, base: int, disp: int) {
+    let rb = ((reg & 7) << 3) | (base & 7)
+    var md = 0x80
+    if disp == 0 && (base & 7) != 5 {
+        md = 0
+    } else if disp >= -128 && disp <= 127 {
+        md = 0x40
+    }
+    emit8(md | rb)
     if (base & 7) == 4 {
         emit8(0x24)
     }
-    emit32(disp)
+    if md == 0x40 {
+        emit8(disp & 255)
+    } else if md == 0x80 {
+        emit32(disp)
+    }
 }
 
 fn emit_load(dst: int, base: int, disp: int) {
@@ -220,8 +238,143 @@ fn fits_i32(v: int) -> bool {
     return v >= -2147483648 && v <= 2147483647
 }
 
+// Последняя инструкция — add/sub rax, число (addimm_end = -1 — записи нет): её
+// можно убрать и взять число смещением адреса (load64(x + 8) — mov rax, [rax + 8]).
+var addimm_at: int
+var addimm_end: int = -1
+var addimm_val: int
+
 // Арифметика с непосредственным операндом: ext — номер операции в группе 0x81.
+// add/sub rax, число сразу за другим (без меток между ними) — одно сложение:
+// x + 8 + 16 — add rax, 24 (проверка переполнения в коде программы стоит после
+// каждого сложения, так что подряд они идут только там, где её нет).
 fn emit_alu_imm(ext: int, dst: int, v: int) {
+    if dst == RAX && (ext == 0 || ext == 5) && addimm_end == code_len && addimm_at >= barrier {
+        var s = addimm_val + v
+        if ext == 5 {
+            s = addimm_val - v
+        }
+        if fits_i32(s) && fits_i32(v) {
+            code_rollback(addimm_at)
+            addimm_at = code_len
+            addimm_val = s
+            emit_alu_imm_raw(0, RAX, s)
+            addimm_end = code_len
+            return
+        }
+    }
+    if dst == RAX && (ext == 0 || ext == 5) {
+        addimm_at = code_len
+        addimm_val = v
+        if ext == 5 {
+            addimm_val = -v
+        }
+    }
+    emit_alu_imm_raw(ext, dst, v)
+    if dst == RAX && (ext == 0 || ext == 5) {
+        addimm_end = code_len
+    }
+}
+
+// Убрать add/sub rax, число, если оно — последняя инструкция и после него нет
+// меток (метка ровно перед ним не мешает): → смещение или 0.
+fn take_addimm() -> int {
+    if addimm_end != code_len || addimm_at < barrier || !fits_i32(addimm_val) {
+        return 0
+    }
+    code_rollback(addimm_at)
+    return addimm_val
+}
+
+// Код с позиции p убран: записи о последних инструкциях (simple, stored,
+// regload, addreg, addimm), которые кончаются дальше p, больше ничего не
+// описывают — иначе новая инструкция той же длины совпала бы с такой записью.
+fn code_rollback(p: int) {
+    code_len = p
+    if simple_end > p {
+        simple_end = -1
+    }
+    if stored_end > p {
+        stored_end = -1
+    }
+    if regload_end > p {
+        regload_end = -1
+    }
+    if addreg_end > p {
+        addreg_end = -1
+    }
+    if addimm_end > p {
+        addimm_end = -1
+    }
+    if setcc_end > p {
+        setcc_end = -1
+    }
+}
+
+// op reg, [base + disp] или [base + disp], reg: op — один байт или два
+// (0x0FB6 — movzx); w — 64 бита (REX.W). Регистры байтов — только al и cl.
+fn emit_mem_sized(op: int, reg: int, base: int, disp: int, w: bool) {
+    var rex = 0x40 | ((reg >> 3) << 2) | (base >> 3)
+    if w {
+        rex = rex | 8
+    }
+    if rex != 0x40 {
+        emit8(rex)
+    }
+    if op > 255 {
+        emit8(op >> 8)
+    }
+    emit8(op & 255)
+    emit_modrm_mem(reg, base, disp)
+}
+
+// То же с индексом: op reg, [base + index + disp] (index = -1 — без индекса).
+fn emit_mem_index(op: int, reg: int, base: int, index: int, disp: int, w: bool) {
+    if index < 0 {
+        emit_mem_sized(op, reg, base, disp, w)
+        return
+    }
+    var rex = 0x40 | ((reg >> 3) << 2) | ((index >> 3) << 1) | (base >> 3)
+    if w {
+        rex = rex | 8
+    }
+    if rex != 0x40 {
+        emit8(rex)
+    }
+    if op > 255 {
+        emit8(op >> 8)
+    }
+    emit8(op & 255)
+    var md = 0x80
+    if disp == 0 && (base & 7) != 5 {
+        md = 0
+    } else if disp >= -128 && disp <= 127 {
+        md = 0x40
+    }
+    emit8(md | ((reg & 7) << 3) | 4)
+    emit8(((index & 7) << 3) | (base & 7))
+    if md == 0x40 {
+        emit8(disp & 255)
+    } else if md == 0x80 {
+        emit32(disp)
+    }
+}
+
+// Операция группы 0x81 над qword [base + disp] с числом (v — 32 бита).
+fn emit_mem_imm(ext: int, base: int, disp: int, v: int) {
+    emit8(0x48 | (base >> 3))
+    if v >= -128 && v <= 127 {
+        emit8(0x83)
+        emit_modrm_mem(ext, base, disp)
+        emit8(v & 255)
+        return
+    }
+    emit8(0x81)
+    emit_modrm_mem(ext, base, disp)
+    emit32(v & 0xFFFFFFFF)
+}
+
+fn emit_alu_imm_raw(ext: int, dst: int, v: int) {
     emit8(0x48 | (dst >> 3))
     if v >= -128 && v <= 127 {
         emit8(0x83)
@@ -247,7 +400,7 @@ fn emit_push(r: int) {
 // pop сразу после push rax превращается в mov.
 fn emit_pop(r: int) {
     if last_push >= 0 && last_push == code_len - 1 && last_push >= barrier {
-        code_len -= 1
+        code_rollback(code_len - 1)
         last_push = -1
         emit_mov_rr(r, RAX)
         return
@@ -264,14 +417,50 @@ fn emit_test_rax() {
     emit8(0xC0)
 }
 
+// Последняя инструкция — rax = условие setcc_cc ? 1 : 0 (setcc_end = -1 — записи
+// нет): проверку значения можно заменить переходом по самому условию.
+var setcc_at: int
+var setcc_end: int = -1
+var setcc_cc: int
+
 // rax = условие cc ? 1 : 0
 fn emit_setcc(cc: int) {
+    setcc_at = code_len
     emit8(0x0F)
     emit8(0x90 + cc)
     emit8(0xC0)
     emit8(0x0F)
     emit8(0xB6)
     emit8(0xC0)
+    setcc_end = code_len
+    setcc_cc = cc
+}
+
+// Убрать setcc (последнюю инструкцию, без меток после её начала): флаги ещё
+// стоят по условию → условие или -1.
+fn take_setcc() -> int {
+    if setcc_end != code_len || setcc_at < barrier {
+        return -1
+    }
+    code_rollback(setcc_at)
+    return setcc_cc
+}
+
+// test rax, rax; jcc — переход, если значение bool в rax равно want (true/false);
+// значение только что из setcc — переход прямо по его условию.
+fn emit_jump_bool(want: bool) -> int {
+    let c = take_setcc()
+    if c >= 0 {
+        if want {
+            return emit_jcc(c)
+        }
+        return emit_jcc(c ^ 1)
+    }
+    emit_test_rax()
+    if want {
+        return emit_jcc(CC_NE)
+    }
+    return emit_jcc(CC_E)
 }
 
 // ---- Вызовы ----

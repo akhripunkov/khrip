@@ -152,7 +152,7 @@ fn parse_value_block(w: int) -> int {
         }
     }
     expect_tok('}')
-    nlocals = saved
+    locals_to(saved)
     if t < 0 {
         error_tok(open, "this block must end with a value", "put the value on the last line, e.g. \{ ...; total }")
         return ty_err
@@ -410,7 +410,7 @@ fn parse_match(as_value: bool, w: int) -> int {
                 s_after = sql_join(s_after, sql_outside)
             }
         }
-        nlocals = saved_n
+        locals_to(saved_n)
         if next_hole >= 0 {
             patch_here(next_hole)
         }
@@ -620,7 +620,7 @@ fn parse_lambda_method(rt: int, nt: Token) -> int {
             patch_here(skip)
         }
     }
-    nlocals = saved_n
+    locals_to(saved_n)
     // idx += 1
     emit_load_local(idx)
     emit_alu_imm(0, RAX, 1)

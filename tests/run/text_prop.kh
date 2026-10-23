@@ -5,10 +5,12 @@
 // Ответы __text_* сверяются с простыми ссылками на байтовом API: деление на
 // символы по правилу Go, срезы, поиск, split(""), replace("", x), trim,
 // lower/upper. Строки длиннее 256 байт идут через кэш строк; вывод один и тот
-// же без кэша, с ним и в проверочном режиме, при SIMD и без.
+// же без кэша, с ним и в проверочном режиме, при SIMD и без (KHRIP_SIMD=2 —
+// AVX2 без PDEP, пустой env — уровень процессора).
 // env: KHRIP_SIMD=0 KHRIP_STRCACHE=off
 // env: KHRIP_SIMD=0
 // env: KHRIP_SIMD=0 KHRIP_STRCACHE=stress
+// env: KHRIP_SIMD=2
 // env: KHRIP_STRCACHE=off
 // env:
 // env: KHRIP_STRCACHE=stress

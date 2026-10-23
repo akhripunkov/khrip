@@ -141,6 +141,15 @@ fn none_tests(from: int, to: int, sep: int, op: int) -> [int] {
     return out
 }
 
+// Конец области видимости: локальные с номера n уходят. Запись о простом
+// значении — локальной оттуда — больше не годится: её номер займут новые.
+fn locals_to(n: int) {
+    nlocals = n
+    if simple_kind == OPK_LOCAL && simple_val >= n {
+        simple_end = -1
+    }
+}
+
 fn find_local(name: str) -> int {
     var i = nlocals - 1
     while i >= local_floor {
@@ -152,22 +161,55 @@ fn find_local(name: str) -> int {
     return -1
 }
 
+// Последняя инструкция — запись rax в локальную (регистр stored_reg или ячейку
+// stored_off): чтение той же локальной сразу за ней не нужно — значение ещё в
+// rax (если между ними нет метки). stored_end = -1 — записи нет.
+var stored_at: int
+var stored_end: int = -1
+var stored_reg: int
+var stored_off: int
+
+// Последняя инструкция — mov rax, регистр локальной (regload_reg): адрес
+// load8(x + ...) можно взять прямо от регистра. regload_end = -1 — записи нет.
+var regload_at: int
+var regload_end: int = -1
+var regload_reg: int
+
 fn emit_load_local(li: int) {
     let l = locals[li]
+    if stored_end == code_len && stored_at >= barrier && stored_reg == l.reg && (l.reg >= 0 || stored_off == l.off) {
+        return
+    }
     if l.reg >= 0 {
+        regload_at = code_len
         emit_mov_rr(RAX, l.reg)
+        regload_end = code_len
+        regload_reg = l.reg
     } else {
         emit_load(RAX, RBP, l.off)
     }
 }
 
+// Убрать mov rax, регистр (последнюю инструкцию, без меток после её начала) → регистр или -1.
+fn take_regload() -> int {
+    if regload_end != code_len || regload_at < barrier {
+        return -1
+    }
+    code_rollback(regload_at)
+    return regload_reg
+}
+
 fn emit_store_local(li: int) {
     let l = locals[li]
+    stored_at = code_len
     if l.reg >= 0 {
         emit_mov_rr(l.reg, RAX)
     } else {
         emit_store(RBP, l.off, RAX)
     }
+    stored_end = code_len
+    stored_reg = l.reg
+    stored_off = l.off
 }
 
 // Временный регистр для скрытых переменных цикла или -1.
@@ -408,7 +450,7 @@ fn peek_simple(level: int) -> bool {
     if tighter_follows(level, kind_at(pos + 1)) {
         return false
     }
-    if (t.kind == T_INT || (t.kind == T_CHAR && want == ty_int)) && fits_i32(t.val) {
+    if t.kind == T_INT || (t.kind == T_CHAR && want == ty_int) {
         op_kind = OPK_IMM
         op_val = t.val
         op_ty = ty_int
@@ -441,7 +483,7 @@ fn peek_simple(level: int) -> bool {
             return true
         }
         let s = sym_find(t.text)
-        if s >= 0 && sym_kind(s) == SK_CONST && consts[sym_idx(s)].ty == ty_int && fits_i32(consts[sym_idx(s)].val) {
+        if s >= 0 && sym_kind(s) == SK_CONST && consts[sym_idx(s)].ty == ty_int {
             op_kind = OPK_IMM
             op_val = consts[sym_idx(s)].val
             op_ty = ty_int
@@ -449,6 +491,121 @@ fn peek_simple(level: int) -> bool {
         }
     }
     return false
+}
+
+// Следующий токен — целая глобальная (не в store) — операнд для оператора уровня
+// level? → её адрес или 0. Ничего не потребляет. Читать её можно только в
+// момент операции (cmp rax, [адрес]): откладывать чтение, как у локальной, нельзя —
+// вызов в другом операнде может её поменять.
+fn peek_global(level: int) -> int {
+    let t = tok()
+    if t.kind != T_IDENT || tighter_follows(level, kind_at(pos + 1)) || find_local(t.text) >= 0 {
+        return 0
+    }
+    let s = sym_find(t.text)
+    if s < 0 || sym_kind(s) != SK_GLOBAL {
+        return 0
+    }
+    let g = globals[sym_idx(s)]
+    if g.ty != ty_int || global_in_store(g) {
+        return 0
+    }
+    return g.addr
+}
+
+// op rax, [адрес]: mr — код «op r, r/m».
+fn emit_alu_abs(mr: int, addr: int) {
+    emit8(0x48)
+    emit8(mr)
+    emit8(0x04)
+    emit8(0x25)
+    emit32(addr)
+}
+
+// Последняя инструкция — загрузка простого значения в rax: неизменяемой
+// локальной (параметр, let) или числа. Если левый операнд бинарной операции —
+// такая загрузка, её можно убрать, посчитать правую часть в rax, а левую взять
+// операндом: без push/pop (take_simple). Значение то же: неизменяемую локальную
+// правая часть поменять не может. simple_end = -1 — записи нет.
+var simple_at: int
+var simple_end: int = -1
+var simple_kind: int
+var simple_val: int
+// загружена изменяемая локальная (var, счётчик цикла)
+var simple_mut: bool
+
+// Загрузка с позиции at до текущего конца кода — простое значение (kind, val).
+fn note_simple(kind: int, val: int, at: int) {
+    simple_at = at
+    simple_end = code_len
+    simple_kind = kind
+    simple_val = val
+    simple_mut = false
+}
+
+// Убрать загрузку простого значения, если она — последняя инструкция и после
+// её начала нет меток (метка ровно в начале не мешает: переход туда выполнит
+// новый код, который считает то же). → true, значение — в op_kind/op_val.
+fn take_simple() -> bool {
+    return take_simple_if(false)
+}
+
+// То же, и изменяемая локальная годится, если mut: её меняет только присваивание,
+// а в выражении оно бывает лишь внутри блока (if, match, { }) — rest_pure.
+fn take_simple_if(mut: bool) -> bool {
+    if simple_end != code_len || simple_at < barrier || (simple_mut && !mut) {
+        return false
+    }
+    code_rollback(simple_at)
+    op_kind = simple_kind
+    op_val = simple_val
+    return true
+}
+
+// Дальше в выражении нет блоков (if, match, { }), а значит, и присваиваний:
+// лексемы — до конца операнда на нулевой глубине скобок (, ) ] } { или начала
+// следующего оператора: if/match, имя или ключевое слово после значения).
+fn rest_pure() -> bool {
+    var depth = 0
+    var j = pos
+    let stop = pos + 200
+    while j < stop && j < toks.len() {
+        let k = toks[j].kind
+        if k == T_EOF {
+            return true
+        }
+        if k == T_IF || k == T_MATCH {
+            if depth == 0 && j > pos && ends_value(toks[j - 1].kind) {
+                return true
+            }
+            return false
+        }
+        if k == '(' || k == '[' {
+            depth += 1
+        } else if k == '\{' {
+            if depth == 0 {
+                return true
+            }
+            return false
+        } else if k == ')' || k == ']' || k == '}' {
+            if depth == 0 {
+                return true
+            }
+            depth -= 1
+        } else if depth == 0 && (k == ',' || k == T_LET || k == T_VAR || k == T_RETURN || k == T_WHILE || k == T_FOR || k == T_BREAK || k == T_CONTINUE) {
+            return true
+        } else if depth == 0 && j > pos && k == T_IDENT && ends_value(toks[j - 1].kind) {
+            // следующий оператор: x = ..., f(...)
+            return true
+        }
+        j += 1
+    }
+    return false
+}
+
+// Лексема может закончить значение (после неё — уже другой оператор).
+fn ends_value(k: int) -> bool {
+    return k == T_IDENT || k == T_INT || k == T_STR || k == T_FLOAT || k == T_TRUE || k == T_FALSE || k == T_NONE || k == ')' || k == ']'
 }
 
 // Загрузить простой операнд в регистр r.
@@ -467,17 +624,42 @@ fn load_operand(r: int) {
 
 // Операция rax = rax op операнд для + - & | ^ и сравнения (cmp).
 // rr — код «op r/m, r», mr — код «op r, r/m», ext — номер в группе 0x81.
+// Последняя инструкция — add rax, регистр локальной (addreg_reg): индекс адреса.
+var addreg_at: int
+var addreg_end: int = -1
+var addreg_reg: int
+
 fn emit_alu_operand(rr: int, mr: int, ext: int) {
     if op_kind == OPK_IMM {
-        emit_alu_imm(ext, RAX, op_val)
+        if fits_i32(op_val) {
+            emit_alu_imm(ext, RAX, op_val)
+        } else {
+            // число больше 32 битов — через rcx
+            emit_mov_imm(RCX, op_val)
+            emit_rr(rr, RCX, RAX)
+        }
         return
     }
     let l = locals[op_val]
     if l.reg >= 0 {
+        addreg_at = code_len
         emit_rr(rr, l.reg, RAX)
+        if rr == 0x01 {
+            addreg_end = code_len
+            addreg_reg = l.reg
+        }
     } else {
         emit_mem(mr, RAX, RBP, l.off)
     }
+}
+
+// Убрать add rax, регистр (последнюю инструкцию) → регистр или -1.
+fn take_addreg() -> int {
+    if addreg_end != code_len || addreg_at < barrier {
+        return -1
+    }
+    code_rollback(addreg_at)
+    return addreg_reg
 }
 
 // ---- Арифметика ----
@@ -565,11 +747,132 @@ fn emit_arith_rcx(op: int, at: Token) {
     }
 }
 
-// Правый операнд бинарной операции op над int: простой или через стек.
+// Сдвиг rax на число: shl rax, k / sar rax, k (как и со сдвигом на cl, x86 берёт
+// младшие 6 битов).
+fn emit_shift_imm(op: int, k: int) {
+    emit8(0x48)
+    emit8(0xC1)
+    if op == T_SHL {
+        emit8(0xE0)
+    } else {
+        emit8(0xF8)
+    }
+    emit8(k & 63)
+}
+
+// rax = rax · v (v — число). В библиотеке переполнение не проверяется, и
+// степень двойки — сдвиг; в программе — imul rax, rax, v (флаг OF для проверки).
+fn emit_mul_imm(v: int, at: Token) {
+    if files[at.file].is_lib && v > 0 && (v & (v - 1)) == 0 {
+        var k = 0
+        while (1 << k) != v {
+            k += 1
+        }
+        if k > 0 {
+            emit_shift_imm(T_SHL, k)
+        }
+        return
+    }
+    if !fits_i32(v) {
+        emit_mov_imm(RCX, v)
+        emit_arith_rcx('*', at)
+        return
+    }
+    emit8(0x48)
+    emit8(0x69)
+    emit8(0xC0)
+    emit32(v & 0xFFFFFFFF)
+    emit_overflow_check(at)
+}
+
+// a op b для чисел (32 бита со знаком: сумма, разность и произведение не
+// выходят за 64 бита); сдвиги — как у x86, на младшие 6 битов.
+fn fold_int(op: int, a: int, b: int) -> int {
+    if op == '+' {
+        return a + b
+    }
+    if op == '-' {
+        return a - b
+    }
+    if op == '*' {
+        return a * b
+    }
+    if op == '&' {
+        return a & b
+    }
+    if op == '|' {
+        return a | b
+    }
+    if op == '^' {
+        return a ^ b
+    }
+    if op == T_SHL {
+        return a << (b & 63)
+    }
+    return a >> (b & 63)
+}
+
+fn is_comm_op(op: int) -> bool {
+    return op == '+' || op == '&' || op == '|' || op == '^' || op == '*'
+}
+
+// rax = rax op операнд для перестановочной op (+ & | ^ *): операнд — левая
+// часть, rax — правая.
+fn emit_comm_operand(op: int, at: Token) {
+    if op == '*' {
+        if op_kind == OPK_IMM {
+            emit_mul_imm(op_val, at)
+            return
+        }
+        load_operand(RCX)
+        emit_arith_rcx(op, at)
+        return
+    }
+    emit_alu_operand(alu_rr(op), alu_rr(op) + 2, alu_ext(op))
+    if op == '+' {
+        emit_overflow_check(at)
+    }
+}
+
+// Правый операнд бинарной операции op над int: простой или через стек. Левый
+// операнд — в rax; если он простой (take_simple), стек не нужен: правая часть
+// считается в rax, левая — операндом.
 fn arith_rhs(op: int, level: int, at: Token) {
     want = ty_int
     if peek_simple(level) && is_int_like(op_ty) {
         advance()
+        // число op число — при компиляции (без деления: там паники). Широкие
+        // числа — только в библиотеке: в программе сумма может переполниться,
+        // а это паника при выполнении, не тихий перенос
+        if op_kind == OPK_IMM && simple_kind == OPK_IMM && op != '/' && op != '%' && ((fits_i32(op_val) && fits_i32(simple_val)) || files[at.file].is_lib) {
+            let r = op_val
+            if take_simple() {
+                let v = fold_int(op, op_val, r)
+                let p = code_len
+                emit_mov_imm(RAX, v)
+                note_simple(OPK_IMM, v, p)
+                return
+            }
+            op_kind = OPK_IMM
+            op_val = r
+        }
+        // число op локальная, op перестановочная: локальная op число
+        if is_comm_op(op) && op_kind == OPK_LOCAL && simple_kind == OPK_IMM {
+            let rk = op_kind
+            let rv = op_val
+            if take_simple() {
+                let lv = op_val
+                op_kind = rk
+                op_val = rv
+                load_operand(RAX)
+                op_kind = OPK_IMM
+                op_val = lv
+                emit_comm_operand(op, at)
+                return
+            }
+            op_kind = rk
+            op_val = rv
+        }
         if (op == '+' || op == '-' || op == '&' || op == '|' || op == '^') {
             emit_alu_operand(alu_rr(op), alu_rr(op) + 2, alu_ext(op))
             if op == '+' || op == '-' {
@@ -578,11 +881,11 @@ fn arith_rhs(op: int, level: int, at: Token) {
             return
         }
         if op == '*' && op_kind == OPK_IMM {
-            emit8(0x48)
-            emit8(0x69)
-            emit8(0xC0)
-            emit32(op_val & 0xFFFFFFFF)
-            emit_overflow_check(at)
+            emit_mul_imm(op_val, at)
+            return
+        }
+        if (op == T_SHL || op == T_SHR) && op_kind == OPK_IMM {
+            emit_shift_imm(op, op_val)
             return
         }
         if (op == '/' || op == '%') && op_kind == OPK_IMM && op_val > 0 {
@@ -601,7 +904,22 @@ fn arith_rhs(op: int, level: int, at: Token) {
         emit_arith_rcx(op, at)
         return
     }
-    emit_push(RAX)
+    // глобальная: операндом из памяти
+    let ga = peek_global(level)
+    if ga != 0 && (op == '+' || op == '-' || op == '&' || op == '|' || op == '^') {
+        advance()
+        emit_alu_abs(alu_rr(op) + 2, ga)
+        if op == '+' || op == '-' {
+            emit_overflow_check(at)
+        }
+        return
+    }
+    let deferred = take_simple_if(simple_mut && rest_pure())
+    let lk = op_kind
+    let lv = op_val
+    if !deferred {
+        emit_push(RAX)
+    }
     var rt = 0
     if level == 1 {
         rt = parse_unary()
@@ -609,6 +927,18 @@ fn arith_rhs(op: int, level: int, at: Token) {
         rt = parse_mul()
     }
     check_int(rt, at, op)
+    if deferred {
+        op_kind = lk
+        op_val = lv
+        if is_comm_op(op) {
+            emit_comm_operand(op, at)
+            return
+        }
+        emit_mov_rr(RCX, RAX)
+        load_operand(RAX)
+        emit_arith_rcx(op, at)
+        return
+    }
     emit_mov_rr(RCX, RAX)
     emit_pop(RAX)
     emit_arith_rcx(op, at)
@@ -709,8 +1039,7 @@ fn parse_or() -> int {
         }
         let at = tok()
         advance()
-        emit_test_rax()
-        holes.push(emit_jcc(CC_NE))
+        holes.push(emit_jump_bool(true))
         want = ty_err
         start = pos
         let rt = parse_and()
@@ -746,8 +1075,7 @@ fn parse_and() -> int {
         }
         let at = tok()
         advance()
-        emit_test_rax()
-        holes.push(emit_jcc(CC_E))
+        holes.push(emit_jump_bool(false))
         want = ty_err
         start = pos
         let rt = parse_cmp()
@@ -846,13 +1174,27 @@ fn emit_compare(op: int, lt: int, at: Token) -> int {
         advance()
         return CC_E
     }
-    emit_push(RAX)
+    let ga = peek_global(3)
+    if ga != 0 && lt == ty_int {
+        advance()
+        emit_alu_abs(0x3B, ga)
+        return cmp_cc(op)
+    }
+    // левая часть — простое значение: без стека (take_simple)
+    let deferred = take_simple_if(simple_mut && rest_pure())
+    let lk = op_kind
+    let lv = op_val
+    if !deferred {
+        emit_push(RAX)
+    }
     let rt = parse_add()
     let ok = compare_ok(lt, rt, ordered, at, left_char)
+    op_kind = lk
+    op_val = lv
     if ok && mixed_opt(lt, rt) {
         // левое → rdi, правое → rsi; необязательное значение — первым
         emit_mov_rr(RSI, RAX)
-        emit_pop(RDI)
+        pop_left(deferred, RDI)
         var inner = ty_inner(lt)
         if tkind(lt) != K_OPT {
             inner = ty_inner(rt)
@@ -873,7 +1215,7 @@ fn emit_compare(op: int, lt: int, at: Token) -> int {
     }
     if ok && lt == ty_str && rt == ty_str {
         emit_mov_rr(RSI, RAX)
-        emit_pop(RDI)
+        pop_left(deferred, RDI)
         if ordered {
             emit_call(rt_func("__str_cmp"))
             emit_alu_imm(7, RAX, 0)
@@ -887,9 +1229,18 @@ fn emit_compare(op: int, lt: int, at: Token) -> int {
         return CC_E
     }
     emit_mov_rr(RCX, RAX)
-    emit_pop(RAX)
+    pop_left(deferred, RAX)
     emit_rr(0x39, RCX, RAX)
     return cmp_cc(op)
+}
+
+// Левая часть сравнения → r: из стека или (deferred) простое значение op_kind/op_val.
+fn pop_left(deferred: bool, r: int) {
+    if deferred {
+        load_operand(r)
+    } else {
+        emit_pop(r)
+    }
 }
 
 // Сравнение типов lt и rt допустимо? Иначе ошибка. left_char — левый операнд
@@ -1122,7 +1473,9 @@ fn parse_unary() -> int {
                 emit_mov_imm(RAX, __int_to_f64_bits(0 - v))
                 return parse_postfix(ty_float, at)
             }
+            let p = code_len
             emit_mov_imm(RAX, -v)
+            note_simple(OPK_IMM, -v, p)
             int_lit_end = pos
             return parse_postfix(ty_int, at)
         }
@@ -1149,7 +1502,13 @@ fn parse_unary() -> int {
         want = ty_err
         let t = parse_unary()
         check_bool(t, at, "!")
-        emit_alu_imm(6, RAX, 1)
+        if setcc_end == code_len && setcc_at >= barrier {
+            // значение только что из setcc: обратить само условие
+            setcc_cc = setcc_cc ^ 1
+            store8(code + setcc_at + 1, 0x90 + setcc_cc)
+        } else {
+            emit_alu_imm(6, RAX, 1)
+        }
         return ty_bool
     }
     if k == '~' {

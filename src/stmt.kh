@@ -58,7 +58,7 @@ fn parse_block() -> bool {
     }
     expect_tok('}')
     panic_mode = false
-    nlocals = saved
+    locals_to(saved)
     narrow_to(nn)
     return div
 }
@@ -416,7 +416,36 @@ fn parse_let() {
     if alias {
         tx_aliases.push(name.text)
     }
-    emit_store_local(li)
+    // let y = x, где x — неизменяемая локальная, а y регистра не получил: y — та
+    // же ячейка (или регистр), без копии; обе не меняются
+    if !mutable && locals[li].reg < 0 && simple_kind == OPK_LOCAL && take_simple() {
+        locals[li].reg = locals[op_val].reg
+        locals[li].off = locals[op_val].off
+        return
+    }
+    if !store_imm_local(li) {
+        emit_store_local(li)
+    }
+}
+
+// Значение — только что загруженное число: прямо в регистр локальной или
+// mov qword [rbp + off], число — без rax (rax после присваивания не нужен).
+fn store_imm_local(li: int) -> bool {
+    if simple_kind != OPK_IMM || simple_end != code_len || !fits_i32(simple_val) {
+        return false
+    }
+    let v = simple_val
+    if !take_simple() {
+        return false
+    }
+    let l = locals[li]
+    if l.reg >= 0 {
+        emit_mov_imm(l.reg, v)
+    } else {
+        emit_mem_sized(0xC7, 0, RBP, l.off, true)
+        emit32(v & 0xFFFFFFFF)
+    }
+    return true
 }
 
 // ---- Присваивание ----
@@ -568,7 +597,7 @@ fn fast_compound(li: int, op_k: int, at: Token) -> bool {
         emit_overflow_check(at)
         return true
     }
-    if op_kind != OPK_IMM {
+    if op_kind != OPK_IMM || !fits_i32(op_val) {
         return false
     }
     let v = op_val
@@ -673,6 +702,9 @@ fn assign_name(t: Token, op: int, at: Token) {
             let vtok = tok()
             let vt = parse_expr(l.ty)
             coerce(vt, l.ty, vtok)
+            if store_imm_local(li) {
+                return
+            }
         } else {
             emit_load_local(li)
             emit_push(RAX)
@@ -954,10 +986,18 @@ fn cond_or(fl: [int]) {
             }
         }
         advance()
-        tl.push(emit_jmp())
-        let h = here()
-        for x in local_fl {
-            patch_rel(x, h)
+        let last = code_len - 4
+        if local_fl.len() == 1 && local_fl[0] == last && last - 2 >= barrier && load8(code + last - 2) == 0x0F {
+            // единственный переход «ложь» — последняя инструкция: обратить его
+            // в переход «истина» на тело
+            store8(code + last - 1, load8(code + last - 1) ^ 1)
+            tl.push(last)
+        } else {
+            tl.push(emit_jmp())
+            let h = here()
+            for x in local_fl {
+                patch_rel(x, h)
+            }
         }
         local_fl = []
         start = pos
@@ -991,15 +1031,15 @@ fn cond_and(fl: [int]) {
     narrow_to(nn)
 }
 
-// x < y, где x — локальная в регистре, а y — константа или локальная:
-// cmp без пересылки в rax. → условие или -1.
+// x < y, где x — локальная, а y — константа или локальная (если x в ячейке —
+// в регистре): cmp без пересылки в rax. → условие или -1.
 fn try_reg_compare() -> int {
     let t = tok()
     if t.kind != T_IDENT || !is_cmp_op(kind_at(pos + 1)) {
         return -1
     }
     let li = find_local(t.text)
-    if li < 0 || locals[li].reg < 0 || !is_int_like(locals[li].ty) {
+    if li < 0 || !is_int_like(locals[li].ty) {
         return -1
     }
     let save = pos
@@ -1012,7 +1052,21 @@ fn try_reg_compare() -> int {
     }
     let op = kind_at(save + 1)
     let r = locals[li].reg
-    if op_kind == OPK_IMM {
+    if r < 0 {
+        // локальная в ячейке: cmp [rbp + off], число или регистр
+        let off = locals[li].off
+        if op_kind == OPK_IMM && fits_i32(op_val) {
+            emit_mem_imm(7, RBP, off, op_val)
+        } else if op_kind == OPK_LOCAL && locals[op_val].reg >= 0 {
+            emit_mem(0x39, locals[op_val].reg, RBP, off)
+        } else {
+            pos = save
+            return -1
+        }
+    } else if op_kind == OPK_IMM && !fits_i32(op_val) {
+        emit_mov_imm(RCX, op_val)
+        emit_rr(0x39, RCX, r)
+    } else if op_kind == OPK_IMM {
         emit_alu_imm(7, r, op_val)
     } else {
         let l2 = locals[op_val]
@@ -1026,7 +1080,46 @@ fn try_reg_compare() -> int {
     return cmp_cc(op)
 }
 
+// Скобка с условием: ( ... ), за которой — &&, ||, ) или { (конец операнда
+// условия). → позиция парной ) или -1.
+fn cond_paren() -> int {
+    if kind() != '(' {
+        return -1
+    }
+    var depth = 0
+    var j = pos
+    while j < toks.len() {
+        let k = toks[j].kind
+        if k == '(' || k == '[' || k == '\{' {
+            depth += 1
+        } else if k == ')' || k == ']' || k == '}' {
+            depth -= 1
+            if depth == 0 {
+                let nk = kind_at(j + 1)
+                if k == ')' && (nk == T_ANDAND || nk == T_OROR || nk == ')' || nk == '\{') {
+                    return j
+                }
+                return -1
+            }
+        } else if k == T_EOF {
+            return -1
+        }
+        j += 1
+    }
+    return -1
+}
+
 fn cond_cmp(fl: [int]) {
+    if cond_paren() >= 0 {
+        // (a || b) && c: внутри — тоже переходы
+        advance()
+        let saved = no_struct
+        no_struct = false
+        cond_or(fl)
+        no_struct = saved
+        expect_tok(')')
+        return
+    }
     let rc = try_reg_compare()
     if rc >= 0 {
         fl.push(emit_jcc(rc ^ 1))
@@ -1055,8 +1148,7 @@ fn cond_cmp(fl: [int]) {
         }
         error_tok(at, "condition must be bool, found " + ty_name(lt), hint)
     }
-    emit_test_rax()
-    fl.push(emit_jcc(CC_E))
+    fl.push(emit_jump_bool(false))
 }
 
 // Продолжение «??» в условии, когда левая часть уже вычислена.
@@ -1151,8 +1243,7 @@ fn cond_cmp_true(tl: [int]) {
     if lt != ty_bool && lt != ty_err {
         error_tok(at, "condition must be bool, found " + ty_name(lt), mismatch_hint(lt, ty_bool))
     }
-    emit_test_rax()
-    tl.push(emit_jcc(CC_NE))
+    tl.push(emit_jump_bool(true))
 }
 
 fn parse_if() -> bool {
@@ -1243,7 +1334,7 @@ fn parse_if_let() -> bool {
     let so = sql_outside
     let d1 = parse_block()
     let s1 = sql_branch(so, d1)
-    nlocals = saved_n
+    locals_to(saved_n)
     sql_outside = s1
     if kind() != T_ELSE {
         patch_here(none_at)
@@ -1372,7 +1463,7 @@ fn parse_for() {
     while tx_aliases.len() > mark {
         tx_aliases.pop()
     }
-    nlocals = saved_n
+    locals_to(saved_n)
 }
 
 // Сравнить локальную a с локальной b (или числом) и перейти, если меньше.
@@ -1423,7 +1514,7 @@ fn for_range(n1: Token, inclusive: bool, saved_ns: bool) {
     var lim = -1
     let lt = tok()
     want = ty_int
-    if peek_simple(3) && op_kind == OPK_IMM && op_ty == ty_int && kind_at(pos + 1) == '\{' {
+    if peek_simple(3) && op_kind == OPK_IMM && op_ty == ty_int && fits_i32(op_val) && kind_at(pos + 1) == '\{' {
         use_imm = true
         lim_imm = op_val
         advance()
@@ -1831,7 +1922,7 @@ fn begin_fn(fi: int) -> int {
     align16()
     funcs[fi].code = here()
     narrow_to(0)
-    nlocals = 0
+    locals_to(0)
     local_floor = 0
     frame = 0
     used_regs = 0
@@ -1841,6 +1932,12 @@ fn begin_fn(fi: int) -> int {
     conts.clear()
     ret_holes.clear()
     panic_sites.clear()
+    simple_end = -1
+    addimm_end = -1
+    stored_end = -1
+    regload_end = -1
+    addreg_end = -1
+    setcc_end = -1
     fn_ret_ty = funcs[fi].ret
     panic_mode = false
     inline_depth = 0
@@ -1876,7 +1973,7 @@ fn end_fn(frame_at: int, diverged: bool) {
     let sled = frame_at + 4
     if diverged && ret_holes.len() > 0 && ret_holes[ret_holes.len() - 1] == code_len - 4 && code_len - 5 >= barrier {
         ret_holes.pop()
-        code_len -= 5
+        code_rollback(code_len - 5)
     } else if !diverged {
         emit_mov_imm(RAX, 0)
     }

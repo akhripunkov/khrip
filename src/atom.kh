@@ -23,7 +23,9 @@ fn parse_atom() -> int {
             emit_mov_imm(RAX, __int_to_f64_bits(t.val))
             return ty_float
         }
+        let at = code_len
         emit_mov_imm(RAX, t.val)
+        note_simple(OPK_IMM, t.val, at)
         int_lit_end = pos
         return ty_int
     }
@@ -187,7 +189,12 @@ fn parse_ident(w: int) -> int {
     }
     let li = find_local(name)
     if li >= 0 {
+        let at = code_len
         emit_load_local(li)
+        if !is_narrowed(li) {
+            note_simple(OPK_LOCAL, li, at)
+            simple_mut = locals[li].mutable
+        }
         let nk = kind()
         let keeps_opt = nk == T_QQ || ((nk == T_EQ || nk == T_NE) && kind_at(pos + 1) == T_NONE)
         if is_narrowed(li) && !keeps_opt {
@@ -218,7 +225,11 @@ fn parse_ident(w: int) -> int {
         }
         if sk == SK_CONST {
             let c = consts[sym_idx(s)]
+            let at = code_len
             emit_mov_imm(RAX, c.val)
+            if c.ty == ty_int {
+                note_simple(OPK_IMM, c.val, at)
+            }
             return c.ty
         }
         if sk == SK_FN {
@@ -958,9 +969,46 @@ fn finish_slice(t: int, at: Token, saved: bool) -> int {
 
 // ---- Вызовы ----
 
-// Аргументы по параметрам ps начиная с first; каждый кладётся в стек.
-// → число положенных аргументов.
-fn compile_args(ps: [Param], first: int, tt: int, kt: int, vt: int, name: str, at: Token) -> int {
+// Аргументы вызовов, которые сейчас разбираются (defer у compile_args): по
+// одной записи на аргумент, у вложенных вызовов — выше. arg_kind = -1 —
+// значение в стеке, иначе это простое значение (OPK_IMM, OPK_LOCAL — число или
+// неизменяемая локальная arg_val), и в стек оно не кладётся: его загрузят прямо
+// в регистр аргумента (emit_call_args) или подставят параметром встроенного тела.
+var arg_kind: [int]
+var arg_val: [int]
+
+// Значение аргумента в rax: в стек или (defer и оно простое) — запись без кода.
+fn push_arg(defer: bool) {
+    if defer && take_simple_if(simple_mut && rest_pure()) {
+        arg_kind.push(op_kind)
+        arg_val.push(op_val)
+        return
+    }
+    emit_push(RAX)
+    if defer {
+        arg_kind.push(-1)
+        arg_val.push(0)
+    }
+}
+
+// Снять записи n последних аргументов → сколько из них лежит в стеке.
+fn args_done(n: int) -> int {
+    var pushed = 0
+    var i = 0
+    while i < n {
+        if arg_kind.pop() < 0 {
+            pushed += 1
+        }
+        arg_val.pop()
+        i += 1
+    }
+    return pushed
+}
+
+// Аргументы по параметрам ps начиная с first; каждый кладётся в стек, а при
+// defer простые значения — в записи arg_kind/arg_val (снять — args_done).
+// → число аргументов.
+fn compile_args(ps: [Param], first: int, tt: int, kt: int, vt: int, name: str, at: Token, defer: bool) -> int {
     let saved = no_struct
     no_struct = false
     var n = 0
@@ -975,7 +1023,7 @@ fn compile_args(ps: [Param], first: int, tt: int, kt: int, vt: int, name: str, a
         if i < ps.len() {
             coerce(t, pt, a)
         }
-        emit_push(RAX)
+        push_arg(defer)
         n += 1
         i += 1
         if kind() == ',' {
@@ -993,7 +1041,7 @@ fn compile_args(ps: [Param], first: int, tt: int, kt: int, vt: int, name: str, a
         let t = parse_expr(pt)
         coerce(t, pt, toks[ps[i].def])
         pos = back
-        emit_push(RAX)
+        push_arg(defer)
         n += 1
         i += 1
     }
@@ -1032,31 +1080,88 @@ fn in_inline_stack(fi: int) -> bool {
     return false
 }
 
-// Вызов функции fi, аргументы (n штук) в стеке.
-fn emit_call_args(fi: int, n: int) {
+// Вызов функции fi, аргументы (n штук) в стеке; deferred — у них есть записи
+// arg_kind/arg_val (compile_args с defer, не больше 6 аргументов), и простые
+// значения в стек не клались.
+fn emit_call_args(fi: int, n: int, deferred: bool) {
     if n == funcs[fi].params.len() && funcs[fi].inline_ok && inline_depth < 3 && fi != cur_fn && !in_inline_stack(fi) && diags.len() == 0 {
-        inline_call(fi, n)
-        return
+        inline_call(fi, n, deferred)
+    } else if deferred {
+        // из стека — в обратном порядке, простые значения — прямо в регистры
+        let base = arg_kind.len() - n
+        var i = n - 1
+        while i >= 0 {
+            if arg_kind[base + i] < 0 {
+                emit_pop(arg_reg(i))
+            }
+            i -= 1
+        }
+        i = 0
+        while i < n {
+            if arg_kind[base + i] >= 0 {
+                op_kind = arg_kind[base + i]
+                op_val = arg_val[base + i]
+                load_operand(arg_reg(i))
+            }
+            i += 1
+        }
+        emit_call(fi)
+    } else {
+        emit_args_to_regs(n)
+        emit_call(fi)
+        emit_args_cleanup(n)
     }
-    emit_args_to_regs(n)
-    emit_call(fi)
-    emit_args_cleanup(n)
+    if deferred {
+        args_done(n)
+    }
 }
 
-// Встраивание: тело функции разбирается заново на месте вызова.
-fn inline_call(fi: int, n: int) {
+// Встраивание: тело функции разбирается заново на месте вызова. Параметр,
+// которому передали неизменяемую локальную (deferred), — она же (её регистр или
+// ячейка): параметр тоже не меняется; число — в свою ячейку, без стека.
+fn inline_call(fi: int, n: int, deferred: bool) {
     let f = funcs[fi]
     var slots: [int] = []
+    var regs: [int] = []
+    var base = 0
+    if deferred {
+        base = arg_kind.len() - n
+    }
     var i = 0
     while i < n {
-        slots.push(new_slot())
+        var r = -1
+        var off = 0
+        if deferred && arg_kind[base + i] == OPK_LOCAL {
+            let l = locals[arg_val[base + i]]
+            r = l.reg
+            off = l.off
+        } else {
+            off = new_slot()
+        }
+        regs.push(r)
+        slots.push(off)
         i += 1
     }
     i = n - 1
     while i >= 0 {
-        emit_pop(RAX)
-        emit_store(RBP, slots[i], RAX)
+        if !deferred || arg_kind[base + i] < 0 {
+            emit_pop(RAX)
+            // значение ещё в rax: чтение параметра сразу за записью не нужно
+            stored_at = code_len
+            emit_store(RBP, slots[i], RAX)
+            stored_end = code_len
+            stored_reg = -1
+            stored_off = slots[i]
+        }
         i -= 1
+    }
+    i = 0
+    while i < n {
+        if deferred && arg_kind[base + i] == OPK_IMM {
+            emit_mov_imm(RAX, arg_val[base + i])
+            emit_store(RBP, slots[i], RAX)
+        }
+        i += 1
     }
     let saved_pos = pos
     let saved_n = nlocals
@@ -1068,7 +1173,7 @@ fn inline_call(fi: int, n: int) {
     local_floor = nlocals
     i = 0
     while i < n {
-        add_local(f.params[i].name, f.params[i].ty, false, -1, slots[i])
+        add_local(f.params[i].name, f.params[i].ty, false, regs[i], slots[i])
         i += 1
     }
     fn_ret_ty = f.ret
@@ -1083,17 +1188,21 @@ fn inline_call(fi: int, n: int) {
     // return в самом конце тела — переход на следующую инструкцию
     if inline_rets.len() > base && inline_rets[inline_rets.len() - 1] == code_len - 4 && code_len - 5 >= barrier {
         inline_rets.pop()
-        code_len -= 5
+        code_rollback(code_len - 5)
     }
-    let end = here()
-    while inline_rets.len() > base {
-        patch_rel(inline_rets.pop(), end)
+    // метка конца — только если на неё есть переходы: иначе записи о последней
+    // инструкции тела (простое значение, setcc) годятся и после встраивания
+    if inline_rets.len() > base {
+        let end = here()
+        while inline_rets.len() > base {
+            patch_rel(inline_rets.pop(), end)
+        }
     }
     inline_stack.pop()
     quiet -= 1
     inline_depth -= 1
     pos = saved_pos
-    nlocals = saved_n
+    locals_to(saved_n)
     local_floor = saved_floor
     fn_ret_ty = saved_ret
     no_struct = saved_ns
@@ -1124,6 +1233,35 @@ fn emit_to_str(t: int, at: Token) -> bool {
 }
 
 fn builtin_args(n: int, at: Token, name: str) -> int {
+    return builtin_args_d(n, at, name, false)
+}
+
+// Аргументы встроенной функции → регистры regs по порядку: из стека, а
+// простые значения — прямо в регистр (как у вызова, push_arg).
+fn builtin_regs(n: int, at: Token, name: str, regs: [int]) -> int {
+    let got = builtin_args_d(n, at, name, true)
+    let base = arg_kind.len() - got
+    var i = got - 1
+    while i >= 0 {
+        if arg_kind[base + i] < 0 && i < regs.len() {
+            emit_pop(regs[i])
+        }
+        i -= 1
+    }
+    i = 0
+    while i < got {
+        if arg_kind[base + i] >= 0 && i < regs.len() {
+            op_kind = arg_kind[base + i]
+            op_val = arg_val[base + i]
+            load_operand(regs[i])
+        }
+        i += 1
+    }
+    args_done(got)
+    return got
+}
+
+fn builtin_args_d(n: int, at: Token, name: str, defer: bool) -> int {
     let saved = no_struct
     no_struct = false
     var got = 0
@@ -1133,7 +1271,7 @@ fn builtin_args(n: int, at: Token, name: str) -> int {
         if t != ty_int && t != ty_err {
             error_tok(a, name + " takes int arguments, found " + ty_name(t), "")
         }
-        emit_push(RAX)
+        push_arg(defer)
         got += 1
         if kind() == ',' {
             advance()
@@ -1174,60 +1312,131 @@ fn emit_setjmp_rax() {
     barrier = code_len
 }
 
+// store8/store32/store64(адрес, значение). Адрес x + число — число смещением; если
+// x — простое значение (неизменяемая локальная, число), стек не нужен: значение
+// считается в rax, а адрес — регистр x или rcx.
+fn parse_store(t: Token, name: str) -> int {
+    advance()
+    let saved = no_struct
+    no_struct = false
+    var got = 0
+    var disp = 0
+    var base = -1
+    var deferred = false
+    var lk = 0
+    var lv = 0
+    while kind() != ')' && kind() != T_EOF && !panic_mode {
+        let a = tok()
+        let ty = parse_expr(ty_int)
+        if ty != ty_int && ty != ty_err {
+            error_tok(a, name + " takes int arguments, found " + ty_name(ty), "")
+        }
+        got += 1
+        if got == 1 {
+            disp = take_addimm()
+            deferred = take_simple_if(simple_mut && rest_pure())
+            lk = op_kind
+            lv = op_val
+            if deferred && lk == OPK_LOCAL && locals[lv].reg >= 0 {
+                base = locals[lv].reg
+            }
+            if !deferred {
+                emit_push(RAX)
+            }
+        }
+        if kind() == ',' {
+            advance()
+        } else if kind() != ')' {
+            syntax_error(tok(), "expected ',' or ')' in the call", "")
+        }
+    }
+    expect_tok(')')
+    no_struct = saved
+    if got != 2 {
+        error_tok(t, name + " takes 2 argument(s), got " + got.to_str(), "")
+        return ty_void
+    }
+    var src = RAX
+    // значение — число: mov [адрес], число (без rax); локальная в регистре —
+    // прямо из него
+    var imm = false
+    var iv = 0
+    if simple_kind == OPK_IMM && (name == "store8" || fits_i32(simple_val)) {
+        let k0 = op_kind
+        let v0 = op_val
+        if take_simple() {
+            imm = true
+            iv = op_val
+        }
+        op_kind = k0
+        op_val = v0
+    } else if simple_kind == OPK_LOCAL && name != "store8" && locals[simple_val].reg >= 0 {
+        let k0 = op_kind
+        let v0 = op_val
+        if take_simple_if(true) {
+            src = locals[op_val].reg
+        }
+        op_kind = k0
+        op_val = v0
+    }
+    if base < 0 {
+        if deferred {
+            op_kind = lk
+            op_val = lv
+            load_operand(RCX)
+        } else {
+            emit_pop(RCX)
+        }
+        base = RCX
+    }
+    if imm {
+        if name == "store8" {
+            emit_mem_sized(0xC6, 0, base, disp, false)
+            emit8(iv & 255)
+        } else {
+            emit_mem_sized(0xC7, 0, base, disp, name == "store64")
+            emit32(iv & 0xFFFFFFFF)
+        }
+    } else if name == "store8" {
+        emit_mem_sized(0x88, src, base, disp, false)
+    } else if name == "store32" {
+        emit_mem_sized(0x89, src, base, disp, false)
+    } else {
+        emit_mem_sized(0x89, src, base, disp, true)
+    }
+    return ty_void
+}
+
 fn parse_builtin(t: Token, w: int) -> int {
     let name = t.text
     if name == "load8" || name == "load32" || name == "load64" {
         advance()
         builtin_args(1, t, name)
         emit_pop(RAX)
+        // адрес x + число: число — смещением; x — неизменяемая локальная в
+        // регистре: прямо [регистр + смещение]
+        let disp = take_addimm()
+        let index = take_addreg()
+        var base = take_regload()
+        if base < 0 {
+            base = RAX
+        }
         if name == "load8" {
-            emit8(0x0F)
-            emit8(0xB6)
-            emit8(0x00)
+            emit_mem_index(0x0FB6, RAX, base, index, disp, false)
         } else if name == "load32" {
-            // mov eax, [rax] (старшие 32 бита — нули)
-            emit8(0x8B)
-            emit8(0x00)
+            // mov eax, [...] (старшие 32 бита — нули)
+            emit_mem_index(0x8B, RAX, base, index, disp, false)
         } else {
-            emit_load(RAX, RAX, 0)
+            emit_mem_index(0x8B, RAX, base, index, disp, true)
         }
         return ty_int
     }
     if name == "store8" || name == "store32" || name == "store64" {
-        advance()
-        builtin_args(2, t, name)
-        emit_pop(RCX)
-        emit_pop(RAX)
-        if name == "store8" {
-            emit8(0x88)
-            emit8(0x08)
-        } else if name == "store32" {
-            // mov [rax], ecx
-            emit8(0x89)
-            emit8(0x08)
-        } else {
-            emit_store(RAX, 0, RCX)
-        }
-        return ty_void
+        return parse_store(t, name)
     }
     if name == "syscall" {
         advance()
-        let n = builtin_args(-1, t, name)
-        var i = n - 1
-        while i >= 0 {
-            if i == 0 {
-                emit_pop(RAX)
-            } else if i == 4 {
-                emit_pop(R10)
-            } else if i == 5 {
-                emit_pop(R8)
-            } else if i == 6 {
-                emit_pop(R9)
-            } else {
-                emit_pop(arg_reg(i - 1))
-            }
-            i -= 1
-        }
+        builtin_regs(-1, t, name, [RAX, RDI, RSI, RDX, R10, R8, R9])
         emit8(0x0F)
         emit8(0x05)
         return ty_int
@@ -1336,7 +1545,7 @@ fn parse_builtin(t: Token, w: int) -> int {
         }
         return ty_opt(inner)
     }
-    let lib_only = name == "__fsqrt" || name.starts_with("__simd_") || name == "__sha256_x64" || name == "__sha512_x64" || name == "__cpu_aes" || name == "__aes_ctr" || name == "__ghash" || name == "__chacha_block" || name == "__mp_add" || name == "__mp_sub" || name == "__mont_mul" || name == "__madd" || name == "__msub" || name == "__wmul" || name == "__cpu_avx2" || name == "__cpu_sha" || name == "__spawn" || name == "__co_call" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset" || name == "__data_end" || name == "__data_hex" || name == "__gc_roots"
+    let lib_only = name == "__fsqrt" || name.starts_with("__simd_") || name == "__sha256_x64" || name == "__sha512_x64" || name == "__cpu_aes" || name == "__aes_ctr" || name == "__ghash" || name == "__chacha_block" || name == "__mp_add" || name == "__mp_sub" || name == "__mont_mul" || name == "__madd" || name == "__msub" || name == "__wmul" || name == "__cpu_avx2" || name == "__cpu_pdep" || name == "__cpu_sha" || name == "__spawn" || name == "__co_call" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset" || name == "__data_end" || name == "__data_hex" || name == "__gc_roots"
     if lib_only && !files[t.file].is_lib {
         return -1
     }
@@ -1366,13 +1575,10 @@ fn parse_builtin(t: Token, w: int) -> int {
     if name == "__simd_find_byte" || name == "__simd_find_json" || name == "__simd_find_crlf2" {
         advance()
         if name == "__simd_find_byte" {
-            builtin_args(3, t, name)
-            emit_pop(RDX)
+            builtin_regs(3, t, name, [RDI, RSI, RDX])
         } else {
-            builtin_args(2, t, name)
+            builtin_regs(2, t, name, [RDI, RSI])
         }
-        emit_pop(RSI)
-        emit_pop(RDI)
         if name == "__simd_find_byte" {
             emit_simd_find_byte()
         } else if name == "__simd_find_json" {
@@ -1382,23 +1588,28 @@ fn parse_builtin(t: Token, w: int) -> int {
         }
         return ty_int
     }
-    if name == "__simd_utf8_scan" || name == "__simd_utf8_skip" || name == "__simd_find_json_hi" {
+    if name == "__simd_utf8_scan" || name == "__simd_utf8_skip" || name == "__simd_utf8_seek" || name == "__simd_find_json_hi" {
         advance()
-        if name == "__simd_utf8_skip" {
-            builtin_args(3, t, name)
-            emit_pop(RDX)
+        if name == "__simd_utf8_skip" || name == "__simd_utf8_seek" {
+            builtin_regs(3, t, name, [RDI, RSI, RDX])
         } else {
-            builtin_args(2, t, name)
+            builtin_regs(2, t, name, [RDI, RSI])
         }
-        emit_pop(RSI)
-        emit_pop(RDI)
         if name == "__simd_utf8_scan" {
             emit_simd_utf8_scan()
         } else if name == "__simd_utf8_skip" {
             emit_simd_utf8_skip()
+        } else if name == "__simd_utf8_seek" {
+            emit_simd_utf8_seek()
         } else {
             emit_simd_find_json_hi()
         }
+        return ty_int
+    }
+    if name == "__simd_case" {
+        advance()
+        builtin_regs(4, t, name, [RDI, RSI, RDX, RCX])
+        emit_simd_case()
         return ty_int
     }
     if name == "__data_hex" {
@@ -1531,6 +1742,12 @@ fn parse_builtin(t: Token, w: int) -> int {
         emit_cpu_avx2()
         return ty_bool
     }
+    if name == "__cpu_pdep" {
+        advance()
+        expect_tok(')')
+        emit_cpu_pdep()
+        return ty_bool
+    }
     if name == "__spawn" {
         // __spawn(вершина стека, аргумент): новый поток (clone) выполняет
         // __thread_main(аргумент) и завершается
@@ -1646,10 +1863,7 @@ fn parse_builtin(t: Token, w: int) -> int {
     if name == "__memset" {
         // rep stosb: rdi = куда, al = байт, rcx = сколько
         advance()
-        builtin_args(3, t, name)
-        emit_pop(RCX)
-        emit_pop(RAX)
-        emit_pop(RDI)
+        builtin_regs(3, t, name, [RDI, RAX, RCX])
         emit8(0xF3)
         emit8(0xAA)
         return ty_void
@@ -1657,10 +1871,7 @@ fn parse_builtin(t: Token, w: int) -> int {
     if name == "__memcpy" {
         // rep movsb: rdi = куда, rsi = откуда, rcx = сколько
         advance()
-        builtin_args(3, t, name)
-        emit_pop(RCX)
-        emit_pop(RSI)
-        emit_pop(RDI)
+        builtin_regs(3, t, name, [RDI, RSI, RCX])
         emit8(0xF3)
         emit8(0xA4)
         return ty_void
@@ -1743,7 +1954,7 @@ fn parse_call(t: Token, w: int) -> int {
         error_tok(t, "unknown function '" + name + "'", hint)
         // разобрать аргументы, чтобы продолжить
         var ps: [Param] = []
-        let n = compile_args(ps, 0, ty_err, ty_err, ty_err, name, t)
+        let n = compile_args(ps, 0, ty_err, ty_err, ty_err, name, t, false)
         emit_alu_imm(0, RSP, n * 8)
         return ty_err
     }
@@ -1759,13 +1970,19 @@ fn parse_call(t: Token, w: int) -> int {
     if f.is_lib {
         driver_query_check(t, pos - 1, 1)
     }
-    let n = compile_args(f.params, 0, ty_err, ty_err, ty_err, name, t)
+    // не больше 6 аргументов — все в регистрах: простые значения — без стека
+    let defer = f.params.len() <= 6
+    let n = compile_args(f.params, 0, ty_err, ty_err, ty_err, name, t, defer)
     if n != f.params.len() {
-        emit_alu_imm(0, RSP, n * 8)
+        var pushed = n
+        if defer {
+            pushed = args_done(n)
+        }
+        emit_alu_imm(0, RSP, pushed * 8)
         return f.ret
     }
     sql_call_check(t, fi)
-    emit_call_args(fi, n)
+    emit_call_args(fi, n, defer)
     last_was_call = true
     if f.is_lib && (name == "fail" || name == "exit") {
         // не возвращаются: годятся для else { ... } и ветвей match
@@ -2012,7 +2229,7 @@ fn parse_method(rt: int, nt: Token) -> int {
     }
     emit_push(RAX)
     advance()
-    let n = compile_args(f.params, 1, tt, ty_err, ty_err, name, nt) + 1
+    let n = compile_args(f.params, 1, tt, ty_err, ty_err, name, nt, false) + 1
     if n != f.params.len() {
         emit_alu_imm(0, RSP, n * 8)
         return subst(f.ret, tt, ty_err, ty_err)
@@ -2038,7 +2255,7 @@ fn parse_method(rt: int, nt: Token) -> int {
         last_was_call = true
         return ty_str
     }
-    emit_call_args(fi, n)
+    emit_call_args(fi, n, false)
     last_was_call = true
     return subst(f.ret, tt, ty_err, ty_err)
 }
@@ -2086,12 +2303,12 @@ fn parse_list_typed_method(rt: int, nt: Token) -> int {
     let f = funcs[fi]
     emit_push(RAX)
     advance()
-    let n = compile_args(f.params, 1, et, ty_err, ty_err, nt.text, nt) + 1
+    let n = compile_args(f.params, 1, et, ty_err, ty_err, nt.text, nt, false) + 1
     if n != f.params.len() {
         emit_alu_imm(0, RSP, n * 8)
         return f.ret
     }
-    emit_call_args(fi, n)
+    emit_call_args(fi, n, false)
     last_was_call = true
     return f.ret
 }

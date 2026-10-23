@@ -471,12 +471,12 @@ fn parse_matches(nt: Token) -> int {
     if lit < 0 {
         let fi = rt_func("__text_matches")
         advance()
-        let n = compile_args(funcs[fi].params, 1, ty_err, ty_err, ty_err, "matches", nt) + 1
+        let n = compile_args(funcs[fi].params, 1, ty_err, ty_err, ty_err, "matches", nt, false) + 1
         if n != funcs[fi].params.len() {
             emit_alu_imm(0, RSP, n * 8)
             return ty_bool
         }
-        emit_call_args(fi, n)
+        emit_call_args(fi, n, false)
         last_was_call = true
         return ty_bool
     }
@@ -493,7 +493,7 @@ fn parse_matches(nt: Token) -> int {
     emit_push(RAX)
     emit_mov_imm(RAX, global_slot())
     emit_push(RAX)
-    emit_call_args(rt_func("__text_matches_at"), 3)
+    emit_call_args(rt_func("__text_matches_at"), 3, false)
     last_was_call = true
     return ty_bool
 }

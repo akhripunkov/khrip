@@ -4,9 +4,12 @@
 // чероки U+13A0 → U+AB70, дезерет (4 байта), знак Кельвина → k, ſ → S,
 // ɐ → Ɐ (растёт из 2 байт в 3); слова по 8 байт ASCII вперемешку с другими
 // символами и неправильные байты (копируются как есть). Если менять нечего,
-// lower/upper возвращают ту же строку (тот же заголовок). В конце — все
-// отображения и \w таблиц сворачиваются в число; ожидаемые числа посчитаны по
-// UnicodeData.txt 17.0.0 отдельно от генератора (tools/unicode_tables.kh).
+// lower/upper возвращают ту же строку (тот же заголовок). Случайные строки из
+// ASCII, кириллицы и других символов (блоки по 32 байта идут через __simd_case,
+// остальное — по символам) сверяются с отображением по символам через
+// __case_map. В конце — все отображения и \w таблиц сворачиваются в число;
+// ожидаемые числа посчитаны по UnicodeData.txt 17.0.0 отдельно от генератора
+// (tools/unicode_tables.kh).
 // env: KHRIP_SIMD=0 KHRIP_STRCACHE=off
 // env: KHRIP_SIMD=0
 // env: KHRIP_SIMD=0 KHRIP_STRCACHE=stress
@@ -48,6 +51,65 @@ fn utf8(cp: int) -> str {
     return buf_str(b)
 }
 
+// Ссылка: каждый символ (правило Go) — через __case_map, неправильный байт — как есть.
+fn ref_case(s: str, up: bool) -> str {
+    let p = __str_ptr(s)
+    let n = s.byte_len()
+    let b = buf_new(n + 16)
+    var i = 0
+    while i < n {
+        let w = __utf8_width(p, n, i)
+        if w == 1 && load8(p + i) >= 0x80 {
+            buf_byte(b, load8(p + i))
+        } else {
+            buf_utf8(b, __case_map(__utf8_decode(p, n, i), up))
+        }
+        i += w
+    }
+    return buf_str(b)
+}
+
+var seed: int = 11
+
+fn rnd(n: int) -> int {
+    seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+    return (seed >> 8) % n
+}
+
+// Случайная строка: other из 1000 символов — не ASCII и не кириллица U+0400–045F
+// (греческий, «», тире, Ѡ, эмодзи, одинокие и неправильные байты).
+fn rnd_text(m: int, other: int) -> str {
+    let b = buf_new(16)
+    for i in 0..m {
+        let r = rnd(1000)
+        if r < other {
+            let k = rnd(8)
+            if k == 0 {
+                buf_utf8(b, 0x460 + rnd(32))
+            } else if k == 1 {
+                buf_utf8(b, 0xAB + 16 * rnd(2))
+            } else if k == 2 {
+                buf_utf8(b, 0x391 + rnd(40))
+            } else if k == 3 {
+                buf_utf8(b, 0x2014)
+            } else if k == 4 {
+                buf_byte(b, 0x80 + rnd(64))
+            } else if k == 5 {
+                buf_byte(b, 0xD0 + rnd(2))
+            } else if k == 6 {
+                buf_utf8(b, 0x1F600 + rnd(16))
+            } else {
+                buf_utf8(b, 0x250 + rnd(16))
+            }
+        } else if r < 450 {
+            buf_byte(b, 32 + rnd(95))
+        } else {
+            buf_utf8(b, 0x400 + rnd(96))
+        }
+    }
+    return buf_str(b)
+}
+
 fn main() -> int {
     show("ЁЖИК ёжик")
     show("ΟΔΟΣ ς")
@@ -84,6 +146,27 @@ fn main() -> int {
     print("ЗАГЛАВНЫЕ Ё: " + same("ЗАГЛАВНЫЕ Ё"))
     print("123 !? —: " + same("123 !? — 😀"))
     print("empty: " + same(""))
+
+    // случайные строки против отображения по символам
+    var cases = 0
+    var wrong = 0
+    for t in 0..3000 {
+        let s = rnd_text(rnd(150), [0, 0, 2, 10, 50, 300][rnd(6)])
+        for up in [false, true] {
+            cases += 1
+            var got = __text_lower(s)
+            if up {
+                got = __text_upper(s)
+            }
+            if got != ref_case(s, up) {
+                wrong += 1
+                if wrong <= 5 {
+                    print("mismatch (up {up}): {hex_bytes(s)}")
+                }
+            }
+        }
+    }
+    print("random strings: {cases} cases, {wrong} mismatches")
 
     // классы символов
     var words = ""
