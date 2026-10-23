@@ -23,6 +23,137 @@ fn raw_bytes(values: [int]) -> str {
     return buf_str(b)
 }
 
+// Заголовок RowBinaryWithNamesAndTypes: число столбцов, имена, типы.
+fn rb_header(b: Buf, names: [str], types: [str]) {
+    __ch_varint(b, names.len())
+    for n in names { __ch_string(b, n) }
+    for t in types { __ch_string(b, t) }
+}
+
+fn bits(f: float) -> int {
+    let v: int = __cast(f)
+    return v
+}
+
+fn le(b: Buf, v: int, width: int) {
+    for i in 0..width { buf_byte(b, (v >> (i * 8)) & 255) }
+}
+
+type Exotic { f: float, u: str, d: float, e: str, t: int, big: int, flag: bool, maybe: str? }
+
+// Ответ DESCRIBE: name, type, default_type.
+fn describe(rows: [[str]]) -> str {
+    let b = buf_new(256)
+    rb_header(b, ["name", "type", "default_type", "comment"], ["String", "String", "String", "String"])
+    for r in rows {
+        for v in r { __ch_string(b, v) }
+        __ch_string(b, "")
+    }
+    return buf_str(b)
+}
+
+type Row { id: int, ts: int, page: str, note: str?, score: float, tags: [str], ok: bool }
+
+// Типы ClickHouse, их чтение и вставка под схему (В6, С6, Н11) — без сервера.
+fn typed_codecs() {
+    // Float32: точное расширение и округление к ближайшему чётному
+    require(__ch_f32_to_f64(0x3FC00000) == bits(1.5), "Float32 1.5")
+    require(__ch_f32_to_f64(0x00000001) == bits(1.401298464324817e-45), "Float32 smallest subnormal")
+    require(__ch_f32_to_f64(0xFF800000) == bits(0.0 - 1.0 / 0.0), "Float32 -Inf")
+    require(__ch_f64_to_f32(bits(1.5)) == 0x3FC00000, "Float32 from 1.5")
+    require(__ch_f64_to_f32(bits(0.1)) == 0x3DCCCCCD, "Float32 from 0.1 rounds to nearest")
+    require(__ch_f64_to_f32(bits(16777217.0)) == 0x4B800000, "Float32 tie rounds to even")
+    require(__ch_f64_to_f32(bits(3.4028234663852886e38)) == 0x7F7FFFFF, "Float32 max")
+    require(__ch_f64_to_f32(bits(3.5e38)) == -1, "Float32 overflow is an error")
+    require(__ch_f64_to_f32(bits(1.0e-46)) == 0, "Float32 underflow to zero")
+    require(__ch_f64_to_f32(bits(1.0e-40)) == 0x000116C2, "Float32 subnormal")
+    // Decimal: по кратчайшей десятичной записи, половина — от нуля
+    require((__ch_decimal_units(1.005, 2, 10) ?? 0) == 101, "Decimal 1.005 -> 1.01")
+    require((__ch_decimal_units(-12.345, 2, 10) ?? 0) == -1235, "Decimal half away from zero")
+    require((__ch_decimal_units(1.0e-7, 2, 10) ?? 1) == 0, "Decimal tiny value")
+    require((__ch_decimal_units(1.5e20, 0, 38) ?? 0) == 0 && __ch_decimal_units(1.5e20, 0, 38) == none, "Decimal beyond int")
+    require(__ch_decimal_units(123456789.0, 2, 10) == none, "Decimal precision")
+    require(__ch_decimal_units(0.0 / 0.0, 2, 10) == none, "Decimal NaN")
+    // разбор типов
+    let en = __ch_type_of("Enum8('it\\'s' = -2, 'a,b' = 1)") ?? __ChType { op: -1 }
+    require(en.op == CHT_ENUM && en.names[0] == "it's" && en.values[0] == -2 && en.names[1] == "a,b", "Enum names with escapes")
+    let lc = __ch_type_of("LowCardinality(Nullable(String))") ?? __ChType { op: -1 }
+    require(lc.op == CHT_NULLABLE && lc.text == "LowCardinality(Nullable(String))", "LowCardinality is its inner type")
+    let dec = __ch_type_of("Decimal(38, 5)") ?? __ChType { op: -1 }
+    require(dec.op == CHT_DEC && dec.width == 16 && dec.scale == 5, "Decimal width")
+    let dt = __ch_type_of("DateTime64(6, 'Europe/Moscow')") ?? __ChType { op: -1 }
+    require(dt.op == CHT_DT64 && dt.scale == 6, "DateTime64 scale")
+    require(__ch_type_of("Map(String, Array(UInt8))") != none && __ch_type_of("Array(") == none, "unknown and broken types")
+    // чтение: Float32, UUID, Decimal128, Enum16, DateTime64, Int128, UInt8 как bool, Nullable
+    let b = buf_new(256)
+    rb_header(b, ["f", "u", "d", "e", "t", "big", "flag", "maybe"], ["Float32", "UUID", "Decimal(20, 3)", "Enum16('x' = -300, 'y' = 2)", "DateTime64(3)", "Int128", "UInt8", "LowCardinality(Nullable(String))"])
+    le(b, 0x3FC00000, 4)
+    le(b, 0x61F0C4045CB311E7, 8)
+    le(b, 0x6AD3DBA0, 4)
+    le(b, 0x907BA600, 4)
+    le(b, -12345, 8)
+    le(b, -1, 8)
+    le(b, -300, 2)
+    le(b, 1700000000123, 8)
+    le(b, -5, 8)
+    le(b, -1, 8)
+    buf_byte(b, 1)
+    buf_byte(b, 0)
+    __ch_string(b, "z")
+    let exotic: [Exotic]? = ch_decode(buf_str(b))
+    require(to_json(exotic ?? []) == "[\{\"f\":1.5,\"u\":\"61f0c404-5cb3-11e7-907b-a6006ad3dba0\",\"d\":-12.345,\"e\":\"x\",\"t\":1700000000123,\"big\":-5,\"flag\":true,\"maybe\":\"z\"}]", "exotic column types")
+    let wide_dec = buf_new(64)
+    rb_header(wide_dec, ["value"], ["Decimal(38, 0)"])
+    le(wide_dec, 0, 8)
+    le(wide_dec, -1, 8)
+    le(wide_dec, 0, 8)
+    le(wide_dec, 1, 8)
+    let decs: [float]? = ch_decode(buf_str(wide_dec))
+    require(to_json(decs ?? []) == "[-18446744073709552000,18446744073709552000]", "Decimal128 beyond int64")
+    let huge = buf_new(64)
+    rb_header(huge, ["value"], ["UInt128"])
+    le(huge, 1, 8)
+    le(huge, 1, 8)
+    let wide: [int]? = ch_decode(buf_str(huge))
+    require(wide == none && ch_error().contains("does not fit"), "UInt128 beyond int")
+    let nb = buf_new(64)
+    rb_header(nb, ["value"], ["Nullable(String)"])
+    buf_byte(nb, 1)
+    let strict: [str]? = ch_decode(buf_str(nb))
+    require(strict == none && ch_error().contains("does not match Khrip type str"), "Nullable needs T?")
+    // вставка под схему: сужение, флаги NULL, массивы
+    let schema = describe([["id", "UInt64", ""], ["ts", "DateTime", ""], ["page", "LowCardinality(String)", ""], ["note", "Nullable(String)", ""], ["score", "Float32", ""], ["tags", "Array(FixedString(2))", ""], ["ok", "UInt8", ""], ["twice", "UInt64", "MATERIALIZED"]])
+    let rows = [Row { id: 7, ts: 1700000000, page: "/", note: none, score: 0.5, tags: ["ab", "c"], ok: true }]
+    let body = ch_encode(rows)
+    let r = __ChReader { p: __str_ptr(body), end: __str_ptr(body) + body.byte_len() }
+    let count = __ch_read_varint(r)
+    var cols: [str] = []
+    var srcs: [str] = []
+    for i in 0..count { cols.push(__ch_read_str(r)) }
+    for i in 0..count { srcs.push(__ch_read_str(r)) }
+    let plan = __ch_insert_plan(schema, cols, srcs)
+    require(plan.error == "" && !plan.same, "insert plan: " + plan.error)
+    let out = __ch_transcode(r, cols, plan)
+    let wanted = buf_new(128)
+    rb_header(wanted, ["id", "ts", "page", "note", "score", "tags", "ok"], ["UInt64", "DateTime", "LowCardinality(String)", "Nullable(String)", "Float32", "Array(FixedString(2))", "UInt8"])
+    le(wanted, 7, 8)
+    le(wanted, 1700000000, 4)
+    __ch_string(wanted, "/")
+    buf_byte(wanted, 1)
+    le(wanted, 0x3F000000, 4)
+    buf_byte(wanted, 2)
+    buf_add(wanted, "ab")
+    buf_add(wanted, "c")
+    buf_byte(wanted, 0)
+    buf_byte(wanted, 1)
+    require(r.error == "" && out == buf_str(wanted), "transcoded batch: " + r.error)
+    require(__ch_insert_plan(describe([["id", "Int64", ""]]), cols, srcs).error == "table has no column 'ts'", "missing column")
+    require(__ch_insert_plan(describe([["id", "Int64", "ALIAS"]]), ["id"], ["Int64"]).error == "column 'id' is ALIAS and cannot be inserted", "alias column")
+    require(__ch_insert_plan(describe([["id", "Tuple(Int64, String)", ""]]), ["id"], ["Int64"]).error == "column 'id': Khrip int cannot be written to ClickHouse Tuple(Int64, String)", "unsupported column type")
+    let same = __ch_insert_plan(describe([["id", "Int64", ""], ["v", "Nullable(String)", ""]]), ["id", "v"], ["Int64", "Nullable(String)"])
+    require(same.error == "" && same.same, "matching types send the batch as is")
+}
+
 fn main() -> int {
     let original = [
         ChSample { id: -9223372036854775807 - 1, name: "Привет\0\n\\", active: true, score: 2.5, maybe_score: -3.125, note: none, tags: ["a", "", "б"], numbers: [1, none, -4], flags: [true, false, true] },
@@ -56,6 +187,7 @@ fn main() -> int {
     require(huge == none, "oversized varint")
     let noncanonical: [int]? = ch_decode(raw_bytes([129,0]))
     require(noncanonical == none, "noncanonical varint")
+    typed_codecs()
     print("ClickHouse codec: ok")
     return 0
 }

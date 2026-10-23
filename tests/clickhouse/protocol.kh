@@ -28,6 +28,44 @@ fn main() -> int {
             return 1
         }
     }
+    // Н10: тело без длины. HTTP/1.1 без Connection: close — ошибка кадрирования;
+    // с ним (и HTTP/1.0) тело читается до конца потока, но не считается полным.
+    // (mock на TLS закрывает без close_notify: это обрыв, тоже ошибка)
+    for path in ["eof-close", "eof-http10"] {
+        let r = ch_query(ChConfig { url: base + "/" + path, timeout_ms: 2000 }, "SELECT 1")
+        if r.ok || !r.unknown_outcome || (scheme == "http" && (r.body != "ok" || !r.error.contains("connection close"))) {
+            eprint("FAIL HTTP " + path + " looks complete: ok=" + r.ok.to_str() + " " + r.error)
+            return 1
+        }
+    }
+    let keepalive = ch_query(ChConfig { url: base + "/eof-keepalive", timeout_ms: 2000 }, "SELECT 1")
+    if keepalive.ok || !keepalive.error.contains("neither Content-Length nor chunked") {
+        eprint("FAIL HTTP/1.1 response without framing accepted: " + keepalive.error)
+        return 1
+    }
+    // С4, С5: только нужные операции настройки; серверного max_result_bytes нет
+    let echo = ChConfig { url: base + "/echo" }
+    let select = ch_query(echo, "SELECT 1")
+    if !select.ok || !select.body.contains("max_execution_time=") || select.body.contains("max_result_bytes") || select.body.contains("input_format_") || !select.body.contains("application/octet-stream") {
+        eprint("FAIL SELECT settings: " + select.body + select.error)
+        return 1
+    }
+    let readonly = ch_query(ChConfig { ...echo, server_timeout: false }, "SELECT 1")
+    if !readonly.ok || readonly.body.contains("max_execution_time") {
+        eprint("FAIL server_timeout: false still sends max_execution_time: " + readonly.body)
+        return 1
+    }
+    let insert = ch_insert(echo, "t", ch_encode([1, 2]))
+    if !insert.ok || !insert.body.contains("input_format_with_types_use_header=1") || !insert.body.contains("database=default") {
+        eprint("FAIL INSERT settings: " + insert.body + insert.error)
+        return 1
+    }
+    // Н9: параметры — в теле multipart/form-data, а не в адресе
+    let params = ch_query_params(echo, "SELECT \{x:String}", {"x": "y"})
+    if !params.ok || params.body.contains("param_x") || !params.body.contains("multipart/form-data; boundary=khrip-") {
+        eprint("FAIL parameters in the URL: " + params.body + params.error)
+        return 1
+    }
     let invalid = ch_query(ChConfig { url: "http://user:password@example.com/" }, "INSERT INTO x VALUES(1)")
     if invalid.ok || invalid.unknown_outcome {
         eprint("FAIL invalid config has a known outcome")

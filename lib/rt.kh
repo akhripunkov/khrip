@@ -694,3 +694,122 @@ fn __co_yield() {
         __co_wait(-1, 0, 0)
     }
 }
+
+// ---- Места с очередью ожидания (FIFO) ----
+// Занятые места — счётчик потока (слово cnt), предел — у каждого вызова свой:
+// конфигурации с разными пределами делят один счётчик. Ждущие сопрограммы
+// стоят в блоке mmap, его адрес — в слове q: [0] — сколько ждут, [8] —
+// вместимость, [16 + 24·i] — сопрограмма, ячейка в её арене (1 — место
+// передано), её предел. Освободившееся место сразу передаётся первому ждущему,
+// чей предел позволяет его взять: поздний запрос не обгонит ранний, и ждущие
+// не просыпаются впустую (опрос sleep(1) будил каждого тысячу раз в секунду).
+// Пока ждущий в очереди, места сверх его предела заняты: новый запрос с тем же
+// пределом встаёт за ним, а не берёт место. Счётчик и очередь — одного потока.
+const WQ_ENTRY = 24
+
+fn __wq_push(q: int, cv: int, cell: int, limit: int) {
+    var w = load64(q)
+    if w == 0 {
+        w = __mmap(4096)
+        store64(w + 8, (4096 - 16) / WQ_ENTRY)
+        store64(q, w)
+    }
+    let n = load64(w)
+    if n == load64(w + 8) {
+        // вырасти до записи: паника __mmap не оставит очередь наполовину
+        let bytes = 16 + n * 2 * WQ_ENTRY
+        let grown = __mmap(bytes)
+        __memcpy(grown, w, 16 + n * WQ_ENTRY)
+        store64(grown + 8, n * 2)
+        syscall(SYS_MUNMAP, w, 16 + n * WQ_ENTRY)
+        w = grown
+        store64(q, w)
+    }
+    let e = w + 16 + n * WQ_ENTRY
+    store64(e, cv)
+    store64(e + 8, cell)
+    store64(e + 16, limit)
+    store64(w, n + 1)
+}
+
+// Убрать i-ю запись (порядок остальных сохраняется).
+fn __wq_drop(w: int, i: int) {
+    let n = load64(w)
+    let e = w + 16 + i * WQ_ENTRY
+    __memcpy(e, e + WQ_ENTRY, (n - i - 1) * WQ_ENTRY)
+    store64(w, n - 1)
+}
+
+// Сколько сопрограмм ждёт место (для тестов и диагностики).
+fn __wq_len(q: int) -> int {
+    let w = load64(q)
+    if w == 0 {
+        return 0
+    }
+    return load64(w)
+}
+
+// Занять место, если занятых меньше limit; иначе ждать в очереди не дольше
+// deadline. Без сопрограммы (main, тест, every) место освободить некому:
+// сразу false.
+fn __slot_take(cnt: int, q: int, limit: int, deadline: int) -> bool {
+    if now_ms() >= deadline {
+        return false
+    }
+    if load64(cnt) < limit {
+        store64(cnt, load64(cnt) + 1)
+        return true
+    }
+    let cv = load64(__ctx() + CTX_CORO)
+    if cv == 0 {
+        return false
+    }
+    let cell = __alloc(8)
+    __wq_push(q, cv, cell, limit)
+    while load64(cell) == 0 {
+        let left = deadline - now_ms()
+        if left <= 0 {
+            break
+        }
+        __co_wait(-1, 0, left)
+    }
+    if load64(cell) == 0 {
+        // срок вышел: уйти из очереди (место никто не передавал)
+        let w = load64(q)
+        for i in 0..load64(w) {
+            if load64(w + 16 + i * WQ_ENTRY) == cv {
+                __wq_drop(w, i)
+                break
+            }
+        }
+        return false
+    }
+    // место передано, но срок мог выйти раньше, чем сопрограмма проснулась
+    if now_ms() >= deadline {
+        __slot_give(cnt, q)
+        return false
+    }
+    return true
+}
+
+// Освободить место: оно сразу переходит к первому ждущему, которому позволяет
+// его предел. Не ждёт и не выделяет память: годится для очистки после panic.
+fn __slot_give(cnt: int, q: int) {
+    let n = (load64(cnt) - 1).max(0)
+    store64(cnt, n)
+    let w = load64(q)
+    if w == 0 {
+        return
+    }
+    for i in 0..load64(w) {
+        let e = w + 16 + i * WQ_ENTRY
+        if load64(e + 16) > n {
+            let cv = load64(e)
+            store64(load64(e + 8), 1)
+            __wq_drop(w, i)
+            store64(cnt, n + 1)
+            __co_notify(cv)
+            return
+        }
+    }
+}

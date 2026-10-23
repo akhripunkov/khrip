@@ -1,0 +1,15 @@
+// expect: ch_query takes the query as a string literal or const: {x} in an ordinary string pastes the value into the SQL text
+// expect: hint: pass values as ClickHouse parameters: ch_query_params(c, "SELECT ... WHERE id = \{id:Int64}", {"id": id.to_str()}); a table name is \{t:Identifier}
+// expect: ch_query_params takes the query as a string literal or const
+// expect: ch_query takes the query as a string literal or const
+// expect: 4 errors
+fn hits(c: ChConfig, page: str, table: str, q: str) {
+    ch_query(c, "SELECT count() FROM hits WHERE page = '{page}'")
+    ch_query_params(c, "SELECT count() FROM " + table + " WHERE id = \{id:Int64}", {"id": "1"})
+    c.ch_query(q)
+    var sql = "SELECT 1"
+    ch_query(c, sql)
+}
+
+fn main() {
+}

@@ -2,9 +2,6 @@
 // TCP/TLS and idle pool, but validates framing and never retries a request.
 // Response bytes are bounded before allocation; a truncated body is an error.
 
-// Worker-shared admission counter; outside the coroutine-saved context range.
-const CTX_CHACTIVE = 296
-
 type __DbHttp {
     c: int
     tag: int
@@ -15,15 +12,14 @@ type __DbHttp {
     lease: bool = false
 }
 
+// Место среди операций ClickHouse потока (CTX_CHACTIVE): занятых меньше
+// max_inflight — сразу, иначе очередь FIFO до h.deadline (__slot_take).
 fn __dh_acquire(h: __DbHttp, max_inflight: int) -> bool {
     let ctx = __ctx()
-    while load64(ctx + CTX_CHACTIVE) >= max_inflight {
-        if now_ms() >= h.deadline { return false }
-        sleep(1)
+    if !__slot_take(ctx + CTX_CHACTIVE, ctx + CTX_CHWAIT, max_inflight, h.deadline) {
+        return false
     }
-    if now_ms() >= h.deadline { return false }
-    // No coroutine switch occurs between increment and setting the lease bit.
-    store64(ctx + CTX_CHACTIVE, load64(ctx + CTX_CHACTIVE) + 1)
+    // между взятием места и битом аренды нет ни переключения, ни паники
     h.lease = true
     return true
 }
@@ -32,7 +28,7 @@ fn __dh_release(h: __DbHttp) {
     if h.lease {
         h.lease = false
         let ctx = __ctx()
-        store64(ctx + CTX_CHACTIVE, (load64(ctx + CTX_CHACTIVE) - 1).max(0))
+        __slot_give(ctx + CTX_CHACTIVE, ctx + CTX_CHWAIT)
     }
 }
 
@@ -281,8 +277,15 @@ fn __dh_response(h: __DbHttp, max: int) -> Response {
             return __fetch_fail(h.error)
         }
     } else {
-        // EOF framing is valid, but the connection cannot be pooled afterwards.
-        hs["connection"] = "close"
+        // Без Content-Length и chunked конец тела — закрытие соединения, и обрыв
+        // от него не отличить. HTTP/1.1 так отвечает только с Connection: close
+        // (без него это ошибка кадрирования); тогда тело читается до конца
+        // потока, но помечается x-khrip-eof-framing: клиент не выдаёт его за
+        // полное.
+        if !(hs["connection"] ?? "").ascii_lower().contains("close") {
+            return __fetch_fail("database HTTP/1.1 response has neither Content-Length nor chunked framing")
+        }
+        hs["x-khrip-eof-framing"] = "1"
         while true {
             if h.pos < h.input.len {
                 if !__dh_take(h, out, h.input.len - h.pos, max) {
@@ -306,7 +309,17 @@ fn __dh_response(h: __DbHttp, max: int) -> Response {
     return Response { status, body: __str_new(out.data, out.len), headers: hs }
 }
 
-fn __dh_exchange(url: __Url, head: str, query: str, payload: str, deadline: int, max: int, max_inflight: int) -> Response {
+// Секунды с миллисекундами: 1500 → "1.500".
+fn __dh_seconds(ms: int) -> str {
+    return (ms / 1000).to_str() + "." + __pad(ms % 1000, 3)
+}
+
+// Обмен одним запросом. head — начало заголовков; при budget сразу за ним
+// пишется остаток срока в секундах (max_execution_time ClickHouse: на момент
+// отправки, после ожидания места и подключения), затем rest — остальные
+// заголовки. Все аргументы — свежие строки арены: в окне без блокировки store
+// здесь ничего не читается из store.
+fn __dh_exchange(url: __Url, head: str, rest: str, budget: bool, query: str, payload: str, deadline: int, max: int, max_inflight: int) -> Response {
     if load64(__ctx() + CTX_CHHELD) != 0 {
         return __fetch_fail("nested ClickHouse operation")
     }
@@ -345,8 +358,23 @@ fn __dh_exchange(url: __Url, head: str, query: str, payload: str, deadline: int,
             h.tag = tag
         }
     }
+    var timing = ""
+    if budget {
+        let left = deadline - now_ms()
+        if left <= 0 {
+            // ещё ничего не отправлено: исход известен, соединение цело
+            __pool_put(ip, url.port, tag, c)
+            h.c = -1
+            __dh_release(h)
+            store64(__ctx() + CTX_CHHELD, 0)
+            return __fetch_fail("ClickHouse deadline exceeded before sending")
+        }
+        timing = __dh_seconds(left)
+    }
     var r = __fetch_fail("database HTTP connection failed while sending; write outcome may be unknown")
-    if __link_write(tag, c, __str_ptr(head), head.byte_len(), deadline) && __link_write(tag, c, __str_ptr(query), query.byte_len(), deadline) && __link_write(tag, c, __str_ptr(payload), payload.byte_len(), deadline) {
+    // заголовки — одной записью (один сегмент TCP, одна запись TLS)
+    let lead = head + timing + rest
+    if __link_write(tag, c, __str_ptr(lead), lead.byte_len(), deadline) && __link_write(tag, c, __str_ptr(query), query.byte_len(), deadline) && __link_write(tag, c, __str_ptr(payload), payload.byte_len(), deadline) {
         r = __dh_response(h, max)
     }
     if r.status == 0 {

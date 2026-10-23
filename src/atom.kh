@@ -1673,6 +1673,8 @@ fn parse_call(t: Token, w: int) -> int {
         }
         tx_arg_check(t, fi, 0)
     }
+    // текущая лексема — первый аргумент, перед ней — (
+    driver_query_check(t, pos - 1, 1)
     let n = compile_args(f.params, 0, ty_err, ty_err, ty_err, name, t)
     if n != f.params.len() {
         emit_alu_imm(0, RSP, n * 8)
@@ -1883,6 +1885,9 @@ fn parse_method(rt: int, nt: Token) -> int {
         return ty_err
     }
     let f = funcs[fi]
+    if f.is_lib {
+        driver_query_check(nt, pos, 0)
+    }
     emit_push(RAX)
     advance()
     let n = compile_args(f.params, 1, tt, ty_err, ty_err, name, nt) + 1

@@ -10,6 +10,23 @@ import time
 import urllib.parse
 
 
+def rowbinary_string(value):
+    data = value.encode()
+    out = bytearray()
+    n = len(data)
+    while n >= 128:
+        out.append((n & 127) | 128)
+        n >>= 7
+    out.append(n)
+    return bytes(out) + data
+
+
+# DESCRIBE of a one-column table `value Int64`, as RowBinaryWithNamesAndTypes.
+DESCRIBE = (bytes([3]) + b"".join(rowbinary_string(x) for x in ("name", "type", "default_type"))
+            + b"".join(rowbinary_string("String") for _ in range(3))
+            + b"".join(rowbinary_string(x) for x in ("value", "Int64", "")))
+
+
 class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
@@ -17,6 +34,7 @@ class Server(http.server.ThreadingHTTPServer):
         super().__init__(*args)
         self.activity_lock = threading.Lock()
         self.active = self.peak = self.requests = 0
+        self.order = []
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -30,17 +48,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if self.path == "/reset":
                 self.server.peak = self.server.active
                 self.server.requests = 0
+                self.server.order = []
             body = json.dumps({"active": self.server.active,
                                "peak": self.server.peak,
-                               "requests": self.server.requests}).encode()
+                               "requests": self.server.requests,
+                               "order": self.server.order}).encode()
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def do_POST(self):
-        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        payload = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         path = urllib.parse.urlsplit(self.path).path
+        if path == "/echo":
+            # the request target (settings) and content type, for assertions
+            body = DESCRIBE if payload.startswith(b"DESCRIBE") else (
+                self.path + "\n" + self.headers.get("Content-Type", "")).encode()
+            self.wfile.write(f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body)
+            self.wfile.flush()
+            return
+        if path.startswith("/order/"):
+            with self.server.activity_lock:
+                self.server.order.append(int(path[7:]))
+            time.sleep(0.08)
+            self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            self.wfile.flush()
+            return
         if path in ("/admission", "/admission-truncated", "/hold"):
             with self.server.activity_lock:
                 self.server.active += 1
@@ -86,6 +120,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\nX-ClickHouse-Exception-Code: 395\r\n\r\n"
         elif path == "/unsupported-compression":
             raw = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 2\r\n\r\nok"
+        elif path == "/eof-close":
+            # HTTP/1.1 without length: valid only with Connection: close, and a
+            # cut at a row boundary would look complete
+            raw = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nok"
+        elif path == "/eof-http10":
+            raw = b"HTTP/1.0 200 OK\r\n\r\nok"
+        elif path == "/eof-keepalive":
+            raw = b"HTTP/1.1 200 OK\r\n\r\nok"
         elif path == "/interim":
             raw = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
         else:

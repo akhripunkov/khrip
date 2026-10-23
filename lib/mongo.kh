@@ -105,8 +105,9 @@ const MB_IN = 56
 const MB_KEY = 96
 const MB_POOL = 128
 const MB_IDLE = 136
-// Страница пула потока (CTX_MONGOPOOL): [0] — занятые соединения, [8 + 8·i] —
-// свободные (MONGO_POOL_SIZE мест), дальше — эти слова.
+// Страница пула потока (CTX_MONGOPOOL): [0] — занятые места (соединения
+// запросов), [8 + 8·i] — свободные соединения (MONGO_POOL_SIZE мест), дальше —
+// эти слова.
 // последний requestID потока
 const MP_REQ = 512
 // реестр курсоров потока (mmap) или 0
@@ -115,6 +116,8 @@ const MP_CURSORS = 520
 const MP_PBKDF2 = 528
 // следующее место кэша SCRAM
 const MP_KEYS_NEXT = 536
+// очередь запросов, ждущих место сверх maxPoolSize (__slot_take в lib/rt.kh)
+const MP_WAIT = 544
 // кэш ключей SCRAM: MONGO_KEYS записей по 96 байт — SHA-256 от (пользователь,
 // пароль, соль, итерации), ClientKey, ServerKey
 const MP_KEYS = 1024
@@ -465,7 +468,7 @@ fn __mongo_discard(c: int) {
     if load64(cx + CTX_MONGOHELD) == c {
         store64(cx + CTX_MONGOHELD, 0)
         let pool = load64(c + MB_POOL)
-        store64(pool, load64(pool) - 1)
+        __slot_give(pool, pool + MP_WAIT)
     }
     __mongo_free(c)
 }
@@ -484,10 +487,14 @@ fn __mongo_discard(c: int) {
 fn __mongo_request_end() {
     let cx = __ctx()
     let c = load64(cx + CTX_MONGOHELD)
-    if c != 0 {
+    let pool = load64(cx + CTX_MONGOPOOL)
+    if c != 0 && c == pool {
+        // место занято, соединения ещё нет (__mongo_take): вернуть место
+        store64(cx + CTX_MONGOHELD, 0)
+        __slot_give(pool, pool + MP_WAIT)
+    } else if c != 0 {
         __mongo_discard(c)
     }
-    let pool = load64(cx + CTX_MONGOPOOL)
     if pool == 0 || load64(cx + CTX_CATCH) != 0 {
         return
     }
@@ -523,7 +530,9 @@ fn __mongo_put(c: int) {
     buf_shrink(b, 65536)
     __mongo_save(c, b)
     store64(__ctx() + CTX_MONGOHELD, 0)
-    store64(pool, load64(pool) - 1)
+    // место — первому ждущему: он проснётся после этой функции, когда
+    // соединение уже лежит среди свободных
+    __slot_give(pool, pool + MP_WAIT)
     store64(c + MB_LAST, now_ms())
     for i in 0..MONGO_POOL_SIZE {
         let slot = pool + 8 + i * 8
@@ -565,17 +574,22 @@ fn __mongo_live(c: int, deadline: int) -> bool {
 
 // Соединение для ключа пула key: свободное живое или новый блок (ещё не
 // подключён: MB_FD < 0). limit — maxPoolSize, idle — maxIdleTimeMS из URI.
+// Сначала место: занятых не больше limit, ждущие — в очереди FIFO (раньше —
+// опрос sleep(1)). Пока соединения нет, CTX_MONGOHELD — сама страница пула:
+// конец запроса (panic) вернёт место.
 fn __mongo_take(key: int, limit: int, idle: int, deadline: int) -> int {
     if now_ms() >= deadline { return 0 }
     let pool = __mongo_pool()
-    while load64(pool) >= limit {
-        if now_ms() >= deadline {
-            return 0
-        }
-        sleep(1)
+    if !__slot_take(pool, pool + MP_WAIT, limit, deadline) {
+        return 0
     }
+    let cx = __ctx()
+    store64(cx + CTX_MONGOHELD, pool)
+    // __mongo_live может ждать (билеты TLS): пока ждёт, другие запросы меняют
+    // свободные места, поэтому самое старое помнится вместе со временем
     var free = 0
-    var oldest = -1
+    var oldest = 0
+    var oldest_at = 0
     for i in 0..MONGO_POOL_SIZE {
         let slot = pool + 8 + i * 8
         let c = load64(slot)
@@ -587,23 +601,31 @@ fn __mongo_take(key: int, limit: int, idle: int, deadline: int) -> int {
             __mongo_free(c)
             continue
         }
-        free += 1
-        if oldest < 0 || load64(c + MB_LAST) < load64(load64(pool + 8 + oldest * 8) + MB_LAST) {
-            oldest = i
-        }
         if __memeq(c + MB_KEY, key, 32) {
             store64(slot, 0)
-            store64(pool, load64(pool) + 1)
-            store64(__ctx() + CTX_MONGOHELD, c)
+            store64(cx + CTX_MONGOHELD, c)
             if __mongo_live(c, deadline) { return c }
-            __mongo_discard(c)
-            return __mongo_take(key, limit, idle, deadline)
+            // закрыто сервером: в отходы, место остаётся за запросом
+            store64(cx + CTX_MONGOHELD, pool)
+            __mongo_free(c)
+            continue
+        }
+        free += 1
+        if oldest == 0 || load64(c + MB_LAST) < oldest_at {
+            oldest = c
+            oldest_at = load64(c + MB_LAST)
         }
     }
-    if free + load64(pool) >= MONGO_POOL_SIZE && oldest >= 0 {
-        let slot = pool + 8 + oldest * 8
-        __mongo_free(load64(slot))
-        store64(slot, 0)
+    // занятые (с этим) и свободные не больше мест: возвращённое найдёт место
+    if free + load64(pool) > MONGO_POOL_SIZE && oldest != 0 {
+        for i in 0..MONGO_POOL_SIZE {
+            let slot = pool + 8 + i * 8
+            if load64(slot) == oldest {
+                store64(slot, 0)
+                __mongo_free(oldest)
+                break
+            }
+        }
     }
     let c = __mmap(MONGO_BLOCK)
     store64(c + MB_FD, -1)
@@ -613,8 +635,7 @@ fn __mongo_take(key: int, limit: int, idle: int, deadline: int) -> int {
     store64(c + MB_BATCH, 100000)
     store64(c + MB_IDLE, idle)
     __memcpy(c + MB_KEY, key, 32)
-    store64(pool, load64(pool) + 1)
-    store64(__ctx() + CTX_MONGOHELD, c)
+    store64(cx + CTX_MONGOHELD, c)
     __mongo_save(c, buf_mm(16384))
     return c
 }

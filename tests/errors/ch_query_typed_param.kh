@@ -1,0 +1,8 @@
+// expect: ch_query_typed_param.kh:6:48: error: {page:String} in a string is Khrip interpolation, not a ClickHouse query parameter
+// expect: hint: write \{page:String} (or use a `raw string`) and pass the value: ch_query_params(c, "... \{name:Type}", {"name": value})
+// expect: 1 error
+fn main() {
+    let c = ChConfig { url: "http://127.0.0.1:8123/" }
+    let r = ch_query_params(c, "SELECT 1 WHERE {page:String} = 'a'", {"page": "/a"})
+    print(r.ok.to_str())
+}

@@ -4,14 +4,32 @@ route GET "/ready" -> str { return "ready" }
 
 route GET "/active" -> int { return load64(__ctx() + CTX_CHACTIVE) }
 
-route GET "/run/{mode}" (mode: str, timeout_ms: int = 5000) -> AdmissionResult {
+route GET "/waiting" -> int { return __wq_len(__ctx() + CTX_CHWAIT) }
+
+route GET "/run/{mode}" (mode: str, timeout_ms: int = 5000, inflight: int = 2) -> AdmissionResult {
     let config = ChConfig {
         url: (env("CH_MOCK_URL") ?? "http://127.0.0.1:18371") + "/" + mode,
         timeout_ms,
-        max_inflight: 2
+        max_inflight: inflight
     }
     let r = ch_query(config, "SELECT 1")
     return AdmissionResult { ok: r.ok, unknown: r.unknown_outcome, error: r.error }
+}
+
+// Порядок обслуживания: mock запоминает номера путей /order/n.
+route GET "/order/{n}" (n: int) -> AdmissionResult {
+    let config = ChConfig { url: (env("CH_MOCK_URL") ?? "http://127.0.0.1:18371") + "/order/" + n.to_str(), timeout_ms: 10000, max_inflight: 1 }
+    let r = ch_query(config, "SELECT 1")
+    return AdmissionResult { ok: r.ok, unknown: r.unknown_outcome, error: r.error }
+}
+
+// Н12: max_execution_time — остаток срока на момент отправки (ожидание места
+// в очереди в него уже не входит).
+route GET "/budget" (timeout_ms: int = 1000) -> str {
+    let config = ChConfig { url: (env("CH_MOCK_URL") ?? "http://127.0.0.1:18371") + "/echo", timeout_ms, max_inflight: 2 }
+    let r = ch_query(config, "SELECT 1")
+    if !r.ok { fail(500, r.error) }
+    return r.body
 }
 
 route POST "/fault/{mode}" (mode: int) -> int | 409 str {

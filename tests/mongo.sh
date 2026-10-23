@@ -19,6 +19,9 @@ if [[ "$window" != "    let result = __mongo_run(q)" ]] ||
     echo "$window"
     exit 1
 fi
+# Очередь пула (С7) — без сервера: блоки мест не подключаются.
+"$KHC" -o "$mongo_tmp/pool" tests/mongo/pool.kh
+python3 tests/mongo/pool.py "$mongo_tmp/pool"
 "$KHC" -o "$mongo_tmp/wire-client" tests/mongo/wire_client.kh
 python3 tests/mongo/wire_peer.py "$mongo_tmp/wire-client"
 if [[ -z ${MONGODB_URI:-} ]]; then

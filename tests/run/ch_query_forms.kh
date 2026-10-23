@@ -1,0 +1,24 @@
+// Запрос ch_query/ch_query_params — литерал, const, сырая строка или
+// неизменяемая локальная с литералами (src/drivers.kh): такие формы
+// компилируются. Сети нет: адрес с учётными данными отвергается до неё.
+const COUNT_HITS = "SELECT count() FROM hits WHERE page = \{page:String}"
+
+fn run(desc: bool) -> [str] {
+    let c = ChConfig { url: "http://user:password@127.0.0.1:1/" }
+    let order = if desc { "SELECT id FROM hits ORDER BY id DESC" } else { "SELECT id FROM hits ORDER BY id" }
+    let fixed = "SELECT 1"
+    var out: [str] = []
+    out.push(ch_query(c, "SELECT 1").error)
+    out.push(ch_query(c, COUNT_HITS).error)
+    out.push(ch_query_params(c, `SELECT {n:Int64} AS value`, {"n": "1"}).error)
+    out.push(ch_query(c, order).error)
+    out.push(c.ch_query(fixed).error)
+    out.push(c.ch_query_params(COUNT_HITS, {"page": ch_null()}).error)
+    return out
+}
+
+fn main() {
+    for e in run(true) {
+        print(e)
+    }
+}

@@ -36,7 +36,7 @@ fn runtime_check_ch(r: ChResult) {
 route GET "/ready" -> str { return "ready" }
 
 route POST "/init" -> 204 {
-    runtime_check_ch(ch_query(runtime_ch(), "CREATE TABLE " + runtime_name() + " (id Int64, value String) ENGINE=Memory"))
+    runtime_check_ch(ch_query_params(runtime_ch(), "CREATE TABLE \{t:Identifier} (id Int64, value String) ENGINE=Memory", {"t": runtime_name()}))
     return 204
 }
 
@@ -58,7 +58,7 @@ route POST "/work/{id}" (id: int) -> RuntimeRow {
     if (actual ?? RuntimeDocument { _id: -1, value: "" }).value != value { fail(500, "BSON data changed across request") }
     runtime_check_mongo(mongo_close(cursor))
 
-    let selected = ch_query_params(config, "SELECT id,value FROM " + runtime_name() + " WHERE id=\{id:Int64}", {"id": id.to_str()})
+    let selected = ch_query_params(config, "SELECT id,value FROM \{t:Identifier} WHERE id=\{id:Int64}", {"t": runtime_name(), "id": id.to_str()})
     runtime_check_ch(selected)
     let decoded: [RuntimeRow]? = ch_decode(selected.body)
     let rows = decoded ?? []
@@ -72,7 +72,7 @@ route GET "/counts" -> RuntimeCounts {
     bson_str(command, "count", runtime_name())
     let m = mongo_command(runtime_mongo(), "khrip_test", bson_finish(command))
     runtime_check_mongo(m)
-    let c = ch_query(runtime_ch(), "SELECT count() AS total FROM " + runtime_name())
+    let c = ch_query_params(runtime_ch(), "SELECT count() AS total FROM \{t:Identifier}", {"t": runtime_name()})
     runtime_check_ch(c)
     let counts: [RuntimeCount]? = ch_decode(c.body)
     let rows = counts ?? []
@@ -152,6 +152,6 @@ route DELETE "/cleanup" -> 204 {
     let command = bson_new()
     bson_str(command, "drop", runtime_name())
     runtime_check_mongo(mongo_command(runtime_mongo(), "khrip_test", bson_finish(command)))
-    runtime_check_ch(ch_query(runtime_ch(), "DROP TABLE IF EXISTS " + runtime_name()))
+    runtime_check_ch(ch_query_params(runtime_ch(), "DROP TABLE IF EXISTS \{t:Identifier}", {"t": runtime_name()}))
     return 204
 }

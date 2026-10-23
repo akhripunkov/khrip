@@ -286,7 +286,10 @@ Direct library drivers use explicit `Mongo` / `ChConfig` values; multiple
 connections can coexist with PostgreSQL. Typed binary codecs: `to_bson(value)`
 → `Bson`, `from_bson(doc)` → `T?`, `ch_encode(rows)` → `str`,
 `ch_decode(body)` → `[T]?`. Network operations return explicit result/error
-values and never automatically retry writes. See [DATABASES.md](DATABASES.md)
+values and never automatically retry writes. The `ch_query`/`ch_query_params`
+query is a string literal or `const`: values go as ClickHouse parameters
+`ch_query_params(c, "... WHERE id = \{id:Int64}", {"id": id.to_str()})`, a
+table name as `\{t:Identifier}`. See [DATABASES.md](DATABASES.md)
 for the API, supported types, limits and runnable examples. These adapters do
 not participate in PostgreSQL `tx`.
 

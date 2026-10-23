@@ -5,6 +5,44 @@ fn driver_io(name: str) -> bool {
     return name == "mongo_command" || name == "mongo_insert" || name == "mongo_update" || name == "mongo_delete" || name == "mongo_cursor" || name == "mongo_find" || name == "mongo_find_with" || name == "mongo_create_indexes" || name == "mongo_next" || name == "mongo_close" || name == "ch_query" || name == "ch_query_params" || name == "ch_insert" || name == "ch_cancel"
 }
 
+// Запрос ch_query и ch_query_params — строковый литерал (без интерполяции), const
+// или неизменяемая локальная, все значения которой — такие литералы. В обычной
+// строке {x} — подстановка значения в текст SQL, то есть инъекция; значения
+// идут параметрами ClickHouse {name:Type} через ch_query_params (так же — имя
+// таблицы: {t:Identifier}). Это минимум до формы ch "..." на лексере sql.
+// open — позиция '(' вызова; idx — номер аргумента-запроса (у метода
+// c.ch_query("...") — 0, получатель не в скобках). У ch_cancel запроса нет:
+// id запроса он передаёт параметром.
+fn driver_query_check(t: Token, open: int, idx: int) {
+    if files[t.file].is_lib || (t.text != "ch_query" && t.text != "ch_query_params") || kind_at(open) != '(' {
+        return
+    }
+    let close = matching_close(open)
+    var i = open + 1
+    var n = 0
+    while i < close {
+        var j = i
+        var depth = 0
+        while j < close && !(depth == 0 && kind_at(j) == ',') {
+            let k = kind_at(j)
+            if k == '(' || k == '[' || k == '\{' {
+                depth += 1
+            } else if k == ')' || k == ']' || k == '}' {
+                depth -= 1
+            }
+            j += 1
+        }
+        if n == idx {
+            if j > i && lit_set(i, j).len() == 0 {
+                error_tok(toks[i], t.text + " takes the query as a string literal or const: \{x} in an ordinary string pastes the value into the SQL text", "pass values as ClickHouse parameters: ch_query_params(c, \"SELECT ... WHERE id = \\\{id:Int64}\", \{\"id\": id.to_str()}); a table name is \\\{t:Identifier}")
+            }
+            return
+        }
+        n += 1
+        i = j + 1
+    }
+}
+
 fn driver_ch_type(t: int, row: bool, depth: int) -> bool {
     if depth > 32 {
         return false

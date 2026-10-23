@@ -235,6 +235,10 @@ fn lex_error(msg: str, start: int) {
     report_at(lx_file, lx_line, start - lx_line_start + 1, msg, "")
 }
 
+fn lex_error_hint(msg: str, hint: str, start: int) {
+    report_at(lx_file, lx_line, start - lx_line_start + 1, msg, hint)
+}
+
 fn three_char_kind(a: int, b: int, c: int) -> int {
     if a == '.' && b == '.' && c == '.' {
         return T_ELLIPSIS
@@ -494,6 +498,33 @@ fn interp_end(from: int, end: int) -> int {
     return -1
 }
 
+// [from, to) — «имя:Тип», параметр ClickHouse ({id:Int64}, {t:Identifier})?
+// В выражении Khrip двоеточия на верхнем уровне не бывает.
+fn is_typed_param(from: int, to: int) -> bool {
+    var i = from
+    while i < to && lx_text.byte(i) == ' ' {
+        i += 1
+    }
+    let start = i
+    while i < to && is_ident_char(lx_text.byte(i)) {
+        i += 1
+    }
+    if i == start || is_digit(lx_text.byte(start)) {
+        return false
+    }
+    while i < to && lx_text.byte(i) == ' ' {
+        i += 1
+    }
+    if i >= to || lx_text.byte(i) != ':' {
+        return false
+    }
+    i += 1
+    while i < to && lx_text.byte(i) == ' ' {
+        i += 1
+    }
+    return i < to && is_alpha(lx_text.byte(i))
+}
+
 // Путь маршрута и имя теста — без интерполяции: {id} в пути — параметр.
 fn raw_string_here() -> bool {
     let n = toks.len()
@@ -567,6 +598,16 @@ fn lex_string(end: int) {
                 }
                 add_tok(T_STR, add_strlit(""), start, lx_p - start)
                 return
+            }
+            if is_typed_param(lx_p + 1, close) {
+                // {name:Type} — параметр ClickHouse, а не выражение Khrip: без
+                // подсказки было бы «unknown name» или «expected ')'»
+                lex_error_hint("\{" + lx_text.byte_slice(lx_p + 1, close) + "} in a string is Khrip interpolation, not a ClickHouse query parameter", "write \\\{" + lx_text.byte_slice(lx_p + 1, close) + "} (or use a `raw string`) and pass the value: ch_query_params(c, \"... \\\{name:Type}\", \{\"name\": value})", lx_p)
+                while lx_p <= close {
+                    buf_byte(b, lx_text.byte(lx_p))
+                    lx_p += 1
+                }
+                continue
             }
             if is_quantifier(lx_p + 1, close) {
                 // {3}, {3,32}, {2,}: число в фигурных скобках — текст (как в регулярных

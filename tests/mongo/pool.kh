@@ -1,0 +1,35 @@
+// Очередь пула MongoDB без сервера: место берёт __mongo_take (блок без
+// подключения), возвращает __mongo_discard или конец запроса.
+type PoolGrant { ok: bool, at: int }
+
+// Программа с драйвером: конец запроса вызывает __mongo_request_end
+// (src/api.kh подключает его по вызовам mongo_*).
+fn pool_close(c: MongoCursor) -> MongoResult { return mongo_close(c) }
+
+route GET "/ready" -> str { return "ready" }
+
+route GET "/held" -> int { return load64(__mongo_pool()) }
+
+route GET "/waiting" -> int { return __wq_len(__mongo_pool() + MP_WAIT) }
+
+// Взять одно место из maxPoolSize=1, подержать hold мс и отдать.
+route GET "/hold" (hold: int = 50, timeout_ms: int = 10000) -> PoolGrant {
+    let c = __mongo_take(__mongo_key("mongodb://pool-test/"), 1, 30000, now_ms() + timeout_ms)
+    if c == 0 {
+        return PoolGrant { ok: false, at: now_ms() }
+    }
+    let at = now_ms()
+    sleep(hold)
+    __mongo_discard(c)
+    return PoolGrant { ok: true, at }
+}
+
+// fail и panic с занятым местом: его возвращает конец запроса.
+route POST "/fault/{mode}" (mode: int) -> int | 409 str {
+    let c = __mongo_take(__mongo_key("mongodb://pool-test/"), 1, 30000, now_ms() + 5000)
+    if c == 0 { fail(500, "pool slot timed out") }
+    sleep(5)
+    if mode == 0 { fail(409, "slot released after fail") }
+    let values = [1]
+    return values[mode]
+}

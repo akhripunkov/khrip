@@ -87,6 +87,10 @@ const CTX_PGPOOL = 272
 const CTX_MEMPANIC = 280
 // пул MongoDB этого потока (lib/mongo.kh) или 0
 const CTX_MONGOPOOL = 288
+// операции ClickHouse этого потока (lib/db_http.kh): сколько идёт сейчас и
+// очередь ждущих места (__slot_take в lib/rt.kh) или 0
+const CTX_CHACTIVE = 296
+const CTX_CHWAIT = 304
 // слова 192–239 — временные буферы системных вызовов (now_ms и __poll в
 // lib/rt.kh, peek в fetch.kh и pg.kh)
 // запись JSON (lib/api.kh; она не переключает сопрограммы): глубина вложенности
