@@ -1423,5 +1423,7 @@ fn __call(method: str, target: str, body: int, d: int, headers: int) -> Response
     let used = load64(c + CTX_PTR) - mark
     __memset(mark, 0, used)
     store64(c + CTX_PTR, mark)
+    // строки запроса умерли, а их адреса займут новые: кэш строк — заново
+    __strc_clear()
     return Response { status: w.status, body: buf_str(w.body), headers: __header_map(buf_str(w.extra)) }
 }

@@ -1,9 +1,46 @@
-// Строки как текст UTF-8. Обёртки над примитивами SIMD (src/simd.kh): функции
-// с __simd_* не встраиваются (src/decl.kh, can_inline), поэтому код примитива —
-// один на программу и только в программах, которые до него доходят.
+// Строки как текст UTF-8: длина, индекс, срезы, поиск, регистр и пробелы в
+// символах — то, что видит пользовательский код. Символ — по правилу Go
+// (lib/core.kh, «UTF-8 без SIMD»): правильная последовательность — один символ,
+// любой другой байт — отдельный символ U+FFFD. Порядок, равенство, contains,
+// split и replace с непустым образцом остаются байтовыми: на правильном тексте
+// это то же самое.
+//
+// Обёртки над примитивами SIMD (src/simd.kh): функции с __simd_* не встраиваются
+// (src/decl.kh, can_inline), поэтому код примитива — один на программу и только
+// в программах, которые до него доходят.
+
+// Кэш строк: 0 — обычный, STRC_OFF — выключен, STRC_STRESS — проверочный
+// (KHRIP_STRCACHE=off|stress; читает __simd_init в lib/rt.kh).
+var __strc_mode: int
+// Таблица символов U+0000–U+07FF (__chars) или 0.
+var __chars_tab: int
+
+const STRC_OFF = 1
+const STRC_STRESS = 2
+// Строки не длиннее STRC_MIN байт не кэшируются: пересчёт стоит ≤ 30 нс.
+const STRC_MIN = 256
+const STRC_N = 8
+// Слова блока кэша; поле записи e — по адресу блок + поле + 8·e.
+const STRC_CLOCK = 8
+const STRC_LAST = 16
+const STRC_HI = 24
+const STRC_DUP = 32
+const STRC_MRU = 40
+const STRC_KP = 64
+const STRC_KN = 128
+const STRC_CNT = 192
+const STRC_VUP = 256
+const STRC_CK = 320
+const STRC_CB = 384
+const STRC_IX = 448
+const STRC_USE = 512
+const STRC_FAR = 576
+// Открытый конец среза: s[a..] передаёт его вместо b.
+const TEXT_END = 0x7FFFFFFFFFFFFFFF
 
 // Число символов, если [p, p + n) — правильный UTF-8, иначе -1.
 fn __utf8_scan(p: int, n: int) -> int {
+    __strc_add(n)
     return __simd_utf8_scan(p, n)
 }
 
@@ -11,5 +48,1089 @@ fn __utf8_scan(p: int, n: int) -> int {
 // начинается в байте 0 и в каждом байте, кроме 10xxxxxx: на правильном UTF-8 это
 // точно, на неправильном — нет (там — __utf8_go_skip).
 fn __utf8_skip(p: int, n: int, k: int) -> int {
-    return __simd_utf8_skip(p, n, k)
+    let r = __simd_utf8_skip(p, n, k)
+    __strc_add(r)
+    return r
+}
+
+// Обходы по правилу Go (lib/core.kh) — со счётом байтов для __strc_scanned.
+fn __tx_go_skip(p: int, n: int, k: int) -> int {
+    let r = __utf8_go_skip(p, n, k)
+    __strc_add(r)
+    return r
+}
+
+fn __tx_go_count(p: int, n: int) -> int {
+    __strc_add(n)
+    return __utf8_go_count(p, n)
+}
+
+// Сколько байтов этот поток пропустил через проверку, пропуск и обходы: тесты
+// проверяют по нему, что работа со строкой не квадратична. Счёт — в контексте
+// потока, а не в глобальной переменной: запись в общую строку кэша процессора
+// из всех потоков замедлила бы их.
+fn __strc_scanned() -> int {
+    return load64(__ctx() + CTX_SCANNED)
+}
+
+fn __strc_add(n: int) {
+    let a = __ctx() + CTX_SCANNED
+    store64(a, load64(a) + n)
+}
+
+// ---- Кэш строк ----
+// Блок STRC_SIZE байт: у запроса — в начале его арены (lib/core.kh,
+// __arena_begin), у кода вне арены — в контексте потока (CTX_STRC). Восемь
+// записей, ключ записи — адрес и длина байтов строки. Байты под ключом не
+// меняются (правило I1 у CTX_PTR), поэтому всё, что узнали о ключе, верно для
+// любой строки с тем же ключом: поля, параметры, результаты trim. Записи хранят
+// только числа относительно ptr и адрес индекса; по ключу ничего не читают, а
+// каждое смещение из записи проверяется перед чтением (__strc_ok).
+//
+// Раскладка — по массиву на поле, у записи e — слово 8·e в каждом:
+//   [0] номер сборки store, [8] часы LRU, [16] запись + 1, курсор которой
+//       передвинул последний поиск (0 — никакой), [24] сколько записей с начала
+//       могут быть заняты (новая запись берёт первое свободное место, поэтому
+//       обходить нужно только их), [32] 1 — у какого-то ключа может быть две
+//       записи (0 — точно нет: __strc_spare не ищет), [40] запись + 1, которую
+//       последней нашёл __strc_get;
+//   kp, kn — ключ (kp = 0 — запись свободна);
+//   cnt    — число символов + 1 (0 — неизвестно);
+//   vup    — [0, vup) — правильный UTF-8, vup — граница символа;
+//   ck, cb — курсор: символ ck начинается в байте cb;
+//   ix     — индекс: смещения символов 0, 64, 128, ... (по 8 байт) или 0;
+//   use    — отметка LRU; far — сколько было дальних переходов.
+// У ключа не больше двух записей (два курсора — для двух указателей); факты
+// (cnt, vup, ix, far) пишутся во все записи ключа.
+//
+// KHRIP_STRCACHE=stress: кэшируется всё, кроме пустых строк, запись одна,
+// индекс строится на первом переходе любой длины, а испорченная запись —
+// паника, а не тихий сброс.
+
+// Блок кэша или 0: кэш выключен, идёт запись в store или выделитель подменён
+// (x509.kh, db.kh). Блок с другим номером сборки store очищается.
+fn __strc() -> int {
+    if __strc_mode == STRC_OFF {
+        return 0
+    }
+    let c = __ctx()
+    let a = load64(c + CTX_ARENA)
+    var b = c + CTX_STRC
+    if a != 0 {
+        let d = load64(c + CTX_PTR) - a
+        if d < STRC_SIZE || d >= ARENA_SIZE {
+            return 0
+        }
+        b = a
+    } else if load64(c + CTX_PSAVE_PTR) != 0 {
+        return 0
+    }
+    if load64(b) != __store_epoch {
+        __memset(b, 0, STRC_SIZE)
+        store64(b, __store_epoch)
+    }
+    return b
+}
+
+// Блок кэша для строки из n байт или 0: короткую строку дешевле пересчитать.
+fn __strc_for(n: int) -> int {
+    if n <= STRC_MIN && (__strc_mode != STRC_STRESS || n == 0) {
+        return 0
+    }
+    return __strc()
+}
+
+fn __strc_slots() -> int {
+    if __strc_mode == STRC_STRESS {
+        return 1
+    }
+    return STRC_N
+}
+
+// Место для новой записи, если среди hi первых свободных нет: следующее за
+// ними или -1, если блок полон.
+fn __strc_more(b: int, hi: int) -> int {
+    if hi >= __strc_slots() {
+        return -1
+    }
+    store64(b + STRC_HI, hi + 1)
+    return hi
+}
+
+fn __strc_touch(b: int, e: int) {
+    let t = load64(b + STRC_CLOCK) + 1
+    store64(b + STRC_CLOCK, t)
+    store64(b + STRC_USE + 8 * e, t)
+}
+
+// Запись e — для ключа (p, n): факты — из записи from (или нули), курсор — на
+// начало. Сначала ключ обнуляется, последним пишется: паника посередине не
+// оставит полузаписи, похожей на настоящую.
+fn __strc_init(b: int, e: int, p: int, n: int, from: int) {
+    let x = b + 8 * e
+    store64(x + STRC_KP, 0)
+    if from >= 0 {
+        let y = b + 8 * from
+        store64(x + STRC_CNT, load64(y + STRC_CNT))
+        store64(x + STRC_VUP, load64(y + STRC_VUP))
+        store64(x + STRC_IX, load64(y + STRC_IX))
+        store64(x + STRC_FAR, load64(y + STRC_FAR))
+    } else {
+        store64(x + STRC_CNT, 0)
+        store64(x + STRC_VUP, 0)
+        store64(x + STRC_IX, 0)
+        store64(x + STRC_FAR, 0)
+    }
+    store64(x + STRC_CK, 0)
+    store64(x + STRC_CB, 0)
+    store64(x + STRC_USE, 0)
+    store64(x + STRC_KN, n)
+    store64(x + STRC_KP, p)
+}
+
+// Запись, которую можно отдать другому ключу без потерь: самая старая из тех, у
+// чьего ключа есть вторая запись (факты остаются в ней, теряется только курсор),
+// кроме записей ключа (p, n); или -1. Так восемь строк не теряют своих фактов
+// из-за вторых курсоров, а записи, которые были вторыми давно, освобождаются.
+fn __strc_spare(b: int, m: int, p: int, n: int) -> int {
+    if load64(b + STRC_DUP) == 0 {
+        return -1
+    }
+    var v = -1
+    var dup = false
+    var i = 0
+    while i < m {
+        let kp = load64(b + STRC_KP + 8 * i)
+        let kn = load64(b + STRC_KN + 8 * i)
+        var j = 0
+        while kp != 0 && j < m {
+            if j != i && load64(b + STRC_KP + 8 * j) == kp && load64(b + STRC_KN + 8 * j) == kn {
+                dup = true
+                if (kp != p || kn != n) && (v < 0 || load64(b + STRC_USE + 8 * i) < load64(b + STRC_USE + 8 * v)) {
+                    v = i
+                }
+                j = m
+            }
+            j += 1
+        }
+        i += 1
+    }
+    if !dup {
+        store64(b + STRC_DUP, 0)
+    }
+    return v
+}
+
+// Запись ключа (p, n): та, что нашлась в прошлый раз, или любая из его записей
+// (факты у них одни), иначе новая — на свободном месте, вместо второй записи
+// другого ключа или вместо самой старой записи.
+fn __strc_get(b: int, p: int, n: int) -> int {
+    var e = load64(b + STRC_MRU) - 1
+    if e >= 0 && load64(b + STRC_KP + 8 * e) == p && load64(b + STRC_KN + 8 * e) == n {
+        __strc_touch(b, e)
+        return e
+    }
+    let m = load64(b + STRC_HI)
+    var free = -1
+    e = 0
+    while e < m {
+        let kp = load64(b + STRC_KP + 8 * e)
+        if kp == p && load64(b + STRC_KN + 8 * e) == n {
+            break
+        }
+        if kp == 0 && free < 0 {
+            free = e
+        }
+        e += 1
+    }
+    if e >= m {
+        e = free
+        if e < 0 {
+            e = __strc_more(b, m)
+        }
+        if e < 0 {
+            e = __strc_spare(b, m, p, n)
+        }
+        if e < 0 {
+            // самая старая запись
+            e = 0
+            var i = 1
+            while i < m {
+                if load64(b + STRC_USE + 8 * i) < load64(b + STRC_USE + 8 * e) {
+                    e = i
+                }
+                i += 1
+            }
+        }
+        __strc_init(b, e, p, n, -1)
+    }
+    store64(b + STRC_MRU, e + 1)
+    __strc_touch(b, e)
+    return e
+}
+
+// Факт о ключе — в его запись e и во вторую, если она может быть.
+fn __strc_fact(b: int, e: int, p: int, n: int, f: int, v: int) {
+    store64(b + f + 8 * e, v)
+    if load64(b + STRC_DUP) == 0 {
+        return
+    }
+    let m = load64(b + STRC_HI)
+    var i = 0
+    while i < m {
+        if load64(b + STRC_KP + 8 * i) == p && load64(b + STRC_KN + 8 * i) == n {
+            store64(b + f + 8 * i, v)
+        }
+        i += 1
+    }
+}
+
+// Смещение off из записи годится строке (p, n): оно внутри строки, а в
+// известной правильной части — не внутри символа.
+fn __strc_ok(p: int, n: int, vup: int, off: int) -> bool {
+    return off == n || (off >= 0 && off < n && (off >= vup || (load8(p + off) & 0xC0) != 0x80))
+}
+
+// Испорченная запись (её не очистили вовремя) забывается; в проверочном режиме
+// это паника.
+fn __strc_drop(b: int, e: int) {
+    if __strc_mode == STRC_STRESS {
+        __panic_msg("internal: string cache")
+    }
+    store64(b + STRC_KP + 8 * e, 0)
+}
+
+// Запись ключа с проверенными фактами.
+fn __strc_entry(b: int, p: int, n: int) -> int {
+    while true {
+        let e = __strc_get(b, p, n)
+        let v = load64(b + STRC_VUP + 8 * e)
+        let c = load64(b + STRC_CNT + 8 * e)
+        if v >= 0 && v <= n && c >= 0 && c <= n + 1 {
+            return e
+        }
+        __strc_drop(b, e)
+    }
+    return -1
+}
+
+// Число символов строки (p, n): из записи или одним проходом.
+fn __strc_count(b: int, p: int, n: int) -> int {
+    // цикл вида while i < s.len() { s[i] }: запись — та, где курсор
+    let t = load64(b + STRC_LAST) - 1
+    if t >= 0 && load64(b + STRC_KP + 8 * t) == p && load64(b + STRC_KN + 8 * t) == n {
+        let c = load64(b + STRC_CNT + 8 * t)
+        if c > 0 && c <= n + 1 {
+            return c - 1
+        }
+    }
+    let e = __strc_entry(b, p, n)
+    let c1 = load64(b + STRC_CNT + 8 * e)
+    if c1 != 0 {
+        return c1 - 1
+    }
+    var c = __utf8_scan(p, n)
+    if c >= 0 {
+        __strc_fact(b, e, p, n, STRC_VUP, n)
+    } else {
+        c = __tx_go_count(p, n)
+    }
+    __strc_fact(b, e, p, n, STRC_CNT, c + 1)
+    return c
+}
+
+// Индекс ключа: смещения символов 0, 64, 128, ... — в памяти запроса (арена)
+// или потока. 1 МБ кириллицы — около 76 КБ, один раз.
+fn __strc_index(b: int, p: int, n: int) {
+    let c = __strc_count(b, p, n)
+    let e = __strc_entry(b, p, n)
+    let valid = load64(b + STRC_VUP + 8 * e) == n
+    let m = c / 64 + 1
+    let t = __alloc(8 * m)
+    var off = 0
+    var j = 1
+    while j < m {
+        if valid {
+            off += __utf8_skip(p + off, n - off, 64)
+        } else {
+            off += __tx_go_skip(p + off, n - off, 64)
+        }
+        store64(t + 8 * j, off)
+        j += 1
+    }
+    __strc_fact(b, e, p, n, STRC_IX, t)
+}
+
+// Вперёд от границы ab (символ ak) до символа k. Пропуск считает символы по
+// первым байтам — это точно на правильном UTF-8 (P3), поэтому часть за vup
+// сначала проверяется: правильная, если примыкает к [0, vup), продлевает её,
+// а на неправильной идёт обход по правилу Go.
+fn __strc_fwd(b: int, e: int, p: int, n: int, ak: int, ab: int, k: int) -> int {
+    if k == ak {
+        return ab
+    }
+    let vup = load64(b + STRC_VUP + 8 * e)
+    let off = ab + __utf8_skip(p + ab, n - ab, k - ak)
+    if off <= vup {
+        return off
+    }
+    if ab <= vup {
+        if __utf8_scan(p + vup, off - vup) >= 0 {
+            __strc_fact(b, e, p, n, STRC_VUP, off)
+            return off
+        }
+    } else if __utf8_scan(p + ab, off - ab) >= 0 {
+        return off
+    }
+    return ab + __tx_go_skip(p + ab, n - ab, k - ak)
+}
+
+// Курсор ключа — на (k, off): тот, с которого шли (from), иначе вторая запись
+// ключа (на свободном месте или вместо второй записи другого ключа), иначе тот
+// курсор ключа, что ближе к k: второй, дальний, ведёт другой указатель (два
+// указателя навстречу), и его терять нельзя.
+fn __strc_cursor(b: int, p: int, n: int, from: int, e0: int, k: int, off: int) {
+    var t = from
+    if t < 0 {
+        let m = load64(b + STRC_HI)
+        var mine = 0
+        var free = -1
+        var i = 0
+        while i < m {
+            let kp = load64(b + STRC_KP + 8 * i)
+            if kp == p && load64(b + STRC_KN + 8 * i) == n {
+                mine += 1
+                if t < 0 || (load64(b + STRC_CK + 8 * i) - k).abs() < (load64(b + STRC_CK + 8 * t) - k).abs() {
+                    t = i
+                }
+            } else if kp == 0 && free < 0 {
+                free = i
+            }
+            i += 1
+        }
+        if mine < 2 && free < 0 {
+            free = __strc_more(b, m)
+        }
+        if mine < 2 && free < 0 {
+            free = __strc_spare(b, m, p, n)
+        }
+        if mine < 2 && free >= 0 {
+            __strc_init(b, free, p, n, e0)
+            store64(b + STRC_DUP, 1)
+            t = free
+        }
+    }
+    store64(b + STRC_CK + 8 * t, k)
+    store64(b + STRC_CB + 8 * t, off)
+    __strc_touch(b, t)
+    store64(b + STRC_LAST, t + 1)
+}
+
+// Курсор, который передвинул последний поиск, — дальше на (k, off).
+fn __strc_move(b: int, p: int, n: int, k: int, off: int) {
+    let t = load64(b + STRC_LAST) - 1
+    if t >= 0 && load64(b + STRC_KP + 8 * t) == p && load64(b + STRC_KN + 8 * t) == n {
+        store64(b + STRC_CK + 8 * t, k)
+        store64(b + STRC_CB + 8 * t, off)
+    }
+}
+
+// Смещение символа k (k >= 0) строки (p, n) или n, если символов не больше k.
+// Опоры: начало; конец, если строка правильная и число символов известно;
+// курсоры ключа; точка индекса. Путь вперёд стоит k − ak, назад — 8·(ak − k) и
+// только в известной правильной части. Дальний переход (путь больше 256
+// символов в строке от 4 КБ) отмечается; на втором по ключу строится индекс —
+// так записи, которые вытесняют, не платят O(n) снова и снова. Курсор — на
+// (k, off), если off < n: пропуск не отличает «k = числу символов» от «k больше».
+fn __strc_off(b: int, p: int, n: int, k: int) -> int {
+    // проход по порядку: курсор, который передвинул прошлый поиск, — ровно на k
+    let t = load64(b + STRC_LAST) - 1
+    if t >= 0 && load64(b + STRC_CK + 8 * t) == k && load64(b + STRC_KP + 8 * t) == p && load64(b + STRC_KN + 8 * t) == n {
+        let cb = load64(b + STRC_CB + 8 * t)
+        if __strc_ok(p, n, load64(b + STRC_VUP + 8 * t), cb) {
+            __strc_touch(b, t)
+            return cb
+        }
+    }
+    let e0 = __strc_entry(b, p, n)
+    let vup = load64(b + STRC_VUP + 8 * e0)
+    let cnt1 = load64(b + STRC_CNT + 8 * e0)
+    store64(b + STRC_LAST, 0)
+    if cnt1 != 0 && k >= cnt1 - 1 {
+        return n
+    }
+    if vup == n && cnt1 == n + 1 {
+        // ASCII
+        return k
+    }
+    var ak = 0
+    var ab = 0
+    var cost = k
+    var from = -1
+    if cnt1 != 0 && vup == n && 8 * (cnt1 - 1 - k) < cost {
+        ak = cnt1 - 1
+        ab = n
+        cost = 8 * (ak - k)
+    }
+    let m = load64(b + STRC_HI)
+    var e = 0
+    while e < m {
+        if load64(b + STRC_KP + 8 * e) == p && load64(b + STRC_KN + 8 * e) == n {
+            let ck = load64(b + STRC_CK + 8 * e)
+            let cb = load64(b + STRC_CB + 8 * e)
+            if ck < 0 || !__strc_ok(p, n, vup, cb) {
+                __strc_drop(b, e)
+                return __strc_off(b, p, n, k)
+            }
+            var d = -1
+            if k >= ck {
+                d = k - ck
+            } else if cb <= vup {
+                d = 8 * (ck - k)
+            }
+            if d >= 0 && d < cost {
+                ak = ck
+                ab = cb
+                cost = d
+                from = e
+            }
+        }
+        e += 1
+    }
+    let stress = __strc_mode == STRC_STRESS
+    let ix = load64(b + STRC_IX + 8 * e0)
+    if ix != 0 {
+        let sk = k & ~63
+        if k - sk < cost {
+            let sb = load64(ix + 8 * (k >> 6))
+            if !__strc_ok(p, n, vup, sb) {
+                __strc_drop(b, e0)
+                return __strc_off(b, p, n, k)
+            }
+            ak = sk
+            ab = sb
+            cost = k - sk
+            from = -1
+        }
+    } else if (stress && cost > 0) || (cost > 256 && n >= 4096) {
+        let far = load64(b + STRC_FAR + 8 * e0) + 1
+        __strc_fact(b, e0, p, n, STRC_FAR, far)
+        if far >= 2 || stress {
+            __strc_index(b, p, n)
+            return __strc_off(b, p, n, k)
+        }
+    }
+    var off = ab
+    if k >= ak {
+        off = __strc_fwd(b, e0, p, n, ak, ab, k)
+    } else {
+        // назад: в правильной части символ начинается с байта не 10xxxxxx
+        var j = ak
+        while j > k && off > 0 {
+            off -= 1
+            while off > 0 && (load8(p + off) & 0xC0) == 0x80 {
+                off -= 1
+            }
+            j -= 1
+        }
+        __strc_add(ab - off)
+    }
+    if off < n {
+        __strc_cursor(b, p, n, from, e0, k, off)
+    }
+    return off
+}
+
+// ---- Символы ----
+
+// Таблица символов U+0000–U+07FF: 2048 заголовков по 16 байт, за ними байты
+// символов, по 2 на код. Циклы по латинице, греческому, кириллице, ивриту и
+// арабскому берут символы отсюда, ничего не выделяя. Строится один раз на
+// процесс в постоянной памяти; у глобальных переменных нет адреса для __cas,
+// поэтому таблицу публикуют под замком постоянной памяти (__store_rw + 48):
+// остаётся первая, построенная одновременно с ней (36 КБ) пропадает.
+fn __chars() -> int {
+    let t0 = __chars_tab
+    if t0 != 0 {
+        return t0
+    }
+    let t = __perm_alloc(36864)
+    var cp = 0
+    while cp < 2048 {
+        let q = t + 32768 + 2 * cp
+        if cp < 0x80 {
+            store8(q, cp)
+            store64(t + 16 * cp + 8, 1)
+        } else {
+            store8(q, 0xC0 | (cp >> 6))
+            store8(q + 1, 0x80 | (cp & 63))
+            store64(t + 16 * cp + 8, 2)
+        }
+        store64(t + 16 * cp, q)
+        cp += 1
+    }
+    __store_rw_init()
+    let lock = __store_rw + 48
+    __mutex_lock(lock)
+    if __chars_tab == 0 {
+        __chars_tab = t
+    }
+    __mutex_unlock(lock)
+    return __chars_tab
+}
+
+// Символ в байтах [off, off + w) строки с началом p: U+0000–U+07FF — из таблицы,
+// остальные (и неправильный байт) — заголовок на байты строки.
+fn __tx_char(p: int, off: int, w: int) -> str {
+    let c = load8(p + off)
+    if c < 0x80 {
+        return __cast(__chars() + 16 * c)
+    }
+    if w == 2 {
+        return __cast(__chars() + 16 * (((c & 0x1F) << 6) | (load8(p + off + 1) & 0x3F)))
+    }
+    return __str_new(p + off, w)
+}
+
+// Символ, который начинается в байте off (граница символа, off < длины).
+fn __text_char_at(self: str, off: int) -> str {
+    let p = __str_ptr(self)
+    return __tx_char(p, off, __utf8_width(p, __str_len(self), off))
+}
+
+// UTF-8 символа cp — в q → число байтов.
+fn __utf8_put(q: int, cp: int) -> int {
+    if cp < 0x80 {
+        store8(q, cp)
+        return 1
+    }
+    if cp < 0x800 {
+        store8(q, 0xC0 | (cp >> 6))
+        store8(q + 1, 0x80 | (cp & 63))
+        return 2
+    }
+    if cp < 0x10000 {
+        store8(q, 0xE0 | (cp >> 12))
+        store8(q + 1, 0x80 | ((cp >> 6) & 63))
+        store8(q + 2, 0x80 | (cp & 63))
+        return 3
+    }
+    store8(q, 0xF0 | (cp >> 18))
+    store8(q + 1, 0x80 | ((cp >> 12) & 63))
+    store8(q + 2, 0x80 | ((cp >> 6) & 63))
+    store8(q + 3, 0x80 | (cp & 63))
+    return 4
+}
+
+// ---- Операции пользовательского кода ----
+// Короткие строки (и все, когда кэш выключен) — одним проходом проверки: ASCII
+// отвечает сразу, правильный UTF-8 — пропуском по первым байтам, неправильный —
+// обходом по правилу Go. Длинные — через кэш.
+
+// s.len(): число символов.
+fn __text_len(self: str) -> int {
+    let p = __str_ptr(self)
+    let n = __str_len(self)
+    let b = __strc_for(n)
+    if b != 0 {
+        return __strc_count(b, p, n)
+    }
+    let c = __utf8_scan(p, n)
+    if c >= 0 {
+        return c
+    }
+    return __tx_go_count(p, n)
+}
+
+// s[i]: символ i (строка из одного символа); вне [0, len) — паника.
+fn __text_at(self: str, i: int) -> str {
+    let p = __str_ptr(self)
+    let n = __str_len(self)
+    if i < 0 {
+        __panic(PANIC_INDEX, "str")
+    }
+    let b = __strc_for(n)
+    var off = 0
+    if b != 0 {
+        off = __strc_off(b, p, n, i)
+    } else {
+        let m = __utf8_scan(p, n)
+        if m == n {
+            if i >= n {
+                __panic(PANIC_INDEX, "str")
+            }
+            return __cast(__chars() + 16 * load8(p + i))
+        }
+        if m >= 0 {
+            off = __utf8_skip(p, n, i)
+        } else {
+            off = __tx_go_skip(p, n, i)
+        }
+    }
+    if off >= n {
+        __panic(PANIC_INDEX, "str")
+    }
+    let w = __utf8_width(p, n, off)
+    if b != 0 {
+        // курсор — на следующий символ; правильный символ сразу за vup
+        // продлевает правильную часть
+        let t = load64(b + STRC_LAST) - 1
+        if t >= 0 && load64(b + STRC_VUP + 8 * t) == off && (w > 1 || load8(p + off) < 0x80) {
+            __strc_fact(b, t, p, n, STRC_VUP, off + w)
+        }
+        if off + w < n {
+            __strc_move(b, p, n, i + 1, off + w)
+        }
+    }
+    return __tx_char(p, off, w)
+}
+
+// s[a..b]: символы [a, b), границы прижаты к [0, len]; b = TEXT_END — до конца.
+// Весь диапазон — сама строка, пустой — "".
+fn __text_slice(self: str, a0: int, b0: int) -> str {
+    let p = __str_ptr(self)
+    let n = __str_len(self)
+    var a = a0
+    if a < 0 {
+        a = 0
+    }
+    if b0 <= a {
+        return ""
+    }
+    var oa = 0
+    var ob = n
+    let b = __strc_for(n)
+    if b != 0 {
+        oa = __strc_off(b, p, n, a)
+        if oa >= n {
+            return ""
+        }
+        // запись ключа: та, чей курсор поиск оставил на a, или любая
+        var e = load64(b + STRC_LAST) - 1
+        if e < 0 {
+            e = __strc_entry(b, p, n)
+        }
+        let c1 = load64(b + STRC_CNT + 8 * e)
+        if b0 != TEXT_END && (c1 == 0 || b0 < c1 - 1) {
+            if c1 == n + 1 && load64(b + STRC_VUP + 8 * e) == n {
+                ob = b0
+            } else {
+                ob = __strc_fwd(b, e, p, n, a, oa, b0)
+                if ob < n {
+                    __strc_move(b, p, n, b0, ob)
+                }
+            }
+        }
+    } else {
+        let m = __utf8_scan(p, n)
+        if m == n {
+            oa = a
+            if oa > n {
+                oa = n
+            }
+            if b0 < n {
+                ob = b0
+            }
+        } else if m >= 0 {
+            oa = __utf8_skip(p, n, a)
+            if b0 != TEXT_END {
+                ob = oa + __utf8_skip(p + oa, n - oa, b0 - a)
+            }
+        } else {
+            oa = __tx_go_skip(p, n, a)
+            if b0 != TEXT_END {
+                ob = oa + __tx_go_skip(p + oa, n - oa, b0 - a)
+            }
+        }
+    }
+    if oa == 0 && ob == n {
+        return self
+    }
+    if ob <= oa {
+        return ""
+    }
+    return __str_new(p + oa, ob - oa)
+}
+
+// s.find(sub): индекс символа, с которого начинается первое вхождение, или none.
+// Ищутся байты; правильный непустой образец совпадает только на границах
+// символов (P4), и от ближайшего курсора остаётся досчитать символы.
+fn __text_find(self: str, sub: str) -> int? {
+    let bi = __str_byte_find_from(self, sub, 0)
+    if bi < 0 {
+        return none
+    }
+    let p = __str_ptr(self)
+    let n = __str_len(self)
+    let b = __strc_for(n)
+    if b == 0 {
+        let c = __utf8_scan(p, bi)
+        if c >= 0 {
+            return c
+        }
+        return __tx_go_count(p, bi)
+    }
+    let e0 = __strc_entry(b, p, n)
+    let vup = load64(b + STRC_VUP + 8 * e0)
+    if vup == n && load64(b + STRC_CNT + 8 * e0) == n + 1 {
+        return bi
+    }
+    // курсор ключа с наибольшим cb <= bi
+    var ck = 0
+    var cb = 0
+    var from = -1
+    let m = load64(b + STRC_HI)
+    var e = 0
+    while e < m {
+        if load64(b + STRC_KP + 8 * e) == p && load64(b + STRC_KN + 8 * e) == n {
+            let k1 = load64(b + STRC_CK + 8 * e)
+            let b1 = load64(b + STRC_CB + 8 * e)
+            if k1 < 0 || !__strc_ok(p, n, vup, b1) {
+                __strc_drop(b, e)
+                return __text_find(self, sub)
+            }
+            if b1 <= bi && b1 >= cb {
+                ck = k1
+                cb = b1
+                from = e
+            }
+        }
+        e += 1
+    }
+    var c = __utf8_scan(p + cb, bi - cb)
+    if c >= 0 {
+        if cb <= vup && bi > vup {
+            __strc_fact(b, e0, p, n, STRC_VUP, bi)
+        }
+    } else {
+        c = __tx_go_count(p + cb, bi - cb)
+    }
+    let k = ck + c
+    // курсор — только на границу символа: неправильный образец ("\x80")
+    // может совпасть внутри символа
+    let sp = __str_ptr(sub)
+    let sn = __str_len(sub)
+    if bi < n && sn > 0 && __utf8_scan(sp, sn) >= 0 {
+        __strc_cursor(b, p, n, from, e0, k, bi)
+    }
+    return k
+}
+
+// s.split(sep): с пустым sep — список символов (как в Go и JS), иначе по байтам.
+fn __text_split(self: str, sep: str) -> [str] {
+    if __str_len(sep) != 0 {
+        return __str_split(self, sep)
+    }
+    var parts: [str] = []
+    let p = __str_ptr(self)
+    let n = __str_len(self)
+    var off = 0
+    while off < n {
+        let w = __utf8_width(p, n, off)
+        parts.push(__tx_char(p, off, w))
+        off += w
+    }
+    return parts
+}
+
+// s.replace(old, new): с пустым old — new между символами и по краям (как в
+// Python и Go: "".replace("", "-") — "-"), иначе по байтам.
+fn __text_replace(self: str, old: str, new: str) -> str {
+    if __str_len(old) != 0 {
+        return __str_replace(self, old, new)
+    }
+    let p = __str_ptr(self)
+    let n = __str_len(self)
+    let b = buf_new(n + 2 * __str_len(new) + 16)
+    buf_add(b, new)
+    var off = 0
+    while off < n {
+        let w = __utf8_width(p, n, off)
+        buf_add_raw(b, p + off, w)
+        buf_add(b, new)
+        off += w
+    }
+    return buf_str(b)
+}
+
+// White_Space (PropList.txt): \t \n \v \f \r, пробел, U+0085, U+00A0, U+1680,
+// U+2000–200A, U+2028, U+2029, U+202F, U+205F, U+3000 — 25 кодов;
+// tools/unicode_tables.kh сверяет список с UCD. ZWSP и BOM — не пробелы (как в
+// Go и C#).
+fn __cp_is_space(cp: int) -> bool {
+    if cp < 0x80 {
+        return cp == ' ' || (cp >= 9 && cp <= 13)
+    }
+    if cp < 0x2000 {
+        return cp == 0x85 || cp == 0xA0 || cp == 0x1680
+    }
+    return cp <= 0x200A || cp == 0x2028 || cp == 0x2029 || cp == 0x202F || cp == 0x205F || cp == 0x3000
+}
+
+// Ширина пробельного символа в байте i или 0. Первые байты пробелов вне ASCII —
+// только C2, E1, E2 и E3.
+fn __tx_space_at(p: int, n: int, i: int) -> int {
+    let c = load8(p + i)
+    if c < 0x80 {
+        if c == ' ' || (c >= 9 && c <= 13) {
+            return 1
+        }
+        return 0
+    }
+    if c != 0xC2 && (c < 0xE1 || c > 0xE3) {
+        return 0
+    }
+    let w = __utf8_width(p, n, i)
+    if w > 1 && __cp_is_space(__utf8_decode(p, n, i)) {
+        return w
+    }
+    return 0
+}
+
+// s.trim(): без White_Space по краям; если обрезать нечего — сама строка.
+fn __text_trim(self: str) -> str {
+    let p = __str_ptr(self)
+    let n = __str_len(self)
+    var a = 0
+    while a < n {
+        let w = __tx_space_at(p, n, a)
+        if w == 0 {
+            break
+        }
+        a += w
+    }
+    var b = n
+    while b > a {
+        // начало последнего символа: назад через байты 10xxxxxx, не дальше 3
+        var q = b - 1
+        while q > a && q > b - 4 && (load8(p + q) & 0xC0) == 0x80 {
+            q -= 1
+        }
+        let w = __tx_space_at(p, b, q)
+        if w == 0 || q + w != b {
+            break
+        }
+        b = q
+    }
+    if a == 0 && b == n {
+        return self
+    }
+    return __str_new(p + a, b - a)
+}
+
+fn __text_lower(self: str) -> str {
+    return __tx_case(self, false)
+}
+
+fn __text_upper(self: str) -> str {
+    return __tx_case(self, true)
+}
+
+// Простое отображение регистра (UnicodeData.txt, поля 12 и 13; как в Go и C#):
+// ß остаётся, "İ".lower() — "i", без правила конечной сигмы. Сначала ищется
+// первый символ, который меняется: слова по 8 байт ASCII — как в __str_case
+// (lib/core.kh), остальные символы — через __case_map. Если такого нет — сама
+// строка, без выделения. Иначе копия: отображения растут не больше чем в 1,5
+// раза (22 из 2 байт в 3, это проверяет tools/unicode_tables.kh), поэтому
+// 1,5·n + 4 байт хватает; лишний хвост возвращается __alloc_trim.
+// Неправильные байты копируются как есть.
+fn __tx_case(self: str, up: bool) -> str {
+    let p = __str_ptr(self)
+    let n = __str_len(self)
+    var lo = 'A'
+    var below = 0x3F3F3F3F
+    var past = 0x25252525
+    if up {
+        lo = 'a'
+        below = 0x1F1F1F1F
+        past = 0x05050505
+    }
+    let high = ~0x7F7F7F7F7F7F7F7F
+    var i = 0
+    while i < n {
+        if i + 8 <= n {
+            let x = load64(p + i)
+            if (x & high) == 0 {
+                if (__case4(x & 0xFFFFFFFF, below, past) | __case4((x >> 32) & 0xFFFFFFFF, below, past)) != 0 {
+                    break
+                }
+                i += 8
+                continue
+            }
+        }
+        let c = load8(p + i)
+        if c < 0x80 {
+            if c >= lo && c < lo + 26 {
+                break
+            }
+            i += 1
+            continue
+        }
+        if c >= 0xC2 && c <= 0xDF && i + 1 < n && (load8(p + i + 1) & 0xC0) == 0x80 {
+            let cp = ((c & 0x1F) << 6) | (load8(p + i + 1) & 0x3F)
+            if __case_map(cp, up) != cp {
+                break
+            }
+            i += 2
+            continue
+        }
+        let w = __utf8_width(p, n, i)
+        if w > 1 {
+            let cp = __utf8_decode(p, n, i)
+            if __case_map(cp, up) != cp {
+                break
+            }
+        }
+        i += w
+    }
+    if i >= n {
+        return self
+    }
+    let cap = n + n / 2 + 4
+    let q = __alloc(cap)
+    __memcpy(q, p, i)
+    var j = i
+    while i < n {
+        if i + 8 <= n {
+            let x = load64(p + i)
+            if (x & high) == 0 {
+                store64(q + j, x ^ (__case4(x & 0xFFFFFFFF, below, past) | (__case4((x >> 32) & 0xFFFFFFFF, below, past) << 32)))
+                i += 8
+                j += 8
+                continue
+            }
+        }
+        var c = load8(p + i)
+        if c < 0x80 {
+            if c >= lo && c < lo + 26 {
+                c = c ^ 32
+            }
+            store8(q + j, c)
+            i += 1
+            j += 1
+            continue
+        }
+        if c >= 0xC2 && c <= 0xDF && i + 1 < n && (load8(p + i + 1) & 0xC0) == 0x80 {
+            // два байта — в два байта, без вызовов разбора
+            let m = __case_map(((c & 0x1F) << 6) | (load8(p + i + 1) & 0x3F), up)
+            if m >= 0x80 && m < 0x800 {
+                store8(q + j, 0xC0 | (m >> 6))
+                store8(q + j + 1, 0x80 | (m & 63))
+                j += 2
+            } else {
+                j += __utf8_put(q + j, m)
+            }
+            i += 2
+            continue
+        }
+        let w = __utf8_width(p, n, i)
+        if w == 1 {
+            store8(q + j, c)
+            j += 1
+        } else {
+            j += __utf8_put(q + j, __case_map(__utf8_decode(p, n, i), up))
+        }
+        i += w
+    }
+    __alloc_trim(q, cap, j + 1)
+    return __str_new(q, j)
+}
+
+// Простое отображение регистра кода cp: в верхний (up) или нижний. ASCII и
+// кириллица U+0400–045F — арифметикой, остальное — двухуровневой таблицей
+// lib/text_tables.kh: номер пары разностей pi = s2[s1[cp >> 6]·64 + (cp & 63)],
+// pi = 0 — без отображения, иначе cp + разность пары (i32: нижний, верхний).
+fn __case_map(cp: int, up: bool) -> int {
+    if cp < 0x80 {
+        if up {
+            if cp >= 'a' && cp <= 'z' {
+                return cp - 32
+            }
+        } else if cp >= 'A' && cp <= 'Z' {
+            return cp + 32
+        }
+        return cp
+    }
+    if cp >= 0x400 && cp < 0x460 {
+        if up {
+            if cp >= 0x450 {
+                return cp - 0x50
+            }
+            if cp >= 0x430 {
+                return cp - 0x20
+            }
+        } else {
+            if cp < 0x410 {
+                return cp + 0x50
+            }
+            if cp < 0x430 {
+                return cp + 0x20
+            }
+        }
+        return cp
+    }
+    if cp >= CASE_END {
+        return cp
+    }
+    let t = __case_tab()
+    let pi = load8(t + CASE_S2 + load8(t + (cp >> 6)) * 64 + (cp & 63))
+    if pi == 0 {
+        return cp
+    }
+    var a = t + CASE_PAL + 8 * pi
+    if up {
+        a += 4
+    }
+    return cp + ((load32(a) << 32) >> 32)
+}
+
+// \w в регулярных выражениях: буквы (L), знаки (M), десятичные цифры (Nd) и
+// соединители (Pc) — как \w у C# и [\p{L}\p{M}\p{Nd}\p{Pc}] у Go и RE2. Выше
+// WORD_END таких кодов нет, кроме селекторов вариантов U+E0100–E01EF; ниже —
+// бит (cp & 127) в 16-байтовом блоке s2[s1[cp >> 7]] таблицы lib/text_tables.kh.
+fn __cp_is_word(cp: int) -> bool {
+    if cp < 0x80 {
+        return (cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z') || (cp >= '0' && cp <= '9') || cp == '_'
+    }
+    if cp >= WORD_END {
+        return cp >= 0xE0100 && cp <= 0xE01EF
+    }
+    let t = __word_tab()
+    let blk = load8(t + (cp >> 7))
+    return ((load8(t + WORD_S2 + 16 * blk + ((cp & 127) >> 3)) >> (cp & 7)) & 1) != 0
+}
+
+// Строка, в которой каждый неправильный байт (правило Go) заменён на U+FFFD
+// (EF BF BD); правильная — сама.
+fn __utf8_sanitize(self: str) -> str {
+    let p = __str_ptr(self)
+    let n = __str_len(self)
+    if __utf8_scan(p, n) >= 0 {
+        return self
+    }
+    let b = buf_new(n + 16)
+    var off = 0
+    while off < n {
+        let bad = off + __utf8_bad_at(p + off, n - off)
+        buf_add_raw(b, p + off, bad - off)
+        if bad < n {
+            buf_utf8(b, 0xFFFD)
+        }
+        off = bad + 1
+    }
+    return buf_str(b)
+}
+
+// Порядок s и однобайтового литерала ASCII c (s < 'a' и т. п.): <0, 0 или >0,
+// как __str_cmp — по байтам.
+fn __text_cmp1(self: str, c: int) -> int {
+    let n = __str_len(self)
+    if n == 0 {
+        return -1
+    }
+    let d = load8(__str_ptr(self)) - c
+    if d != 0 {
+        return d
+    }
+    return n - 1
 }

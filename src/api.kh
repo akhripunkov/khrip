@@ -76,6 +76,7 @@ fn lib_files() -> [str] {
     names.push("pk.kh")
     names.push("regex.kh")
     names.push("text.kh")
+    names.push("text_tables.kh")
     return names
 }
 

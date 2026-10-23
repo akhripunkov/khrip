@@ -1,0 +1,399 @@
+// Кэш строк (lib/text.kh) через операции __text_*: проход вперёд и назад,
+// палиндром (два указателя навстречу), две и три строки вперемешку, доступ
+// вразнобой, срезы, поиск со срезом остатка, строка в поле структуры и в
+// функции-помощнике, а в конце — 600 000 обращений к десяти строкам (больше,
+// чем записей в кэше) — всё сверяется со ссылкой без кэша: границами символов,
+// посчитанными заранее байтовым API. Вывод один и тот же без кэша, с ним и в
+// проверочном режиме, при SIMD и без. С кэшем проверяется и то, что проходы не
+// квадратичны: байтов прочитано не больше нескольких длин строки.
+// env: KHRIP_SIMD=0 KHRIP_STRCACHE=off
+// env: KHRIP_SIMD=0
+// env: KHRIP_SIMD=0 KHRIP_STRCACHE=stress
+// env: KHRIP_STRCACHE=off
+// env:
+// env: KHRIP_STRCACHE=stress
+
+const END = 0x7FFFFFFFFFFFFFFF
+
+var checks: int = 0
+var bad: int = 0
+
+fn verify(what: str, ok: bool) {
+    checks += 1
+    if !ok {
+        bad += 1
+        if bad <= 10 {
+            print("failed: " + what)
+        }
+    }
+}
+
+// Ширина символа по правилу Go в байте i (неправильный байт — 1).
+fn ref_width(s: str, i: int) -> int {
+    let n = s.byte_len()
+    let c = s.byte(i)
+    var len = 1
+    var lo = 0x80
+    var hi = 0xBF
+    if c >= 0xC2 && c <= 0xDF {
+        len = 2
+    } else if c >= 0xE0 && c <= 0xEF {
+        len = 3
+        if c == 0xE0 {
+            lo = 0xA0
+        } else if c == 0xED {
+            hi = 0x9F
+        }
+    } else if c >= 0xF0 && c <= 0xF4 {
+        len = 4
+        if c == 0xF0 {
+            lo = 0x90
+        } else if c == 0xF4 {
+            hi = 0x8F
+        }
+    }
+    if len == 1 || i + len > n || s.byte(i + 1) < lo || s.byte(i + 1) > hi {
+        return 1
+    }
+    for j in 2..len {
+        if (s.byte(i + j) & 0xC0) != 0x80 {
+            return 1
+        }
+    }
+    return len
+}
+
+// Ссылка без кэша: начала символов и в конце — длина в байтах.
+fn ref_bounds(s: str) -> [int] {
+    var b: [int] = []
+    var i = 0
+    while i < s.byte_len() {
+        b.push(i)
+        i += ref_width(s, i)
+    }
+    b.push(s.byte_len())
+    return b
+}
+
+type Text {
+    s: str
+    b: [int]
+    valid: bool
+}
+
+fn text(s: str) -> Text {
+    let b = ref_bounds(s)
+    var valid = true
+    for i in 0..b.len() - 1 {
+        if b[i + 1] - b[i] == 1 && s.byte(b[i]) >= 0x80 {
+            valid = false
+        }
+    }
+    return Text { s: s, b: b, valid: valid }
+}
+
+fn count(t: Text) -> int {
+    return t.b.len() - 1
+}
+
+fn ch(t: Text, i: int) -> str {
+    return t.s.byte_slice(t.b[i], t.b[i + 1])
+}
+
+fn at_ok(t: Text, i: int) -> bool {
+    return __text_at(t.s, i) == ch(t, i)
+}
+
+fn clamp(v: int, hi: int) -> int {
+    if v < 0 {
+        return 0
+    }
+    if v > hi {
+        return hi
+    }
+    return v
+}
+
+fn slice_ok(t: Text, a: int, b: int) -> bool {
+    let n = count(t)
+    let ca = clamp(a, n)
+    var cb = n
+    if b != END {
+        cb = clamp(b, n)
+    }
+    var want = ""
+    if cb > ca {
+        want = t.s.byte_slice(t.b[ca], t.b[cb])
+    }
+    return __text_slice(t.s, a, b) == want
+}
+
+var seed: int = 5
+
+fn rnd(n: int) -> int {
+    seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+    return (seed >> 8) % n
+}
+
+// Текст из m символов: кириллица, латиница, иероглифы, эмодзи, знаки — по весам
+// w (ASCII, 2, 3, 4 байта из 100); bad > 0 — каждый bad-й символ заменён
+// неправильными байтами.
+fn gen(m: int, w2: int, w3: int, w4: int, bad: int) -> str {
+    let b = buf_new(16)
+    for i in 0..m {
+        if bad > 0 && i % bad == bad - 1 {
+            let r = rnd(4)
+            if r == 0 {
+                buf_byte(b, 0x80 + rnd(64))
+            } else if r == 1 {
+                buf_byte(b, 0xE2)
+                buf_byte(b, 0x82)
+            } else if r == 2 {
+                buf_byte(b, 0xED)
+                buf_byte(b, 0xA0)
+                buf_byte(b, 0x80)
+            } else {
+                buf_byte(b, 0xFF)
+            }
+            continue
+        }
+        let r = rnd(100)
+        if r < w2 {
+            buf_utf8(b, 0x410 + rnd(64))
+        } else if r < w2 + w3 {
+            buf_utf8(b, 0x4E00 + rnd(500))
+        } else if r < w2 + w3 + w4 {
+            buf_utf8(b, 0x1F600 + rnd(64))
+        } else if rnd(8) == 0 {
+            buf_byte(b, 44)
+        } else {
+            buf_byte(b, 97 + rnd(26))
+        }
+    }
+    return buf_str(b)
+}
+
+// Строка наоборот по символам.
+fn reversed(t: Text) -> str {
+    let b = buf_new(t.s.byte_len() + 1)
+    var i = count(t) - 1
+    while i >= 0 {
+        buf_add(b, ch(t, i))
+        i -= 1
+    }
+    return buf_str(b)
+}
+
+type Doc {
+    title: str
+    body: str
+}
+
+// Помощник: символ по индексу (получатель — параметр, ключ кэша — тот же).
+fn char_of(s: str, i: int) -> str {
+    return __text_slice(s, i, i + 1)
+}
+
+// С кэшем (обычный режим) байтов прочитано не больше limit; в других режимах
+// граница не проверяется, а вывод тот же. Назад кэш ходит только по известной
+// правильной части, поэтому у строк с неправильными байтами граница — для
+// прохода вперёд и вразнобой.
+fn bounded(what: str, before: int, limit: int, valid: bool) {
+    if __strc_mode == 0 && valid {
+        verify(what + ": " + (__strc_scanned() - before).to_str() + " bytes scanned, limit " + limit.to_str(), __strc_scanned() - before <= limit)
+    } else {
+        verify(what, true)
+    }
+}
+
+fn main() -> int {
+    let cyr = text(gen(3000, 85, 0, 0, 0))
+    let mix = text(gen(2500, 40, 20, 5, 0))
+    let inv = text(gen(2500, 40, 20, 5, 37))
+    let asc = text(gen(5000, 0, 0, 0, 0))
+    print("strings: {cyr.s.byte_len()} {mix.s.byte_len()} {inv.s.byte_len()} {asc.s.byte_len()} bytes, {count(cyr)} {count(mix)} {count(inv)} {count(asc)} characters")
+    for t in [cyr, mix, inv, asc] {
+        verify("len", __text_len(t.s) == count(t))
+    }
+
+    // вперёд и назад
+    for t in [cyr, mix, inv, asc] {
+        let n = t.s.byte_len()
+        var s0 = __strc_scanned()
+        var ok = true
+        for i in 0..count(t) {
+            if !at_ok(t, i) {
+                ok = false
+            }
+        }
+        verify("forward", ok)
+        bounded("forward", s0, 4 * n, true)
+        s0 = __strc_scanned()
+        var i = count(t) - 1
+        while i >= 0 {
+            if !at_ok(t, i) {
+                ok = false
+            }
+            i -= 1
+        }
+        verify("backward", ok)
+        bounded("backward", s0, 4 * n, t.valid)
+    }
+    print("forward and backward: ok")
+
+    // палиндром: два указателя навстречу по одной строке
+    let pal = text(mix.s + reversed(mix))
+    var answers = ""
+    for t in [pal, mix] {
+        let s0 = __strc_scanned()
+        var lo = 0
+        var hi = count(t) - 1
+        var is_pal = true
+        while lo < hi {
+            let a = __text_at(t.s, lo)
+            let b = __text_at(t.s, hi)
+            verify("palindrome chars", a == ch(t, lo) && b == ch(t, hi))
+            if a != b {
+                is_pal = false
+            }
+            lo += 1
+            hi -= 1
+        }
+        bounded("palindrome", s0, 4 * t.s.byte_len(), t.valid)
+        answers += " {is_pal}"
+    }
+    print("palindrome:" + answers)
+
+    // две строки с общим началом и три строки по кругу
+    let twin = text(cyr.s.byte_slice(0, 3000) + mix.s.byte_slice(0, 2000))
+    var same = 0
+    var s1 = __strc_scanned()
+    for i in 0..count(twin).min(count(cyr)) {
+        let a = __text_at(cyr.s, i)
+        let b = __text_at(twin.s, i)
+        verify("two strings", a == ch(cyr, i) && b == ch(twin, i))
+        if a == b {
+            same += 1
+        }
+    }
+    bounded("two strings", s1, 4 * (cyr.s.byte_len() + twin.s.byte_len()), true)
+    print("two strings: {same} equal characters")
+    s1 = __strc_scanned()
+    var k = 0
+    while k < 2400 {
+        verify("three strings", at_ok(cyr, k) && at_ok(mix, k) && at_ok(inv, k))
+        k += 1
+    }
+    bounded("three strings", s1, 4 * (cyr.s.byte_len() + mix.s.byte_len() + inv.s.byte_len()), true)
+    print("three strings: ok")
+
+    // вразнобой: после второго дальнего перехода — индекс, дальше не больше
+    // 64 символов на обращение
+    for t in [cyr, inv] {
+        let s0 = __strc_scanned()
+        for r in 0..20000 {
+            let i = rnd(count(t))
+            verify("random", at_ok(t, i))
+        }
+        bounded("random", s0, 3 * t.s.byte_len() + 20000 * 64 * 4, true)
+    }
+    print("random access: ok")
+
+    // срезы: окна подряд, открытый конец, прижатие
+    for t in [cyr, inv, asc] {
+        let s0 = __strc_scanned()
+        for i in 0..count(t) {
+            verify("window", slice_ok(t, i, i + 3))
+        }
+        bounded("windows", s0, 8 * t.s.byte_len(), t.valid)
+        for r in 0..300 {
+            let a = rnd(count(t) + 10) - 5
+            verify("slice", slice_ok(t, a, a + rnd(200) - 20) && slice_ok(t, a, END))
+        }
+    }
+    print("slices: ok")
+
+    // поиск и срез остатка: while let i = rest.find(",") { rest = rest[i + 1..] }
+    for t in [mix, inv] {
+        var rest = t.s
+        var parts = 0
+        var rebuilt: [str] = []
+        while true {
+            let i = __text_find(rest, ",") ?? -1
+            if i < 0 {
+                break
+            }
+            rebuilt.push(__text_slice(rest, 0, i))
+            rest = __text_slice(rest, i + 1, END)
+            parts += 1
+        }
+        rebuilt.push(rest)
+        verify("find and slice", rebuilt.join(",") == t.s)
+        print("find and slice: {parts + 1} parts")
+    }
+
+    // поле структуры и помощник: ключ кэша — байты, а не выражение
+    let doc = Doc { title: "заголовок", body: cyr.s }
+    var ok = true
+    for i in 0..count(cyr) {
+        if __text_at(doc.body, i) != ch(cyr, i) || char_of(doc.body, i) != ch(cyr, i) {
+            ok = false
+        }
+    }
+    verify("field and helper", ok)
+    // переприсваивание в цикле: каждый раз новая строка (новый ключ)
+    var s = inv.s
+    var dropped = 0
+    while __text_len(s) > 2000 {
+        verify("reassign", __text_at(s, 0) == ch(inv, dropped))
+        s = __text_slice(s, 1, END)
+        dropped += 1
+    }
+    print("field, helper, reassignment: ok")
+
+    // 600 000 обращений к десяти строкам от 256 байт вперемешку: подряд,
+    // назад, вразнобой и срезами; записей в кэше — восемь
+    var texts: [Text] = []
+    for j in 0..10 {
+        texts.push(text(gen(240 + 40 * j, 10 * j, 10, 2 * (j % 3), 7 * (j % 4))))
+    }
+    var pos: [int] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    var lookups = 0
+    let before = bad
+    while lookups < 600000 {
+        let j = rnd(10)
+        let t = texts[j]
+        let n = count(t)
+        let mode = rnd(4)
+        var steps = 1 + rnd(40)
+        while steps > 0 && lookups < 600000 {
+            var i = pos[j]
+            if mode == 0 {
+                i = (i + 1) % n
+            } else if mode == 1 {
+                i = (i + n - 1) % n
+            } else if mode == 2 {
+                i = rnd(n)
+            }
+            pos[j] = i
+            if mode == 3 {
+                verify("mixed slice", slice_ok(t, i, i + 2))
+            } else {
+                verify("mixed at", at_ok(t, i))
+            }
+            lookups += 1
+            steps -= 1
+        }
+    }
+    var sizes = ""
+    for t in texts {
+        sizes += " {t.s.byte_len()}"
+    }
+    print("mixed lookups: {lookups} in strings of{sizes} bytes, mismatches: {bad - before}")
+
+    print("checks: {checks}, mismatches: {bad}")
+    if bad > 0 {
+        return 1
+    }
+    return 0
+}

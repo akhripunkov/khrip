@@ -1,0 +1,490 @@
+// Строки как текст (lib/text.kh): свойства из §1.1 дизайна v0.13-utf8 на 10 000
+// строк из детерминированного генератора — правильный UTF-8 с символами в 1–4
+// байта, правильные символы вперемешку с неправильными байтами и правильный
+// текст, разрезанный byte_slice не по границам символов и склеенный снова.
+// Ответы __text_* сверяются с простыми ссылками на байтовом API: деление на
+// символы по правилу Go, срезы, поиск, split(""), replace("", x), trim,
+// lower/upper. Строки длиннее 256 байт идут через кэш строк; вывод один и тот
+// же без кэша, с ним и в проверочном режиме, при SIMD и без.
+// env: KHRIP_SIMD=0 KHRIP_STRCACHE=off
+// env: KHRIP_SIMD=0
+// env: KHRIP_SIMD=0 KHRIP_STRCACHE=stress
+// env: KHRIP_STRCACHE=off
+// env:
+// env: KHRIP_STRCACHE=stress
+
+const END = 0x7FFFFFFFFFFFFFFF
+
+var checks: int = 0
+var bad: int = 0
+var cur: str = ""
+
+fn hexs(s: str) -> str {
+    var r = ""
+    for i in 0..s.byte_len() {
+        r += " " + s.byte(i).to_str()
+    }
+    return r
+}
+
+fn verify(what: str, ok: bool) {
+    checks += 1
+    if !ok {
+        bad += 1
+        if bad <= 10 {
+            print("failed: {what} on{hexs(cur)}")
+        }
+    }
+}
+
+// ---- ссылки: правило Go на байтовом API ----
+
+fn is_cont(b: int) -> bool {
+    return (b & 0xC0) == 0x80
+}
+
+// Ширина правильной последовательности (таблица 3-7 Unicode) в байте i или 0.
+fn ref_seq(s: str, i: int) -> int {
+    let n = s.byte_len()
+    let c = s.byte(i)
+    if c < 0x80 {
+        return 1
+    }
+    var len = 0
+    var lo = 0x80
+    var hi = 0xBF
+    if c >= 0xC2 && c <= 0xDF {
+        len = 2
+    } else if c == 0xE0 {
+        len = 3
+        lo = 0xA0
+    } else if c >= 0xE1 && c <= 0xEC {
+        len = 3
+    } else if c == 0xED {
+        len = 3
+        hi = 0x9F
+    } else if c >= 0xEE && c <= 0xEF {
+        len = 3
+    } else if c == 0xF0 {
+        len = 4
+        lo = 0x90
+    } else if c >= 0xF1 && c <= 0xF3 {
+        len = 4
+    } else if c == 0xF4 {
+        len = 4
+        hi = 0x8F
+    } else {
+        return 0
+    }
+    if i + len > n {
+        return 0
+    }
+    let c1 = s.byte(i + 1)
+    if c1 < lo || c1 > hi {
+        return 0
+    }
+    for j in 2..len {
+        if !is_cont(s.byte(i + j)) {
+            return 0
+        }
+    }
+    return len
+}
+
+// Начала символов и в конце — длина в байтах.
+fn ref_bounds(s: str) -> [int] {
+    var b: [int] = []
+    var i = 0
+    while i < s.byte_len() {
+        b.push(i)
+        var w = ref_seq(s, i)
+        if w == 0 {
+            w = 1
+        }
+        i += w
+    }
+    b.push(s.byte_len())
+    return b
+}
+
+// Код символа в байте i шириной w или -1, если это неправильный байт.
+fn ref_cp(s: str, i: int, w: int) -> int {
+    let c = s.byte(i)
+    if w == 1 {
+        if c < 0x80 {
+            return c
+        }
+        return -1
+    }
+    var cp = c & (0x7F >> w)
+    for j in 1..w {
+        cp = cp * 64 + (s.byte(i + j) & 0x3F)
+    }
+    return cp
+}
+
+fn ref_space(cp: int) -> bool {
+    return cp == 32 || (cp >= 9 && cp <= 13) || cp == 0x85 || cp == 0xA0 || cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) || cp == 0x2028 || cp == 0x2029 || cp == 0x202F || cp == 0x205F || cp == 0x3000
+}
+
+fn clamp(v: int, hi: int) -> int {
+    if v < 0 {
+        return 0
+    }
+    if v > hi {
+        return hi
+    }
+    return v
+}
+
+// ---- генератор ----
+
+var seed: int = 7
+
+fn rnd(n: int) -> int {
+    seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+    return (seed >> 8) % n
+}
+
+fn pick(xs: [int]) -> int {
+    return xs[rnd(xs.len())]
+}
+
+fn gen_cp() -> int {
+    let r = rnd(20)
+    if r < 8 {
+        if rnd(4) == 0 {
+            return pick([32, 32, 9, 10, 11, 12, 13, 0])
+        }
+        return 32 + rnd(95)
+    }
+    if r < 14 {
+        if rnd(4) == 0 {
+            return pick([0x85, 0xA0, 0x130, 0x131, 0x17F, 0x1C5, 0x250, 0x7FF, 0x80, 0x401, 0x451, 0x3A3, 0x3C3, 0x141, 0x11E, 0xDF])
+        }
+        return pick([0x400, 0x391, 0xC0, 0x100]) + rnd(96)
+    }
+    if r < 18 {
+        if rnd(3) == 0 {
+            return pick([0x2000, 0x2005, 0x200A, 0x3000, 0x2028, 0x2029, 0x202F, 0x205F, 0x1680, 0x200B, 0xFEFF, 0x212A, 0x10D0, 0x1C90, 0x13A0, 0xAB70, 0xFFFD, 0xE000, 0x1E9E, 0x2C6F, 0x800, 0xFFFF])
+        }
+        return 0x4E00 + rnd(2000)
+    }
+    if rnd(15) == 0 {
+        return pick([0x10000, 0x10FFFF, 0x1F9FF])
+    }
+    return pick([0x1F600, 0x10400, 0x1E900]) + rnd(80)
+}
+
+// Неправильные кусочки: лишнее продолжение, обрезанные последовательности,
+// лишне длинные формы, суррогаты, коды выше U+10FFFF, запрещённые байты.
+fn gen_bad(b: Buf) {
+    let r = rnd(11)
+    if r == 0 {
+        buf_byte(b, 0x80 + rnd(64))
+    } else if r == 1 {
+        buf_byte(b, pick([0xC0, 0xC1, 0xF5, 0xF8, 0xFE, 0xFF]))
+        buf_byte(b, 0x80 + rnd(64))
+    } else if r == 2 {
+        buf_byte(b, 0xC2 + rnd(30))
+    } else if r == 3 {
+        buf_byte(b, 0xE2)
+        buf_byte(b, 0x82)
+    } else if r == 4 {
+        buf_byte(b, 0xE0)
+        buf_byte(b, 0x80 + rnd(32))
+        buf_byte(b, 0x80)
+    } else if r == 5 {
+        buf_byte(b, 0xED)
+        buf_byte(b, 0xA0 + rnd(32))
+        buf_byte(b, 0x80)
+    } else if r == 6 {
+        buf_byte(b, 0xF4)
+        buf_byte(b, 0x90)
+        buf_byte(b, 0x80)
+        buf_byte(b, 0x80)
+    } else if r == 7 {
+        buf_byte(b, 0xF0)
+        buf_byte(b, 0x9F)
+        buf_byte(b, 0x98)
+    } else if r == 8 {
+        buf_byte(b, 0xF0)
+        buf_byte(b, 0x80 + rnd(16))
+        buf_byte(b, 0x80)
+        buf_byte(b, 0x80)
+    } else {
+        buf_byte(b, 0x80 + rnd(128))
+    }
+}
+
+fn gen_len() -> int {
+    let r = rnd(20)
+    if r < 13 {
+        return rnd(40)
+    }
+    if r < 19 {
+        return 40 + rnd(80)
+    }
+    return 150 + rnd(250)
+}
+
+fn gen_valid(m: int) -> str {
+    let b = buf_new(16)
+    for i in 0..m {
+        buf_utf8(b, gen_cp())
+    }
+    return buf_str(b)
+}
+
+fn gen(kind: int) -> str {
+    let m = gen_len()
+    if kind == 0 {
+        return gen_valid(m)
+    }
+    if kind == 1 {
+        let b = buf_new(16)
+        for i in 0..m {
+            if rnd(5) == 0 {
+                gen_bad(b)
+            } else {
+                buf_utf8(b, gen_cp())
+            }
+        }
+        return buf_str(b)
+    }
+    // правильный текст, разрезанный по байтам и склеенный
+    var s = gen_valid(m)
+    for k in 0..1 + rnd(3) {
+        let n = s.byte_len()
+        if n == 0 {
+            break
+        }
+        let x = rnd(n + 1)
+        let y = x + rnd(n + 1 - x)
+        s = s.byte_slice(0, x) + gen_valid(rnd(3)) + s.byte_slice(y, n)
+    }
+    return s
+}
+
+// ---- проверки одной строки ----
+
+fn check(s: str) {
+    cur = s
+    let n = s.byte_len()
+    let bounds = ref_bounds(s)
+    let cnt = bounds.len() - 1
+    var chars: [str] = []
+    var good: [bool] = []
+    for i in 0..cnt {
+        chars.push(s.byte_slice(bounds[i], bounds[i + 1]))
+        good.push(ref_seq(s, bounds[i]) != 0)
+    }
+
+    // 2: len — число символов; s[i] по порядку; их склейка — сама строка
+    verify("len", __text_len(s) == cnt)
+    var got: [str] = []
+    for i in 0..cnt {
+        let c = __text_at(s, i)
+        verify("at", c == chars[i])
+        got.push(c)
+    }
+    verify("concat", got.join("") == s)
+    verify("len again", __text_len(s) == cnt)
+    // назад, вразнобой и двумя указателями навстречу
+    var i = cnt - 1
+    while i >= 0 {
+        verify("at back", __text_at(s, i) == chars[i])
+        i -= 1
+    }
+    for k in 0..6 {
+        if cnt > 0 {
+            let j = rnd(cnt)
+            verify("at random", __text_at(s, j) == chars[j])
+        }
+    }
+    var lo = 0
+    var hi = cnt - 1
+    while lo < hi {
+        verify("at two", __text_at(s, lo) == chars[lo] && __text_at(s, hi) == chars[hi])
+        lo += 1
+        hi -= 1
+    }
+    // 3: s[i] == s[i..i + 1]
+    for j in 0..cnt {
+        verify("slice1", __text_slice(s, j, j + 1) == chars[j])
+    }
+    // split("") и replace("", x)
+    let parts = __text_split(s, "")
+    var same = parts.len() == cnt
+    if same {
+        for j in 0..cnt {
+            if parts[j] != chars[j] {
+                same = false
+            }
+        }
+    }
+    verify("split", same)
+    var rep = "|"
+    if cnt > 0 {
+        rep = "|" + chars.join("|") + "|"
+    }
+    verify("replace", __text_replace(s, "", "|") == rep)
+
+    // 4, 6: срезы с прижатием — байты ровно от границы до границы
+    for k in 0..8 {
+        let a = rnd(cnt + 5) - 2
+        let b = rnd(cnt + 5) - 2
+        let ca = clamp(a, cnt)
+        let cb = clamp(b, cnt)
+        var want = ""
+        if cb > ca {
+            want = s.byte_slice(bounds[ca], bounds[cb])
+        }
+        let sl = __text_slice(s, a, b)
+        verify("slice", sl == want)
+        var wl = cb - ca
+        if wl < 0 {
+            wl = 0
+        }
+        verify("slice len", __text_len(sl) == wl)
+        verify("slice open", __text_slice(s, a, END) == s.byte_slice(bounds[ca], n))
+    }
+    // 1: s[..k] + s[k..] == s
+    for k in [0, cnt, cnt + 1, rnd(cnt + 1), rnd(cnt + 1), rnd(cnt + 1)] {
+        verify("split at", __text_slice(s, 0, k) + __text_slice(s, k, END) == s)
+    }
+    // целый срез — та же строка (тот же заголовок)
+    let whole = __text_slice(s, 0, END)
+    let hs: int = __cast(s)
+    let hw: int = __cast(whole)
+    verify("whole", n == 0 || hs == hw)
+
+    // 5: поиск куска строки и коротких образцов; индекс — символов до первого
+    // совпадения байтов
+    var needles: [str] = ["а", "e", "€", "😀", " ", "ab"]
+    needles.push(buf_str(buf_with(0xA9)))
+    for k in 0..4 {
+        if cnt > 0 {
+            let a = rnd(cnt)
+            let b = a + 1 + rnd(4)
+            needles.push(s.byte_slice(bounds[a], bounds[clamp(b, cnt)]))
+        }
+    }
+    for x in needles {
+        var want = -1
+        if let bi = s.byte_find(x) {
+            want = ref_bounds(s.byte_slice(0, bi)).len() - 1
+        }
+        let f = __text_find(s, x) ?? -1
+        verify("find", f == want)
+        var wf = true
+        let xb = ref_bounds(x)
+        for j in 0..xb.len() - 1 {
+            if ref_seq(x, xb[j]) == 0 {
+                wf = false
+            }
+        }
+        if f >= 0 && wf {
+            verify("find slice", __text_slice(s, f, END).starts_with(x))
+            // курсор, который оставил поиск, годится и для индекса
+            if f < cnt {
+                verify("find at", __text_at(s, f) == chars[f])
+            }
+        }
+    }
+
+    // trim: White_Space по краям, только правильные символы
+    var a = 0
+    while a < cnt && good[a] && ref_space(ref_cp(s, bounds[a], bounds[a + 1] - bounds[a])) {
+        a += 1
+    }
+    var b = cnt
+    while b > a && good[b - 1] && ref_space(ref_cp(s, bounds[b - 1], bounds[b] - bounds[b - 1])) {
+        b -= 1
+    }
+    let tr = __text_trim(s)
+    verify("trim", tr == s.byte_slice(bounds[a], bounds[b]))
+    if a == 0 && b == cnt {
+        let ht: int = __cast(tr)
+        verify("trim same", ht == hs)
+    }
+
+    // lower/upper: по символу через __case_map; неправильные байты — как есть;
+    // 7: число символов то же; без изменений — та же строка
+    for up in [false, true] {
+        let w = buf_new(16)
+        for j in 0..cnt {
+            if good[j] {
+                buf_utf8(w, __case_map(ref_cp(s, bounds[j], bounds[j + 1] - bounds[j]), up))
+            } else {
+                buf_add(w, chars[j])
+            }
+        }
+        let want = buf_str(w)
+        var r = __text_lower(s)
+        if up {
+            r = __text_upper(s)
+        }
+        verify("case", r == want)
+        verify("case len", __text_len(r) == cnt)
+        if want == s {
+            let hr: int = __cast(r)
+            verify("case same", hr == hs)
+        }
+    }
+
+    // замена неправильных байтов на U+FFFD
+    let z = buf_new(16)
+    for j in 0..cnt {
+        if good[j] {
+            buf_add(z, chars[j])
+        } else {
+            buf_utf8(z, 0xFFFD)
+        }
+    }
+    verify("sanitize", __utf8_sanitize(s) == buf_str(z))
+
+    // сравнение с однобайтовым литералом — порядок байтов
+    for c in [0, 32, 97, 109, 122, 127] {
+        let one = buf_str(buf_with(c))
+        var want = 1
+        if s < one {
+            want = -1
+        } else if s == one {
+            want = 0
+        }
+        let d = __text_cmp1(s, c)
+        verify("cmp1", (d < 0 && want < 0) || (d == 0 && want == 0) || (d > 0 && want > 0))
+    }
+}
+
+fn buf_with(c: int) -> Buf {
+    let b = buf_new(1)
+    buf_byte(b, c)
+    return b
+}
+
+fn main() -> int {
+    var kinds = [0, 0, 0]
+    var bytes = 0
+    var total = 0
+    var cached = 0
+    check("")
+    for k in 0..10000 {
+        let s = gen(k % 3)
+        kinds[k % 3] += 1
+        bytes += s.byte_len()
+        total += ref_bounds(s).len() - 1
+        if s.byte_len() > 256 {
+            cached += 1
+        }
+        check(s)
+    }
+    print("strings: 10001 (valid {kinds[0]}, with invalid bytes {kinds[1]}, cut and joined {kinds[2]}, longer than 256 bytes {cached})")
+    print("bytes: {bytes}, characters: {total}")
+    print("checks: {checks}, mismatches: {bad}")
+    if bad > 0 {
+        return 1
+    }
+    return 0
+}

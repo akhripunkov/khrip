@@ -1,0 +1,12 @@
+strings: 5597 4926 4960 5000 bytes, 3000 2500 2543 5000 characters
+forward and backward: ok
+palindrome: true false
+two strings: 1609 equal characters
+three strings: ok
+random access: ok
+slices: ok
+find and slice: 107 parts
+find and slice: 107 parts
+field, helper, reassignment: ok
+mixed lookups: 600000 in strings of 296 379 494 544 656 782 856 1022 1174 1236 bytes, mismatches: 0
+checks: 660795, mismatches: 0

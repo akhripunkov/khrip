@@ -1,0 +1,384 @@
+// Генератор lib/text_tables.kh — таблиц Unicode для lib/text.kh — из файлов UCD
+// (Unicode Character Database) 17.0.0:
+//   UnicodeData.txt — общая категория (поле 2) и простые отображения регистра
+//                     (поля 12 и 13);
+//   PropList.txt    — White_Space: список в __cp_is_space сверяется с ним.
+// Версия закреплена: генератор принимает только файлы с известными sha256 и
+// пишет их в заголовок таблиц. Для новой версии Unicode поменяйте UCD_VERSION и
+// хэши ниже, запустите генератор и tools/unicode_check.sh.
+//
+// Запуск из корня репозитория (сборка этот генератор не запускает):
+//   build/khc -o /tmp/unicode_tables tools/unicode_tables.kh
+//   /tmp/unicode_tables UnicodeData.txt PropList.txt lib/text_tables.kh
+//
+// Таблицы (src/emit.kh, __data_hex: байты — в DATA при компиляции):
+//   регистр — двухуровневая: s1 (u8 на 64 кода) → блок s2 (u8 на код: номер
+//     пары) → пара разностей {i32 к нижнему, i32 к верхнему}; коды от CASE_END
+//     регистра не имеют;
+//   \w — двухуровневый набор битов: s1 (u8 на 128 кодов) → блок s2 (16 байт,
+//     бит на код); выше WORD_END — только U+E0100–E01EF. \w — категории L
+//     (Lu Ll Lt Lm Lo), M (Mn Mc Me), Nd и Pc: \w у C#, [\p{L}\p{M}\p{Nd}\p{Pc}]
+//     у Go и RE2 (их собственный \w — только ASCII).
+
+const UCD_VERSION = "17.0.0"
+const SHA_DATA = "2e1efc1dcb59c575eedf5ccae60f95229f706ee6d031835247d843c11d96470c"
+const SHA_PROPS = "130dcddcaadaf071008bdfce1e7743e04fdfbc910886f017d9f9ac931d8c64dd"
+const MAX_CP = 0x110000
+
+// Шестнадцатеричное число (цифры без префикса) или -1.
+fn hex_val(s: str) -> int {
+    if s.byte_len() == 0 {
+        return -1
+    }
+    var v = 0
+    for i in 0..s.byte_len() {
+        let c = s.byte(i)
+        var d = -1
+        if c >= '0' && c <= '9' {
+            d = c - '0'
+        } else if c >= 'A' && c <= 'F' {
+            d = c - 'A' + 10
+        } else if c >= 'a' && c <= 'f' {
+            d = c - 'a' + 10
+        }
+        if d < 0 {
+            return -1
+        }
+        v = v * 16 + d
+    }
+    return v
+}
+
+fn hex_str(v: int) -> str {
+    let digits = "0123456789ABCDEF"
+    var r = ""
+    var x = v
+    while true {
+        r = digits.byte_slice(x % 16, x % 16 + 1) + r
+        x = x / 16
+        if x == 0 {
+            break
+        }
+    }
+    return r
+}
+
+// Байт в две шестнадцатеричные цифры (для __data_hex).
+fn hex2(b: int) -> str {
+    let s = hex_str(b & 255)
+    if s.byte_len() == 1 {
+        return "0" + s
+    }
+    return s
+}
+
+// Число i32 в четыре байта, младший первым.
+fn hex_i32(v: int) -> str {
+    let u = v & 0xFFFFFFFF
+    return hex2(u) + hex2(u >> 8) + hex2(u >> 16) + hex2(u >> 24)
+}
+
+fn utf8_len(cp: int) -> int {
+    if cp < 0x80 {
+        return 1
+    }
+    if cp < 0x800 {
+        return 2
+    }
+    if cp < 0x10000 {
+        return 3
+    }
+    return 4
+}
+
+fn is_word_cat(cat: str) -> bool {
+    let c = cat.byte(0)
+    return c == 'L' || c == 'M' || cat == "Nd" || cat == "Pc"
+}
+
+fn with_commas(v: int) -> str {
+    let s = v.to_str()
+    var r = ""
+    for i in 0..s.byte_len() {
+        if i > 0 && (s.byte_len() - i) % 3 == 0 {
+            r += ","
+        }
+        r += s.byte_slice(i, i + 1)
+    }
+    return r
+}
+
+fn main() -> int {
+    let a = args()
+    if a.len() < 3 {
+        eprint("usage: unicode_tables UnicodeData.txt PropList.txt [lib/text_tables.kh]")
+        return 2
+    }
+    var out = "lib/text_tables.kh"
+    if a.len() > 3 {
+        out = a[3]
+    }
+    let data = read_file(a[1]) else {
+        eprint("cannot read " + a[1])
+        return 1
+    }
+    let props = read_file(a[2]) else {
+        eprint("cannot read " + a[2])
+        return 1
+    }
+    let sha_data = sha256(data)
+    let sha_props = sha256(props)
+    if sha_data != SHA_DATA || sha_props != SHA_PROPS {
+        eprint("the input is not the pinned UCD {UCD_VERSION}: sha256 {sha_data} and {sha_props}; for another Unicode version update UCD_VERSION, SHA_DATA and SHA_PROPS in tools/unicode_tables.kh")
+        return 1
+    }
+
+    // ---- UnicodeData.txt: категории и простые отображения ----
+    var word = [0].repeat(MAX_CP)
+    var dl = [0].repeat(MAX_CP)
+    var du = [0].repeat(MAX_CP)
+    var first = -1
+    for line in data.split("\n") {
+        let f = line.split(";")
+        if f.len() < 15 {
+            continue
+        }
+        let cp = hex_val(f[0])
+        if cp < 0 || cp >= MAX_CP {
+            eprint("bad line: " + line)
+            return 1
+        }
+        let w = is_word_cat(f[2])
+        if f[1].ends_with(", First>") {
+            first = cp
+            continue
+        }
+        var lo = cp
+        if f[1].ends_with(", Last>") {
+            lo = first
+        }
+        for c in lo..cp + 1 {
+            if w {
+                word[c] = 1
+            }
+        }
+        if f[12].byte_len() > 0 {
+            du[cp] = hex_val(f[12]) - cp
+        }
+        if f[13].byte_len() > 0 {
+            dl[cp] = hex_val(f[13]) - cp
+        }
+    }
+
+    // ---- PropList.txt: White_Space сверяется с __cp_is_space (lib/text.kh) ----
+    var ws = [0].repeat(MAX_CP)
+    var nws = 0
+    for line in props.split("\n") {
+        let body = line.split("#")[0]
+        let f = body.split(";")
+        if f.len() < 2 || f[1].trim() != "White_Space" {
+            continue
+        }
+        let r = f[0].trim()
+        var lo = 0
+        var hi = 0
+        if let d = r.byte_find("..") {
+            lo = hex_val(r.byte_slice(0, d))
+            hi = hex_val(r.byte_slice(d + 2, r.byte_len()))
+        } else {
+            lo = hex_val(r)
+            hi = lo
+        }
+        for c in lo..hi + 1 {
+            ws[c] = 1
+            nws += 1
+        }
+    }
+    for c in 0..MAX_CP {
+        if (ws[c] == 1) != __cp_is_space(c) {
+            eprint("White_Space differs from __cp_is_space at U+" + hex_str(c) + ": update lib/text.kh")
+            return 1
+        }
+    }
+
+    // ---- регистр ----
+    var case_end = 0
+    var nl = 0
+    var nu = 0
+    var grow = 0
+    var shrink = 0
+    for c in 0..MAX_CP {
+        for d in [dl[c], du[c]] {
+            if d != 0 {
+                let m = c + d
+                if utf8_len(m) > utf8_len(c) {
+                    grow += 1
+                } else if utf8_len(m) < utf8_len(c) {
+                    shrink += 1
+                }
+                // __tx_case выделяет 1,5·n + 4 байт
+                if 2 * utf8_len(m) > 3 * utf8_len(c) {
+                    eprint("U+" + hex_str(c) + " grows from {utf8_len(c)} to {utf8_len(m)} bytes: the 1.5n bound in __tx_case breaks")
+                    return 1
+                }
+                case_end = c + 1
+            }
+        }
+        if dl[c] != 0 {
+            nl += 1
+        }
+        if du[c] != 0 {
+            nu += 1
+        }
+    }
+    case_end = (case_end + 63) / 64 * 64
+    // ASCII и U+0400–045F __case_map считает арифметикой
+    for c in 0..0x460 {
+        var wl = 0
+        var wu = 0
+        if c >= 'A' && c <= 'Z' {
+            wl = 32
+        } else if c >= 'a' && c <= 'z' {
+            wu = -32
+        } else if c >= 0x400 && c < 0x410 {
+            wl = 0x50
+        } else if c >= 0x410 && c < 0x430 {
+            wl = 0x20
+        } else if c >= 0x430 && c < 0x450 {
+            wu = -0x20
+        } else if c >= 0x450 && c < 0x460 {
+            wu = -0x50
+        }
+        let arith = c < 0x80 || c >= 0x400
+        if arith && (dl[c] != wl || du[c] != wu) {
+            eprint("U+" + hex_str(c) + ": the arithmetic in __case_map no longer matches UnicodeData.txt")
+            return 1
+        }
+    }
+    var pal_idx: map[str, int] = {}
+    var pal: [str] = []
+    pal_idx["0,0"] = 0
+    pal.push(hex_i32(0) + hex_i32(0))
+    var blk_idx: map[str, int] = {}
+    var s1: [str] = []
+    var s2: [str] = []
+    var b = 0
+    while b < case_end {
+        var key = ""
+        var bytes: [str] = []
+        for c in b..b + 64 {
+            let pk = "{dl[c]},{du[c]}"
+            if !pal_idx.has(pk) {
+                pal_idx[pk] = pal.len()
+                pal.push(hex_i32(dl[c]) + hex_i32(du[c]))
+            }
+            let pi = pal_idx[pk] ?? 0
+            key += "{pi},"
+            bytes.push(hex2(pi))
+        }
+        if !blk_idx.has(key) {
+            blk_idx[key] = s2.len() / 64
+            for x in bytes {
+                s2.push(x)
+            }
+        }
+        s1.push(hex2(blk_idx[key] ?? 0))
+        b += 64
+    }
+    let case_blocks = s2.len() / 64
+    if case_blocks > 256 || pal.len() > 256 {
+        eprint("the case table needs {case_blocks} blocks and {pal.len()} pairs: more than a byte can index")
+        return 1
+    }
+    let case_hex = s1.join("") + s2.join("") + pal.join("")
+    let case_size = s1.len() + s2.len() + 8 * pal.len()
+
+    // ---- \w ----
+    var last = 0
+    var nword = 0
+    for c in 0..MAX_CP {
+        if word[c] == 1 {
+            nword += 1
+            if c < 0xE0000 {
+                last = c
+            }
+        }
+    }
+    let word_end = (last / 128 + 1) * 128
+    for c in word_end..MAX_CP {
+        if (word[c] == 1) != (c >= 0xE0100 && c <= 0xE01EF) {
+            eprint("U+" + hex_str(c) + ": \\w above WORD_END is not only U+E0100-E01EF: update __cp_is_word")
+            return 1
+        }
+    }
+    var wblk_idx: map[str, int] = {}
+    var w1: [str] = []
+    var w2: [str] = []
+    var nranges = 0
+    for c in 1..MAX_CP {
+        if word[c] == 1 && word[c - 1] == 0 {
+            nranges += 1
+        }
+    }
+    b = 0
+    while b < word_end {
+        var key = ""
+        for i in 0..16 {
+            var v = 0
+            for j in 0..8 {
+                v = v | (word[b + 8 * i + j] << j)
+            }
+            key += hex2(v)
+        }
+        if !wblk_idx.has(key) {
+            wblk_idx[key] = w2.len()
+            w2.push(key)
+        }
+        w1.push(hex2(wblk_idx[key] ?? 0))
+        b += 128
+    }
+    if w2.len() > 256 {
+        eprint("the \\w table needs {w2.len()} blocks: more than a byte can index")
+        return 1
+    }
+    let word_hex = w1.join("") + w2.join("")
+    let word_size = w1.len() + 16 * w2.len()
+
+    var t = ""
+    t += "// Таблицы Unicode для lib/text.kh: простое отображение регистра (__case_map)\n"
+    t += "// и \\w регулярных выражений (__cp_is_word). Файл создан tools/unicode_tables.kh —\n"
+    t += "// не правьте его руками, запустите генератор.\n"
+    t += "//\n"
+    t += "// Unicode {UCD_VERSION}, файлы UCD:\n"
+    t += "//   UnicodeData.txt  sha256 {sha_data}\n"
+    t += "//   PropList.txt     sha256 {sha_props}\n"
+    t += "//\n"
+    t += "// Регистр: отображений в нижний — {nl}, в верхний — {nu}; в UTF-8 растут {grow}\n"
+    t += "// (не больше чем в 1,5 раза), уменьшаются {shrink}. s1 — u8 × {s1.len()} (cp >> 6 < CASE_END),\n"
+    t += "// s2 — блоки по 64 u8 (номер пары), их {case_blocks}; пары — {pal.len()} × \{i32 к нижнему,\n"
+    t += "// i32 к верхнему}. Всего байт: {case_size}.\n"
+    t += "// \\w — категории L, M, Nd и Pc: кодов {nword}, диапазонов {nranges}. s1 — u8 × {w1.len()}\n"
+    t += "// (cp >> 7 < WORD_END), s2 — блоки по 16 байт (бит на код), их {w2.len()}. Всего байт:\n"
+    t += "// {word_size}. Выше WORD_END — только U+E0100–E01EF.\n"
+    t += "// White_Space из PropList.txt (кодов: {nws}) совпадает с __cp_is_space.\n"
+    t += "\n"
+    t += "const CASE_END = 0x{hex_str(case_end)}\n"
+    t += "const CASE_S2 = {s1.len()}\n"
+    t += "const CASE_PAL = {s1.len() + s2.len()}\n"
+    t += "const WORD_END = 0x{hex_str(word_end)}\n"
+    t += "const WORD_S2 = {w1.len()}\n"
+    t += "\n"
+    t += "fn __case_tab() -> int \{\n"
+    t += "    return __data_hex(\"{case_hex}\")\n"
+    t += "}\n"
+    t += "\n"
+    t += "fn __word_tab() -> int \{\n"
+    t += "    return __data_hex(\"{word_hex}\")\n"
+    t += "}\n"
+    if !write_file(out, t, false) {
+        eprint("cannot write " + out)
+        return 1
+    }
+    print("{out}: case {with_commas(case_size)} B (CASE_END 0x{hex_str(case_end)}, {case_blocks} blocks, {pal.len()} pairs), \\w {with_commas(word_size)} B (WORD_END 0x{hex_str(word_end)}, {w2.len()} blocks)")
+    return 0
+}
