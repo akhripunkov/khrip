@@ -1,0 +1,271 @@
+// Сборщик мусора store (docs/design/v0.13-store-gc.md). Пока здесь загрузка
+// store (§5.3) и проверка графа от корней (KHRIP_GC_VERIFY=1); куча store,
+// записи и сама сборка — следующие шаги проекта (§14).
+
+// KHRIP_GC_VERIFY=1: проверки сборщика (пока — граф store после загрузки)
+var __gc_verify: bool
+
+// Настройки сборщика из окружения.
+fn __gc_init() {
+    if let v = env("KHRIP_GC_VERIFY") {
+        __gc_verify = v == "1"
+    }
+}
+
+// ---- Загрузка ----
+
+// Начало программы со store (__serve, __run_timers — с load, __tests_init —
+// без): постоянная память, начальные значения глобальных пользователя
+// (__init_stores) и, если load, восстановление из KHRIP_DATA. Всё временное —
+// значения инициализаторов до копии, текст файла, разобранное значение —
+// выделяется в арене загрузки BOOT_ARENA (64 ГБ адресов, MAP_NORESERVE), а в
+// store значения копирует __persist (store_write в __init_stores и в
+// __store_restore). После загрузки граф store — только STORE и DATA (I1), и
+// арена целиком возвращается системе: из пика памяти (файл, разобранное
+// значение, временное декодера, store) остаётся только store.
+fn __store_boot(load: bool) {
+    __store_init()
+    __store_rw_init()
+    __store_lock()
+    let c = __ctx()
+    let pa = load64(c + CTX_ARENA)
+    let pe = load64(c + CTX_ARENA_END)
+    __arena_attach(c, BOOT_ARENA)
+    __arena_begin()
+    __gc_init()
+    __init_stores()
+    if __gc_verify {
+        __gc_verify_graph("boot")
+    }
+    var restored = false
+    if load {
+        restored = __load_store()
+    }
+    // Арена больше не нужна: снова обычная память потока, а арена — системе
+    // целиком (__arena_end обнулил бы до 32 МБ её страниц ради следующего
+    // запроса, а у арены загрузки его не будет). В неё не указывает никто:
+    // store — копия, а JSON-null восстановления и кэш строк арены (её первые
+    // STRC_SIZE байт) уходят вместе с ней.
+    store64(c + CTX_PTR, load64(c + CTX_SAVE_PTR))
+    store64(c + CTX_END, load64(c + CTX_SAVE_END))
+    syscall(SYS_MUNMAP, BOOT_ARENA, BOOT_ARENA_SIZE)
+    store64(c + CTX_ARENA, pa)
+    store64(c + CTX_ARENA_END, pe)
+    store64(c + CTX_JNULLS, 0)
+    if restored && __gc_verify {
+        __gc_verify_graph("restore")
+    }
+    __store_unlock()
+    __store_saved = __store_touches
+}
+
+// ---- Проверка графа (KHRIP_GC_VERIFY=1) ----
+// Обход store от корней (__gc_roots(): [n, (адрес глобальной, описание её
+// типа) × n], src/api.kh, gc_root_table) по описаниям типов: каждый указатель
+// графа — 0, адрес в занятой части STORE или в DATA (I1: ни арены, ни обычной
+// памяти потока). Объекты в DATA — литералы, варианты без полей, ячейки
+// значений по умолчанию — не обходятся: их не освобождают и не копируют. Без
+// рекурсии (список в миллион звеньев — не миллион кадров): стек пар (значение,
+// описание) и множество пройденных адресов (общие объекты и циклы обходятся
+// один раз) — в своих кусках mmap, они возвращаются системе в конце; память
+// store, арены и потока проверка не меняет (кроме сообщений).
+//
+// Состояние (кусок mmap): [0] стек, [8] пар в нём, [16] его размер в парах,
+// [24] множество (открытая адресация, 0 — пусто), [32] адресов в нём, [40] его
+// размер, [48] номер корня, от которого идёт обход.
+fn __gc_verify_graph(when: str) {
+    let roots = __gc_roots()
+    let n = load64(roots)
+    let st = __mmap(64)
+    store64(st, __mmap(1024 * 16))
+    store64(st + 16, 1024)
+    store64(st + 24, __mmap(4096 * 8))
+    store64(st + 40, 4096)
+    for i in 0..n {
+        store64(st + 48, i)
+        __gcv_push(st, load64(load64(roots + 8 + i * 16)), load64(roots + 16 + i * 16))
+        while load64(st + 8) > 0 {
+            let k = load64(st + 8) - 1
+            store64(st + 8, k)
+            let e = load64(st) + k * 16
+            __gcv_visit(st, when, load64(e), load64(e + 8))
+        }
+    }
+    let objs = load64(st + 32)
+    syscall(SYS_MUNMAP, load64(st), load64(st + 16) * 16)
+    syscall(SYS_MUNMAP, load64(st + 24), load64(st + 40) * 8)
+    syscall(SYS_MUNMAP, st, 64)
+    eprint("khrip: gc verify ({when}): {n} roots, {objs} objects in STORE, every pointer in STORE or DATA")
+}
+
+// Значение v с описанием d: проверить его адрес, а у объекта в store — и его
+// внутренние указатели, ссылки — в стек.
+fn __gcv_visit(st: int, when: str, v: int, d: int) {
+    var t = d
+    // T? ссылки — то же слово, что и сама ссылка (none — 0)
+    while load64(t) == D_OPT && !__is_scalar(load64(t + 8)) {
+        t = load64(t + 8)
+    }
+    let k = load64(t)
+    if k == D_INT || k == D_BOOL || k == D_FLOAT || v == 0 {
+        return
+    }
+    __gcv_ptr(st, when, v, "a value")
+    if __in_data(v) || !__gcv_first(st, v) {
+        return
+    }
+    if k == D_STR {
+        if load64(v + 8) > 0 {
+            __gcv_ptr(st, when, load64(v), "string bytes")
+        }
+        return
+    }
+    if k == D_LIST {
+        let data = load64(v)
+        __gcv_ptr(st, when, data, "list data")
+        let ed = load64(t + 8)
+        if !__is_scalar(ed) {
+            let n = load64(v + 8)
+            for i in 0..n {
+                __gcv_push(st, load64(data + i * 8), ed)
+            }
+        }
+        return
+    }
+    if k == D_MAP {
+        // записи по порядку: keys [0], vals [16], alive [24] — списки; слоты [32]
+        let keys = load64(v)
+        let vals = load64(v + 16)
+        let alive = load64(v + 24)
+        __gcv_ptr(st, when, keys, "map keys")
+        __gcv_ptr(st, when, vals, "map values")
+        __gcv_ptr(st, when, alive, "map entries")
+        __gcv_ptr(st, when, load64(v + 32), "map slots")
+        __gcv_ptr(st, when, load64(keys), "map keys data")
+        __gcv_ptr(st, when, load64(vals), "map values data")
+        __gcv_ptr(st, when, load64(alive), "map entries data")
+        let kd = load64(t + 8)
+        let vd = load64(t + 16)
+        let n = load64(keys + 8)
+        for i in 0..n {
+            if __word_at(alive, i) != 0 {
+                if !__is_scalar(kd) {
+                    __gcv_push(st, __word_at(keys, i), kd)
+                }
+                if !__is_scalar(vd) {
+                    __gcv_push(st, __word_at(vals, i), vd)
+                }
+            }
+        }
+        return
+    }
+    var sd = t
+    if k == D_SUM {
+        let e = __variant_entry(t, v)
+        if e == 0 {
+            __gcv_fail(st, when, "a variant with an unknown tag at " + __gc_hex(v))
+        }
+        sd = load64(e + 8)
+    } else if k != D_STRUCT {
+        // ячейка int?, bool? или float?
+        return
+    }
+    let nf = load64(sd + 8)
+    for i in 0..nf {
+        let fd = __field_desc(sd, i)
+        if !__is_scalar(fd) {
+            __gcv_push(st, load64(v + i * 8), fd)
+        }
+    }
+}
+
+// Указатель p — в занятой части STORE или в DATA. Занятая часть — до курсора
+// выделения store (__store_ptr; куча store шага 3 заменит его битами начал).
+fn __gcv_ptr(st: int, when: str, p: int, what: str) {
+    if (__in_store(p) && p < __store_ptr) || __in_data(p) {
+        return
+    }
+    __gcv_fail(st, when, what + " at " + __gc_hex(p) + ", outside STORE and DATA")
+}
+
+// Ошибка проверки — конец программы: граф store уже неверен, и продолжать
+// значит портить данные дальше.
+fn __gcv_fail(st: int, when: str, what: str) {
+    let i = load64(st + 48)
+    let d = load64(__gc_roots() + 16 + i * 16)
+    eprint("khrip: gc verify ({when}): root {i} ({__desc_name(d)}) reaches {what}")
+    exit(101)
+}
+
+fn __gc_hex(x: int) -> str {
+    let digits = "0123456789abcdef"
+    var r = ""
+    var sh = 60
+    while sh >= 0 {
+        let h = (x >> sh) & 15
+        if h != 0 || r.byte_len() > 0 || sh == 0 {
+            r += digits.byte_slice(h, h + 1)
+        }
+        sh -= 4
+    }
+    return "0x" + r
+}
+
+fn __gcv_push(st: int, v: int, d: int) {
+    let n = load64(st + 8)
+    let cap = load64(st + 16)
+    if n == cap {
+        let s = __mmap(cap * 2 * 16)
+        __memcpy(s, load64(st), n * 16)
+        syscall(SYS_MUNMAP, load64(st), cap * 16)
+        store64(st, s)
+        store64(st + 16, cap * 2)
+    }
+    let e = load64(st) + n * 16
+    store64(e, v)
+    store64(e + 8, d)
+    store64(st + 8, n + 1)
+}
+
+// Первая встреча с адресом p: true и p — в множестве; false — уже был.
+fn __gcv_first(st: int, p: int) -> bool {
+    var cap = load64(st + 40)
+    if (load64(st + 32) + 1) * 2 > cap {
+        // множество вдвое больше
+        let old = load64(st + 24)
+        let t = __mmap(cap * 2 * 8)
+        for i in 0..cap {
+            let k = load64(old + i * 8)
+            if k != 0 {
+                __gcv_place(t, cap * 2, k)
+            }
+        }
+        syscall(SYS_MUNMAP, old, cap * 8)
+        cap *= 2
+        store64(st + 24, t)
+        store64(st + 40, cap)
+    }
+    let t = load64(st + 24)
+    var i = __addr_hash(p) & (cap - 1)
+    while true {
+        let k = load64(t + i * 8)
+        if k == p {
+            return false
+        }
+        if k == 0 {
+            store64(t + i * 8, p)
+            store64(st + 32, load64(st + 32) + 1)
+            return true
+        }
+        i = (i + 1) & (cap - 1)
+    }
+    return false
+}
+
+fn __gcv_place(t: int, cap: int, p: int) {
+    var i = __addr_hash(p) & (cap - 1)
+    while load64(t + i * 8) != 0 {
+        i = (i + 1) & (cap - 1)
+    }
+    store64(t + i * 8, p)
+}

@@ -147,7 +147,7 @@ fn __strc() -> int {
     var b = c + CTX_STRC
     if a != 0 {
         let d = load64(c + CTX_PTR) - a
-        if d < STRC_SIZE || d >= ARENA_SIZE {
+        if d < STRC_SIZE || d >= __arena_size(a) {
             return 0
         }
         b = a

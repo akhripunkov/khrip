@@ -83,6 +83,7 @@ fn lib_files() -> [str] {
 fn api_lib_files() -> [str] {
     var names: [str] = []
     names.push("api.kh")
+    names.push("gc.kh")
     names.push("http.kh")
     names.push("fetch.kh")
     names.push("x509.kh")
@@ -992,6 +993,38 @@ fn store_touch() {
 // в var, повисло бы после теста.
 fn global_in_store(g: Global) -> bool {
     return g.is_store || (api_mode && !files[toks[g.tok].file].is_lib)
+}
+
+// Таблица корней store для сборщика (lib/gc.kh, __gc_roots()) — в DATA:
+// [n, (адрес глобальной, описание её типа) × n]. Корни — глобальные
+// пользователя, которые живут в store (global_in_store) и держат ссылку. Тип —
+// настоящий, а не T? снимка KHRIP_DATA, и описания есть и в khc test, где
+// снимка нет. Строится один раз: при первом __gc_roots(), когда все глобальные
+// уже известны.
+var gc_roots_used: bool
+var gc_roots_off: int
+
+fn gc_root_table() -> int {
+    if !gc_roots_used {
+        gc_roots_used = true
+        var roots: [int] = []
+        for g in globals {
+            if global_in_store(g) && !files[toks[g.tok].file].is_lib && !is_scalar_ty(g.ty) {
+                let d = type_desc(g.ty)
+                if d != 0 {
+                    roots.push(g.addr)
+                    roots.push(d)
+                }
+            }
+        }
+        // описания строятся раньше: они тоже занимают место в DATA
+        gc_roots_off = desc_reserve(1 + roots.len())
+        desc_put(gc_roots_off, 0, roots.len() / 2)
+        for i in 0..roots.len() {
+            desc_put(gc_roots_off, 1 + i, roots[i])
+        }
+    }
+    return DATA_BASE + gc_roots_off
 }
 
 // Значение (rax), которое записывается в store, копируется в постоянную память.

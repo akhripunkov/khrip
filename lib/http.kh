@@ -990,49 +990,24 @@ fn __block_signals() {
     syscall(SYS_RT_SIGPROCMASK, 0, __signal_set(), 0, 8)
 }
 
-// Восстановление (под блокировкой store): __store_restore копирует значения в
-// store (__persist), а текст файла и разобранное значение нужны только до конца
-// копии. Поэтому они выделяются во временной области — резерве адресов
-// RESTORE_SIZE (MAP_NORESERVE: страницы появляются по мере выделения), — и она
-// целиком возвращается системе. Кончится область — выделение продолжится в
-// обычной памяти потока (__alloc_slow), не дали её — всё в обычной памяти. На
-// область потом не указывает никто: store — копия, CTX_JNULLS обнуляется, кэш
-// строк потока (его ключи и индексы могли быть в ней) очищается. Шаг 2
-// docs/design/v0.13-store-gc.md заменит область ареной загрузки (§5.3).
-const RESTORE_SIZE = 0x1000000000
-
-fn __load_store() {
+// Восстановление из KHRIP_DATA — в __store_boot (lib/gc.kh): под блокировкой
+// store и в арене загрузки. __store_restore присваивает глобальным через
+// store_write, и __persist копирует значения в store; текст файла и
+// разобранное значение остаются в арене и уходят вместе с ней. → true, если
+// файл прочитан (нет файла — store начинается с начальных значений).
+fn __load_store() -> bool {
     let path = __data_path()
     if path.byte_len() == 0 {
-        return
+        return false
     }
-    let c = __ctx()
-    // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
-    let r = syscall(SYS_MMAP, 0, RESTORE_SIZE, 3, 0x22 | 0x4000, -1, 0)
-    if r < 0 {
-        __restore_from(path)
-        return
-    }
-    let sp = load64(c + CTX_PTR)
-    let se = load64(c + CTX_END)
-    store64(c + CTX_PTR, r)
-    store64(c + CTX_END, r + RESTORE_SIZE)
-    __restore_from(path)
-    store64(c + CTX_PTR, sp)
-    store64(c + CTX_END, se)
-    store64(c + CTX_JNULLS, 0)
-    __memset(c + CTX_STRC + 8, 0, STRC_SIZE - 8)
-    syscall(SYS_MUNMAP, r, RESTORE_SIZE)
-}
-
-fn __restore_from(path: str) {
     let text = read_file(path) else {
-        return
+        return false
     }
     if !__store_restore(text) {
         eprint("khrip: cannot read store from {path}: {json_error()}")
         exit(1)
     }
+    return true
 }
 
 // Снимок store под блокировкой, запись — в файл рядом и переименование. Если
@@ -1136,15 +1111,7 @@ fn __timer_loop() {
 // Программа без route, но с every: только фоновые задачи.
 fn __run_timers() {
     __ignore_sigpipe()
-    __store_init()
-    __store_rw_init()
-    // начальные значения глобальных пользователя и восстановленное значение
-    // копируются в store (__persist) — под блокировкой
-    __store_lock()
-    __init_stores()
-    __load_store()
-    __store_unlock()
-    __store_saved = __store_touches
+    __store_boot(true)
     __db_init()
     __block_signals()
     eprint("khrip: running {__every_count()} background task(s)")
@@ -1156,15 +1123,7 @@ fn __run_timers() {
 fn __serve() {
     __http_port = __env_int("PORT", 8080)
     __ignore_sigpipe()
-    __store_init()
-    __store_rw_init()
-    // начальные значения глобальных пользователя и восстановленное значение
-    // копируются в store (__persist) — под блокировкой
-    __store_lock()
-    __init_stores()
-    __load_store()
-    __store_unlock()
-    __store_saved = __store_touches
+    __store_boot(true)
     __db_init()
     __read_cpus()
     var n = __env_int("THREADS", __cpus.len())

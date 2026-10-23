@@ -1,0 +1,124 @@
+// Загрузка store (tests/http.sh): начальные значения глобальных и KHRIP_DATA
+// строятся в арене загрузки и копируются в store. Снимок
+// tests/load/boot_store.v012.json сохранила эта же программа, собранная khc
+// 0.12 (POST /fill/12, GET /items/3, SIGTERM): восстановление читает файлы
+// прошлой версии. Программа понятна обоим компиляторам: в ней нет строковых
+// методов, которые с тех пор поменялись.
+type Shape = Circle { r: float } | Rect { w: int, h: int } | Empty
+
+type Role = Admin | Member | Guest
+
+type Item {
+    name: str
+    tags: [str]
+    shape: Shape
+    role: Role = Member
+    note: str?
+    score: int?
+    ratio: float?
+    flags: [bool]
+    attrs: map[str, int]
+}
+
+store items: map[int, Item]
+store by_tag: map[str, [int]]
+store grid: [[float]]
+// начальное значение строится через временные списки: они остаются в арене
+// загрузки, в store — только результат
+store seeds: [int] = squares(1000)
+store title: str = "boot"
+store last: Item?
+store hits: int = 0
+
+fn squares(n: int) -> [int] {
+    var r: [int] = []
+    for i in 0..n {
+        var tmp: [int] = []
+        tmp.push(i * i)
+        r.push(tmp[0])
+    }
+    return r
+}
+
+fn shape_of(i: int) -> Shape {
+    if i % 3 == 0 {
+        return Circle { r: i.to_float() / 4.0 }
+    }
+    if i % 3 == 1 {
+        return Rect { w: i, h: i * 2 }
+    }
+    return Empty
+}
+
+fn role_of(i: int) -> Role {
+    if i % 5 == 0 {
+        return Admin
+    }
+    if i % 5 == 1 {
+        return Guest
+    }
+    return Member
+}
+
+// n записей с номера items.len(): у каждой около 250 байт в JSON
+route POST "/fill/{n}" (n: int) -> int {
+    let start = items.len()
+    for k in 0..n {
+        let i = start + k
+        var note: str? = none
+        if i % 2 == 0 {
+            note = "заметка {i}: \"кавычки\", \\ и\tтаб"
+        }
+        var score: int? = none
+        if i % 4 != 3 {
+            score = i * 7
+        }
+        var ratio: float? = none
+        if i % 4 == 1 {
+            ratio = i.to_float() / 8.0
+        }
+        let tag = "t{i % 50}"
+        let item = Item {
+            name: "item-{i} привет, мир",
+            tags: [tag, "all", "g{i % 7}"],
+            shape: shape_of(i),
+            role: role_of(i),
+            note: note,
+            score: score,
+            ratio: ratio,
+            flags: [i % 2 == 0, i % 3 == 0],
+            attrs: { "a": i, "b": i * 2, "long-attribute-name": i * 3 },
+        }
+        items[i] = item
+        var ids = by_tag[tag] ?? []
+        ids.push(i)
+        by_tag[tag] = ids
+        if i % 1000 == 0 {
+            grid.push([i.to_float(), 0.5, -1.25])
+        }
+        last = item
+    }
+    title = "filled {items.len()}"
+    return items.len()
+}
+
+route GET "/items/{id}" (id: int) -> Item | 404 {
+    hits += 1
+    return items[id] ?? 404
+}
+
+route GET "/summary" -> str {
+    var tags = 0
+    for _, ids in by_tag {
+        tags += ids.len()
+    }
+    var cells = 0
+    for row in grid {
+        cells += row.len()
+    }
+    var name = "none"
+    if let it = last {
+        name = it.name
+    }
+    return "{items.len()} {tags} {cells} {seeds.len()} {seeds[999]} {title} {name}"
+}

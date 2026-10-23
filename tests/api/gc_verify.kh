@@ -1,0 +1,36 @@
+// Проверка графа store (lib/gc.kh, KHRIP_GC_VERIFY=1): обход от корней по
+// типам проходит общие объекты и циклы один раз, а указатель вне STORE и DATA —
+// ошибка, после которой программа останавливается. Указатель сюда кладётся в
+// обход языка (store64): правильная программа так сделать не может.
+
+type Node { name: str, next: Node? }
+
+type Shape = Dot { at: [int] } | Blank
+
+store nodes: map[str, Node]
+store shapes: [Shape]
+store pairs: [[str]]
+var count: int? = 5
+
+test "the graph of store is walked from the roots" {
+    let a = Node { name: "a" + "", next: none }
+    nodes["a"] = a
+    let b = nodes["a"] ?? a
+    b.next = b
+    shapes.push(Dot { at: [1, 2] })
+    shapes.push(Blank)
+    let xs = ["x" + "y", "z"]
+    pairs.push(xs)
+    pairs.push(pairs[0])
+    // корни: nodes, shapes, pairs, count; объекты: словарь, Node, его имя,
+    // список, Dot и его список, список списков, ["xy", "z"] и "xy", ячейка int?
+    __gc_verify_graph("test")
+}
+
+test "a pointer outside STORE and DATA stops the program" {
+    let l: int = __cast(pairs[0])
+    // первый элемент ["xy", "z"] — адрес в арене запроса
+    store64(load64(l), 0x200000001000)
+    __gc_verify_graph("test")
+    expect false
+}

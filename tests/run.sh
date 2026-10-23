@@ -9,7 +9,8 @@
 #   tests/errors/*.kh — не должны компилироваться; вывод компилятора должен
 #                       содержать каждую строку «// expect: ...»; ключи
 #                       компилятора — из «// flags: ...»;
-#   tests/api/*.kh    — блоки test (khc test); вывод сравнивается с .out;
+#   tests/api/*.kh    — блоки test (khc test); вывод сравнивается с .out, и
+#                       ещё раз — с проверкой графа store (KHRIP_GC_VERIFY=1);
 #   tests/locks/*.kh  — какие маршруты берут store на чтение (khc check --locks);
 #   tests/sqlcheck/   — правильный SQL: khc check без базы не находит ошибок;
 #   khc check --all-lib — вся библиотека (и не вызванные функции) и исходники
@@ -91,6 +92,24 @@ for src in tests/api/*.kh; do
 	"$KHC" test "$src" >"$tmp/$name.out" 2>&1
 	if ! diff -u "tests/api/$name.out" "$tmp/$name.out" >"$tmp/$name.diff"; then
 		failed "$src" "вывод тестов отличается от ожидаемого"
+		cat "$tmp/$name.diff"
+		continue
+	fi
+	pass=$((pass + 1))
+done
+
+# KHRIP_GC_VERIFY=1: после загрузки store каждый указатель его графа — в STORE
+# или DATA (обход от корней, lib/gc.kh); вывод тестов тот же, плюс строка
+# проверки.
+for src in tests/api/*.kh; do
+	name=$(basename "$src" .kh)
+	KHRIP_GC_VERIFY=1 "$KHC" test "$src" >"$tmp/$name.vout" 2>&1
+	if [[ $(grep -c '^khrip: gc verify (boot): [0-9]* roots, [0-9]* objects in STORE, every pointer in STORE or DATA$' "$tmp/$name.vout") != 1 ]]; then
+		failed "$src (KHRIP_GC_VERIFY=1)" "нет строки проверки графа после загрузки:"$'\n'"$(cat "$tmp/$name.vout")"
+		continue
+	fi
+	if ! grep -v '^khrip: gc verify (boot): ' "$tmp/$name.vout" | diff -u "tests/api/$name.out" - >"$tmp/$name.diff"; then
+		failed "$src (KHRIP_GC_VERIFY=1)" "вывод тестов отличается от ожидаемого"
 		cat "$tmp/$name.diff"
 		continue
 	fi
