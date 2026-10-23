@@ -1,0 +1,34 @@
+// Типы слоя баз данных, которые видит программа (docs/design/v0.13-drivers.md
+// §2.9). Подключаются только к программам, которые объявляют таблицу ClickHouse
+// или пишут ch "..." (src/drivers.kh): своя type Insert в остальных программах
+// ни с чем не конфликтует.
+
+// Явная форма записи: let r: DbResult = events.insert(rows). Неудача не
+// завершает запрос, а возвращается здесь; r нужно проверить (r.ok, r.status).
+type DbResult {
+    // вся операция прошла
+    ok: bool = false
+    // статус, которым ответила бы обычная форма (200 — ok)
+    status: int = 200
+    // код ClickHouse (или MongoDB); 0 — ошибка клиента или сети
+    code: int = 0
+    // тело ответа обычной формы; "" — ok
+    error: str = ""
+    // запись могла выполниться (ответ потерян): не повторять вслепую
+    unknown_outcome: bool = false
+    // вставлено / записано строк
+    count: int = 0
+    // MongoDB: изменено документов
+    modified: int = 0
+    // MongoDB: upsert вставил документ
+    upserted: bool = false
+    // MongoDB: номера документов списка, которые не вставились
+    failed: [int] = []
+}
+
+// Параметры вставки t.insert(rows, Insert { dedup: key }): повтор с тем же
+// ключом после «write outcome unknown» сохраняется один раз (таблица —
+// Replicated или с non_replicated_deduplication_window > 0, проверка при запуске).
+type Insert {
+    dedup: str = ""
+}

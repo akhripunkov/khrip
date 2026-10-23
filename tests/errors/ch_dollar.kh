@@ -1,0 +1,6 @@
+// expect: values go in place in ch: WHERE id = {id}, not $1
+type Row { n: int }
+fn main() {
+    let rows: [Row] = ch "SELECT count() AS n FROM events WHERE id = $1"
+    print(rows.len())
+}

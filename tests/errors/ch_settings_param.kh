@@ -1,0 +1,7 @@
+// expect: values cannot go into SETTINGS: ClickHouse settings are literals
+type Row { n: int }
+fn main() {
+    let threads = 4
+    let rows: [Row] = ch "SELECT count() AS n FROM events SETTINGS max_threads = {threads}"
+    print(rows.len())
+}

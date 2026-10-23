@@ -1,0 +1,32 @@
+// Без ClickHouse программа с ch не запускается (S3); с сервером её вывод
+// сверяет tests/chdb.sh с tests/chdb/ch_lex.out.
+// env: CLICKHOUSE_URL=
+// exit: 1
+// Лексер ch "...": строки ClickHouse с \' и '', комментарии #, -- и /* */,
+// "имена" и `имена`, $$...$$ — во всём этом {x} остаётся текстом; {}, {3},
+// {1,2} — текст; '%{x}%' — параметр.
+type Pair { a: str, b: str }
+type Braces { a: str, b: str, c: str }
+type Names { x: int, y: int }
+
+fn main() {
+    let x = "X"
+    let p: Pair = ch `SELECT 'it\'s' AS a, 'a''b' AS b # comment {x}
+        -- other {x}
+        /* block {x} */`
+    print(p.a + "|" + p.b)
+    let q: Pair = ch "SELECT 'back\\\\slash' AS a, 'tab\\tend' AS b"
+    print(q.a + "|" + q.b.byte_len().to_str())
+    let h: str = ch `SELECT $$x\{y}$$ AS v`
+    print(h)
+    let tag: str = ch `SELECT $t$a'b$t$ AS v`
+    print(tag)
+    let br: Braces = ch "SELECT '{}' AS a, 'x{3}' AS b, '{1,2}' AS c"
+    print(br.a + " " + br.b + " " + br.c)
+    let names: Names = ch "SELECT 1 AS \"x\", 2 AS `y`"
+    print(names.x + names.y)
+    let wrapped: str = ch "SELECT 'a{x}b' AS v"
+    print(wrapped)
+    let raw: str = ch `SELECT concat('[', {x}, ']') AS v`
+    print(raw)
+}

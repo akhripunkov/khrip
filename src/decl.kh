@@ -744,8 +744,11 @@ fn prescan_from(pass: int, from: int) {
                     prescan_migration()
                     i += 3
                     continue
+                } else if k == T_IDENT && toks[i].text == "clickhouse" && kind_at(i + 1) == T_IDENT && kind_at(i + 2) == '=' {
+                    i = prescan_ch_conn()
+                    continue
                 } else if k != T_TYPE && starts_decl_error(i) {
-                    error_tok(toks[i], "expected a declaration (fn, type, var, const, store, route, every or test), found " + tok_show(toks[i]), decl_hint(toks[i]))
+                    error_tok(toks[i], "expected a declaration (fn, type, var, const, store, route, every, test, migration, table or clickhouse), found " + tok_show(toks[i]), decl_hint(toks[i]))
                 }
             }
         }

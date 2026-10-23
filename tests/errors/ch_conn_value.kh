@@ -1,0 +1,5 @@
+// expect: metrics is a ClickHouse connection, not a value
+clickhouse metrics = env("METRICS_CLICKHOUSE_URL")
+fn main() {
+    let m = metrics
+}

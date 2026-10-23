@@ -1,0 +1,4 @@
+// expect: ch needs to know the result type of this query
+fn main() {
+    ch "SELECT count() FROM events"
+}

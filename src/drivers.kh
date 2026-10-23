@@ -166,6 +166,10 @@ fn driver_libs(lib: str, api: bool, all: bool) -> [str] {
     libs.push(driver_lib(lib, "bson.kh", "MongoDB", ["to_bson", "from_bson"]))
     libs.push(driver_lib(lib, "mongo.kh", "MongoDB", []))
     libs.push(driver_lib(lib, "clickhouse.kh", "ClickHouse", ["ch_encode", "ch_decode"]))
+    // типизированный слой ClickHouse (ch "...", table, migration ch): его
+    // имена (DbResult, Insert) — имена слоя баз данных
+    libs.push(driver_lib(lib, "chdb.kh", "ClickHouse", []))
+    libs.push(driver_lib(lib, "dbtyped.kh", "database", []))
     let first = first_own_tok()
     let own = own_top_names(first)
     var i = first
@@ -179,6 +183,12 @@ fn driver_libs(lib: str, api: bool, all: bool) -> [str] {
             }
         }
         i += 1
+    }
+    // слой ch и таблиц — по объявлениям и формам, а не по именам
+    libs[3].used = uses_ch
+    libs[4].used = uses_ch
+    if uses_ch {
+        libs[2].used = true
     }
     if all && (api || libs[0].used || libs[1].used || libs[2].used) {
         for d in libs {
@@ -198,6 +208,16 @@ fn driver_libs(lib: str, api: bool, all: bool) -> [str] {
     while k < own.keys.len() {
         let name = own.keys[k]
         for d in libs {
+            if d.used && smap_get(d.names, name) >= 0 && smap_get(drv_clash, name) < 0 && (d.file == "chdb.kh" || d.file == "dbtyped.kh") {
+                // E-D9: имена типизированного слоя баз данных
+                smap_put(drv_clash, name, 1)
+                var what = "function"
+                let at = toks[own.vals[k]]
+                if at.file >= 0 && own.vals[k] > 0 && toks[own.vals[k] - 1].kind == T_TYPE {
+                    what = "type"
+                }
+                error_tok(at, "'" + name + "' is a " + what + " of the database layer; choose another name", "")
+            }
             if d.used && smap_get(d.names, name) >= 0 && smap_get(drv_clash, name) < 0 {
                 smap_put(drv_clash, name, 1)
                 var other = "my_" + name
@@ -219,6 +239,12 @@ fn driver_libs(lib: str, api: bool, all: bool) -> [str] {
     if drv_ch {
         out.push("db_http.kh")
         out.push("clickhouse.kh")
+    }
+    if libs[4].used {
+        out.push("dbtyped.kh")
+    }
+    if libs[3].used {
+        out.push("chdb.kh")
     }
     return out
 }

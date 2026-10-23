@@ -1,0 +1,172 @@
+// ============================================================================
+// Объявления баз данных, кроме PostgreSQL (docs/design/v0.13-drivers.md §2.1):
+// соединения clickhouse ИМЯ = выражение, таблицы ClickHouse table t: T,
+// миграции migration ch N. Слова — контекстные, как every и migration: имена
+// collection, table, clickhouse и ch остаются доступны программам.
+// ============================================================================
+
+const SK_CONN = 6
+const SK_TABLE = 7
+
+// Соединение ClickHouse: [0] — CLICKHOUSE_URL, остальные — clickhouse ИМЯ = выражение.
+type ChConn {
+    name: str
+    // скрытая глобальная str? со значением выражения (-1 — CLICKHOUSE_URL)
+    global: int
+    tok: int
+    // текст выражения (для сообщений при запуске)
+    expr: str
+}
+
+var ch_conns: [ChConn]
+
+fn ch_conns_init() {
+    if ch_conns.len() == 0 {
+        ch_conns.push(ChConn { name: "", global: -1, tok: -1, expr: "" })
+    }
+}
+
+fn ch_conn_find(name: str) -> int {
+    let s = sym_find(name)
+    if s < 0 || sym_kind(s) != SK_CONN {
+        return -1
+    }
+    return sym_idx(s)
+}
+
+// Таблица ClickHouse: table ИМЯ: ТИП [in СОЕДИНЕНИЕ] [at "имя"] [{ async_insert }].
+type ChTable {
+    name: str
+    // имя на сервере (at "...") или name
+    server: str
+    ty: int
+    conn: int
+    async_insert: bool
+    tok: int
+}
+
+var ch_tables: [ChTable]
+
+fn ch_table_find_server(name: str) -> int {
+    for i in 0..ch_tables.len() {
+        if ch_tables[i].server == name {
+            return i
+        }
+    }
+    return -1
+}
+
+// Таблица ClickHouse по имени символа (а не по имени на сервере) или -1.
+fn ch_table_sym(name: str) -> int {
+    let s = sym_find(name)
+    if s < 0 || sym_kind(s) != SK_TABLE {
+        return -1
+    }
+    return sym_idx(s)
+}
+
+// Тип результата DbResult (явная форма записи, lib/chdb.kh).
+fn is_db_result(t: int) -> bool {
+    return tkind(t) == K_STRUCT && structs[types[t].a].name == "DbResult" && files[toks[structs[types[t].a].tok].file].is_lib
+}
+
+// Лексема i начинает строку верхнего уровня (объявление).
+fn line_start_at(i: int) -> bool {
+    if i == 0 {
+        return true
+    }
+    return toks[i - 1].line != toks[i].line || toks[i - 1].file != toks[i].file
+}
+
+// Пользуется ли программа ClickHouse (типизированный слой): ch "...", table t:,
+// clickhouse ИМЯ =, migration ch N. Тогда подключаются lib/clickhouse.kh и
+// lib/chdb.kh.
+fn scan_uses_ch() -> bool {
+    var i = 0
+    while i < toks.len() {
+        let t = toks[i]
+        if !files[t.file].is_lib {
+            if t.kind == T_SQL && sqllits[t.val].ch {
+                return true
+            }
+            if t.kind == T_IDENT && line_start_at(i) {
+                if t.text == "table" && kind_at(i + 1) == T_IDENT && kind_at(i + 2) == ':' {
+                    return true
+                }
+                if t.text == "clickhouse" && kind_at(i + 1) == T_IDENT && kind_at(i + 2) == '=' {
+                    return true
+                }
+                if t.text == "migration" && kind_at(i + 1) == T_IDENT && kind_at(i + 2) == T_INT {
+                    return true
+                }
+            }
+        }
+        i += 1
+    }
+    return false
+}
+
+// clickhouse ИМЯ = выражение: значение — при запуске, до маршрутов (скрытая
+// глобальная str?). → лексема за выражением (до конца строки).
+fn prescan_ch_conn() -> int {
+    ch_conns_init()
+    let kw = tok()
+    advance()
+    let name_at = pos
+    let name = tok()
+    advance()
+    advance()
+    let init = pos
+    var e = pos
+    while toks[e].kind != T_EOF && toks[e].line == kw.line && toks[e].file == kw.file {
+        e += 1
+    }
+    let g = globals.len()
+    globals.push(Global { name: "__ch_conn_" + name.text, ty: ty_opt(ty_str), addr: global_slot(), init: init, tok: name_at, is_store: false })
+    ch_conns.push(ChConn { name: name.text, global: g, tok: name_at, expr: sql_tok_text(init, e) })
+    sym_add(name.text, SK_CONN, ch_conns.len() - 1, name)
+    return e
+}
+
+// Имя соединения или таблицы там, где ждут значение (E-D1).
+fn db_name_not_value(t: Token, sk: int) {
+    if sk == SK_CONN {
+        error_tok(t, t.text + " is a ClickHouse connection, not a value", "use it in ch " + t.text + " \"...\" or in table t: T in " + t.text)
+        return
+    }
+    error_tok(t, t.text + " is a ClickHouse table, not a value", "insert rows with " + t.text + ".insert(rows); read with ch \"SELECT ... FROM " + ch_tables[0].server + "\"")
+}
+
+// После компиляции всех функций: таблицы мест, соединений, таблиц, миграций.
+fn ch_finish() {
+    if !ch_root_used {
+        return
+    }
+    ch_conns_init()
+    let st = desc_reserve(1 + ch_sites.len())
+    desc_put(st, 0, ch_sites.len())
+    for i in 0..ch_sites.len() {
+        desc_put(st, 1 + i, ch_sites[i])
+    }
+    // соединения: имя, адрес глобальной (0 — CLICKHOUSE_URL), выражение, место
+    let ct = desc_reserve(1 + 4 * ch_conns.len())
+    desc_put(ct, 0, ch_conns.len())
+    for i in 0..ch_conns.len() {
+        let c = ch_conns[i]
+        desc_put(ct, 1 + 4 * i, const_str(c.name))
+        if c.global >= 0 {
+            desc_put(ct, 2 + 4 * i, globals[c.global].addr)
+            let t = toks[c.tok]
+            desc_put(ct, 4 + 4 * i, const_str(files[t.file].path + ":" + t.line.to_str() + ":" + t.col.to_str()))
+        }
+        desc_put(ct, 3 + 4 * i, const_str(c.expr))
+    }
+    desc_put(ch_root_off, 0, DATA_BASE + st)
+    desc_put(ch_root_off, 1, DATA_BASE + ct)
+}
+
+// t.insert(rows [, Insert { dedup }]) — шаг 2.
+fn parse_table_method(t: Token, ti: int, w: int) -> int {
+    error_tok(t, "ClickHouse tables are not supported yet", "")
+    return ty_err
+}

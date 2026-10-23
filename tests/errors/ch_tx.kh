@@ -1,0 +1,9 @@
+// expect: ch inside tx: the block may run again after a conflict, and ClickHouse is not part of it
+// expect: call it before or after the tx block
+route POST "/orders/{id}/pay" (id: int) -> 204 {
+    tx {
+        sql "UPDATE orders SET paid = true WHERE id = {id}"
+        ch "ALTER TABLE order_events UPDATE paid = 1 WHERE order_id = {id}"
+    }
+    return 204
+}

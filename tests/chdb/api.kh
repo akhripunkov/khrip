@@ -1,0 +1,29 @@
+// Статусы ch в маршрутах (§5.3): строки, 404 без строки, 400 на плохое
+// значение, 500 на ошибку программы, 503 и Retry-After при недоступной базе и
+// после срока клиента (тогда же KILL QUERY).
+type Click { ts: int, user_id: int, url: str, country: str, ms: int }
+type N { n: int }
+
+route GET "/count" (user: int) -> N {
+    let n: int = ch "SELECT count() FROM clicks WHERE user_id = {user}"
+    return N { n }
+}
+
+route GET "/click" (ts: int) -> Click | 404 {
+    return ch "SELECT * FROM clicks WHERE ts = {ts}"
+}
+
+route GET "/parse" (s: str) -> N {
+    let n: int = ch "SELECT toInt64({s}) AS n"
+    return N { n }
+}
+
+route GET "/huge" -> N {
+    let n: int = ch "SELECT toUInt64(18446744073709551615) AS n"
+    return N { n }
+}
+
+route GET "/slow" -> N {
+    let n: int = ch "SELECT sum(sleepEachRow(0.2)) AS n FROM numbers(50) SETTINGS max_block_size = 1"
+    return N { n }
+}

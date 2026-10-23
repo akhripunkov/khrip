@@ -395,12 +395,16 @@ fn sql_finish() {
     desc_put(sql_root_off, 1, DATA_BASE + mt)
 }
 
-// Есть ли в программе (не в библиотеке) sql или migration.
+// Есть ли в программе (не в библиотеке) sql или migration N (PostgreSQL; ch "..."
+// и migration ch N — ClickHouse, scan_uses_ch).
 fn scan_uses_db() -> bool {
-    for t in toks {
-        if !files[t.file].is_lib && (t.kind == T_SQL || (t.kind == T_IDENT && t.text == "migration")) {
+    var i = 0
+    while i < toks.len() {
+        let t = toks[i]
+        if !files[t.file].is_lib && ((t.kind == T_SQL && !sqllits[t.val].ch) || (t.kind == T_IDENT && t.text == "migration" && kind_at(i + 1) == T_INT)) {
             return true
         }
+        i += 1
     }
     return false
 }
@@ -434,10 +438,16 @@ fn fn_effect(fi: int) -> str {
         var i = f.body
         while i < f.body_end && why == "" {
             let t = toks[i]
+            if t.kind == T_SQL && sqllits[t.val].ch {
+                why = "runs ch"
+            } else if t.kind == T_IDENT && kind_at(i + 1) == '.' && ch_table_sym(t.text) >= 0 && (i == 0 || toks[i - 1].kind != '.') {
+                why = "calls " + t.text + "." + toks[i + 2].text
+            }
             if t.kind == T_IDENT {
                 let nk = kind_at(i + 1)
                 let dotted = i > 0 && toks[i - 1].kind == '.'
-                if (t.text == "fetch" && !dotted) || ((t.text == "sleep" || driver_io(t.text)) && nk == '(') {
+                if why != "" {
+                } else if (t.text == "fetch" && !dotted) || ((t.text == "sleep" || driver_io(t.text)) && nk == '(') {
                     why = "calls " + t.text
                 } else if nk == '(' {
                     // f(...) и x.f(...)
@@ -830,9 +840,14 @@ fn sql_starts_words(s: str, ws: [str]) -> int {
 
 // ---- Сканер текста SQL ----
 // Состояние каждого символа: 0 — код, 1 — '...', 2 — "имя", 3 — -- комментарий,
-// 4 — /* */, 5 — E'...' (с \-экранированием), 6 — $тег$...$тег$. Последний
-// элемент — состояние после текста. Один сканер на всё: поиск слов, кавычек,
-// таблиц и ошибок привычек видит одно и то же.
+// 4 — /* */, 5 — E'...' (с \-экранированием), 6 — $тег$...$тег$, 7 — `имя`
+// (ClickHouse). Последний элемент — состояние после текста. Один сканер на всё:
+// поиск слов, кавычек, таблиц и ошибок привычек видит одно и то же.
+//
+// sql_ch — текст ch "...": в '...' обратная косая черта экранирует, # —
+// комментарий, `имя` — имя.
+var sql_ch: bool
+
 fn sql_states(s: str) -> [int] {
     var out: [int] = []
     var st = 0
@@ -844,15 +859,23 @@ fn sql_states(s: str) -> [int] {
         if st == 0 {
             if c == '\'' {
                 st = 1
-                if i > 0 && (s.byte(i - 1) == 'e' || s.byte(i - 1) == 'E') && (i == 1 || !is_ident_char(s.byte(i - 2))) {
+                if !sql_ch && i > 0 && (s.byte(i - 1) == 'e' || s.byte(i - 1) == 'E') && (i == 1 || !is_ident_char(s.byte(i - 2))) {
                     st = 5
                 }
                 out.push(st)
                 i += 1
                 continue
             }
+            if sql_ch && c == '`' {
+                st = 7
+                out.push(7)
+                i += 1
+                continue
+            }
             if c == '"' {
                 st = 2
+            } else if sql_ch && c == '#' {
+                st = 3
             } else if c == '-' && i + 1 < n && s.byte(i + 1) == '-' {
                 st = 3
             } else if c == '/' && i + 1 < n && s.byte(i + 1) == '*' {
@@ -880,9 +903,17 @@ fn sql_states(s: str) -> [int] {
             i += 1
             continue
         }
+        if st == 7 {
+            out.push(7)
+            if c == '`' {
+                st = 0
+            }
+            i += 1
+            continue
+        }
         if st == 1 || st == 5 {
             out.push(st)
-            if c == '\\' && st == 5 && i + 1 < n {
+            if c == '\\' && (st == 5 || sql_ch) && i + 1 < n {
                 out.push(st)
                 i += 2
                 continue
@@ -1551,26 +1582,31 @@ fn sql_habit_placeholder(at: Token, text: str) {
 
 // ---- Выражение sql ----
 
-fn parse_sql(w: int) -> int {
-    let at = tok()
-    if in_global_init {
-        error_tok(at, "sql in the initial value of a global runs before the database is connected", "compute it in main, a route or an every task")
-    }
-    let lit = sqllits[at.val]
-    advance()
+// Значения {выражение} запроса: каждое вычисляется и кладётся в стек;
+// одинаковые чистые выражения ({id} дважды) — одно значение.
+type SqlVals {
+    // номер значения у каждого параметра
+    vals: [int]
+    // по значениям: тип, ключ слияния, текст выражения
+    vtypes: [int]
+    vkeys: [str]
+    vtexts: [str]
+    // по параметрам: лексема «(», начало и конец выражения
+    ptoks: [Token]
+    pfrom: [int]
+    pto: [int]
+    ok: bool
+}
+
+fn sql_parse_values(lit: SqlLit) -> SqlVals {
+    let out = SqlVals { vals: [], vtypes: [], vkeys: [], vtexts: [], ptoks: [], pfrom: [], pto: [], ok: true }
     let n = lit.quoted.len()
-    var vals: [int] = []
-    var vtypes: [int] = []
-    var vkeys: [str] = []
-    var vtexts: [str] = []
-    var ptoks: [Token] = []
-    var pfrom: [int] = []
-    var pto: [int] = []
     for i in 0..n {
         let pt = tok()
-        ptoks.push(pt)
+        out.ptoks.push(pt)
         if !expect_tok('(') {
-            return ty_err
+            out.ok = false
+            return out
         }
         let from = pos
         let saved = no_struct
@@ -1580,8 +1616,8 @@ fn parse_sql(w: int) -> int {
         sql_quoted_param = false
         no_struct = saved
         let to = pos
-        pfrom.push(from)
-        pto.push(to)
+        out.pfrom.push(from)
+        out.pto.push(to)
         expect_tok(')')
         if et == ty_void || et == ty_never {
             error_tok(pt, "this expression has no value to send to the database", "")
@@ -1591,28 +1627,52 @@ fn parse_sql(w: int) -> int {
         let key = sql_pure_key(from, to)
         if key.byte_len() == 0 {
             // вызов мог изменить то, что вычислили раньше: дальше не сливать с прежними
-            for j in 0..vkeys.len() {
-                vkeys[j] = ""
+            for j in 0..out.vkeys.len() {
+                out.vkeys[j] = ""
             }
         }
         var vi = -1
         if key.byte_len() > 0 {
-            for j in 0..vkeys.len() {
-                let k = vkeys[j]
+            for j in 0..out.vkeys.len() {
+                let k = out.vkeys[j]
                 if k == key && vi < 0 {
                     vi = j
                 }
             }
         }
         if vi < 0 {
-            vi = vtypes.len()
-            vtypes.push(et)
-            vkeys.push(key)
-            vtexts.push(sql_tok_text(from, to))
+            vi = out.vtypes.len()
+            out.vtypes.push(et)
+            out.vkeys.push(key)
+            out.vtexts.push(sql_tok_text(from, to))
             emit_push(RAX)
         }
-        vals.push(vi)
+        out.vals.push(vi)
     }
+    return out
+}
+
+fn parse_sql(w: int) -> int {
+    let at = tok()
+    let lit = sqllits[at.val]
+    if lit.ch {
+        return parse_ch(w)
+    }
+    if in_global_init {
+        error_tok(at, "sql in the initial value of a global runs before the database is connected", "compute it in main, a route or an every task")
+    }
+    advance()
+    let n = lit.quoted.len()
+    let sv = sql_parse_values(lit)
+    if !sv.ok {
+        return ty_err
+    }
+    let vals = sv.vals
+    let vtypes = sv.vtypes
+    let vtexts = sv.vtexts
+    let ptoks = sv.ptoks
+    let pfrom = sv.pfrom
+    let pto = sv.pto
     sql_habit_placeholder(at, lit.segs.join("\0"))
     // форма результата — из ожидаемого типа
     var shape = SH_COUNT
@@ -2135,6 +2195,11 @@ fn sql_close_quote(s: str) -> int {
     var i = 0
     let n = s.byte_len()
     while i < n {
+        if sql_ch && s.byte(i) == '\\' {
+            // ClickHouse: \' — кавычка внутри строки
+            i += 2
+            continue
+        }
         if s.byte(i) == '\'' {
             if i + 1 < n && s.byte(i + 1) == '\'' {
                 i += 2
@@ -2332,4 +2397,773 @@ fn sql_insert_target(cur: str) -> bool {
         return false
     }
     return sql_ends_word(cur, s, "into") >= 0 && sql_ends_word(cur, sql_ends_word(cur, s, "into"), "insert") >= 0
+}
+
+// ============================================================================
+// ch "...": запрос к ClickHouse (docs/design/v0.13-drivers.md §2.8, §3.2).
+// Тот же разбор, что у sql, с переключателями диалекта: {x} — параметр
+// {pN:Тип} (тип — из типа Khrip), IS NULL — тот же параметр Nullable(T),
+// IN ({xs}) — IN {pN:Array(T)}, '%{q}%' — concat(...). Место запроса — в
+// данных программы (слова CHS_* в lib/chdb.kh); при запуске его проверяет
+// сервер (DESCRIBE), исполняет __chdb_run.
+// ============================================================================
+
+// Виды операторов ch (слово места CHS_KIND)
+const CHK_ROWS = 1
+const CHK_KILL = 2
+const CHK_INSERT_SELECT = 3
+const CHK_MUTATION = 4
+const CHK_STATEMENT = 5
+
+// Слова места ch (lib/chdb.kh CHS_*)
+const CH_SITE_WORDS = 24
+const CHS_W_VARIANTS = 9
+
+var ch_sites: [int]
+var ch_root_used: bool
+var ch_root_off: int
+// в программе есть ClickHouse: ch "...", table, clickhouse ИМЯ =, migration ch
+var uses_ch: bool
+
+// Корень для рантайма (__chdb_root): [0] места ch, [1] соединения, [2] таблицы,
+// [3] миграции, [4] места вставки t.insert.
+fn ch_root() -> int {
+    if !ch_root_used {
+        ch_root_used = true
+        ch_root_off = desc_reserve(8)
+    }
+    return DATA_BASE + ch_root_off
+}
+
+// Тип параметра ClickHouse для значения Khrip типа t; "" — не бывает.
+fn ch_param_type(t: int) -> str {
+    let k = tkind(t)
+    if k == K_INT {
+        return "Int64"
+    }
+    if k == K_FLOAT {
+        return "Float64"
+    }
+    if k == K_BOOL {
+        return "Bool"
+    }
+    if k == K_STR || is_enum(t) {
+        return "String"
+    }
+    if k == K_LIST {
+        let e = ch_param_type(ty_elem(t))
+        if e.byte_len() == 0 {
+            return ""
+        }
+        return "Array(" + e + ")"
+    }
+    if k == K_MAP {
+        let kt = ch_param_type(types[t].a)
+        let vt = ch_param_type(types[t].b)
+        if kt.byte_len() == 0 || vt.byte_len() == 0 || kt.starts_with("Nullable") {
+            return ""
+        }
+        return "Map(" + kt + ", " + vt + ")"
+    }
+    if k == K_OPT {
+        let inner = ty_inner(t)
+        let ik = tkind(inner)
+        if ik == K_LIST || ik == K_MAP {
+            return ""
+        }
+        let e = ch_param_type(inner)
+        if e.byte_len() == 0 {
+            return ""
+        }
+        return "Nullable(" + e + ")"
+    }
+    return ""
+}
+
+// Параметр стоит в SETTINGS (последнее слово-раздел перед ним — SETTINGS).
+fn ch_settings_slot(cur: str) -> bool {
+    let ws = sql_code_words(cur)
+    var i = ws.len() - 1
+    while i >= 0 {
+        let w = ws[i].w
+        if w == "settings" && ws[i].depth == 0 {
+            return true
+        }
+        if w == "select" || w == "where" || w == "from" || w == "format" || w == "values" || w == "having" || w == "limit" {
+            return false
+        }
+        i -= 1
+    }
+    return false
+}
+
+// Параметр на месте имени таблицы: FROM, JOIN, INTO, TABLE, UPDATE.
+fn ch_names_slot(cur: str, vk: int) -> bool {
+    let ws = sql_code_words(cur)
+    let n = ws.len()
+    if n == 0 {
+        return false
+    }
+    let w = ws[n - 1].w
+    if sql_ends_word(cur, cur.byte_len(), w) < 0 {
+        return false
+    }
+    if w == "table" {
+        return true
+    }
+    return sql_names_slot(cur, vk)
+}
+
+// x IN ({xs}) / x IN {xs}: → позиция в cur, с которой заменить хвост, и
+// сколько символов next убрать (закрывающая скобка); -1 — не IN.
+fn ch_in_head(cur: str) -> int {
+    var e = sql_trim_end(cur)
+    if e > 0 && cur.byte(e - 1) == '(' {
+        if sql_ends_word(cur, e - 1, "in") >= 0 {
+            return e - 1
+        }
+        return -1
+    }
+    if sql_ends_word(cur, e, "in") >= 0 {
+        return e
+    }
+    return -1
+}
+
+// Связать ch ИМЯ с соединением: номер в ch_conns (0 — CLICKHOUSE_URL).
+fn ch_conn_of(name: str, at: Token, col: int) -> int {
+    if name.byte_len() == 0 {
+        return 0
+    }
+    let ci = ch_conn_find(name)
+    if ci < 0 {
+        let t = Token { kind: T_IDENT, val: 0, text: name, line: at.line, col: col, file: at.file }
+        error_tok(t, "unknown connection " + name, "declare it: clickhouse " + name + " = env(\"" + sql_upper(name) + "_CLICKHOUSE_URL\")")
+        return 0
+    }
+    return ci
+}
+
+fn parse_ch(w: int) -> int {
+    let at = tok()
+    let lit = sqllits[at.val]
+    if in_global_init {
+        error_tok(at, "ch in the initial value of a global runs before the database is connected", "compute it in main, a route or an every task")
+    }
+    if tx_depth > 0 && !files[at.file].is_lib {
+        error_tok(at, "ch inside tx: the block may run again after a conflict, and ClickHouse is not part of it", "call it before or after the tx block")
+    }
+    let conn = ch_conn_of(lit.conn, at, lit.conn_col)
+    advance()
+    let n = lit.quoted.len()
+    let sv = sql_parse_values(lit)
+    if !sv.ok {
+        return ty_err
+    }
+    let vals = sv.vals
+    let vtypes = sv.vtypes
+    let vtexts = sv.vtexts
+    let ptoks = sv.ptoks
+    // форма результата — из ожидаемого типа
+    var shape = SH_COUNT
+    var rt = ty_int
+    var inner = ty_err
+    var explicit = false
+    let optional_follow = kind() == T_ELSE || kind() == T_QQ
+    if w != ty_err && w != ty_void && w != ty_never && w != ty_none {
+        if is_db_result(w) {
+            explicit = true
+            rt = w
+        } else if tkind(w) == K_LIST {
+            shape = SH_LIST
+            inner = ty_elem(w)
+            rt = w
+            if tkind(inner) == K_OPT && tkind(ty_inner(inner)) == K_STRUCT {
+                error_tok(at, "a row is never none: a list of rows is " + ty_name(ty_list(ty_inner(inner))), "let rows: " + ty_name(ty_list(ty_inner(inner))) + " = ch ...")
+            }
+        } else if tkind(w) == K_OPT {
+            shape = SH_OPT
+            inner = ty_inner(w)
+            rt = w
+        } else if optional_follow {
+            shape = SH_OPT
+            inner = w
+            rt = ty_opt(w)
+        } else {
+            shape = SH_ONE
+            inner = w
+            rt = w
+        }
+    }
+    sql_ch = true
+    var cur = lit.segs[0]
+    var ps: [SqlParam] = []
+    var pnames: [str] = []
+    // сравнения с T? без проверки IS NULL: номер значения и место; значения с IS NULL
+    var cmp_v: [int] = []
+    var cmp_at: [int] = []
+    var guarded: [int] = []
+    var in_lit = false
+    var lit_like = false
+    var order_vi = -1
+    var order_lits: [str] = []
+    for i in 0..n {
+        let vi = vals[i]
+        let vt = vtypes[vi]
+        var next = lit.segs[i + 1]
+        let vk = tkind(vt)
+        let x = vtexts[vi]
+        let pt = ptoks[i]
+        let isnull = sql_starts_words(next, ["is", "null"])
+        let notnull = sql_starts_words(next, ["is", "not", "null"])
+        let by = sql_ends_word(cur, cur.byte_len(), "by")
+        if !lit.quoted[i] && by >= 0 && sql_ends_word(cur, by, "order") >= 0 {
+            let lits = lit_set(sv.pfrom[i], sv.pto[i])
+            if lits.len() == 0 {
+                error_tok(pt, "ORDER BY \{" + x + "}: a parameter here is a constant and sorts nothing", "let order = match " + x + " \{ \"price\" => \"price, id\", ... _ => return 400 \"bad sort\" }, then ORDER BY \{order}")
+            } else if order_vi >= 0 {
+                error_tok(pt, "one ORDER BY \{...} per query", "put the whole ORDER BY list in one string")
+            } else if lits.len() > SQL_MAX_ORDERS {
+                error_tok(pt, "ORDER BY \{" + x + "} has " + lits.len().to_str() + " variants, at most " + SQL_MAX_ORDERS.to_str(), "")
+            } else {
+                order_vi = vi
+                order_lits = lits
+            }
+            cur = cur + "%%O%%" + next
+            continue
+        }
+        let row_like = vk == K_STRUCT || (vk == K_SUM && !is_enum(vt)) || (vk == K_LIST && (tkind(ty_elem(vt)) == K_STRUCT || (tkind(ty_elem(vt)) == K_SUM && !is_enum(ty_elem(vt)))))
+        if !lit.quoted[i] && row_like && sql_insert_target(cur) {
+            let table = cur.byte_slice(sql_insert_name_at(cur), sql_trim_end(cur)).replace("`", "")
+            error_tok(pt, "insert rows with " + table + ".insert(rows)", ch_table_hint(table))
+            cur = cur + "NULL" + next
+            continue
+        }
+        if row_like {
+            error_tok(pt, "a struct cannot be a ClickHouse parameter", "insert rows with " + ch_some_table() + ".insert(rows)")
+            cur = cur + "NULL" + next
+            continue
+        }
+        if vk == K_OPT && (tkind(ty_inner(vt)) == K_LIST || tkind(ty_inner(vt)) == K_MAP) {
+            error_tok(pt, ty_name(vt) + " cannot be a ClickHouse parameter: arrays are never NULL", "use [] for none")
+            cur = cur + "NULL" + next
+            continue
+        }
+        if !lit.quoted[i] && ch_settings_slot(cur) {
+            error_tok(pt, "values cannot go into SETTINGS: ClickHouse settings are literals", "")
+        }
+        if !lit.quoted[i] && ch_names_slot(cur, vk) {
+            error_tok(pt, "\{" + x + "} cannot name a table: values are sent as parameters, never as SQL text", "choose between whole queries with if/match")
+        }
+        let ptype = ch_param_type(vt)
+        if ptype.byte_len() == 0 && !lit.quoted[i] {
+            error_tok(pt, ty_name(vt) + " cannot be a ClickHouse parameter", "send int, float, bool, str, enums, lists, maps or their optionals")
+            cur = cur + "NULL" + next
+            continue
+        }
+        if lit.quoted[i] {
+            // '...{x}...' → concat('...', {pN:String}, '...'); в шаблоне LIKE
+            // \, % и _ значения — буквы
+            if !in_lit {
+                let q = sql_open_quote(cur)
+                lit_like = q >= 0 && sql_like_context(cur, q)
+                if q >= 0 {
+                    cur = cur.byte_slice(0, q) + "concat(" + cur.byte_slice(q, cur.byte_len())
+                    in_lit = true
+                }
+            }
+            var pk = PK_TEXT
+            if lit_like {
+                pk = PK_LIKE
+            }
+            var stype = "String"
+            if vk == K_OPT {
+                stype = "Nullable(String)"
+            }
+            let no = sql_param_no(ps, pk, vt, vi, -1)
+            ch_param_name(pnames, no, x)
+            cur = cur + "', \{p" + no.to_str() + ":" + stype + "}, '"
+            if in_lit {
+                let close = sql_close_quote(next)
+                if close >= 0 {
+                    if lit_like && sql_starts_words(next.byte_slice(close + 1, next.byte_len()), ["escape"]) > 0 {
+                        error_tok(pt, "ESCAPE with a value inside the pattern: % and _ in \{" + x + "} are already escaped with \\", "drop the ESCAPE clause")
+                    }
+                    next = next.byte_slice(0, close + 1) + ")" + next.byte_slice(close + 1, next.byte_len())
+                    in_lit = false
+                }
+            }
+        } else if isnull > 0 || notnull > 0 {
+            if vk != K_OPT {
+                error_tok(pt, "\{" + x + "} is " + ty_name(vt) + " and is never none, so IS NULL is always false here", "drop the IS NULL check, or make the value optional (" + ty_name(vt) + "?)")
+            }
+            let no = sql_param_no(ps, PK_VAL, vt, vi, -1)
+            ch_param_name(pnames, no, x)
+            guarded.push(vi)
+            cur = cur + "\{p" + no.to_str() + ":" + ptype + "}"
+        } else if vk == K_LIST && ch_in_head(cur) >= 0 && (ch_in_head(cur) == sql_trim_end(cur) || sql_starts_close(next) > 0) {
+            // x IN ({xs}) и x IN {xs} → IN {pN:Array(T)}; пустой список ничему не равен
+            let head = ch_in_head(cur)
+            let paren = head < sql_trim_end(cur)
+            let no = sql_param_no(ps, PK_VAL, vt, vi, -1)
+            ch_param_name(pnames, no, x)
+            cur = cur.byte_slice(0, head) + " \{p" + no.to_str() + ":" + ptype + "}"
+            if paren {
+                next = next.byte_slice(sql_starts_close(next), next.byte_len())
+            }
+        } else {
+            if vk == K_OPT && (sql_ends_cmp(cur) || sql_starts_cmp(next)) && !sql_in_set(cur) {
+                cmp_v.push(vi)
+                cmp_at.push(i)
+            }
+            let no = sql_param_no(ps, PK_VAL, vt, vi, -1)
+            ch_param_name(pnames, no, x)
+            cur = cur + "\{p" + no.to_str() + ":" + ptype + "}"
+        }
+        cur = cur + next
+    }
+    for k in 0..cmp_v.len() {
+        var safe = false
+        for g in guarded {
+            if g == cmp_v[k] {
+                safe = true
+            }
+        }
+        if !safe {
+            let x = vtexts[cmp_v[k]]
+            error_tok(ptoks[cmp_at[k]], "\{" + x + "} may be none, and a comparison with NULL is never true: rows would silently not match", "write (\{" + x + "} IS NULL OR column = \{" + x + "}), or unwrap it first: let v = " + x + " else \{ return 400 }")
+        }
+    }
+    var texts: [str] = [cur]
+    if order_lits.len() > 0 {
+        texts = []
+        for o in order_lits {
+            let at_o = cur.byte_find("%%O%%") ?? 0
+            texts.push(cur.byte_slice(0, at_o) + o + cur.byte_slice(at_o + 5, cur.byte_len()))
+        }
+        cur = texts[0]
+    }
+    let kind = ch_rules(at, cur, shape)
+    let rows = kind == CHK_ROWS || kind == CHK_KILL
+    if kind == CHK_ROWS && shape == SH_COUNT && !explicit {
+        error_tok(at, "ch needs to know the result type of this query", "let rows: [Row] = ch ...")
+    }
+    if explicit && rows {
+        error_tok(at, "a failed read ends the request; DbResult is for writes", "let rows: [Row] = ch ...")
+    }
+    if !rows && (shape == SH_LIST || shape == SH_OPT || (shape == SH_ONE && inner != ty_int)) {
+        error_tok(at, "this ch statement returns no rows: it gives the number of written rows (int) or a DbResult", "drop the type, or write let n: int = ch ...")
+    }
+    if kind == CHK_KILL && shape == SH_ONE && inner == ty_int {
+        // KILL QUERY ... в int — сколько запросов найдено
+        shape = SH_COUNT
+    }
+    if shape == SH_ONE && kind == CHK_ROWS && !sql_one_row(cur) {
+        sql_note_404(at)
+    }
+    sql_ch = false
+    var sites: [int] = []
+    var offs: [int] = []
+    for text in texts {
+        let off = ch_site(at, text, vtypes.len(), ps, pnames, shape, inner, kind, conn, explicit)
+        offs.push(off)
+        sites.push(DATA_BASE + off)
+    }
+    if order_lits.len() > 0 {
+        let vt = desc_reserve(2 + 2 * order_lits.len())
+        desc_put(vt, 0, order_vi)
+        desc_put(vt, 1, order_lits.len())
+        for j in 0..order_lits.len() {
+            desc_put(vt, 2 + 2 * j, const_str(order_lits[j]))
+            desc_put(vt, 3 + 2 * j, sites[j])
+        }
+        desc_put(offs[0], CHS_W_VARIANTS, DATA_BASE + vt)
+    }
+    ch_root()
+    emit_mov_imm(RDI, sites[0])
+    emit_mov_rr(RSI, RSP)
+    emit_call(rt_func("__chdb_run"))
+    if vtypes.len() > 0 {
+        emit_alu_imm(0, RSP, vtypes.len() * 8)
+    }
+    last_was_call = true
+    if explicit {
+        return rt
+    }
+    if shape == SH_COUNT {
+        return ty_int
+    }
+    return rt
+}
+
+// Имя параметра pN → текст выражения (для сообщений при запуске).
+fn ch_param_name(names: [str], no: int, x: str) {
+    while names.len() < no {
+        names.push("")
+    }
+    names[no - 1] = x
+}
+
+// Подсказка E-CH2: объявить таблицу (или она уже объявлена).
+fn ch_table_hint(table: str) -> str {
+    if ch_table_find_server(table) >= 0 {
+        return ""
+    }
+    var ty = table
+    if ty.byte_len() > 1 && ty.ends_with("s") {
+        ty = ty.byte_slice(0, ty.byte_len() - 1)
+    }
+    if ty.byte_len() > 0 && ty.byte(0) >= 'a' && ty.byte(0) <= 'z' {
+        ty = sql_upper(ty.byte_slice(0, 1)) + ty.byte_slice(1, ty.byte_len())
+    }
+    return "declare the table: table " + table + ": " + ty
+}
+
+// Таблица для подсказок: первая объявленная или events.
+fn ch_some_table() -> str {
+    if ch_tables.len() > 0 {
+        return ch_tables[0].name
+    }
+    return "events"
+}
+
+// Место ch в данных программы (слова CHS_* в lib/chdb.kh) → смещение.
+fn ch_site(at: Token, cur: str, nv: int, ps: [SqlParam], pnames: [str], shape: int, inner: int, kind: int, conn: int, explicit: bool) -> int {
+    let off = desc_reserve(CH_SITE_WORDS)
+    let pt = desc_reserve(4 * ps.len() + 1)
+    for i in 0..ps.len() {
+        let p = ps[i]
+        desc_put(pt, 4 * i, p.kind)
+        desc_put(pt, 4 * i + 1, type_desc(p.ty))
+        desc_put(pt, 4 * i + 2, p.v)
+        var name = ""
+        if i < pnames.len() {
+            name = pnames[i]
+        }
+        desc_put(pt, 4 * i + 3, const_str(name))
+    }
+    desc_put(off, 0, const_str(cur))
+    desc_put(off, 1, nv)
+    desc_put(off, 2, ps.len())
+    desc_put(off, 3, DATA_BASE + pt)
+    desc_put(off, 4, shape)
+    if shape != SH_COUNT {
+        desc_put(off, 5, type_desc(inner))
+    }
+    if shape == SH_OPT {
+        desc_put(off, 13, type_desc(ty_opt(inner)))
+    }
+    desc_put(off, 6, const_str(files[at.file].path + ":" + at.line.to_str() + ":" + at.col.to_str()))
+    desc_put(off, 7, kind)
+    desc_put(off, 8, conn)
+    desc_put(off, 10, ch_sites.len())
+    if explicit {
+        desc_put(off, 11, 1)
+    }
+    desc_put(off, 12, const_str(ch_main_table(cur)))
+    ch_sites.push(DATA_BASE + off)
+    return off
+}
+
+// Таблица оператора (INSERT INTO t, ALTER TABLE t, DELETE FROM t, TRUNCATE t,
+// OPTIMIZE TABLE t) — для проверки при запуске (EXISTS TABLE).
+fn ch_main_table(s: str) -> str {
+    let ws = sql_code_words(s)
+    for i in 0..ws.len() {
+        let x = ws[i]
+        if x.depth == 0 && (x.w == "into" || x.w == "table" || (x.w == "from" && i > 0 && ws[i - 1].w == "delete")) {
+            return sql_name_at(s, x.at + x.w.byte_len())
+        }
+    }
+    if ws.len() > 1 && ws[0].w == "truncate" {
+        return sql_name_at(s, ws[1].at)
+    }
+    return ""
+}
+
+// Правила текста ch: привычки, DDL, FORMAT, SET, базы, ; — и вид оператора.
+fn ch_rules(at: Token, s: str, shape: int) -> int {
+    let ws = sql_code_words(s)
+    if ws.len() == 0 {
+        error_tok(at, "ch needs a query", "")
+        return CHK_STATEMENT
+    }
+    let st = sql_states(s)
+    let n = s.byte_len()
+    // несколько операторов через ;
+    var semi = false
+    for i in 0..n {
+        if st[i] == 0 {
+            let c = s.byte(i)
+            if c == ';' {
+                semi = true
+            } else if semi && !sql_space(c) {
+                error_tok(at, "ch runs one statement; this one has several separated by ;", "write one ch per statement")
+                return CHK_STATEMENT
+            }
+        }
+    }
+    // заполнители других драйверов: ?, :name, @name, $1
+    for i in 0..n {
+        if st[i] != 0 {
+            continue
+        }
+        let c = s.byte(i)
+        var mark = ""
+        if c == '$' && i + 1 < n && is_digit(s.byte(i + 1)) && (i == 0 || !is_ident_char(s.byte(i - 1))) {
+            mark = s.byte_slice(i, i + 2)
+        } else if c == '?' || c == ':' || c == '@' {
+            let q = sql_prev_code(s, st, i)
+            let after_op = q >= 0 && (s.byte(q) == '=' || s.byte(q) == '<' || s.byte(q) == '>' || s.byte(q) == '(' || s.byte(q) == ',')
+            if after_op && !(q == i - 1 && c == ':' && s.byte(q) == ':') {
+                if c == '?' {
+                    var j = i + 1
+                    while j < n && sql_space(s.byte(j)) {
+                        j += 1
+                    }
+                    if j >= n || s.byte(j) == ')' || s.byte(j) == ',' || s.byte(j) == ';' {
+                        mark = "?"
+                    }
+                } else if i + 1 < n && is_alpha(s.byte(i + 1)) && (i == 0 || s.byte(i - 1) != ':') {
+                    var j = i + 1
+                    while j < n && is_ident_char(s.byte(j)) {
+                        j += 1
+                    }
+                    mark = s.byte_slice(i, j)
+                }
+            }
+        }
+        if mark.byte_len() > 0 {
+            error_tok(at, "values go in place in ch: WHERE id = \{id}, not " + mark, "every \{expression} is sent as a parameter, never as SQL text")
+            return CHK_STATEMENT
+        }
+    }
+    let first = ws[0].w
+    let main = sql_main_word(s)
+    var kind = CHK_STATEMENT
+    if first == "create" || first == "drop" || first == "rename" || first == "attach" || first == "detach" || first == "exchange" || first == "undrop" || first == "grant" || first == "revoke" || first == "backup" || first == "restore" || first == "move" {
+        error_tok(at, sql_upper(first) + " belongs in a migration: the schema changes only through migrations", "migration ch N `...` with the next number")
+        return CHK_STATEMENT
+    }
+    if first == "set" {
+        error_tok(at, "SET in ch has no effect on later queries", "put SETTINGS x = 1 at the end of the query")
+        return CHK_STATEMENT
+    }
+    if first == "use" {
+        error_tok(at, "USE in ch has no effect on later queries", "declare a connection for the other database: clickhouse NAME = env(\"NAME_CLICKHOUSE_URL\")")
+        return CHK_STATEMENT
+    }
+    if first == "begin" || first == "commit" || first == "rollback" {
+        error_tok(at, sql_upper(first) + " in ch: ClickHouse statements here run without transactions", "write each change as one statement")
+        return CHK_STATEMENT
+    }
+    if main == "select" || first == "select" || first == "show" || first == "describe" || first == "desc" || first == "exists" || first == "explain" || first == "values" {
+        kind = CHK_ROWS
+    } else if first == "kill" {
+        kind = CHK_KILL
+    } else if first == "insert" {
+        var sel = false
+        for x in ws {
+            if x.depth == 0 && (x.w == "values" || x.w == "format") {
+                let table = ch_main_table(s)
+                error_tok(at, "insert rows with " + table + ".insert(rows)", ch_table_hint(table))
+                return CHK_STATEMENT
+            }
+            if x.w == "select" {
+                sel = true
+            }
+        }
+        if !sel {
+            let table = ch_main_table(s)
+            error_tok(at, "insert rows with " + table + ".insert(rows)", ch_table_hint(table))
+            return CHK_STATEMENT
+        }
+        kind = CHK_INSERT_SELECT
+    } else if first == "alter" {
+        // ALTER TABLE t [ON CLUSTER c] UPDATE/DELETE — мутация; иначе — схема
+        var j = 1
+        if ws.len() > 1 && ws[1].w == "table" {
+            j = 2
+        }
+        // имя таблицы (с базой — два слова)
+        j += 1
+        if j < ws.len() && ws[j].at > 0 && s.byte(ws[j].at - 1) == '.' {
+            j += 1
+        }
+        if j + 1 < ws.len() && ws[j].w == "on" && ws[j + 1].w == "cluster" {
+            j += 3
+        }
+        if j < ws.len() && (ws[j].w == "update" || ws[j].w == "delete") {
+            kind = CHK_MUTATION
+        } else {
+            error_tok(at, "ALTER belongs in a migration: the schema changes only through migrations", "migration ch N `...` with the next number")
+            return CHK_STATEMENT
+        }
+    }
+    // FORMAT: ответ читает сам Khrip
+    for i in 0..ws.len() {
+        let x = ws[i]
+        if x.w == "format" && x.depth == 0 && !(x.at > 0 && s.byte(x.at - 1) == '.') {
+            var p = x.at + 6
+            while p < n && sql_space(s.byte(p)) {
+                p += 1
+            }
+            if p >= n || s.byte(p) != '(' {
+                error_tok(at, "FORMAT in ch: Khrip reads the rows itself", "drop FORMAT ...; the expected type picks the result")
+                return kind
+            }
+        }
+        if x.w == "wait_for_async_insert" {
+            var p = x.at + x.w.byte_len()
+            while p < n && sql_space(s.byte(p)) {
+                p += 1
+            }
+            if p < n && s.byte(p) == '=' {
+                p += 1
+                while p < n && sql_space(s.byte(p)) {
+                    p += 1
+                }
+                if (p < n && s.byte(p) == '0') || sql_starts_words(s.byte_slice(p, n), ["false"]) > 0 {
+                    error_tok(at, "with wait_for_async_insert = 0 a failed insert is lost silently", "drop the setting; async_insert in the table block waits for the flush")
+                    return kind
+                }
+            }
+        }
+    }
+    // имена с базой: одна связь — одна база (khc test подменяет её)
+    for i in 0..ws.len() {
+        let x = ws[i]
+        let w = x.w
+        if !(w == "from" || w == "join" || w == "into" || w == "table" || (i == 0 && (w == "describe" || w == "desc"))) {
+            continue
+        }
+        if w == "from" && i > 0 && ws[i - 1].w == "distinct" {
+            continue
+        }
+        if x.depth > 0 && ch_in_call(s, st, x.at) {
+            continue
+        }
+        let db = ch_qualified_db(s, x.at + w.byte_len())
+        if db.byte_len() > 0 && db.ascii_lower() != "system" && db.ascii_lower() != "information_schema" {
+            error_tok(at, "ch names database " + db + ": one connection is one database (khc test replaces it)", "declare a connection: clickhouse " + db + " = env(\"" + sql_upper(db) + "_CLICKHOUSE_URL\"), then ch " + db + " \"...\"")
+            return kind
+        }
+    }
+    // = NULL, <> NULL
+    for x in ws {
+        if x.w == "null" {
+            let q = sql_prev_code(s, st, x.at)
+            if q >= 0 {
+                let c = s.byte(q)
+                var p = ' '
+                if q > 0 {
+                    p = s.byte(q - 1)
+                }
+                if (c == '>' && p == '<') || (c == '=' && p == '!') {
+                    error_tok(at, "<> NULL is never true in SQL", "IS NOT NULL")
+                    return kind
+                }
+                if c == '=' && p != '<' && p != '>' && p != '!' && p != ':' && p != '=' {
+                    error_tok(at, "= NULL is never true in SQL", "IS NULL")
+                    return kind
+                }
+            }
+        }
+    }
+    // DELETE без WHERE
+    if first == "delete" {
+        var has_where = false
+        for x in ws {
+            if x.depth == 0 && x.w == "where" {
+                has_where = true
+            }
+        }
+        if !has_where {
+            error_tok(at, "DELETE without WHERE changes every row of " + ch_main_table(s), "add WHERE ...; write WHERE true if you mean every row")
+            return kind
+        }
+    }
+    // список со страницами без порядка
+    if shape == SH_LIST {
+        var lim = false
+        var ord = false
+        for i in 0..ws.len() {
+            let x = ws[i]
+            if x.depth == 0 {
+                if x.w == "limit" || x.w == "offset" {
+                    lim = true
+                }
+                if x.w == "order" && i + 1 < ws.len() && ws[i + 1].w == "by" {
+                    ord = true
+                }
+            }
+        }
+        if lim && !ord {
+            error_tok(at, "LIMIT without ORDER BY returns rows in no fixed order: pages repeat or skip rows", "ORDER BY id (or another unique key last)")
+            return kind
+        }
+    }
+    return kind
+}
+
+// Слово на позиции at стоит внутри вызова функции (EXTRACT(DAY FROM t.ts)):
+// ближайшая незакрытая «(» перед ним идёт сразу за именем.
+fn ch_in_call(s: str, st: [int], at: int) -> bool {
+    var depth = 0
+    var i = at - 1
+    while i >= 0 {
+        if st[i] == 0 {
+            let c = s.byte(i)
+            if c == ')' {
+                depth += 1
+            } else if c == '(' {
+                if depth == 0 {
+                    var j = i - 1
+                    while j >= 0 && sql_space(s.byte(j)) {
+                        j -= 1
+                    }
+                    return j >= 0 && is_ident_char(s.byte(j))
+                }
+                depth -= 1
+            }
+        }
+        i -= 1
+    }
+    return false
+}
+
+// Имя после позиции p: база в «база.таблица» или "".
+fn ch_qualified_db(s: str, p0: int) -> str {
+    var p = p0
+    let n = s.byte_len()
+    while p < n && sql_space(s.byte(p)) {
+        p += 1
+    }
+    let b = buf_new(16)
+    if p < n && (s.byte(p) == '`' || s.byte(p) == '"') {
+        let q = s.byte(p)
+        p += 1
+        while p < n && s.byte(p) != q {
+            buf_byte(b, s.byte(p))
+            p += 1
+        }
+        p += 1
+    } else {
+        while p < n && is_ident_char(s.byte(p)) {
+            buf_byte(b, s.byte(p))
+            p += 1
+        }
+    }
+    if b.len == 0 || p >= n || s.byte(p) != '.' {
+        return ""
+    }
+    // база.функция( — табличная функция, не таблица
+    var e = p + 1
+    while e < n && (is_ident_char(s.byte(e)) || s.byte(e) == '`' || s.byte(e) == '"') {
+        e += 1
+    }
+    if e < n && s.byte(e) == '(' {
+        return ""
+    }
+    return buf_str(b)
 }

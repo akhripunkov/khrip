@@ -1,0 +1,7 @@
+// expect: 'Insert' is a type of the database layer; choose another name
+type Insert { id: int }
+type Row { n: int }
+fn main() {
+    let rows: [Row] = ch "SELECT count() AS n FROM events"
+    print(rows.len())
+}

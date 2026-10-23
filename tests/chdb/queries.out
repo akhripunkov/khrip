@@ -1,0 +1,26 @@
+written 48
+[{"url":"/p0","hits":12,"users":5,"p95_ms":418},{"url":"/p1","hits":12,"users":5,"p95_ms":428}]
+[{"url":"/p0","hits":4,"users":4,"p95_ms":342},{"url":"/p1","hits":4,"users":4,"p95_ms":431.99999999999994}]
+[{"day":"2026-10-22","hits":4},{"day":"2026-10-23","hits":24},{"day":"2026-10-24","hits":20}]
+3
+user 1: 10
+true 0
+true 0
+true 0
+true 0
+true 0
+true 0
+12 0 0
+24 0 24
+32 48
+/p0@1792757600,/p0@1792829600,/p1@1792703600
+/p2@1792865600,/p1@1792847600,/p0@1792829600
+{"i":7,"f":2.5,"b":true,"s":"s'\\","e":"Clicked","xs":[3,-1],"m":{"a":1,"it's":2},"o":null,"nested":[["x","y'z"],[]]}
+true
+{"at":"2023-11-14T22:13:20.123Z","day":1792713600,"amount":"12.30","flag":true,"maybe":null,"tags":["a","b"],"kind":"Clicked"}
+0
+null
+after delete: 0
+killed 0
+other: 2
+2026-10-23

@@ -1,0 +1,7 @@
+// expect: values go in place in ch: WHERE id = {id}, not ?
+// expect: every {expression} is sent as a parameter, never as SQL text
+type Row { n: int }
+fn main() {
+    let rows: [Row] = ch "SELECT count() AS n FROM events WHERE id = ?"
+    print(rows.len())
+}

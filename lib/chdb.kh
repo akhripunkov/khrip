@@ -1,0 +1,855 @@
+// ClickHouse в языке: места ch "...", таблицы table t: T и миграции
+// migration ch N, которые собрал компилятор (src/sql.kh parse_ch, src/coll.kh).
+// docs/design/v0.13-drivers.md §2.8, §3.2, §4.7, §4.8, §5.3, §6, §7.3.
+//
+// При запуске (__chdb_start): конфигурация из окружения (CLICKHOUSE_URL, ...),
+// разобранная один раз в постоянную память; для каждого соединения — версия,
+// readonly и пояс сервера, миграции, DESCRIBE таблиц и каждого места ch.
+// Ошибки — все сразу, с местом в исходнике, затем выход с кодом 1.
+//
+// Запрос (__chdb_run): параметры {pN:Тип} — текстом ClickHouse, свой query_id
+// и log_comment «файл:строка:столбец», session_timezone = UTC, у мутаций —
+// mutations_sync = 1; пользователь с readonly=1 настроек не получает. Ответ
+// RowBinaryWithNamesAndTypes сверяется с типом Khrip до разбора. Ошибка —
+// статус, как у sql: плохое значение 400, нет строки 404, база недоступна 503
+// (+ Retry-After), исход записи неизвестен 500, остальное 500.
+
+// Слова места ch (их пишет компилятор, src/sql.kh ch_site)
+const CHS_SQL = 0
+const CHS_NVALS = 8
+const CHS_NPARAMS = 16
+const CHS_PARAMS = 24
+const CHS_SHAPE = 32
+const CHS_DESC = 40
+const CHS_LOC = 48
+const CHS_KIND = 56
+const CHS_CONN = 64
+const CHS_VARIANTS = 72
+const CHS_INDEX = 80
+const CHS_EXPLICIT = 88
+const CHS_TABLE = 96
+// T? — описание всего T? (одно значение или none)
+const CHS_ODESC = 104
+// заполняет запуск: 1 — проверено DESCRIBE, 2 — не проверено (S19)
+const CHS_STATE = 112
+
+// Виды операторов
+const CHK_ROWS = 1
+const CHK_KILL = 2
+const CHK_INSERT_SELECT = 3
+const CHK_MUTATION = 4
+const CHK_STATEMENT = 5
+
+// Соединение: разобранная конфигурация и то, что узнал запуск.
+type __ChdbConn {
+    name: str
+    cfg: ChConfig
+    // getSetting('readonly'): 1 — без настроек вообще (С4)
+    readonly: int = 0
+    tz: str = "UTC"
+    version: str = ""
+    // khc test: временная база (удаляется в конце)
+    test_db: str = ""
+    host: str = ""
+}
+
+// Соединения по номерам компилятора; после запуска только читаются.
+var __chdb_conns: [__ChdbConn] = []
+var __chdb_bad: int = 0
+
+fn __chdb_testing() -> bool {
+    return load64(__ctx() + CTX_WORKER) != 0 && __w().testing
+}
+
+// ---- Конфигурация ----
+
+// %XX в имени пользователя и пароле адреса.
+fn __chdb_unpct(s: str) -> str {
+    if s.byte_find("%") == none {
+        return s
+    }
+    let b = buf_new(s.byte_len())
+    var i = 0
+    while i < s.byte_len() {
+        let c = s.byte(i)
+        if c == '%' && i + 2 < s.byte_len() && __hex_val(s.byte(i + 1)) >= 0 && __hex_val(s.byte(i + 2)) >= 0 {
+            buf_byte(b, __hex_val(s.byte(i + 1)) * 16 + __hex_val(s.byte(i + 2)))
+            i += 3
+            continue
+        }
+        buf_byte(b, c)
+        i += 1
+    }
+    return buf_str(b)
+}
+
+// http(s)://user:password@host:8123/database → ChConfig (без пути — default);
+// none — не адрес ClickHouse (why — почему).
+fn __chdb_parse_url(raw: str, why: Buf) -> ChConfig? {
+    var rest = raw
+    var scheme = ""
+    if rest.starts_with("http://") {
+        scheme = "http://"
+    } else if rest.starts_with("https://") {
+        scheme = "https://"
+    } else {
+        buf_add(why, "not an http:// or https:// URL")
+        return none
+    }
+    rest = rest.byte_slice(scheme.byte_len(), rest.byte_len())
+    let q = rest.byte_find("?") ?? -1
+    if q >= 0 {
+        rest = rest.byte_slice(0, q)
+    }
+    var user = "default"
+    var password = ""
+    let at = rest.byte_find("@") ?? -1
+    if at >= 0 {
+        let cred = rest.byte_slice(0, at)
+        rest = rest.byte_slice(at + 1, rest.byte_len())
+        let colon = cred.byte_find(":") ?? -1
+        if colon >= 0 {
+            user = __chdb_unpct(cred.byte_slice(0, colon))
+            password = __chdb_unpct(cred.byte_slice(colon + 1, cred.byte_len()))
+        } else {
+            user = __chdb_unpct(cred)
+        }
+    }
+    var database = "default"
+    let slash = rest.byte_find("/") ?? -1
+    var host = rest
+    if slash >= 0 {
+        host = rest.byte_slice(0, slash)
+        let path = rest.byte_slice(slash + 1, rest.byte_len())
+        if path.byte_len() > 0 {
+            database = path
+        }
+    }
+    if host.byte_len() == 0 {
+        buf_add(why, "has no host")
+        return none
+    }
+    if !__ch_identifier(database) {
+        buf_add(why, "names database '" + database + "', which is not a plain name")
+        return none
+    }
+    let timeout = __env_int("CLICKHOUSE_TIMEOUT", __env_int("DATABASE_TIMEOUT", 10000)).max(1).min(3600000)
+    let max = __env_int("CLICKHOUSE_MAX_RESULT", 67108864).max(1024).min(134217728)
+    let inflight = __env_int("CLICKHOUSE_INFLIGHT", 32).max(1).min(128)
+    let c = ChConfig { url: scheme + host + "/", database, user, password, timeout_ms: timeout, max_response_bytes: max, max_request_bytes: 134217728, max_inflight: inflight }
+    let err = __ch_config_error(c)
+    if err.byte_len() > 0 {
+        buf_add(why, err)
+        return none
+    }
+    return c
+}
+
+// Адрес соединения для сообщений: host:port.
+fn __chdb_host(c: ChConfig) -> str {
+    if let u = __parse_url(c.url) {
+        return u.host + ":" + u.port.to_str()
+    }
+    return c.url
+}
+
+// ---- Корень компилятора ----
+
+fn __chdb_sites() -> [int] {
+    var out: [int] = []
+    let st = load64(__chdb_root())
+    if st != 0 {
+        for i in 0..load64(st) {
+            out.push(load64(st + 8 + 8 * i))
+        }
+    }
+    return out
+}
+
+// ---- Запуск ----
+
+fn __chdb_start() {
+    // всё, что строит запуск (соединения, планы), живёт до конца процесса:
+    // свежий кусок mmap, а не арена запроса
+    let cx = __ctx()
+    let sp = load64(cx + CTX_PTR)
+    let se = load64(cx + CTX_END)
+    store64(cx + CTX_PTR, 0)
+    store64(cx + CTX_END, 0)
+    __chdb_start_here()
+    store64(cx + CTX_PTR, sp)
+    store64(cx + CTX_END, se)
+}
+
+// Что пользуется соединением ci (для сообщения «не задан адрес»).
+fn __chdb_users(ci: int) -> str {
+    var queries = 0
+    for site in __chdb_sites() {
+        if load64(site + CHS_CONN) == ci {
+            queries += 1
+        }
+    }
+    var parts: [str] = []
+    for t in __chdb_table_names(ci) {
+        parts.push("table " + t)
+    }
+    if queries == 1 {
+        parts.push("1 ch query")
+    } else if queries > 1 {
+        parts.push(queries.to_str() + " ch queries")
+    }
+    if __chdb_migrations(ci).len() > 0 {
+        parts.push("migrations")
+    }
+    return parts.join(", ")
+}
+
+// Конфигурация соединения ci: none — ошибка уже напечатана.
+fn __chdb_config(ci: int, ct: int) -> ChConfig? {
+    let name: str = __cast(load64(ct + 8 + 32 * ci))
+    let addr = load64(ct + 16 + 32 * ci)
+    let expr: str = __cast(load64(ct + 24 + 32 * ci))
+    let testing = __chdb_testing()
+    var raw = ""
+    var source = "CLICKHOUSE_URL"
+    if testing {
+        raw = env("KHRIP_TEST_CLICKHOUSE_URL") ?? ""
+        source = "KHRIP_TEST_CLICKHOUSE_URL"
+        if raw.byte_len() == 0 {
+            raw = env("CLICKHOUSE_URL") ?? ""
+            source = "CLICKHOUSE_URL"
+        }
+        if raw.byte_len() == 0 {
+            eprint("khrip: tests use ClickHouse: set KHRIP_TEST_CLICKHOUSE_URL=http://user:password@host:8123/test (khc test works in its own temporary database and drops it)")
+            return none
+        }
+    } else if addr == 0 {
+        raw = env("CLICKHOUSE_URL") ?? ""
+        if raw.byte_len() == 0 {
+            eprint("khrip: CLICKHOUSE_URL is not set (" + __chdb_users(ci) + "): http://user:password@host:8123/database")
+            return none
+        }
+    } else {
+        let v: str? = __cast(load64(addr))
+        let s = v else {
+            let loc: str = __cast(load64(ct + 32 + 32 * ci))
+            eprint(loc + ": error: clickhouse " + name + " = " + expr + " is none: the connection needs a URL")
+            return none
+        }
+        raw = s
+        source = "clickhouse " + name
+    }
+    let why = buf_new(32)
+    let c = __chdb_parse_url(raw, why) else {
+        eprint("khrip: " + source + " " + buf_str(why) + " (http://user:password@host:8123/database)")
+        return none
+    }
+    // CLICKHOUSE_USER / CLICKHOUSE_PASSWORD — секреты отдельно от адреса
+    if addr == 0 || testing {
+        var prefix = "CLICKHOUSE_"
+        if testing && source == "KHRIP_TEST_CLICKHOUSE_URL" {
+            prefix = "KHRIP_TEST_CLICKHOUSE_"
+        }
+        if let u = env(prefix + "USER") {
+            c.user = u
+        }
+        if let p = env(prefix + "PASSWORD") {
+            c.password = p
+        }
+    }
+    return c
+}
+
+type __ChdbProbe {
+    version: str
+    ro: int
+    tz: str
+}
+
+fn __chdb_start_here() {
+    let root = __chdb_root()
+    let ct = load64(root + 8)
+    if ct == 0 {
+        return
+    }
+    let n = load64(ct)
+    var conns: [__ChdbConn] = []
+    var bad = 0
+    for ci in 0..n {
+        let name: str = __cast(load64(ct + 8 + 32 * ci))
+        // соединение, которым никто не пользуется, не нужно настраивать
+        if ci > 0 && __chdb_users(ci).byte_len() == 0 {
+            conns.push(__ChdbConn { name, cfg: ChConfig { url: "" } })
+            continue
+        }
+        if ci == 0 && __chdb_users(0).byte_len() == 0 {
+            conns.push(__ChdbConn { name, cfg: ChConfig { url: "" } })
+            continue
+        }
+        let cfg = __chdb_config(ci, ct) else {
+            bad += 1
+            conns.push(__ChdbConn { name, cfg: ChConfig { url: "" } })
+            continue
+        }
+        conns.push(__ChdbConn { name, cfg, host: __chdb_host(cfg) })
+    }
+    if bad > 0 {
+        exit(1)
+    }
+    __chdb_conns = conns
+    for ci in 0..n {
+        let conn = conns[ci]
+        if conn.cfg.url.byte_len() == 0 {
+            continue
+        }
+        if !__chdb_connect(ci) {
+            bad += 1
+        }
+    }
+    if bad > 0 {
+        exit(1)
+    }
+    __chdb_bad = 0
+    __chdb_check_all()
+    if __chdb_bad > 0 {
+        eprint("khrip: " + __chdb_bad.to_str() + " ClickHouse declaration(s) or ch statement(s) do not match the server")
+        exit(1)
+    }
+}
+
+// Первый запрос к соединению: версия, readonly и пояс сервера (повтор сетевых
+// ошибок до 60 с — база может ещё подниматься). khc test — временная база.
+fn __chdb_connect(ci: int) -> bool {
+    let conn = __chdb_conns[ci]
+    let cfg = ChConfig { ...conn.cfg, server_timeout: false }
+    let until = now_ms() + 60000
+    var said = false
+    var r = ChResult {}
+    while true {
+        r = __ch_run(cfg, "SELECT version() AS version, toInt64(getSetting('readonly')) AS ro, serverTimezone() AS tz", "", {}, false, false, now_ms() + 10000, __ChCall {})
+        if r.ok || r.status != 0 || now_ms() >= until {
+            break
+        }
+        if !said {
+            eprint("khrip: waiting for ClickHouse at " + conn.host + " (" + r.error + ")")
+            said = true
+        }
+        sleep(500)
+    }
+    if !r.ok {
+        if r.code == 516 || r.code == 192 || r.status == 401 || r.status == 403 {
+            eprint("khrip: ClickHouse at " + conn.host + ": authentication failed for user " + cfg.user)
+        } else {
+            eprint("khrip: cannot connect to ClickHouse at " + conn.host + ": " + __chdb_first_line(r.error))
+        }
+        return false
+    }
+    let got = __ch_tdecode(r.body, __chdb_probe_desc())
+    if got.error.byte_len() > 0 || got.count != 1 {
+        eprint("khrip: ClickHouse at " + conn.host + " answered an unexpected probe: " + got.error)
+        return false
+    }
+    let p: __ChdbProbe = __cast(__lget(got.rows, 0))
+    conn.version = p.version
+    conn.readonly = p.ro
+    conn.tz = p.tz
+    if p.ro == 1 {
+        // С4: пользователь с readonly=1 не меняет настроек (max_execution_time тоже)
+        conn.cfg = ChConfig { ...conn.cfg, server_timeout: false }
+    }
+    // S20: пишет ли программа через это соединение
+    if p.ro >= 1 {
+        let writes = __chdb_writes(ci)
+        if writes.byte_len() > 0 {
+            eprint("khrip: ClickHouse user " + conn.cfg.user + " is read-only, but the program writes (" + writes + ")")
+            return false
+        }
+    }
+    if p.ro == 1 && p.tz != "UTC" && p.tz != "Etc/UTC" {
+        eprint("khrip: note: ClickHouse at " + conn.host + " uses the time zone " + p.tz + ", and the read-only user cannot set session_timezone: toDate() and toStartOfDay() count days in " + p.tz)
+    }
+    if __chdb_testing() {
+        let db = "khrip_test_" + syscall(39).to_str() + "_" + random_str(6).ascii_lower()
+        let made = __ch_run(cfg, "CREATE DATABASE " + db, "", {}, false, false, now_ms() + 30000, __ChCall {})
+        if !made.ok {
+            eprint("khrip: cannot create the test database on ClickHouse at " + conn.host + ": " + __chdb_first_line(made.error))
+            return false
+        }
+        conn.test_db = db
+        conn.cfg = ChConfig { ...conn.cfg, database: db }
+    }
+    return true
+}
+
+// Места записи через соединение ci (S20): ch-операторы без строк, вставки, миграции.
+fn __chdb_writes(ci: int) -> str {
+    for site in __chdb_sites() {
+        let kind = load64(site + CHS_KIND)
+        if load64(site + CHS_CONN) == ci && kind != CHK_ROWS && kind != CHK_KILL {
+            let loc: str = __cast(load64(site + CHS_LOC))
+            return loc
+        }
+    }
+    let ins = __chdb_insert_locs(ci)
+    if ins.byte_len() > 0 {
+        return ins
+    }
+    if __chdb_migrations(ci).len() > 0 {
+        return "migration ch"
+    }
+    return ""
+}
+
+// Описание __ChdbProbe (version: str, ro: int, tz: str) — без компилятора.
+var __chdb_probe_d: int = 0
+
+fn __chdb_probe_desc() -> int {
+    if __chdb_probe_d != 0 {
+        return __chdb_probe_d
+    }
+    let ds = __alloc(8)
+    store64(ds, D_STR)
+    let di = __alloc(8)
+    store64(di, D_INT)
+    let names = ["version", "ro", "tz"]
+    let descs = [ds, di, ds]
+    let d = __alloc(32 + 3 * 40)
+    store64(d, D_STRUCT)
+    store64(d + 8, 3)
+    store64(d + 16, __cast("__ChdbProbe"))
+    store64(d + 24, -1)
+    for i in 0..3 {
+        let f = d + 32 + i * 40
+        store64(f, __cast(names[i]))
+        store64(f + 8, __cast("\"" + names[i] + "\":"))
+        store64(f + 16, descs[i])
+        store64(f + 24, 0)
+        store64(f + 32, 0)
+    }
+    __chdb_probe_d = d
+    return d
+}
+
+// Конец khc test: удалить временные базы.
+fn __chdb_test_done() {
+    for conn in __chdb_conns {
+        if conn.test_db.byte_len() > 0 {
+            let db = conn.test_db
+            conn.test_db = ""
+            __ch_run(ChConfig { ...conn.cfg, database: "default" }, "DROP DATABASE IF EXISTS " + db + " SYNC", "", {}, false, false, now_ms() + 30000, __ChCall {})
+        }
+    }
+}
+
+// ---- Выполнение ----
+
+// Первая строка сообщения ClickHouse без «Code: N. DB::Exception: », без
+// «(ИМЯ) (version ...)» и без текста запроса.
+fn __chdb_first_line(msg: str) -> str {
+    var s = msg.ascii_trim()
+    let nl = s.byte_find("\n") ?? -1
+    if nl >= 0 {
+        s = s.byte_slice(0, nl)
+    }
+    let ex = s.byte_find("DB::Exception: ") ?? -1
+    if ex >= 0 {
+        s = s.byte_slice(ex + 15, s.byte_len())
+    }
+    for cut in [" (version ", ": while executing", ". (", " In scope ", ": In scope "] {
+        let at = s.byte_find(cut) ?? -1
+        if at > 0 {
+            s = s.byte_slice(0, at)
+        }
+    }
+    return s.ascii_trim()
+}
+
+// Имя исключения: последнее «(ИМЯ)» перед «(version».
+fn __chdb_code_name(msg: str) -> str {
+    let v = msg.byte_find(" (version") ?? msg.byte_len()
+    var e = v
+    while e > 0 && msg.byte(e - 1) == ' ' {
+        e -= 1
+    }
+    if e < 2 || msg.byte(e - 1) != ')' {
+        return ""
+    }
+    var s = e - 2
+    while s > 0 && msg.byte(s) != '(' {
+        s -= 1
+    }
+    let name = msg.byte_slice(s + 1, e - 1)
+    if __ch_identifier(name) {
+        return name
+    }
+    return ""
+}
+
+// Ошибка ClickHouse → статус и тело ответа (§5.3). reads — оператор только
+// читает: потерянный ответ — 503, а у записи — «исход неизвестен».
+fn __chdb_classify(r: ChResult, reads: bool) -> __DbFail {
+    if r.status == 0 || (r.unknown_outcome && r.status < 400) {
+        if r.unknown_outcome && !reads {
+            return __DbFail { status: 500, msg: "write outcome unknown" }
+        }
+        if r.error.contains("max_response_bytes") || r.error.contains("512 MiB") {
+            return __DbFail { status: 500, msg: "internal error" }
+        }
+        return __DbFail { status: 503, msg: "database unavailable, try again" }
+    }
+    let code = r.code
+    if code == 6 || code == 27 || code == 38 || code == 41 || code == 53 || code == 69 || code == 70 || code == 72 || code == 321 || code == 376 || code == 395 || code == 440 || code == 457 || code == 691 {
+        return __DbFail { status: 400, msg: "bad value: " + __chdb_first_line(r.error) }
+    }
+    if code == 319 {
+        return __DbFail { status: 500, msg: "write outcome unknown" }
+    }
+    if code == 159 || code == 160 || code == 201 || code == 202 || code == 203 || code == 209 || code == 210 || code == 241 || code == 242 || code == 252 || code == 285 || code == 394 || code == 425 || code == 439 || code == 999 || code == 516 {
+        return __DbFail { status: 503, msg: "database unavailable, try again" }
+    }
+    if code == 0 && r.status >= 500 {
+        return __DbFail { status: 503, msg: "database unavailable, try again" }
+    }
+    return __DbFail { status: 500, msg: "internal error" }
+}
+
+// Строка журнала для ошибок 5xx: место, код, имя, сообщение, query_id.
+fn __chdb_log(loc: str, f: __DbFail, r: ChResult, extra: str) {
+    if f.status < 500 {
+        return
+    }
+    var what = "[" + r.code.to_str() + "]"
+    let name = __chdb_code_name(r.error)
+    if name.byte_len() > 0 {
+        what += " " + name
+    }
+    var msg = __chdb_first_line(r.error)
+    if r.code == 516 {
+        msg = "authentication failed after start (credentials rotated?): " + msg
+    }
+    eprint(loc + ": clickhouse failed " + what + " " + msg + extra + " (query_id " + r.query_id + ")")
+}
+
+// Явная форма: DbResult вместо завершения запроса.
+fn __chdb_result(f: __DbFail, r: ChResult) -> DbResult {
+    return DbResult { ok: false, status: f.status, code: r.code, error: f.msg, unknown_outcome: f.msg == "write outcome unknown" }
+}
+
+// ORDER BY {o}: место, текст которого собран с этой строкой o.
+fn __chdb_variant(site: int, vt: int, vals: int) -> int {
+    let nv = load64(site + CHS_NVALS)
+    let o: str = __cast(load64(vals + (nv - 1 - load64(vt)) * 8))
+    let k = load64(vt + 8)
+    for j in 0..k {
+        let s: str = __cast(load64(vt + 16 + j * 16))
+        if s == o {
+            return load64(vt + 24 + j * 16)
+        }
+    }
+    let loc: str = __cast(load64(site + CHS_LOC))
+    __panic_msg(loc + ": ORDER BY got \"" + o + "\", which is none of the strings the compiler saw")
+    return site
+}
+
+// Текст значения параметра. quoted — внутри массива или словаря: строки в
+// '...' с \\-экранированием, NULL — словом; иначе — формат escaped (TSV), \N — NULL.
+fn __chdb_ptext(b: Buf, v: int, d: int, quoted: bool) {
+    let k = load64(d)
+    if k == D_OPT {
+        if v == 0 {
+            if quoted {
+                buf_add(b, "NULL")
+            } else {
+                buf_add(b, "\\N")
+            }
+            return
+        }
+        let inner = load64(d + 8)
+        if __is_scalar(inner) {
+            __chdb_ptext(b, load64(v), inner, quoted)
+        } else {
+            __chdb_ptext(b, v, inner, quoted)
+        }
+        return
+    }
+    if k == D_INT {
+        buf_add(b, v.to_str())
+        return
+    }
+    if k == D_FLOAT {
+        let f: float = __cast(v)
+        let t = f.to_str()
+        if t == "NaN" {
+            buf_add(b, "nan")
+        } else if t == "Infinity" {
+            buf_add(b, "inf")
+        } else if t == "-Infinity" {
+            buf_add(b, "-inf")
+        } else {
+            buf_add(b, t)
+        }
+        return
+    }
+    if k == D_BOOL {
+        if v != 0 {
+            buf_add(b, "true")
+        } else {
+            buf_add(b, "false")
+        }
+        return
+    }
+    if k == D_LIST {
+        let ed = load64(d + 8)
+        buf_byte(b, '[')
+        for i in 0..load64(v + 8) {
+            if i > 0 {
+                buf_byte(b, ',')
+            }
+            __chdb_ptext(b, __lget(v, i), ed, true)
+        }
+        buf_byte(b, ']')
+        return
+    }
+    if k == D_MAP {
+        let keys: [int] = __cast(__map_keys(v))
+        let values: [int] = __cast(__map_values(v, 8))
+        buf_byte(b, '\{')
+        for i in 0..keys.len() {
+            if i > 0 {
+                buf_byte(b, ',')
+            }
+            __chdb_ptext(b, keys[i], load64(d + 8), true)
+            buf_byte(b, ':')
+            __chdb_ptext(b, values[i], load64(d + 16), true)
+        }
+        buf_byte(b, '}')
+        return
+    }
+    var s = ""
+    if k == D_STR {
+        s = __cast(v)
+    } else if __ch_desc_enum(d) {
+        s = __ch_enum_label(d, v)
+    }
+    if quoted {
+        buf_byte(b, '\'')
+        for i in 0..s.byte_len() {
+            let c = s.byte(i)
+            if c == '\\' || c == '\'' {
+                buf_byte(b, '\\')
+                buf_byte(b, c)
+            } else if c == 0 {
+                buf_add(b, "\\0")
+            } else {
+                buf_byte(b, c)
+            }
+        }
+        buf_byte(b, '\'')
+        return
+    }
+    buf_add(b, __ch_param(s))
+}
+
+// Текст значения для '...{x}...' (String): числа и bool — текстом, перечисление
+// — меткой; like — \, % и _ значения экранированы для LIKE.
+fn __chdb_text_param(v: int, d: int, like: bool) -> str {
+    var dd = d
+    var x = v
+    if load64(d) == D_OPT {
+        if v == 0 {
+            return "\\N"
+        }
+        dd = load64(d + 8)
+        if __is_scalar(dd) {
+            x = load64(v)
+        }
+    }
+    let b = buf_new(32)
+    let k = load64(dd)
+    var s = ""
+    if k == D_STR {
+        s = __cast(x)
+    } else if __ch_desc_enum(dd) {
+        s = __ch_enum_label(dd, x)
+    } else {
+        __chdb_ptext(b, x, dd, false)
+        s = buf_str(b)
+    }
+    if like {
+        s = s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    }
+    return __ch_param(s)
+}
+
+// Параметры места: p1 … pN — текстом ClickHouse.
+fn __chdb_params(site: int, vals: int) -> map[str, str] {
+    let nv = load64(site + CHS_NVALS)
+    let np = load64(site + CHS_NPARAMS)
+    let pt = load64(site + CHS_PARAMS)
+    var out: map[str, str] = {}
+    for i in 0..np {
+        let kind = load64(pt + i * 32)
+        let d = load64(pt + i * 32 + 8)
+        let v = load64(vals + (nv - 1 - load64(pt + i * 32 + 16)) * 8)
+        let name = "p" + (i + 1).to_str()
+        if kind == PK_LIKE || kind == PK_TEXT {
+            out[name] = __chdb_text_param(v, d, kind == PK_LIKE)
+        } else {
+            let b = buf_new(32)
+            __chdb_ptext(b, v, d, false)
+            out[name] = buf_str(b)
+        }
+    }
+    return out
+}
+
+// query_id для одного вызова: khrip-<16 шестнадцатеричных цифр>.
+fn __chdb_query_id() -> str {
+    let raw = __alloc(8)
+    __random_bytes(raw, 8)
+    let hex = "0123456789abcdef"
+    let b = buf_new(22)
+    buf_add(b, "khrip-")
+    for i in 0..8 {
+        let c = load8(raw + i)
+        buf_byte(b, hex.byte(c >> 4))
+        buf_byte(b, hex.byte(c & 15))
+    }
+    return buf_str(b)
+}
+
+// Настройки вызова: log_comment — место в исходнике, session_timezone = UTC,
+// у мутаций mutations_sync = 1. Пользователю с readonly=1 — ничего.
+fn __chdb_opts(conn: __ChdbConn, loc: str, mutation: bool) -> __ChCall {
+    let opts = __ChCall { query_id: __chdb_query_id(), raw: true }
+    if conn.readonly != 1 {
+        opts.settings["log_comment"] = loc
+        opts.settings["session_timezone"] = "UTC"
+        if mutation {
+            opts.settings["mutations_sync"] = "1"
+        }
+    }
+    return opts
+}
+
+// Строк в ответе RowBinaryWithNamesAndTypes (KILL QUERY в int).
+fn __chdb_count_rows(body: str) -> int {
+    let r = __ChReader { p: __str_ptr(body), end: __str_ptr(body) + body.byte_len() }
+    let count = __ch_read_varint(r)
+    if r.error.byte_len() > 0 || count <= 0 || count > 1024 {
+        return 0
+    }
+    for i in 0..count {
+        __ch_read_str(r)
+    }
+    var types: [__ChType] = []
+    for i in 0..count {
+        types.push(__ch_type_of(__ch_read_str(r)) ?? __ChType { op: CHT_OTHER })
+    }
+    var rows = 0
+    while r.p < r.end && r.error.byte_len() == 0 {
+        for t in types {
+            __ch_skip(r, t, 0)
+        }
+        rows += 1
+    }
+    return rows
+}
+
+// Выполнить место ch: значения параметров на стеке, результат — слово Khrip.
+fn __chdb_run(site0: int, vals: int) -> int {
+    var site = site0
+    let vt = load64(site0 + CHS_VARIANTS)
+    if vt != 0 {
+        site = __chdb_variant(site0, vt, vals)
+    }
+    let conn = __chdb_conns[load64(site + CHS_CONN)]
+    let cfg = conn.cfg
+    let loc: str = __cast(load64(site + CHS_LOC))
+    let kind = load64(site + CHS_KIND)
+    let reads = kind == CHK_ROWS || kind == CHK_KILL
+    let explicit = load64(site + CHS_EXPLICIT) != 0
+    let deadline = now_ms() + cfg.timeout_ms
+    let params = __chdb_params(site, vals)
+    let sql: str = __cast(load64(site + CHS_SQL))
+    let opts = __chdb_opts(conn, loc, kind == CHK_MUTATION)
+    let r = __ch_run(cfg, sql, "", params, false, false, deadline, opts)
+    if !r.ok {
+        var extra = ""
+        if reads && r.status == 0 && now_ms() >= deadline {
+            // срок клиента вышел: сервер не должен считать дальше (Н12)
+            __ch_kill_async(cfg, opts.query_id)
+            extra = " (client deadline; KILL QUERY sent)"
+        }
+        let f = __chdb_classify(r, reads)
+        __chdb_log(loc, f, r, extra)
+        if explicit {
+            return __cast(__chdb_result(f, r))
+        }
+        __db_answer(f, loc + ": clickhouse failed [" + r.code.to_str() + "] " + __chdb_first_line(r.error))
+        return 0
+    }
+    if !reads {
+        let n = r.written_rows.max(0)
+        if explicit {
+            return __cast(DbResult { ok: true, count: n })
+        }
+        return n
+    }
+    let shape = load64(site + CHS_SHAPE)
+    if kind == CHK_KILL && shape == SH_COUNT {
+        return __chdb_count_rows(r.body)
+    }
+    var d = load64(site + CHS_DESC)
+    let odesc = load64(site + CHS_ODESC)
+    if shape == SH_OPT && odesc != 0 && __is_scalar(d) {
+        // T? из одного столбца: и «нет строки», и NULL — none
+        d = odesc
+    }
+    let got = __ch_tdecode(r.body, d)
+    if got.error.byte_len() > 0 {
+        eprint(loc + ": clickhouse result does not fit the type: " + got.error + " (query_id " + r.query_id + ")")
+        __db_answer(__DbFail { status: 500, msg: "internal error" }, loc + ": clickhouse result does not fit the type: " + got.error)
+        return 0
+    }
+    if shape == SH_LIST {
+        return got.rows
+    }
+    if got.count > 1 {
+        __panic_msg(loc + ": the query returned " + got.count.to_str() + " rows, but one is expected: filter by a unique key, add LIMIT 1 with ORDER BY, or use a list [T]")
+    }
+    if got.count == 0 {
+        if shape == SH_OPT {
+            return 0
+        }
+        // T без строки: 404, как fail(404)
+        if load64(__ctx() + CTX_WORKER) != 0 && __w().cur != 0 {
+            fail(404, "not found")
+        }
+        __panic_msg(loc + ": the query returned no row")
+    }
+    let v = __lget(got.rows, 0)
+    if shape == SH_OPT && __is_scalar(load64(site + CHS_DESC)) && d == load64(site + CHS_DESC) {
+        let b = __alloc(8)
+        store64(b, v)
+        return b
+    }
+    return v
+}
+
+// ---- Таблицы, вставки и миграции (шаг 2) ----
+
+fn __chdb_table_names(ci: int) -> [str] {
+    return []
+}
+
+fn __chdb_migrations(ci: int) -> [int] {
+    return []
+}
+
+fn __chdb_insert_locs(ci: int) -> str {
+    return ""
+}
+
+fn __chdb_check_all() {
+}

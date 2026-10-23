@@ -1,0 +1,5 @@
+// expect: SET in ch has no effect on later queries
+// expect: put SETTINGS x = 1 at the end of the query
+fn main() {
+    ch "SET max_threads = 1"
+}

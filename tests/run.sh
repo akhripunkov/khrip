@@ -243,7 +243,7 @@ fi
 # что пропущено (настоящие серверы, контейнер с TLS), видно по строкам SKIP.
 # Общий сценарий обоих драйверов в одном сервере (tests/databases/runtime.sh)
 # — когда заданы оба адреса.
-for driver in mongo clickhouse databases/runtime; do
+for driver in mongo clickhouse databases/runtime chdb; do
 	if ! command -v python3 >/dev/null; then
 		echo "SKIP $driver: нет python3 для mock-серверов"
 		continue

@@ -257,10 +257,11 @@ fn main() -> int {
         fi += 1
     }
     uses_db = scan_uses_db()
+    uses_ch = scan_uses_ch()
     load_migration_files(inputs[0])
     // библиотека API — только программам с route, test, store, JSON или базой;
     // библиотеки драйверов — только тем, кто пользуется их именами
-    let base_api = test_mode || uses_api() || uses_db
+    let base_api = test_mode || uses_api() || uses_db || uses_ch
     let drivers = driver_libs(lib, base_api, all_lib)
     if drv_clash.keys.len() > 0 {
         // библиотека драйвера разбиралась бы с чужими типами: только эти ошибки
@@ -335,6 +336,7 @@ fn main() -> int {
         w += 1
     }
     sql_finish()
+    ch_finish()
     resolve_fixups()
     if diags.len() > 0 {
         print_diags()

@@ -112,6 +112,11 @@ type SqlLit {
     // строка и столбец начала каждого куска — для ошибок внутри запроса
     lines: [int]
     cols: [int]
+    // ch "...": диалект ClickHouse (src/sql.kh parse_ch); conn — имя
+    // соединения из ch ИМЯ "..." ("" — CLICKHOUSE_URL), conn_col — его столбец
+    ch: bool
+    conn: str
+    conn_col: int
 }
 
 var sqllits: [SqlLit]
@@ -662,33 +667,84 @@ fn sql_string_next(end: int) -> bool {
     return q < end && (lx_text.byte(q) == '"' || lx_text.byte(q) == '`')
 }
 
+// После слова ch — "..." или `...`, или имя соединения и затем строка (на
+// той же строке)? Иначе ch — обычное имя (let ch = s[i]).
+fn ch_string_next(end: int) -> bool {
+    var q = lx_p
+    while q < end && lx_text.byte(q) == ' ' {
+        q += 1
+    }
+    if q < end && (lx_text.byte(q) == '"' || lx_text.byte(q) == '`') {
+        return true
+    }
+    if q >= end || !is_alpha(lx_text.byte(q)) {
+        return false
+    }
+    let w = q
+    while q < end && is_ident_char(lx_text.byte(q)) {
+        q += 1
+    }
+    if keyword_kind(lx_text.byte_slice(w, q)) != T_IDENT {
+        return false
+    }
+    while q < end && lx_text.byte(q) == ' ' {
+        q += 1
+    }
+    return q < end && (lx_text.byte(q) == '"' || lx_text.byte(q) == '`')
+}
+
 // sql "..." или sql `...`: обычный SQL, строка может занимать несколько строк;
 // {выражение} — параметр запроса. Внутри комментариев и "имён" SQL скобки — текст;
 // {}, {3}, {1,2} — тоже текст (пустой массив, квантификатор). В "..." действуют
 // экранирования Khrip, в `...` — только \{.
-fn lex_sql(start: int, end: int) {
+//
+// ch "..." (dialect_ch) — то же для ClickHouse: '...' с экранированием \' и
+// \\ (и ''), "имя" и `имя`, комментарии --, # и /* */, $тег$...$тег$ и
+// $$...$$; {имя:Тип} — привычка ClickHouse, ошибка с исправлением {имя}.
+fn lex_sql(start: int, end: int, dialect_ch: bool) {
     let tok_line = lx_line
     let tok_col = start - lx_line_start + 1
     while lx_text.byte(lx_p) == ' ' {
         lx_p += 1
     }
+    // ch ИМЯ "...": соединение
+    var conn = ""
+    var conn_col = 0
+    if dialect_ch && is_alpha(lx_text.byte(lx_p)) {
+        let w = lx_p
+        while is_ident_char(lx_text.byte(lx_p)) {
+            lx_p += 1
+        }
+        conn = lx_text.byte_slice(w, lx_p)
+        conn_col = w - lx_line_start + 1
+        while lx_text.byte(lx_p) == ' ' {
+            lx_p += 1
+        }
+    }
     let close_ch = lx_text.byte(lx_p)
     let raw = close_ch == '`'
     let open = lx_p
     lx_p += 1
-    let lit = SqlLit { segs: [], quoted: [], lines: [lx_line], cols: [lx_p - lx_line_start + 1] }
+    let lit = SqlLit { segs: [], quoted: [], lines: [lx_line], cols: [lx_p - lx_line_start + 1], ch: dialect_ch, conn: conn, conn_col: conn_col }
     let b = buf_new(64)
     // состояние SQL: 0 — код, 1 — '...', 2 — "имя", 3 — -- комментарий, 4 — /* */,
-    // 5 — E'...' (с \-экранированием), 6 — $тег$...$тег$; параметры — только в 0 и 1
+    // 5 — E'...' (с \-экранированием), 6 — $тег$...$тег$, 7 — `имя` (ClickHouse);
+    // параметры — только в 0 и 1
     var st = 0
     var dtag = ""
+    // ClickHouse: предыдущий символ строки '...' — обратная косая черта
+    var esc = false
+    var word = "sql"
+    if dialect_ch {
+        word = "ch"
+    }
     // номер занят сразу: в параметре может встретиться свой sql "..."
     let li = sqllits.len()
     sqllits.push(lit)
-    toks.push(Token { kind: T_SQL, val: li, text: "sql", line: tok_line, col: tok_col, file: lx_file })
+    toks.push(Token { kind: T_SQL, val: li, text: word, line: tok_line, col: tok_col, file: lx_file })
     while true {
         if lx_p >= end {
-            lex_error("unterminated sql string: close it with " + lx_text.byte_slice(open, open + 1), open)
+            lex_error("unterminated " + word + " string: close it with " + lx_text.byte_slice(open, open + 1), open)
             break
         }
         let c = lx_text.byte(lx_p)
@@ -712,6 +768,20 @@ fn lex_sql(start: int, end: int) {
                 lex_error("\{...} inside E'...' or $$...$$ is plain text, not a parameter", lx_p)
             }
         }
+        if c == '\{' && (st == 0 || st == 1) && dialect_ch {
+            // {from:Int64} — заполнитель ClickHouse: тип даёт значение Khrip
+            let close = interp_end(lx_p + 1, end)
+            if close > 0 && is_typed_param(lx_p + 1, close) {
+                let inside = lx_text.byte_slice(lx_p + 1, close)
+                let colon = inside.byte_find(":") ?? 0
+                lex_error_hint("\{" + inside + "} is ClickHouse's placeholder; in ch \"...\" write \{" + inside.byte_slice(0, colon).ascii_trim() + "}", "the type comes from the Khrip value: int is sent as Int64", lx_p)
+                while lx_p <= close {
+                    buf_byte(b, lx_text.byte(lx_p))
+                    lx_p += 1
+                }
+                continue
+            }
+        }
         if c == '\{' && (st == 0 || st == 1) {
             let close = interp_end(lx_p + 1, end)
             if close == lx_p + 1 || (close > 0 && is_quantifier(lx_p + 1, close)) || (close > 0 && st == 1 && sql_array_literal(lx_p + 1, close)) {
@@ -723,7 +793,7 @@ fn lex_sql(start: int, end: int) {
                 continue
             }
             if close < 0 {
-                lex_error("unclosed \{ in sql string; write \\\{ for a literal brace", lx_p)
+                lex_error("unclosed \{ in " + word + " string; write \\\{ for a literal brace", lx_p)
                 buf_byte(b, c)
                 lx_p += 1
                 continue
@@ -758,9 +828,13 @@ fn lex_sql(start: int, end: int) {
             if ch == '\'' {
                 st = 1
                 // E'...': обратная косая черта экранирует кавычку
-                if prev > 0 && (load8(b.data + prev - 1) == 'e' || load8(b.data + prev - 1) == 'E') && (prev == 1 || !is_ident_char(load8(b.data + prev - 2))) {
+                if !dialect_ch && prev > 0 && (load8(b.data + prev - 1) == 'e' || load8(b.data + prev - 1) == 'E') && (prev == 1 || !is_ident_char(load8(b.data + prev - 2))) {
                     st = 5
                 }
+            } else if dialect_ch && ch == '#' {
+                st = 3
+            } else if dialect_ch && ch == '`' {
+                st = 7
             } else if ch == '$' && (prev == 0 || !is_ident_char(load8(b.data + prev - 1))) && lx_p < end && !is_digit(lx_text.byte(lx_p)) {
                 // $тег$ ... $тег$
                 var j = lx_p
@@ -785,7 +859,15 @@ fn lex_sql(start: int, end: int) {
                 st = 4
             }
         } else if st == 1 {
-            if ch == '\'' {
+            if esc {
+                esc = false
+            } else if dialect_ch && ch == '\\' {
+                esc = true
+            } else if ch == '\'' {
+                st = 0
+            }
+        } else if st == 7 {
+            if ch == '`' {
                 st = 0
             }
         } else if st == 5 {
@@ -873,7 +955,11 @@ fn lex_range(end: int) {
             }
             let word = lx_text.byte_slice(start, lx_p)
             if word == "sql" && sql_string_next(end) {
-                lex_sql(start, end)
+                lex_sql(start, end, false)
+                continue
+            }
+            if word == "ch" && ch_string_next(end) && !(toks.len() > 0 && toks[toks.len() - 1].kind == '.') {
+                lex_sql(start, end, true)
                 continue
             }
             add_tok(keyword_kind(word), 0, start, lx_p - start)

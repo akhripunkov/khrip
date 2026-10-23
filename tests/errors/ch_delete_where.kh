@@ -1,0 +1,5 @@
+// expect: DELETE without WHERE changes every row of events
+// expect: add WHERE ...; write WHERE true if you mean every row
+fn main() {
+    ch "DELETE FROM events"
+}

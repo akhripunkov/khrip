@@ -1950,7 +1950,7 @@ fn compile_main_wrapper(fi: int, test_mode: bool) {
             // __init_stores просто задаёт начальные значения
             emit_call(rt_func("__init_stores"))
         }
-        if uses_db {
+        if uses_db || uses_ch {
             emit_call(rt_func("__db_init"))
         }
         emit_call(m)

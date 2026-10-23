@@ -1,0 +1,7 @@
+// expect: FORMAT in ch: Khrip reads the rows itself
+// expect: drop FORMAT ...; the expected type picks the result
+type Row { n: int }
+fn main() {
+    let rows: [Row] = ch "SELECT count() AS n FROM events FORMAT JSONEachRow"
+    print(rows.len())
+}

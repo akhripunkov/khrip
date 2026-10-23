@@ -1,0 +1,8 @@
+// expect: [str]? cannot be a ClickHouse parameter: arrays are never NULL
+// expect: use [] for none
+type Row { n: int }
+fn main() {
+    let pages: [str]? = none
+    let rows: [Row] = ch "SELECT count() AS n FROM events WHERE has({pages}, page)"
+    print(rows.len())
+}

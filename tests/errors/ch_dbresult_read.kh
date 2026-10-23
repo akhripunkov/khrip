@@ -1,0 +1,5 @@
+// expect: a failed read ends the request; DbResult is for writes
+fn main() {
+    let r: DbResult = ch "SELECT count() FROM events"
+    print(r.ok)
+}

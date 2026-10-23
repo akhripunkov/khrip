@@ -1,0 +1,4 @@
+// expect: ALTER belongs in a migration: the schema changes only through migrations
+fn main() {
+    ch "ALTER TABLE events ADD COLUMN country String"
+}

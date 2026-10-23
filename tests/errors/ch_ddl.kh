@@ -1,0 +1,5 @@
+// expect: CREATE belongs in a migration: the schema changes only through migrations
+// expect: migration ch N `...` with the next number
+fn main() {
+    ch "CREATE TABLE events (ts DateTime) ENGINE = MergeTree ORDER BY ts"
+}

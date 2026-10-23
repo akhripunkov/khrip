@@ -1522,11 +1522,23 @@ fn gen_json_float(b: Buf) {
 // PostgreSQL: откат открытой транзакции ждёт сервер до 5 с. Хук TLS нужен
 // всем, кто открывает TLS: PostgreSQL, драйверам и fetch.
 fn gen_db(b: Buf) {
+    // запуск: PostgreSQL, затем каждое соединение ClickHouse (§7.1); конец
+    // khc test — удалить временные схему и базы
+    buf_add(b, "fn __db_init() \{\n")
     if uses_db {
-        buf_add(b, "fn __db_init() \{\n    __db_start()\n}\n\nfn __db_done() \{\n    __db_test_done()\n}\n\n")
-    } else {
-        buf_add(b, "fn __db_init() \{\n}\n\nfn __db_done() \{\n}\n\n")
+        buf_add(b, "    __db_start()\n")
     }
+    if uses_ch {
+        buf_add(b, "    __chdb_start()\n")
+    }
+    buf_add(b, "}\n\nfn __db_done() \{\n")
+    if uses_db {
+        buf_add(b, "    __db_test_done()\n")
+    }
+    if uses_ch {
+        buf_add(b, "    __chdb_test_done()\n")
+    }
+    buf_add(b, "}\n\n")
     buf_add(b, "fn __db_end() \{\n")
     if drv_mongo {
         buf_add(b, "    __mongo_request_end()\n")
@@ -1534,7 +1546,7 @@ fn gen_db(b: Buf) {
     if drv_ch {
         buf_add(b, "    __ch_request_cleanup()\n")
     }
-    if uses_db || drv_mongo || drv_ch || uses_fetch() {
+    if uses_db || uses_ch || drv_mongo || drv_ch || uses_fetch() {
         buf_add(b, "    __tls_pending_cleanup()\n")
     }
     if uses_db {
