@@ -177,7 +177,8 @@ fn __dc_alloc(st: int, n: int) -> int {
         store64(c + CTX_PSAVE_PTR, p + size)
         return p
     }
-    if __in_arena(p) && p + size > load64(c + CTX_ARENA) + ARENA_SIZE - ARENA_RESERVE {
+    let a = load64(c + CTX_ARENA)
+    if __in_arena(p) && p + size > a + __arena_size(a) - ARENA_RESERVE {
         let q = __mmap(size + 16)
         store64(q + 8, size + 16)
         if st != 0 {
@@ -1647,12 +1648,7 @@ var __test_bad: bool
 var __test_log: str
 
 fn __tests_init() {
-    __store_init()
-    __store_rw_init()
-    // начальные значения глобальных пользователя — в store
-    __store_lock()
-    __init_stores()
-    __store_unlock()
+    __store_boot(false)
     __arena_init()
     let w = __worker_init()
     w.testing = true

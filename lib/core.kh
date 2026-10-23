@@ -113,7 +113,13 @@ const BIG = 262144
 // по 1 ГБ на арену, store — адрес >> 40 == 0x10.
 const ARENA_REGION = 0x200000000000
 const ARENA_SIZE = 0x40000000
-const ARENA_SLOTS = 32767
+const ARENA_SLOTS = 32703
+// Арена загрузки (lib/gc.kh, __store_boot) — 64 ГБ сразу за ARENA_SLOTS аренами
+// запросов, ARENA_REGION + ARENA_SLOTS · ARENA_SIZE: начальные значения
+// глобальных пользователя и восстановление KHRIP_DATA. Её адреса — тоже арена
+// (адрес >> 45 == 1).
+const BOOT_ARENA = 0x3FEFC0000000
+const BOOT_ARENA_SIZE = 0x1000000000
 const STORE_REGION = 0x100000000000
 const STORE_SIZE = 0x4000000000
 const COMMIT = 4194304
@@ -175,7 +181,7 @@ fn __alloc_slow(c: int, size: int) -> int {
         // арена или постоянная память: зарезервированная область подключается кусками
         var limit = STORE_REGION + STORE_SIZE
         if arena {
-            limit = load64(c + CTX_ARENA) + ARENA_SIZE
+            limit = load64(c + CTX_ARENA) + __arena_size(load64(c + CTX_ARENA))
             if load64(c + CTX_MEMPANIC) == 0 {
                 limit -= ARENA_RESERVE
             }
@@ -222,6 +228,14 @@ fn __reserve(at: int, size: int) -> bool {
 
 fn __in_arena(p: int) -> bool {
     return (p >> 45) == 1
+}
+
+// Размер арены с началом base: у арены загрузки — BOOT_ARENA_SIZE.
+fn __arena_size(base: int) -> int {
+    if base == BOOT_ARENA {
+        return BOOT_ARENA_SIZE
+    }
+    return ARENA_SIZE
 }
 
 fn __in_store(p: int) -> bool {
@@ -331,15 +345,17 @@ fn __pmode_off() {
 // ---- Арена запроса: своя у каждой сопрограммы (и у потока задач, и у тестов) ----
 
 // Подключить арену с началом base к контексту cx (номер арены выдаёт
-// __arena_take в lib/rt.kh). Арена — 1 ГБ адресов: если система разрешает,
-// они сразу доступны на запись (страницы появятся при первом касании, соседние
-// арены — одна область для ядра), иначе подключаются кусками по COMMIT.
+// __arena_take в lib/rt.kh, арена загрузки — BOOT_ARENA). Арена — 1 ГБ адресов
+// (арена загрузки — 64 ГБ): если система разрешает, они сразу доступны на
+// запись (страницы появятся при первом касании, соседние арены — одна область
+// для ядра), иначе подключаются кусками по COMMIT.
 fn __arena_attach(cx: int, base: int) {
+    let size = __arena_size(base)
     // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE
-    let p = syscall(SYS_MMAP, base, ARENA_SIZE, 3, 0x22 | 0x4000 | 0x100000, -1, 0)
-    var end = base + ARENA_SIZE
+    let p = syscall(SYS_MMAP, base, size, 3, 0x22 | 0x4000 | 0x100000, -1, 0)
+    var end = base + size
     if p != base {
-        if !__reserve(base, ARENA_SIZE) {
+        if !__reserve(base, size) {
             __panic(PANIC_MEMORY, "arena region")
         }
         end = base
@@ -358,7 +374,7 @@ fn __arena_begin() {
     // последние ARENA_RESERVE байт — запас на ответ 500 после исчерпания памяти:
     // быстрый путь выделения до них не доходит
     var end = load64(c + CTX_ARENA_END)
-    let cap = load64(c + CTX_ARENA) + ARENA_SIZE - ARENA_RESERVE
+    let cap = load64(c + CTX_ARENA) + __arena_size(load64(c + CTX_ARENA)) - ARENA_RESERVE
     if end > cap {
         end = cap
     }
@@ -375,7 +391,7 @@ fn __strc_clear() {
     let c = __ctx()
     let a = load64(c + CTX_ARENA)
     let d = load64(c + CTX_PTR) - a
-    if a != 0 && d >= STRC_SIZE && d < ARENA_SIZE {
+    if a != 0 && d >= STRC_SIZE && d < __arena_size(a) {
         __memset(a + 8, 0, STRC_SIZE - 8)
     }
 }

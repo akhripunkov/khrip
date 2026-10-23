@@ -201,3 +201,61 @@ elif "$KHC" -o "$tmp/fetch_store" tests/load/fetch_store.kh >"$tmp/fetch_store.e
 else
 	failed "tests/load/fetch_store.kh" "$(cat "$tmp/fetch_store.err")"
 fi
+
+# Загрузка store (lib/gc.kh, __store_boot): начальные значения глобальных и
+# KHRIP_DATA строятся в арене загрузки, в store остаётся только копия. С
+# KHRIP_GC_VERIFY=1 обход от корней подтверждает: после загрузки и после
+# восстановления каждый указатель графа store — в STORE или DATA. Снимок khc 0.12
+# восстанавливается и сохраняется снова тем же файлом; снимок в 50 МБ — тоже, а
+# память после загрузки меньше половины пика: текст файла и разобранное значение
+# уходят вместе с ареной.
+bs_port=$((HTTP_PORT + 5))
+bs_url="http://127.0.0.1:$bs_port"
+bs_verify() {
+	grep -q "^khrip: gc verify ($1): 6 roots, [0-9]* objects in STORE, every pointer in STORE or DATA$" "$tmp/boot_store.log"
+}
+# bs_start <файл>: сервер с KHRIP_DATA=<файл>; ждёт конца загрузки
+bs_start() {
+	PORT=$bs_port THREADS=2 KHRIP_GC_VERIFY=1 KHRIP_DATA="$1" "$tmp/boot_store" 2>"$tmp/boot_store.log" &
+	bs_pid=$!
+	for _ in $(seq 600); do
+		curl -s -o /dev/null "$bs_url/summary" && return
+		sleep 0.05
+	done
+}
+# SIGTERM сохраняет store
+bs_stop() {
+	kill -TERM "$bs_pid"
+	wait "$bs_pid" 2>/dev/null
+}
+if "$KHC" -o "$tmp/boot_store" tests/load/boot_store.kh >"$tmp/boot_store.err" 2>&1; then
+	cp tests/load/boot_store.v012.json "$tmp/v012.json"
+	bs_start "$tmp/v012.json"
+	r=$(curl -s "$bs_url/summary")
+	bs_stop
+	if [[ "$r" == "12 12 3 1000 998001 filled 12 item-11 привет, мир" ]] && bs_verify boot && bs_verify restore && cmp -s "$tmp/v012.json" tests/load/boot_store.v012.json; then
+		http_ok
+	else
+		failed "http: снимок store khc 0.12" "ответ «$r»; журнал: $(cat "$tmp/boot_store.log"); сохранено: $(head -c 300 "$tmp/v012.json")"
+	fi
+
+	rm -f "$tmp/big.json"
+	bs_start "$tmp/big.json"
+	curl -s -o /dev/null -X POST "$bs_url/fill/180000"
+	bs_stop
+	cp "$tmp/big.json" "$tmp/big.orig"
+	bs_start "$tmp/big.json"
+	# VmHWM — пик памяти (загрузка), VmRSS — после неё; в КБ
+	read -r hwm rss < <(awk '/^VmHWM:|^VmRSS:/ { printf "%s ", $2 }' "/proc/$bs_pid/status")
+	r=$(curl -s "$bs_url/summary")
+	bs_stop
+	size=$(stat -c %s "$tmp/big.orig")
+	if [[ "$r" == "180000 180000 540 1000 998001 filled 180000 item-179999 привет, мир" ]] && ((size > 50000000 && rss * 2 < hwm)) && bs_verify restore && cmp -s "$tmp/big.json" "$tmp/big.orig"; then
+		http_ok
+	else
+		failed "http: восстановление 50 МБ" "ответ «$r», файл $size Б, пик $hwm КБ, после загрузки $rss КБ; журнал: $(cat "$tmp/boot_store.log")"
+	fi
+	rm -f "$tmp/big.json" "$tmp/big.orig"
+else
+	failed "tests/load/boot_store.kh" "$(cat "$tmp/boot_store.err")"
+fi
