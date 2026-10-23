@@ -1025,11 +1025,24 @@ fn __tx_lead_width(c: int) -> int {
     return 0
 }
 
-// s.len(): число символов.
+// s.len(): число символов. Короткая строка — одной проверкой со счётом; длинная —
+// в __text_len_c (отдельно, чтобы короткой не сохранять регистры длинной).
 fn __text_len(self: str) -> int {
     let p = __str_ptr(self)
     let n = __str_len(self)
-    let b = __strc_for(n)
+    if n > STRC_MIN || (__strc_mode == STRC_STRESS && n != 0) {
+        return __text_len_c(p, n)
+    }
+    let c = __utf8_scan(p, n)
+    if c >= 0 {
+        return c
+    }
+    return __tx_go_count(p, n)
+}
+
+// Длина строки (p, n), которую кэш может хранить.
+fn __text_len_c(p: int, n: int) -> int {
+    let b = __strc()
     if b != 0 {
         let e = __strc_key_len(b, p, n)
         if e >= 0 {
@@ -1236,13 +1249,26 @@ fn __text_slice(self: str, a0: int, b0: int) -> str {
                 }
             }
         }
+    } else if b0 != TEXT_END {
+        // конец первым: проверка [0, ob) вместе с пропуском — один проход, а
+        // начало — пропуск в уже проверенной части
+        let r = __utf8_seek(p, n, b0)
+        if r >= 0 {
+            ob = r
+            oa = __utf8_skip(p, r, a)
+        } else {
+            oa = __tx_go_skip(p, n, a)
+            if oa < n {
+                ob = oa + __tx_go_skip(p + oa, n - oa, b0 - a)
+            }
+        }
+        if oa >= n {
+            return ""
+        }
     } else {
         oa = __tx_seek(p, n, a)
         if oa >= n {
             return ""
-        }
-        if b0 != TEXT_END {
-            ob = oa + __tx_seek(p + oa, n - oa, b0 - a)
         }
     }
     if oa == 0 && ob == n {
