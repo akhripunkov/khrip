@@ -169,15 +169,32 @@ fn emit_mov_rr(dst: int, src: int) {
     }
 }
 
-// op reg, [base + disp32] или [base + disp32], reg — по коду операции.
+// op reg, [base + disp] или [base + disp], reg — по коду операции.
 fn emit_mem(op: int, reg: int, base: int, disp: int) {
     emit8(rex_w(reg, base))
     emit8(op)
-    emit8(0x80 | ((reg & 7) << 3) | (base & 7))
+    emit_modrm_mem(reg, base, disp)
+}
+
+// ModRM (и SIB для rsp, r12) операнда [base + disp]: без смещения, со смещением
+// в байт или в 4 байта — самое короткое (у rbp и r13 смещение есть всегда).
+fn emit_modrm_mem(reg: int, base: int, disp: int) {
+    let rb = ((reg & 7) << 3) | (base & 7)
+    var md = 0x80
+    if disp == 0 && (base & 7) != 5 {
+        md = 0
+    } else if disp >= -128 && disp <= 127 {
+        md = 0x40
+    }
+    emit8(md | rb)
     if (base & 7) == 4 {
         emit8(0x24)
     }
-    emit32(disp)
+    if md == 0x40 {
+        emit8(disp & 255)
+    } else if md == 0x80 {
+        emit32(disp)
+    }
 }
 
 fn emit_load(dst: int, base: int, disp: int) {
@@ -221,8 +238,56 @@ fn fits_i32(v: int) -> bool {
     return v >= -2147483648 && v <= 2147483647
 }
 
+// Последняя инструкция — add/sub rax, число (addimm_end = -1 — записи нет): её
+// можно убрать и взять число смещением адреса (load64(x + 8) — mov rax, [rax + 8]).
+var addimm_at: int
+var addimm_end: int = -1
+var addimm_val: int
+
 // Арифметика с непосредственным операндом: ext — номер операции в группе 0x81.
 fn emit_alu_imm(ext: int, dst: int, v: int) {
+    if dst == RAX && (ext == 0 || ext == 5) {
+        addimm_at = code_len
+        addimm_val = v
+        if ext == 5 {
+            addimm_val = -v
+        }
+    }
+    emit_alu_imm_raw(ext, dst, v)
+    if dst == RAX && (ext == 0 || ext == 5) {
+        addimm_end = code_len
+    }
+}
+
+// Убрать add/sub rax, число, если оно — последняя инструкция и после него нет
+// меток (метка ровно перед ним не мешает): → смещение или 0.
+fn take_addimm() -> int {
+    if addimm_end != code_len || addimm_at < barrier || !fits_i32(addimm_val) {
+        return 0
+    }
+    code_len = addimm_at
+    addimm_end = -1
+    return addimm_val
+}
+
+// op reg, [base + disp] или [base + disp], reg: op — один байт или два
+// (0x0FB6 — movzx); w — 64 бита (REX.W). Регистры байтов — только al и cl.
+fn emit_mem_sized(op: int, reg: int, base: int, disp: int, w: bool) {
+    var rex = 0x40 | ((reg >> 3) << 2) | (base >> 3)
+    if w {
+        rex = rex | 8
+    }
+    if rex != 0x40 {
+        emit8(rex)
+    }
+    if op > 255 {
+        emit8(op >> 8)
+    }
+    emit8(op & 255)
+    emit_modrm_mem(reg, base, disp)
+}
+
+fn emit_alu_imm_raw(ext: int, dst: int, v: int) {
     emit8(0x48 | (dst >> 3))
     if v >= -128 && v <= 127 {
         emit8(0x83)

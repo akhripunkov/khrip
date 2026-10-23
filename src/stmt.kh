@@ -1728,6 +1728,8 @@ fn begin_fn(fi: int) -> int {
     conts.clear()
     ret_holes.clear()
     panic_sites.clear()
+    simple_end = -1
+    addimm_end = -1
     fn_ret_ty = funcs[fi].ret
     panic_mode = false
     inline_depth = 0

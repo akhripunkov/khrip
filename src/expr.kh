@@ -450,6 +450,38 @@ fn peek_simple(level: int) -> bool {
     return false
 }
 
+// Последняя инструкция — загрузка простого значения в rax: неизменяемой
+// локальной (параметр, let) или числа. Если левый операнд бинарной операции —
+// такая загрузка, её можно убрать, посчитать правую часть в rax, а левую взять
+// операндом: без push/pop (take_simple). Значение то же: неизменяемую локальную
+// правая часть поменять не может. simple_end = -1 — записи нет.
+var simple_at: int
+var simple_end: int = -1
+var simple_kind: int
+var simple_val: int
+
+// Загрузка с позиции at до текущего конца кода — простое значение (kind, val).
+fn note_simple(kind: int, val: int, at: int) {
+    simple_at = at
+    simple_end = code_len
+    simple_kind = kind
+    simple_val = val
+}
+
+// Убрать загрузку простого значения, если она — последняя инструкция и после
+// её начала нет меток (метка ровно в начале не мешает: переход туда выполнит
+// новый код, который считает то же). → true, значение — в op_kind/op_val.
+fn take_simple() -> bool {
+    if simple_end != code_len || simple_at < barrier {
+        return false
+    }
+    code_len = simple_at
+    simple_end = -1
+    op_kind = simple_kind
+    op_val = simple_val
+    return true
+}
+
 // Загрузить простой операнд в регистр r.
 fn load_operand(r: int) {
     if op_kind == OPK_IMM {
@@ -564,11 +596,85 @@ fn emit_arith_rcx(op: int, at: Token) {
     }
 }
 
-// Правый операнд бинарной операции op над int: простой или через стек.
+// Сдвиг rax на число: shl rax, k / sar rax, k (как и со сдвигом на cl, x86 берёт
+// младшие 6 битов).
+fn emit_shift_imm(op: int, k: int) {
+    emit8(0x48)
+    emit8(0xC1)
+    if op == T_SHL {
+        emit8(0xE0)
+    } else {
+        emit8(0xF8)
+    }
+    emit8(k & 63)
+}
+
+// rax = rax · v (v — число). В библиотеке переполнение не проверяется, и
+// степень двойки — сдвиг; в программе — imul rax, rax, v (флаг OF для проверки).
+fn emit_mul_imm(v: int, at: Token) {
+    if files[at.file].is_lib && v > 0 && (v & (v - 1)) == 0 {
+        var k = 0
+        while (1 << k) != v {
+            k += 1
+        }
+        if k > 0 {
+            emit_shift_imm(T_SHL, k)
+        }
+        return
+    }
+    emit8(0x48)
+    emit8(0x69)
+    emit8(0xC0)
+    emit32(v & 0xFFFFFFFF)
+    emit_overflow_check(at)
+}
+
+fn is_comm_op(op: int) -> bool {
+    return op == '+' || op == '&' || op == '|' || op == '^' || op == '*'
+}
+
+// rax = rax op операнд для перестановочной op (+ & | ^ *): операнд — левая
+// часть, rax — правая.
+fn emit_comm_operand(op: int, at: Token) {
+    if op == '*' {
+        if op_kind == OPK_IMM {
+            emit_mul_imm(op_val, at)
+            return
+        }
+        load_operand(RCX)
+        emit_arith_rcx(op, at)
+        return
+    }
+    emit_alu_operand(alu_rr(op), alu_rr(op) + 2, alu_ext(op))
+    if op == '+' {
+        emit_overflow_check(at)
+    }
+}
+
+// Правый операнд бинарной операции op над int: простой или через стек. Левый
+// операнд — в rax; если он простой (take_simple), стек не нужен: правая часть
+// считается в rax, левая — операндом.
 fn arith_rhs(op: int, level: int, at: Token) {
     want = ty_err
     if peek_simple(level) && is_int_like(op_ty) {
         advance()
+        // число op локальная, op перестановочная: локальная op число
+        if is_comm_op(op) && op_kind == OPK_LOCAL && simple_kind == OPK_IMM {
+            let rk = op_kind
+            let rv = op_val
+            if take_simple() {
+                let lv = op_val
+                op_kind = rk
+                op_val = rv
+                load_operand(RAX)
+                op_kind = OPK_IMM
+                op_val = lv
+                emit_comm_operand(op, at)
+                return
+            }
+            op_kind = rk
+            op_val = rv
+        }
         if (op == '+' || op == '-' || op == '&' || op == '|' || op == '^') {
             emit_alu_operand(alu_rr(op), alu_rr(op) + 2, alu_ext(op))
             if op == '+' || op == '-' {
@@ -577,11 +683,11 @@ fn arith_rhs(op: int, level: int, at: Token) {
             return
         }
         if op == '*' && op_kind == OPK_IMM {
-            emit8(0x48)
-            emit8(0x69)
-            emit8(0xC0)
-            emit32(op_val & 0xFFFFFFFF)
-            emit_overflow_check(at)
+            emit_mul_imm(op_val, at)
+            return
+        }
+        if (op == T_SHL || op == T_SHR) && op_kind == OPK_IMM {
+            emit_shift_imm(op, op_val)
             return
         }
         if (op == '/' || op == '%') && op_kind == OPK_IMM && op_val > 0 {
@@ -600,7 +706,12 @@ fn arith_rhs(op: int, level: int, at: Token) {
         emit_arith_rcx(op, at)
         return
     }
-    emit_push(RAX)
+    let deferred = take_simple()
+    let lk = op_kind
+    let lv = op_val
+    if !deferred {
+        emit_push(RAX)
+    }
     var rt = 0
     if level == 1 {
         rt = parse_unary()
@@ -608,6 +719,18 @@ fn arith_rhs(op: int, level: int, at: Token) {
         rt = parse_mul()
     }
     check_int(rt, at, op)
+    if deferred {
+        op_kind = lk
+        op_val = lv
+        if is_comm_op(op) {
+            emit_comm_operand(op, at)
+            return
+        }
+        emit_mov_rr(RCX, RAX)
+        load_operand(RAX)
+        emit_arith_rcx(op, at)
+        return
+    }
     emit_mov_rr(RCX, RAX)
     emit_pop(RAX)
     emit_arith_rcx(op, at)
@@ -828,13 +951,21 @@ fn emit_compare(op: int, lt: int, at: Token) -> int {
         advance()
         return CC_E
     }
-    emit_push(RAX)
+    // левая часть — простое значение: без стека (take_simple)
+    let deferred = take_simple()
+    let lk = op_kind
+    let lv = op_val
+    if !deferred {
+        emit_push(RAX)
+    }
     let rt = parse_add()
     let ok = compare_ok(lt, rt, ordered, at)
+    op_kind = lk
+    op_val = lv
     if ok && mixed_opt(lt, rt) {
         // левое → rdi, правое → rsi; необязательное значение — первым
         emit_mov_rr(RSI, RAX)
-        emit_pop(RDI)
+        pop_left(deferred, RDI)
         var inner = ty_inner(lt)
         if tkind(lt) != K_OPT {
             inner = ty_inner(rt)
@@ -855,7 +986,7 @@ fn emit_compare(op: int, lt: int, at: Token) -> int {
     }
     if ok && lt == ty_str && rt == ty_str {
         emit_mov_rr(RSI, RAX)
-        emit_pop(RDI)
+        pop_left(deferred, RDI)
         if ordered {
             emit_call(rt_func("__str_cmp"))
             emit_alu_imm(7, RAX, 0)
@@ -869,9 +1000,18 @@ fn emit_compare(op: int, lt: int, at: Token) -> int {
         return CC_E
     }
     emit_mov_rr(RCX, RAX)
-    emit_pop(RAX)
+    pop_left(deferred, RAX)
     emit_rr(0x39, RCX, RAX)
     return cmp_cc(op)
+}
+
+// Левая часть сравнения → r: из стека или (deferred) простое значение op_kind/op_val.
+fn pop_left(deferred: bool, r: int) {
+    if deferred {
+        load_operand(r)
+    } else {
+        emit_pop(r)
+    }
 }
 
 fn compare_ok(lt: int, rt: int, ordered: bool, at: Token) -> bool {
