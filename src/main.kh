@@ -292,6 +292,9 @@ fn main() -> int {
         return 2
     }
     lex_file(files.len() - 1)
+    if all_lib && drivers.len() > 0 {
+        driver_names_check()
+    }
     lx_file = files.len() - 1
     add_tok_text(T_EOF, 0, "", lx_p)
     let init_fn = gen_func("__init_globals", ty_void)

@@ -250,6 +250,9 @@ fn __mongo_url(uri: str) -> __MongoUrl {
         u.auth_source = "admin"
     }
     let seen: map[str, bool] = {}
+    // tls=false явно: вместе с tlsCAFile — противоречие (после цикла, чтобы
+    // порядок опций не менял итог)
+    var tls_off = false
     for option in query.split("&") {
         if option == "" {
             continue
@@ -294,9 +297,13 @@ fn __mongo_url(uri: str) -> __MongoUrl {
                 return u
             }
             u.tls = value == "true"
+            tls_off = value == "false"
         } else if key == "tlscafile" {
+            if value == "" {
+                u.error = "tlsCAFile needs a file name"
+                return u
+            }
             u.root = value
-            u.tls = true
         } else if key == "w" {
             if value == "0" {
                 u.error = "unacknowledged MongoDB writes (w=0) are not supported"
@@ -388,6 +395,13 @@ fn __mongo_url(uri: str) -> __MongoUrl {
             u.error = "unsupported MongoDB URI option: " + name
             return u
         }
+    }
+    if u.root != "" {
+        if tls_off {
+            u.error = "tlsCAFile needs TLS, but the URI sets tls=false"
+            return u
+        }
+        u.tls = true
     }
     if !__mongo_db_name(u.database) || !__mongo_db_name(u.auth_source) {
         u.error = "invalid MongoDB database name"
@@ -736,9 +750,7 @@ fn __mongo_response(raw: str, request: int, max_doc: int) -> MongoResult {
     if !__bson_check(body, size, BSON_MAX_DEPTH - 128, false, false) {
         return __mongo_failure("invalid BSON in MongoDB response", true)
     }
-    let doc = Bson {
-        data: __str_new(body, size), checked: true
-    }
+    let doc = __bson_mark(__str_new(body, size))
     var ok = 0
     var message = 0
     var code = 0
@@ -1069,6 +1081,10 @@ fn __mongo_connect(c: int, u: __MongoUrl, deadline: int) -> str {
     if u.connect_ms > 0 {
         opening = deadline.min(now_ms() + u.connect_ms)
     }
+    // свой корень — до сети: ошибка называет файл, а не обрыв рукопожатия
+    if u.tls && u.root != "" && __roots_from(u.root).len() == 0 {
+        return "MongoDB tlsCAFile " + u.root + " cannot be read or holds no PEM certificates"
+    }
     let ip = __resolve(u.host, opening) else {
         return "cannot resolve MongoDB host"
     }
@@ -1199,7 +1215,7 @@ fn __mongo_command_check(command: Bson) -> str {
     if command.error != "" {
         return "invalid BSON command: " + command.error
     }
-    if !command.checked && !bson_valid(command) {
+    if !__bson_trusted(command) && !bson_valid(command) {
         return "invalid BSON command"
     }
     let p = __str_ptr(command.data)
@@ -1344,7 +1360,20 @@ fn mongo_insert(client: Mongo, database: str, collection: str, documents: [Bson]
     return mongo_command(client, database, bson_finish(command))
 }
 
+// Фильтр записи, из которого to_bson выбросил поле none, совпал бы с лишними
+// документами (без поля owner — со всеми): это ошибка, а не запись. В mongo_find
+// пропуск none остаётся — необязательные условия поиска.
+fn __mongo_filter_none(filter: Bson, operation: str) -> MongoResult? {
+    if filter.__none == "" || filter.error != "" {
+        return none
+    }
+    return __mongo_failure(operation + " filter field '" + filter.__none + "' is none, and to_bson leaves none out, so the filter would match more documents; unwrap the value first (let v = x else \{ ... }) or match null with bson_null", false)
+}
+
 fn mongo_update(client: Mongo, database: str, collection: str, filter: Bson, update: Bson, many: bool = false, upsert: bool = false) -> MongoResult {
+    if let bad = __mongo_filter_none(filter, "mongo_update") {
+        return bad
+    }
     let item = bson_new()
     bson_doc(item, "q", filter)
     bson_doc(item, "u", update)
@@ -1357,6 +1386,9 @@ fn mongo_update(client: Mongo, database: str, collection: str, filter: Bson, upd
 }
 
 fn mongo_delete(client: Mongo, database: str, collection: str, filter: Bson, many: bool = false) -> MongoResult {
+    if let bad = __mongo_filter_none(filter, "mongo_delete") {
+        return bad
+    }
     let item = bson_new()
     bson_doc(item, "q", filter)
     if many {
@@ -1622,9 +1654,7 @@ fn __mongo_cursor_batch(cursor: MongoCursor, result: MongoResult, field: str) {
             cursor.error = "invalid MongoDB cursor document"
             return
         }
-        cursor.documents.push(Bson {
-            data: __str_new(z + 1, next - z - 1), checked: true
-        })
+        cursor.documents.push(__bson_mark(__str_new(z + 1, next - z - 1)))
         item = next
     }
 }
@@ -1642,9 +1672,7 @@ fn __mongo_with_cursor(command: Bson) -> Bson {
     buf_byte(b, 0)
     buf_byte(b, 0)
     store32(b.data, b.len)
-    return Bson {
-        data: __str_new(b.data, b.len), checked: command.checked
-    }
+    return __bson_part(command, __str_new(b.data, b.len))
 }
 
 // Собственная команда find или aggregate: проекция, сортировка, hint, стадии

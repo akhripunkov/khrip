@@ -364,7 +364,8 @@ fn parse_let() {
     var lits: [str] = []
     if !mutable && kind() != T_ELSE {
         if lit_on {
-            if lit_ok {
+            // ветви — набор значений, только если if/match — весь инициализатор
+            if lit_ok && ifv_from == from && ifv_to == pos {
                 lits = lit_vals
             }
         } else {

@@ -5,17 +5,41 @@
 // Драйвер подключается, только если программа пользуется его именем: именем
 // верхнего уровня библиотеки (fn, type, const, var — берутся из её текста,
 // без разбора) или встроенной функцией драйвера (to_bson, ch_decode, ...).
-// Имена сравниваются точно и после разрешения: имя, которое программа
-// объявляет сама, — её собственное. Поэтому своя type Mongo или fn ch_query в
-// программе без драйверов не конфликтует с библиотекой, а программа без
-// драйверов не платит за них ни временем компиляции, ни размером.
+// Имена сравниваются точно. Своё имя программы верхнего уровня — её
+// собственное, а функция драйвера считается, только когда её вызывают:
+// функций-значений в Khrip нет, поэтому локальная или параметр object_id
+// драйвер не подключают. Своя type Mongo или fn ch_query в программе без
+// драйверов не конфликтует с библиотекой. Тексты библиотек читаются, только
+// если имя программы похоже на имя драйвера (driver_like), поэтому программа
+// без драйверов не платит за них ни временем компиляции, ни размером.
 
 type DriverLib {
     file: str
     title: str
-    // имена верхнего уровня библиотеки и встроенные функции драйвера
+    // имена верхнего уровня библиотеки и встроенные функции драйвера: 1 —
+    // функция (считается только вызов), 2 — тип, константа, переменная
     names: StrMap
     used: bool
+}
+
+// Имя похоже на имя драйвера: так начинаются все имена библиотек драйверов,
+// кроме служебных «__» (khc check --all-lib это проверяет: driver_names_check).
+// Строчные (bson_, mongo_, ch_, object_id, to_bson, from_bson) — функции, они в
+// счёт только вызовом (called); типы и константы начинаются с заглавной. Только
+// с таким именем в программе компилятор читает тексты библиотек.
+fn driver_like(name: str, called: bool) -> bool {
+    var n = name
+    if n.starts_with("__") {
+        n = n.byte_slice(2, n.byte_len())
+    }
+    if n.starts_with("bson_") || n.starts_with("mongo_") || n.starts_with("ch_") || n == "object_id" || n == "to_bson" || n == "from_bson" {
+        return called
+    }
+    if n.starts_with("Bson") || n.starts_with("BSON_") || n.starts_with("Mongo") || n.starts_with("MONGO_") || n.starts_with("CH") {
+        return true
+    }
+    // MB_, MP_, MC_ — раскладки блоков MongoDB; ChConfig, ChResult
+    return n.byte_len() >= 3 && ((n.byte(0) == 'M' && (n.byte(1) == 'B' || n.byte(1) == 'P' || n.byte(1) == 'C') && n.byte(2) == '_') || (n.byte(0) == 'C' && n.byte(1) == 'h' && n.byte(2) >= 'A' && n.byte(2) <= 'Z'))
 }
 
 // Подключены ли библиотеки: lib/bson.kh, lib/mongo.kh, lib/clickhouse.kh
@@ -72,9 +96,11 @@ fn driver_lib_names(text: str, names: StrMap) {
     var at = 0
     while at < n {
         var skip = 0
+        var kind = 2
         let c = text.byte(at)
         if c == 'f' && word_at(text, at, "fn ") {
             skip = 3
+            kind = 1
         } else if c == 'v' && word_at(text, at, "var ") {
             skip = 4
         } else if c == 't' && word_at(text, at, "type ") {
@@ -88,7 +114,7 @@ fn driver_lib_names(text: str, names: StrMap) {
                 e += 1
             }
             if e > at + skip {
-                smap_put(names, text.byte_slice(at + skip, e), 1)
+                smap_put(names, text.byte_slice(at + skip, e), kind)
             }
         }
         at = next_line(p, at, n)
@@ -102,6 +128,28 @@ fn driver_lib(lib: str, file: str, title: str, builtins: [str]) -> DriverLib {
     }
     driver_lib_names(read_file(lib + "/" + file) ?? "", names)
     return DriverLib { file: file, title: title, names: names, used: false }
+}
+
+// khc check --all-lib: каждое имя верхнего уровня библиотек драйверов, кроме
+// служебных «__», похоже на имя драйвера — иначе программа, которая пользуется
+// только им, не подключила бы библиотеку (её текст не читался бы).
+fn driver_names_check() {
+    var i = 0
+    while i + 1 < toks.len() {
+        let t = toks[i]
+        let path = files[t.file].path
+        if files[t.file].is_lib && t.col == 1 && (t.kind == T_FN || t.kind == T_TYPE || t.kind == T_VAR || t.kind == T_CONST || t.kind == T_STORE) && toks[i + 1].kind == T_IDENT && (path.ends_with("/bson.kh") || path.ends_with("/mongo.kh") || path.ends_with("/clickhouse.kh")) {
+            let name = toks[i + 1].text
+            if !name.starts_with("__") && !driver_like(name, t.kind == T_FN) {
+                var hint = "start it with bson_, Bson, mongo_, Mongo, ch_, Ch or CH (driver_like in src/drivers.kh), or with __ if it is internal"
+                if driver_like(name, true) {
+                    hint = "lowercase driver names are functions; name a type or constant with Bson, BSON_, Mongo, MONGO_, Ch or CH"
+                }
+                error_tok(toks[i + 1], "'" + name + "' does not look like a driver name, so a program that uses only it would not load the driver", hint)
+            }
+        }
+        i += 1
+    }
 }
 
 // Первая лексема программы: пока подключены только библиотеки ядра, файлы
@@ -162,23 +210,48 @@ fn name_use_at(i: int) -> bool {
 // библиотека API подключается и без драйверов; тогда с all подключаются все
 // драйверы (khc check --all-lib проверяет и не вызванные функции библиотек).
 fn driver_libs(lib: str, api: bool, all: bool) -> [str] {
+    let first = first_own_tok()
+    let own = own_top_names(first)
+    // имена программы, похожие на имена драйверов: 1 — вызов, 2 — иное (3 — оба)
+    let wanted = smap_new()
+    var i = first
+    while i < toks.len() {
+        let t = toks[i]
+        let called = kind_at(i + 1) == '('
+        if t.kind == T_IDENT && !files[t.file].is_lib && driver_like(t.text, called) && smap_get(own, t.text) < 0 && name_use_at(i) {
+            var how = 2
+            if called {
+                how = 1
+            }
+            let seen = smap_get(wanted, t.text)
+            if seen > 0 {
+                how = how | seen
+            }
+            smap_put(wanted, t.text, how)
+        }
+        i += 1
+    }
+    if wanted.keys.len() == 0 && !all {
+        // ни одного похожего имени: тексты библиотек не читаются
+        drv_bson = false
+        drv_mongo = false
+        drv_ch = false
+        return []
+    }
     var libs: [DriverLib] = []
     libs.push(driver_lib(lib, "bson.kh", "MongoDB", ["to_bson", "from_bson"]))
     libs.push(driver_lib(lib, "mongo.kh", "MongoDB", []))
     libs.push(driver_lib(lib, "clickhouse.kh", "ClickHouse", ["ch_encode", "ch_decode"]))
-    let first = first_own_tok()
-    let own = own_top_names(first)
-    var i = first
-    while i < toks.len() {
-        let t = toks[i]
-        if t.kind == T_IDENT && !files[t.file].is_lib && smap_get(own, t.text) < 0 && name_use_at(i) {
-            for d in libs {
-                if !d.used && smap_get(d.names, t.text) >= 0 {
-                    d.used = true
-                }
+    var w = 0
+    while w < wanted.keys.len() {
+        for d in libs {
+            let kind = smap_get(d.names, wanted.keys[w])
+            // функция драйвера — только вызовом: не локальная с тем же именем
+            if !d.used && kind >= 0 && (kind != 1 || (wanted.vals[w] & 1) != 0) {
+                d.used = true
             }
         }
-        i += 1
+        w += 1
     }
     if all && (api || libs[0].used || libs[1].used || libs[2].used) {
         for d in libs {

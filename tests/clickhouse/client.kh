@@ -35,6 +35,9 @@ type ChWide {
 type ChWideText { uid: str, kind: str, amount: str, at_ms: str, day: str, code: str, small: str, flag: str, on: str, maybe: str? }
 type Doubled { id: int, doubled: int }
 type HitCountry { id: int, country: int }
+type Narrow { id: int, e: str, code: str }
+type Dec { n: int, a: float, b: float, p: float }
+type DecText { a: str, b: str, p: str }
 type Optional { id: int, name: str? }
 
 fn need(ok: bool, label: str) {
@@ -173,15 +176,14 @@ fn main() -> int {
     // таблицу изменили после кэша: незнакомый столбец — повторный DESCRIBE
     successful(ch_query_params(c, "ALTER TABLE \{t:Identifier} ADD COLUMN country UInt32 DEFAULT 0", {"t": hits}), "add column")
     successful(ch_insert(c, hits, ch_encode([HitCountry { id: 10, country: 31 }])), "insert after ALTER ADD COLUMN")
-    // + 1 — ещё и отказ MATERIALIZED выше: ошибка по схеме из кэша её перепроверяет
-    need(__ch_schema_misses() == misses + 3, "unknown column asks DESCRIBE again")
-    // тип столбца сменился: заголовок пакета с прежним типом отвергает сервер,
-    // кэш сбрасывается, следующая вставка идёт под новый тип
+    // + 4 — ещё и отказы выше (три диапазона и MATERIALIZED): ошибка по схеме
+    // из кэша её перепроверяет — таблицу могли изменить
+    need(__ch_schema_misses() == misses + 6, "unknown column asks DESCRIBE again")
+    // тип столбца сменился: заголовок пакета с прежним типом сервер отвергает
+    // до чтения строк — схема заново, та же вставка проходит
     successful(ch_query_params(c, "ALTER TABLE \{t:Identifier} MODIFY COLUMN country UInt64", {"t": hits}), "modify column")
-    let stale = ch_insert(c, hits, ch_encode([HitCountry { id: 11, country: 49 }]))
-    need(!stale.ok && stale.error.contains("country") && !stale.unknown_outcome, "stale cached type rejected by the server")
     successful(ch_insert(c, hits, ch_encode([HitCountry { id: 11, country: 49 }])), "insert after ALTER MODIFY COLUMN")
-    need(__ch_schema_misses() == misses + 4, "server schema error drops the cached schema")
+    need(__ch_schema_misses() == misses + 7, "server header rejection asks DESCRIBE again")
     need(table_count(c, hits) == 5, "analytic row count")
     successful(ch_query_params(c, "DROP TABLE \{t:Identifier}", {"t": hits}), "drop analytic table")
 
@@ -207,6 +209,42 @@ fn main() -> int {
     refused(ch_insert(c, typed, ch_encode([ChWide { ...rows[0], code: "abcde" }])), "FixedString length", "column 'code' (FixedString(4)): 5 bytes do not fit")
     refused(ch_insert(c, typed, ch_encode([ChWide { ...rows[0], small: 128 }])), "Int8 range", "column 'small' (Int8): value 128 is out of range -128..127")
     successful(ch_query_params(c, "DROP TABLE \{t:Identifier}", {"t": typed}), "drop typed table")
+
+    // ALTER расширил столбцы после кэша схемы: значения, верные для новых типов,
+    // не отвергаются клиентом по старым (повторный DESCRIBE).
+    let widened = "kh_widen_" + random_str(12)
+    successful(ch_query_params(c, "CREATE TABLE \{t:Identifier} (id UInt8, e Enum8('a' = 1, 'b' = 2), code FixedString(2)) ENGINE=MergeTree ORDER BY tuple()", {"t": widened}), "create narrow table")
+    successful(ch_insert(c, widened, ch_encode([Narrow { id: 1, e: "a", code: "xy" }])), "narrow insert")
+    successful(ch_query_params(c, "ALTER TABLE \{t:Identifier} MODIFY COLUMN id UInt16, MODIFY COLUMN e Enum8('a' = 1, 'b' = 2, 'c' = 3), MODIFY COLUMN code FixedString(4)", {"t": widened}), "widen columns")
+    let before_widen = __ch_schema_misses()
+    successful(ch_insert(c, widened, ch_encode([Narrow { id: 300, e: "a", code: "xy" }])), "UInt16 value after ALTER")
+    successful(ch_insert(c, widened, ch_encode([Narrow { id: 2, e: "c", code: "xy" }])), "new Enum value after ALTER")
+    successful(ch_insert(c, widened, ch_encode([Narrow { id: 3, e: "b", code: "wxyz" }])), "longer FixedString after ALTER")
+    need(__ch_schema_misses() == before_widen + 1, "widened schema asked once")
+    refused(ch_insert(c, widened, ch_encode([Narrow { id: 70000, e: "a", code: "xy" }])), "UInt16 range with a fresh schema", "column 'id' (UInt16): value 70000 is out of range 0..65535")
+    need(table_count(c, widened) == 4, "widened row count")
+    successful(ch_query_params(c, "DROP TABLE \{t:Identifier}", {"t": widened}), "drop widened table")
+
+    // Decimal128/256: целое без запятой шире int (Decimal(38, 18) у денег и
+    // токенов) пишется словами, а не отвергается.
+    let decimals = "kh_dec_" + random_str(12)
+    successful(ch_query_params(c, "CREATE TABLE \{t:Identifier} (n Int64, a Decimal(38, 18), b Decimal(76, 30), p Decimal(18, 10)) ENGINE=Memory", {"t": decimals}), "create decimal table")
+    successful(ch_insert(c, decimals, ch_encode([
+        Dec { n: 1, a: 10.5, b: 1.5, p: 1.5 },
+        Dec { n: 2, a: -1000.25, b: -0.000001, p: -9.25 },
+        Dec { n: 3, a: 12345678901234567000.0, b: 123456789012345678901234567890.0, p: 0.0 }
+    ])), "Decimal128 and Decimal256 insert")
+    let dec_text = ch_query_params(c, "SELECT toString(a) AS a, toString(b) AS b, toString(p) AS p FROM \{t:Identifier} ORDER BY n", {"t": decimals})
+    successful(dec_text, "decimal select as text")
+    let dec_rows: [DecText]? = ch_decode(dec_text.body)
+    need(to_json(dec_rows ?? []) == "[\{\"a\":\"10.5\",\"b\":\"1.5\",\"p\":\"1.5\"},\{\"a\":\"-1000.25\",\"b\":\"-0.000001\",\"p\":\"-9.25\"},\{\"a\":\"12345678901234567000\",\"b\":\"123456789012345680000000000000\",\"p\":\"0\"}]", "server sees exact wide decimals")
+    let dec_back = ch_query_params(c, "SELECT n, a, b, p FROM \{t:Identifier} ORDER BY n", {"t": decimals})
+    let dec_floats: [Dec]? = ch_decode(dec_back.body)
+    // чтение во float — с точностью float (__ch_decimal_float): сравнение с допуском
+    let back = dec_floats ?? []
+    need(back.len() == 3 && back[0].a == 10.5 && back[0].b == 1.5 && back[1].p == -9.25 && (back[1].a + 1000.25).abs() < 0.000000001 && (back[2].b / 123456789012345678901234567890.0 - 1.0).abs() < 0.000000000000001, "wide decimals read back as float")
+    refused(ch_insert(c, decimals, ch_encode([Dec { n: 4, a: 1.0e20, b: 0.0, p: 0.0 }])), "Decimal(38, 18) precision", "value 100000000000000000000 does not fit Decimal(38, 18)")
+    successful(ch_query_params(c, "DROP TABLE \{t:Identifier}", {"t": decimals}), "drop decimal table")
     let strict = "kh_strict_" + random_str(12)
     successful(ch_query_params(c, "CREATE TABLE \{t:Identifier} (id Int64, name String) ENGINE=Memory", {"t": strict}), "create strict table")
     refused(ch_insert(c, strict, ch_encode([Optional { id: 1, name: "x" }])), "optional into non-Nullable", "column 'name' is String, not Nullable, but the Khrip field is optional (str?)")

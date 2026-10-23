@@ -4,8 +4,12 @@
 // до чтения по ним.
 //
 // Документ проверяется один раз — на границе доверия: bson_parse, bson_finish,
-// to_bson и ответ сервера (lib/mongo.kh). Результат помечен checked: его не
-// проверяют снова, когда вкладывают в другой документ или отправляют.
+// to_bson и ответ сервера (lib/mongo.kh). Результат помечен (__checked): его не
+// проверяют снова, когда вкладывают в другой документ или отправляют. Метка —
+// адрес именно этой строки data, а поле служебное: JSON его не читает и не
+// пишет (src/api.kh type_desc). Поэтому ни тело запроса, ни новые байты в
+// data, ни копия в store метку не получают — такой документ проверяется при
+// вложении целиком.
 // Аксессоры, обходы и from_bson не проверяют документ заранее и не строят
 // списков полей: каждый шаг сверяет длину значения с границами документа,
 // поэтому они безопасны и на непроверенных байтах (испорченная часть просто не
@@ -19,11 +23,16 @@ const BSON_MAX_DEPTH = 64
 type Bson {
     data: str
     error: str = ""
-    // байты проверены (ставит библиотека): вложение и отправка их не перепроверяют
-    checked: bool = false
+    // адрес строки data, байты которой проверила библиотека (__bson_mark), или 0
+    __checked: int = 0
+    // путь первого поля, которое to_bson пропустил как none, или "": такой
+    // документ в фильтре mongo_update/mongo_delete совпал бы с лишними
+    __none: str = ""
 }
 type BsonBuilder {
     buffer: Buf, error: str = "", keys: map[str, bool] = {}
+    // как Bson.__none: из вложенных документов
+    __none: str = ""
 }
 type BsonObjectId {
     hex: str
@@ -49,12 +58,16 @@ type BsonField {
 type __BsonRead {
     error: str = ""
     path: str = ""
+    // документ проверен: вложенные Bson получают его метку
+    trusted: bool = false
 }
 // Запись to_bson: один буфер на весь документ, вложенные документы — на месте.
 type __BsonOut {
     b: Buf
     error: str = ""
     path: str = ""
+    // путь первого поля, пропущенного как none (Bson.__none)
+    dropped: str = ""
 }
 
 fn __bson_u32(b: Buf, n: int) {
@@ -85,6 +98,31 @@ fn __bson_zero(p: int, end: int) -> int {
         return -1
     }
     return p + i
+}
+
+// Документ, байты которого проверены (или пришли от сервера).
+fn __bson_mark(data: str) -> Bson {
+    let h: int = __cast(data)
+    return Bson {
+        data, __checked: h
+    }
+}
+
+// Метка документа относится к его строке data: строки не меняются, поэтому
+// те же байты проверять незачем.
+fn __bson_trusted(doc: Bson) -> bool {
+    let h: int = __cast(doc.data)
+    return doc.__checked == h
+}
+
+// Часть data документа doc: проверена, если проверен он.
+fn __bson_part(doc: Bson, data: str) -> Bson {
+    if __bson_trusted(doc) {
+        return __bson_mark(data)
+    }
+    return Bson {
+        data
+    }
 }
 
 // Конец полей документа [p, p + n) — адрес завершающего нуля — или 0, если
@@ -453,12 +491,13 @@ fn __bson_to_int(f: float) -> int {
     return f.to_int()
 }
 
-// float хранит int64 v точно.
+// float хранит int64 v точно. Значения до -2^63 + 512 округляются к -2^63,
+// а -2^63.to_int() паникует: это число сравнивается отдельно, как в __bson_whole.
 fn __bson_exact_float(v: int) -> bool {
-    if v == -9223372036854775807 - 1 {
-        return true
-    }
     let f = v.to_float()
+    if f == -9223372036854775808.0 {
+        return v == -9223372036854775807 - 1
+    }
     return f < 9223372036854775808.0 && f.to_int() == v
 }
 
@@ -470,15 +509,13 @@ fn bson_valid(doc: Bson) -> bool {
 }
 
 fn bson_parse(data: str) -> Bson {
-    let doc = Bson {
-        data, checked: true
-    }
-    if !bson_valid(doc) {
+    let n = data.byte_len()
+    if n > BSON_MAX_BYTES || !__bson_check(__str_ptr(data), n, 0, false, true) {
         return Bson {
             data: "", error: "invalid BSON document"
         }
     }
-    return doc
+    return __bson_mark(data)
 }
 
 // ---- Построитель ----
@@ -527,6 +564,14 @@ fn __bson_fail(b: BsonBuilder, key: str, message: str) {
         return
     }
     b.error = "BSON field '" + key + "' " + message
+}
+
+// Вложенный документ, в котором to_bson пропустил поле none: путь — в
+// построитель (первый), чтобы mongo_update и mongo_delete узнали его в фильтре.
+fn __bson_none_up(b: BsonBuilder, key: str, path: str) {
+    if path != "" && b.__none == "" {
+        b.__none = __bson_join(key, path)
+    }
 }
 
 fn bson_int(b: BsonBuilder, key: str, value: int) {
@@ -583,7 +628,7 @@ fn __bson_nested(key: str, value: Bson) -> str {
     if value.error != "" {
         return __bson_nest_error(key, value.error)
     }
-    if !value.checked && !bson_valid(value) {
+    if !__bson_trusted(value) && !bson_valid(value) {
         return "BSON field '" + key + "' holds an invalid BSON document"
     }
     return ""
@@ -600,6 +645,7 @@ fn __bson_doc(b: BsonBuilder, key: str, value: Bson, kind: int) {
     }
     if __bson_key(b, key, kind, value.data.byte_len()) {
         buf_add(b.buffer, value.data)
+        __bson_none_up(b, key, value.__none)
     }
 }
 
@@ -607,20 +653,36 @@ fn bson_doc(b: BsonBuilder, key: str, value: Bson) {
     __bson_doc(b, key, value, 3)
 }
 
+// Байты ключей массива из n элементов: у каждого — вид, цифры индекса и ноль.
+fn __bson_index_bytes(n: int) -> int {
+    var total = 2 * n
+    var from = 0
+    var limit = 10
+    var digits = 1
+    while from < n {
+        total += digits * (n.min(limit) - from)
+        from = limit
+        limit = limit * 10
+        digits += 1
+    }
+    return total
+}
+
 // Массив документов пишется сразу в буфер построителя: без промежуточного
-// документа, словаря ключей и строк индексов.
+// документа, словаря ключей и строк индексов. Размер — точный, как у документа
+// из построителя.
 fn bson_array(b: BsonBuilder, key: str, values: [Bson]) {
     if b.error != "" {
         return
     }
-    var size = 5
+    var size = 5 + __bson_index_bytes(values.len())
     for i in 0..values.len() {
         let value = values[i]
-        if value.error != "" || (!value.checked && !bson_valid(value)) {
+        if value.error != "" || (!__bson_trusted(value) && !bson_valid(value)) {
             b.error = __bson_nested(key + "." + i.to_str(), value)
             return
         }
-        size += value.data.byte_len() + 12
+        size += value.data.byte_len()
     }
     if !__bson_key(b, key, 4, size) {
         return
@@ -632,13 +694,16 @@ fn bson_array(b: BsonBuilder, key: str, values: [Bson]) {
         buf_byte(b.buffer, 3)
         __bson_put_index(b.buffer, i)
         buf_add(b.buffer, values[i].data)
+        if values[i].__none != "" {
+            __bson_none_up(b, key + "." + i.to_str(), values[i].__none)
+        }
     }
     buf_byte(b.buffer, 0)
     store32(b.buffer.data + start, b.buffer.len - start)
 }
 
 fn bson_int_array(b: BsonBuilder, key: str, values: [int]) {
-    if !__bson_key(b, key, 4, 5 + values.len() * 21) {
+    if !__bson_key(b, key, 4, 5 + __bson_index_bytes(values.len()) + values.len() * 8) {
         return
     }
     let start = b.buffer.len
@@ -735,9 +800,9 @@ fn bson_finish(b: BsonBuilder) -> Bson {
     __memcpy(data, b.buffer.data, b.buffer.len)
     store32(data, n)
     store8(data + n - 1, 0)
-    return Bson {
-        data: __str_new(data, n), checked: true
-    }
+    let doc = __bson_mark(__str_new(data, n))
+    doc.__none = b.__none
+    return doc
 }
 
 // ---- Чтение полей ----
@@ -919,9 +984,7 @@ fn __bson_get_doc(doc: Bson, key: str, report: bool) -> Bson? {
         return none
     }
     let v = at + 2 + key.byte_len()
-    return Bson {
-        data: __str_new(v, load32(v)), checked: doc.checked
-    }
+    return __bson_part(doc, __str_new(v, load32(v)))
 }
 
 fn bson_get_doc(doc: Bson, key: str) -> Bson? {
@@ -959,9 +1022,7 @@ fn bson_get_array(doc: Bson, key: str) -> [Bson]? {
             __bson_get_fail(true, key + "." + i.to_str(), "is a BSON " + __bson_kind_name(load8(e)) + ", not a document")
             return none
         }
-        out.push(Bson {
-            data: __str_new(z + 1, next - z - 1), checked: doc.checked
-        })
+        out.push(__bson_part(doc, __str_new(z + 1, next - z - 1)))
         e = next
         i += 1
     }
@@ -1070,6 +1131,9 @@ fn __bson_out_field(o: __BsonOut, kp: int, kn: int, v: int, d: int, depth: int) 
     var vv = v
     if load64(dd) == D_OPT {
         if vv == 0 {
+            if o.dropped == "" {
+                o.dropped = __str_copy(kp, kn)
+            }
             return
         }
         dd = load64(d + 8)
@@ -1084,6 +1148,27 @@ fn __bson_out_field(o: __BsonOut, kp: int, kn: int, v: int, d: int, depth: int) 
     buf_byte(o.b, 0)
     let kind = __bson_out_value(o, at + 1, vv, dd, depth)
     store8(o.b.data + at, kind)
+}
+
+// Ключ поля по смещению key в o.b.
+fn __bson_out_key(o: __BsonOut, key: int) -> str {
+    let kp = o.b.data + key
+    return __str_copy(kp, __bson_zero(kp, o.b.data + o.b.len) - kp)
+}
+
+// Во вложенном значении поля key пропущено поле none (had — путь уже был до
+// него): имя поля — спереди пути.
+fn __bson_out_none_up(o: __BsonOut, key: int, had: bool) {
+    if !had && o.dropped != "" {
+        o.dropped = __bson_join(__bson_out_key(o, key), o.dropped)
+    }
+}
+
+// Вложенный готовый Bson, в котором to_bson пропустил поле path.
+fn __bson_out_none(o: __BsonOut, key: int, path: str) {
+    if path != "" && o.dropped == "" {
+        o.dropped = __bson_join(__bson_out_key(o, key), path)
+    }
 }
 
 // Значение по описанию d; ключ поля — в o.b по смещению key. → вид BSON.
@@ -1135,9 +1220,11 @@ fn __bson_out_value(o: __BsonOut, key: int, v: int, d: int, depth: int) -> int {
         __bson_out_fail(o, key, "is nested deeper than 64 levels")
         return 3
     }
+    let had = o.dropped != ""
     if kind == D_STRUCT || kind == D_MAP {
         __bson_out_doc(o, v, d, depth + 1)
         __bson_out_up(o, key)
+        __bson_out_none_up(o, key, had)
         return 3
     }
     if kind == D_LIST {
@@ -1180,6 +1267,7 @@ fn __bson_out_value(o: __BsonOut, key: int, v: int, d: int, depth: int) -> int {
         buf_byte(b, 0)
         store32(b.data + start, b.len - start)
         __bson_out_up(o, key)
+        __bson_out_none_up(o, key, had)
         return 4
     }
     if kind == D_SUM {
@@ -1208,6 +1296,7 @@ fn __bson_out_value(o: __BsonOut, key: int, v: int, d: int, depth: int) -> int {
         buf_byte(b, 0)
         store32(b.data + start, b.len - start)
         __bson_out_up(o, key)
+        __bson_out_none_up(o, key, had)
         return 3
     }
     __bson_out_fail(o, key, "has a type that BSON cannot hold")
@@ -1233,11 +1322,12 @@ fn __bson_out_special(o: __BsonOut, key: int, name: str, v: int) -> int {
             }
             return 3
         }
-        if !doc.checked && !bson_valid(doc) {
+        if !__bson_trusted(doc) && !bson_valid(doc) {
             __bson_out_fail(o, key, "holds an invalid BSON document")
             return 3
         }
         buf_add(b, doc.data)
+        __bson_out_none(o, key, doc.__none)
         return 3
     }
     if name == "BsonObjectId" {
@@ -1340,6 +1430,23 @@ fn __bson_out_doc(o: __BsonOut, v: int, d: int, depth: int) {
 
 fn __bson_encode(v: int, d: int) -> Bson {
     let k = load64(d)
+    if k == D_STRUCT && __bson_struct_name(d) == "Bson" {
+        // готовый документ — он сам, как при вложении, а не структура {data, error}
+        let doc: Bson = __cast(v)
+        if doc.error != "" {
+            return Bson {
+                data: "", error: doc.error
+            }
+        }
+        if !__bson_trusted(doc) && !bson_valid(doc) {
+            return Bson {
+                data: "", error: "invalid BSON document"
+            }
+        }
+        let out = __bson_mark(doc.data)
+        out.__none = doc.__none
+        return out
+    }
     if k != D_STRUCT && !(k == D_MAP && load64(load64(d + 8)) == D_STR) {
         return Bson {
             data: "", error: "BSON root must be a struct or map[str, T]"
@@ -1363,9 +1470,9 @@ fn __bson_encode(v: int, d: int) -> Bson {
     }
     // буфер — последний выделенный блок: его хвост возвращается выделителю
     __alloc_trim(o.b.data, o.b.cap, o.b.len)
-    return Bson {
-        data: __str_new(o.b.data, o.b.len), checked: true
-    }
+    let doc = __bson_mark(__str_new(o.b.data, o.b.len))
+    doc.__none = o.dropped
+    return doc
 }
 
 // ---- from_bson ----
@@ -1468,13 +1575,19 @@ fn __bson_read(r: __BsonRead, kind: int, p: int, end: int, d: int, depth: int) -
 // Обёртки точных типов BSON и вложенный Bson. → значение или 0 (не подходит).
 fn __bson_read_special(r: __BsonRead, kind: int, p: int, end: int, name: str) -> int {
     if name == "Bson" && kind == 3 {
-        // вложенный документ как есть: проверяется его структура
+        // вложенный документ как есть: проверяется его структура, а метку
+        // «проверен» он получает от внешнего документа (как bson_get_doc) —
+        // иначе проверка UTF-8 при вложении была бы пропущена
         if !__bson_check(p, end - p, 0, false, false) {
             r.error = "holds an invalid BSON document"
             return 0
         }
+        let data = __str_new(p, end - p)
+        if r.trusted {
+            return __cast(__bson_mark(data))
+        }
         return __cast(Bson {
-            data: __str_new(p, end - p), checked: true
+            data
         })
     }
     if name == "BsonObjectId" && kind == 7 {
@@ -1622,7 +1735,7 @@ fn __bson_read_struct(r: __BsonRead, p: int, end: int, d: int, depth: int) -> in
         }
         let f = __field(d, i)
         let dk = load64(f + 24)
-        if dk == 1 {
+        if dk == 1 || dk == 4 {
             store64(out + i * 8, load64(f + 32))
         } else if dk == 2 {
             store64(out + i * 8, __list_new(4, load64(f + 32)))
@@ -1718,7 +1831,9 @@ fn __bson_read_sum(r: __BsonRead, kind: int, p: int, end: int, d: int, depth: in
 // общем состоянии потоков: bson_error() и json_error() описывают последнее
 // чтение.
 fn __bson_decode(doc: Bson, d: int) -> int {
-    let r = __BsonRead {}
+    let r = __BsonRead {
+        trusted: __bson_trusted(doc)
+    }
     var result = 0
     let p = __str_ptr(doc.data)
     let n = doc.data.byte_len()

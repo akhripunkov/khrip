@@ -62,6 +62,11 @@ var sql_outside: int
 var lit_on: bool
 var lit_ok: bool
 var lit_vals: [str]
+// Последнее разобранное if/match-значение: первая лексема и позиция за ним.
+// Набор ветвей годится, только если if/match — всё выражение, а не начало
+// «if c \{ "a" } else \{ "b" } + id» или «match ... \{ ... }.replace(...)».
+var ifv_from: int = -1
+var ifv_to: int = -1
 
 // Строки, которые даёт выражение toks[s..e]: строка-литерал, const или локальная
 // с известным набором; [] — неизвестно.
@@ -90,13 +95,17 @@ fn lit_set(s: int, e: int) -> [str] {
 }
 
 // Значение ветви toks[s..e] внутри let o = if/match: литерал — в набор; вложенный
-// if/match отметил свои ветви сам; иное — набор неизвестен.
+// if/match (целиком) отметил свои ветви сам; иное — набор неизвестен.
 fn lit_note(s: int, e: int) {
     if !lit_on || s >= toks.len() {
         return
     }
     let k = toks[s].kind
     if k == T_IF || k == T_MATCH {
+        // свои ветви вложенный if/match отметил сам — если он и есть всё значение
+        if ifv_from != s || ifv_to != e {
+            lit_ok = false
+        }
         return
     }
     let xs = lit_set(s, e)

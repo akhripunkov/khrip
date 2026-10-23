@@ -186,6 +186,7 @@ fn parse_arm_value(w: int) -> int {
 // if условие { a } else { b } в позиции значения.
 fn parse_if_expr(w: int) -> int {
     let at = tok()
+    let from = pos
     advance()
     if kind() == T_LET {
         error_tok(tok(), "if let cannot be used as a value", "use x ?? default or match")
@@ -221,6 +222,8 @@ fn parse_if_expr(w: int) -> int {
     if end >= 0 {
         patch_here(end)
     }
+    ifv_from = from
+    ifv_to = pos
     return result
 }
 
@@ -240,6 +243,7 @@ fn emit_cmp_imm(r: int, v: int) {
 // as_value: значение match остаётся в rax. → тип значения.
 fn parse_match(as_value: bool, w: int) -> int {
     let at = tok()
+    let from = pos
     advance()
     let saved_ns = no_struct
     no_struct = true
@@ -457,6 +461,10 @@ fn parse_match(as_value: bool, w: int) -> int {
     patch_all(end_holes, here())
     release_hidden(sl)
     match_div = all_div && complete
+    if as_value {
+        ifv_from = from
+        ifv_to = pos
+    }
     if as_value && result == ty_never && !all_div {
         return ty_err
     }

@@ -332,6 +332,44 @@ else
 	failed "драйверы по точным именам" "в программе без драйверов есть их код:"$'\n'"$(grep -E ' __(bson|mongo|ch|dh|tls|json|reply|dispatch)' "$tmp/own_api.sizes" "$tmp/own_cli.sizes" | head)"
 fi
 
+# Программа без имён, похожих на имена драйверов (свои Mongo и ch_query тоже
+# не в счёт), не читает тексты их библиотек: здесь вместо них именованные
+# каналы, открытие которых ждало бы писателя, — компиляция не закончилась бы.
+mkdir -p "$tmp/fifolib"
+cp lib/*.kh "$tmp/fifolib/"
+for f in bson mongo clickhouse; do
+	rm -f "$tmp/fifolib/$f.kh"
+	mkfifo "$tmp/fifolib/$f.kh"
+done
+fifo_ok=1
+for src in tests/run/own_driver_names.kh tests/api/own_driver_names.kh tests/api/crud.kh; do
+	if ! KHRIP_LIB="$tmp/fifolib" timeout 20 "$KHC" -o "$tmp/fifo_prog" "$src" >"$tmp/fifo.txt" 2>&1; then
+		fifo_ok=0
+		failed "$src без драйверов" "читает библиотеки драйверов (или не скомпилировалось): $(cat "$tmp/fifo.txt")"
+	fi
+done
+[[ $fifo_ok -eq 1 ]] && pass=$((pass + 1))
+# Тексты библиотек читаются только при имени, похожем на имя драйвера
+# (driver_like): khc check --all-lib находит имя библиотеки драйвера не по образцу.
+mkdir -p "$tmp/namelib"
+cp lib/*.kh "$tmp/namelib/"
+printf '\nfn sloppy_helper() -> int {\n    return 1\n}\n' >>"$tmp/namelib/bson.kh"
+KHRIP_LIB="$tmp/namelib" "$KHC" check --all-lib tests/api/crud.kh >"$tmp/names.txt" 2>&1
+if grep -q "'sloppy_helper' does not look like a driver name" "$tmp/names.txt" && grep -q "^1 error" "$tmp/names.txt"; then
+	pass=$((pass + 1))
+else
+	failed "имена библиотек драйверов" "$(cat "$tmp/names.txt")"
+fi
+
+# tests/databases/run.sh работает и в macOS, где /bin/bash — 3.2: там пустой
+# массив в "${a[@]}" при set -u — «unbound variable» (раскрывать как
+# ${a[@]+"${a[@]}"}), а mapfile, declare -A и ${x,,} нет вовсе.
+if ! grep -nE '(^|[^+])"\$\{[A-Za-z_]+\[[@*]\]\}"|mapfile|readarray|declare -A|\$\{[A-Za-z_]+(,,|\^\^)\}' tests/databases/run.sh | grep -v '^[0-9]*:[[:space:]]*#' >"$tmp/bash32.txt"; then
+	pass=$((pass + 1))
+else
+	failed "tests/databases/run.sh: bash 3.2" "$(cat "$tmp/bash32.txt")"
+fi
+
 # Конец запроса (__db_end, src/api.kh gen_db): очистки без сети — MongoDB,
 # ClickHouse, TLS — раньше отката PostgreSQL, который ждёт сервер до 5 с; хук
 # TLS есть и в программе только с fetch. Хуки маленькие и встраиваются, в

@@ -74,6 +74,20 @@ fn typed_codecs() {
     require((__ch_decimal_units(1.5e20, 0, 38) ?? 0) == 0 && __ch_decimal_units(1.5e20, 0, 38) == none, "Decimal beyond int")
     require(__ch_decimal_units(123456789.0, 2, 10) == none, "Decimal precision")
     require(__ch_decimal_units(0.0 / 0.0, 2, 10) == none, "Decimal NaN")
+    // Decimal128/256: целое без запятой шире int пишется словами (Decimal(38, 18)
+    // денег и токенов), предел — точность P
+    let d128 = buf_new(32)
+    require(__ch_decimal_wide(d128, 10.5, 18, 38, 16) && d128.len == 16 && load64(d128.data) == -7946744073709551616 && load64(d128.data + 8) == 0, "Decimal128 10.5 at scale 18")
+    let n128 = buf_new(32)
+    require(__ch_decimal_wide(n128, -10.5, 18, 38, 16) && load64(n128.data) == 7946744073709551616 && load64(n128.data + 8) == -1, "Decimal128 negative")
+    let d256 = buf_new(32)
+    require(__ch_decimal_wide(d256, 1.5, 40, 76, 32) && d256.len == 32 && load64(d256.data) == -7570531732156317696 && load64(d256.data + 8) == 1494890120908054401 && load64(d256.data + 16) == 44 && load64(d256.data + 24) == 0, "Decimal256 1.5 at scale 40")
+    require(!__ch_decimal_wide(buf_new(32), 1.0e20, 18, 38, 16) && __ch_decimal_wide(buf_new(32), 9.9e19, 18, 38, 16), "Decimal128 precision")
+    require(!__ch_decimal_wide(buf_new(32), 1.5, 2, 18, 8), "Decimal64 stays in int")
+    let digits = __ch_digits(12345678901234567000.0) ?? __ChDigits {}
+    require(digits.digits == 12345678901234567 && digits.count == 17 && digits.exp == 3, "trailing zeros of a whole float")
+    let fraction = __ch_digits(-0.00105) ?? __ChDigits {}
+    require(fraction.neg && fraction.digits == 105 && fraction.count == 3 && fraction.exp == -5, "digits of a fraction")
     // разбор типов
     let en = __ch_type_of("Enum8('it\\'s' = -2, 'a,b' = 1)") ?? __ChType { op: -1 }
     require(en.op == CHT_ENUM && en.names[0] == "it's" && en.values[0] == -2 && en.names[1] == "a,b", "Enum names with escapes")
