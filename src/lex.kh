@@ -1095,9 +1095,94 @@ fn lex_range(end: int) {
             }
             continue
         }
-        lex_error("unexpected character '" + lx_text.byte_slice(start, start + 1) + "'", start)
+        if c >= 0x80 {
+            lex_non_ascii(start, end)
+            continue
+        }
+        if c < 32 || c == 127 {
+            report_at(lx_file, lx_line, start - lx_line_start + 1, "unexpected control character U+" + hex_text(c, 4), "delete it")
+        } else {
+            lex_error("unexpected character '" + lx_text.byte_slice(start, start + 1) + "'", start)
+        }
         lx_p += 1
     }
+}
+
+// Символ вне ASCII в коде (не в строке и не в комментарии): в сообщении он
+// целиком и с кодом. Буква — имя не на ASCII; у типографских кавычек, тире,
+// знаков вроде × и ≤, особых пробелов и полноширинных знаков — замена на ASCII.
+fn lex_non_ascii(start: int, end: int) {
+    let p = __str_ptr(lx_text)
+    let w = __utf8_width(p, end, start)
+    lx_p = start + w
+    let col = start - lx_line_start + 1
+    if w == 1 {
+        // неправильный байт: файл — не UTF-8 (первый такой байт назвал lex_file)
+        report_at(lx_file, lx_line, col, "file is not valid UTF-8: byte " + hex_byte(lx_text.byte(start)), "save the file in UTF-8")
+        return
+    }
+    let cp = __utf8_decode(p, end, start)
+    let code = "U+" + hex_text(cp, 4)
+    let shown = "'" + lx_text.byte_slice(start, lx_p) + "' (" + code + ")"
+    if (cp >= 0x200B && cp <= 0x200D) || cp == 0x2060 || cp == 0xFEFF {
+        report_at(lx_file, lx_line, col, "unexpected invisible character " + code, "delete it")
+        return
+    }
+    let ascii = ascii_lookalike(cp)
+    if ascii == " " {
+        report_at(lx_file, lx_line, col, "unexpected character " + shown, "use a plain space instead")
+    } else if ascii != "" {
+        report_at(lx_file, lx_line, col, "unexpected character " + shown, "use the ASCII " + ascii + " instead")
+    } else if cp < 0xC0 || cp == 0xD7 || cp == 0xF7 || (cp >= 0x2000 && cp < 0x2C00) || (cp >= 0x3000 && cp < 0x3040) || (cp >= 0x1F000 && cp < 0x1FB00) {
+        report_at(lx_file, lx_line, col, "unexpected character " + shown, "characters outside ASCII can go in strings and comments")
+    } else {
+        report_at(lx_file, lx_line, col, "identifiers use ASCII letters, digits and _; found " + shown, "write the name in ASCII; other characters can go in strings and comments")
+    }
+}
+
+// ASCII-замена символа, похожего на знак Khrip, или "".
+fn ascii_lookalike(cp: int) -> str {
+    if cp == 0x2018 || cp == 0x2019 || cp == 0x201A || cp == 0x201B || cp == 0x2032 {
+        return "'"
+    }
+    if cp == 0x201C || cp == 0x201D || cp == 0x201E || cp == 0x201F || cp == 0xAB || cp == 0xBB || cp == 0x2033 {
+        return "\""
+    }
+    if (cp >= 0x2010 && cp <= 0x2015) || cp == 0x2212 {
+        return "-"
+    }
+    if cp == 0xD7 {
+        return "*"
+    }
+    if cp == 0xF7 {
+        return "/"
+    }
+    if cp == 0x2264 {
+        return "<="
+    }
+    if cp == 0x2265 {
+        return ">="
+    }
+    if cp == 0x2260 {
+        return "!="
+    }
+    if cp == 0x2192 {
+        return "->"
+    }
+    if cp == 0x21D2 {
+        return "=>"
+    }
+    if cp == 0x2026 {
+        return "..."
+    }
+    if cp == 0xA0 || (cp >= 0x2000 && cp <= 0x200A) || cp == 0x202F || cp == 0x205F || cp == 0x3000 {
+        return " "
+    }
+    if cp >= 0xFF01 && cp <= 0xFF5E {
+        // полноширинные формы ASCII: （ → (
+        return __str_from_byte(cp - 0xFEE0)
+    }
+    return ""
 }
 
 fn lex_file(fi: int) {

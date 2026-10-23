@@ -1953,7 +1953,7 @@ fn sql_site(at: Token, cur: str, nv: int, ps: [SqlParam], shape: int, inner: int
     if shape != SH_COUNT {
         desc_put(off, 5, type_desc(inner))
     }
-    desc_put(off, 6, const_str(files[at.file].path + ":" + at.line.to_str() + ":" + at.col.to_str()))
+    desc_put(off, 6, const_str(files[at.file].path + ":" + at.line.to_str() + ":" + src_col(at.file, at.line, at.col).to_str()))
     desc_put(off, 7, const_str(sql_target_table(cur)))
     desc_put(off, 8, sql_sites.len())
     let keys = sql_row_keys(cur, ps)

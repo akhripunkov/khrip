@@ -1795,6 +1795,37 @@ fn str_method_fn(name: str, system: bool) -> str {
     return "__str_" + name
 }
 
+// Встроенные методы str в коде программы → сколько у них аргументов после
+// получателя: 0 или 1 (один и больше); -1 — не метод. s.имя(...) вызывает
+// встроенный метод, даже если в программе есть fn имя(s: str, ...), поэтому
+// такое объявление — ошибка (str_method_clash).
+fn str_method_args(name: str) -> int {
+    if name == "len" || name == "byte_len" || name == "trim" || name == "lower" || name == "upper" || name == "ascii_trim" || name == "ascii_lower" || name == "ascii_upper" || name == "to_int" || name == "to_float" || name == "to_str" {
+        return 0
+    }
+    if name == "byte" || name == "byte_slice" || name == "byte_find" || name == "byte_find_from" || name == "contains" || name == "starts_with" || name == "ends_with" || name == "find" || name == "find_from" || name == "split" || name == "replace" || name == "repeat" || name == "matches" {
+        return 1
+    }
+    return -1
+}
+
+// fn имя(s: str, ...) с именем встроенного метода str: функция программы — метод
+// своего первого параметра, но s.имя(...) у str всегда вызывает встроенный
+// метод. Раньше fn trim(s: str) молча проигрывала встроенному trim (а до
+// байтового API s.byte_len() вызывал функцию программы) — теперь это ошибка в
+// объявлении. Первый параметр str? — тоже: у str-получателя метод встроенный.
+fn str_method_clash(name: Token, ps: [Param]) {
+    let n = str_method_args(name.text)
+    if n < 0 || ps.len() == 0 || ps[0].ty == ty_err || !assignable(ty_str, ps[0].ty) {
+        return
+    }
+    var form = "s." + name.text + "()"
+    if n > 0 {
+        form = "s." + name.text + "(...)"
+    }
+    error_tok(name, "fn " + name.text + " clashes with the built-in str method " + name.text, "rename it: " + form + " calls the built-in, never a function that takes str first")
+}
+
 // Методы str, которые в системном коде запрещены: у них будет символьный смысл.
 // Текущий токен — '('.
 fn system_str_method(nt: Token) {
@@ -1813,25 +1844,6 @@ fn system_str_method(nt: Token) {
         } else {
             system_str_error(nt, "replace(\"\", ...)", "a Buf filled byte by byte")
         }
-    }
-}
-
-// Байтовый API у str — встроенные методы v0.13, и s.имя(...) вызывает метод,
-// даже если в программе есть fn имя(s: str, ...). До v0.13 такой вызов шёл
-// в функцию программы: вместо тихой замены — ошибка. (s.byte(i) и прочие
-// методы str были встроенными и раньше: их вызов не изменился.)
-fn byte_api_shadow(rt: int, nt: Token) {
-    let name = nt.text
-    if name != "byte_len" && name != "byte_slice" && name != "byte_find" && name != "byte_find_from" && name != "ascii_lower" && name != "ascii_upper" && name != "ascii_trim" {
-        return
-    }
-    let uf = func_find(name)
-    if uf >= 0 && !funcs[uf].is_lib && funcs[uf].params.len() > 0 && assignable(rt, funcs[uf].params[0].ty) {
-        var args = "(s)"
-        if funcs[uf].params.len() > 1 {
-            args = "(s, ...)"
-        }
-        error_tok(nt, "s." + name + "() is the built-in str method, not your fn " + name, "call your function as " + name + args + ", or rename it")
     }
 }
 
@@ -1866,7 +1878,6 @@ fn parse_method(rt: int, nt: Token) -> int {
         if system_code(nt) {
             system_str_method(nt)
         }
-        byte_api_shadow(rt, nt)
     }
     if k == K_FLOAT && name == "to_int" && kind_at(pos + 1) == ')' {
         advance()
@@ -1925,7 +1936,11 @@ fn parse_method(rt: int, nt: Token) -> int {
     var fi = -1
     let prefix = method_prefix(k)
     if k == K_STR {
-        fi = func_find(str_method_fn(name, system_code(nt)))
+        // в коде программы — только встроенные методы; прочие __str_* —
+        // внутренние функции библиотеки (s.slice — байтовый срез)
+        if system_code(nt) || str_method_args(name) >= 0 {
+            fi = func_find(str_method_fn(name, system_code(nt)))
+        }
     } else if prefix.byte_len() > 0 {
         fi = func_find(prefix + name)
         if k == K_LIST && name == "sum" && tt == ty_float {

@@ -7,8 +7,10 @@
 #                       один: так тесты строк идут без кэша строк, с ним и в
 #                       проверочном режиме (KHRIP_STRCACHE), с SIMD и без;
 #   tests/errors/*.kh — не должны компилироваться; вывод компилятора должен
-#                       содержать каждую строку «// expect: ...»; ключи
-#                       компилятора — из «// flags: ...»;
+#                       содержать каждую строку «// expect: ...», а если есть
+#                       .err — совпасть с ним целиком; ключи компилятора — из
+#                       «// flags: ...»; с --json (нужен python3) — правильный
+#                       JSON с теми же местами и сообщениями;
 #   tests/api/*.kh    — блоки test (khc test); вывод сравнивается с .out;
 #   tests/locks/*.kh  — какие маршруты берут store на чтение (khc check --locks);
 #   tests/sqlcheck/   — правильный SQL: khc check без базы не находит ошибок;
@@ -65,6 +67,7 @@ for src in tests/run/*.kh; do
 	done
 done
 
+mkdir -p "$tmp/json"
 for src in tests/errors/*.kh; do
 	flags=$(sed -n 's|^// flags: *||p' "$src" | head -1)
 	# shellcheck disable=SC2086
@@ -72,6 +75,8 @@ for src in tests/errors/*.kh; do
 		failed "$src" "скомпилировалось, а должна быть ошибка"
 		continue
 	fi
+	# обычный вывод — для сверки с --json ниже
+	[[ "$flags" != *--json* ]] && cp "$tmp/err.txt" "$tmp/json/$(basename "$src" .kh).text"
 	ok=1
 	while IFS= read -r want; do
 		if ! grep -qF -- "$want" "$tmp/err.txt"; then
@@ -80,8 +85,63 @@ for src in tests/errors/*.kh; do
 			break
 		fi
 	done < <(sed -n 's|^// expect: *||p' "$src")
+	if [[ $ok -eq 1 && -f "${src%.kh}.err" ]] && ! diff -u "${src%.kh}.err" "$tmp/err.txt" >"$tmp/err.diff"; then
+		failed "$src" "вывод отличается от ${src%.kh}.err"
+		cat "$tmp/err.diff"
+		ok=0
+	fi
 	[[ $ok -eq 1 ]] && pass=$((pass + 1))
 done
+
+# Ошибки в JSON (khc check --json): правильный JSON в UTF-8, какие бы байты ни
+# были в исходнике и в пути, и те же места (столбец — номер символа) и
+# сообщения, что в обычном выводе. Все tests/errors и файл с кавычкой, \,
+# табуляцией и неправильным байтом в имени, а в тексте — с неправильным байтом,
+# управляющим символом и кириллицей.
+if command -v python3 >/dev/null; then
+	odd="$tmp/json/"$'q"u\\o\tte\xff'".kh"
+	printf 'fn main() {\n    let s = "мир\xff"; let x: int = "a"\n    let t = 1\x01\n    let имя = 2\n}\n' >"$odd"
+	n=0
+	for src in tests/errors/*.kh "$odd"; do
+		flags=$(sed -n 's|^// flags: *||p' "$src" | head -1)
+		# shellcheck disable=SC2086
+		"$KHC" check $flags --json "$src" >"$tmp/json/$n.json" 2>&1
+		text="$tmp/json/$(basename "$src" .kh).text"
+		if [[ -f "$text" ]]; then
+			mv "$text" "$tmp/json/$n.txt"
+		else
+			# shellcheck disable=SC2086
+			"$KHC" check ${flags//--json/} "$src" >"$tmp/json/$n.txt" 2>&1
+		fi
+		printf '%s\n' "$src" >"$tmp/json/$n.src"
+		n=$((n + 1))
+	done
+	if python3 -I - "$tmp/json" "$n" >"$tmp/json.txt" 2>&1 <<'PY'; then
+import json, re, sys
+d, n = sys.argv[1], int(sys.argv[2])
+bad = 0
+for i in range(n):
+    src = open(f"{d}/{i}.src", "rb").read().decode("utf-8", "replace").strip()
+    try:
+        items = json.loads(open(f"{d}/{i}.json", "rb").read().decode("utf-8"))
+        assert isinstance(items, list) and items, "an empty list"
+        got = [(e["file"], e["line"], e["col"], e["message"], e["hint"]) for e in items]
+    except Exception as e:
+        print(f"{src}: not valid --json: {e}")
+        bad += 1
+        continue
+    text = open(f"{d}/{i}.txt", "rb").read().decode("utf-8", "replace")
+    want = [(f, int(l), int(c), m) for f, l, c, m in re.findall(r"^(.*):(\d+):(\d+): error: (.*)$", text, re.M)]
+    if [g[:4] for g in got] != want:
+        print(f"{src}: --json differs from the text output:\n  {got}\n  {want}")
+        bad += 1
+sys.exit(1 if bad else 0)
+PY
+		pass=$((pass + 1))
+	else
+		failed "khc check --json" "$(cat "$tmp/json.txt")"
+	fi
+fi
 
 for src in tests/api/*.kh; do
 	name=$(basename "$src" .kh)
