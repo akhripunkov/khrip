@@ -27,6 +27,7 @@ const STRC_HI = 24
 const STRC_DUP = 32
 const STRC_MRU = 40
 const STRC_MEMO = 48
+const STRC_MEMO_CNT = 56
 const STRC_KP = 64
 const STRC_KN = 128
 const STRC_CNT = 192
@@ -36,9 +37,13 @@ const STRC_CB = 384
 const STRC_IX = 448
 const STRC_USE = 512
 const STRC_FAR = 576
-// Память фактов (STRC_MEMO): STRC_MEMO_N мест по 6 слов — kp, kn, cnt, vup, ix,
-// far; у ключа два места — пара 2h, 2h + 1, h — по хешу (p, n).
+// Память фактов (STRC_MEMO): STRC_MEMO_N мест по STRC_MEMO_W байт — kp, kn, cnt,
+// vup, ix, far, use; место ключа ищется от места по хешу (p, n) подряд, по
+// кругу. Ключей в ней не больше STRC_MEMO_K (их число — слово STRC_MEMO_CNT
+// блока).
 const STRC_MEMO_N = 64
+const STRC_MEMO_K = 32
+const STRC_MEMO_W = 56
 // Открытый конец среза: s[a..] передаёт его вместо b.
 const TEXT_END = 0x7FFFFFFFFFFFFFFF
 
@@ -97,7 +102,8 @@ fn __strc_add(n: int) {
 //       могут быть заняты (новая запись берёт первое свободное место, поэтому
 //       обходить нужно только их), [32] 1 — у какого-то ключа может быть две
 //       записи (0 — точно нет: __strc_spare не ищет), [40] запись + 1, которую
-//       последней нашёл __strc_get, [48] память фактов или 0 (ниже);
+//       последней нашёл __strc_get, [48] память фактов или 0 (ниже), [56]
+//       сколько в ней ключей;
 //   kp, kn — ключ (kp = 0 — запись свободна);
 //   cnt    — число символов + 1 (0 — неизвестно);
 //   vup    — [0, vup) — правильный UTF-8, vup — граница символа;
@@ -117,6 +123,14 @@ fn __strc_add(n: int) {
 // читается, когда у ключа появляется новая запись (__strc_init). Как и записи,
 // хранит только числа и адрес индекса, всё проверяется перед чтением; уходит
 // вместе с блоком (обнуление блока стирает её адрес).
+//
+// Место ключа ищется от места по хешу адреса подряд до ключа или пустого места
+// (открытая адресация), а ключей не больше половины мест, поэтому поиск
+// короткий. Хеш решает только, где ключ лежит, а не сохранится ли он: факты
+// теряет лишь ключ, после которого запомнились или прочитались STRC_MEMO_K
+// других, — новый ключ сверх STRC_MEMO_K вытесняет самый давний (use — часы
+// блока). Таблица по два места на хеш теряла факты, когда три строки из
+// девяти по кругу попадали в одну пару, и проход снова становился O(n²).
 //
 // KHRIP_STRCACHE=stress: кэшируется всё, кроме пустых строк, запись одна,
 // индекс строится на первом переходе любой длины, а испорченная запись —
@@ -212,55 +226,111 @@ fn __strc_init(b: int, e: int, p: int, n: int, from: int) {
     store64(x + STRC_KP, p)
 }
 
-// Первое из двух мест ключа (p, n) в памяти фактов (адрес слова) или 0, если
-// памяти нет. Хеш — умножением (в библиотеке оно по модулю 2^64), старшие биты.
-fn __strc_memo_pair(b: int, p: int, n: int) -> int {
+// Номер места ключа (p, n) по хешу: умножение (в библиотеке оно по модулю
+// 2^64), старшие биты.
+fn __strc_memo_home(p: int, n: int) -> int {
+    return (((p ^ (n << 24)) * 0x7F4A7C159E3779B1) >> 40) & (STRC_MEMO_N - 1)
+}
+
+// Факты ключа (p, n) из памяти: адрес места или 0 (ключа нет, нет памяти).
+// Найденное место получает отметку use — ключ прочитан недавно.
+fn __strc_memo_find(b: int, p: int, n: int) -> int {
     let m = load64(b + STRC_MEMO)
     if m == 0 {
         return 0
     }
-    let h = (((p ^ (n << 24)) * 0x7F4A7C159E3779B1) >> 40) & (STRC_MEMO_N / 2 - 1)
-    return m + 96 * h
-}
-
-// Факты ключа (p, n) из памяти: адрес места или 0.
-fn __strc_memo_find(b: int, p: int, n: int) -> int {
-    var z = __strc_memo_pair(b, p, n)
-    if z == 0 {
-        return 0
-    }
-    if load64(z) == p && load64(z + 8) == n {
-        return z
-    }
-    z += 48
-    if load64(z) == p && load64(z + 8) == n {
-        return z
+    var h = __strc_memo_home(p, n)
+    var i = 0
+    while i < STRC_MEMO_N {
+        let z = m + STRC_MEMO_W * h
+        let kp = load64(z)
+        if kp == 0 {
+            return 0
+        }
+        if kp == p && load64(z + 8) == n {
+            store64(z + 48, load64(b + STRC_CLOCK))
+            return z
+        }
+        h = (h + 1) & (STRC_MEMO_N - 1)
+        i += 1
     }
     return 0
 }
 
-// Запомнить факты записи e ключа (p, n): в место ключа, иначе в свободное из
-// двух, иначе вместо первого. Ключ места обнуляется первым и пишется
-// последним, как в __strc_init.
+// Запомнить факты записи e ключа (p, n): в место ключа, иначе в первое пустое
+// от места по хешу; ключей уже STRC_MEMO_K — сначала вытесняется самый давний.
+// Ключ нового места пишется последним, как в __strc_init.
 fn __strc_remember(b: int, e: int, p: int, n: int) {
     if load64(b + STRC_MEMO) == 0 {
-        store64(b + STRC_MEMO, __alloc(48 * STRC_MEMO_N))
+        store64(b + STRC_MEMO, __alloc(STRC_MEMO_W * STRC_MEMO_N))
+        store64(b + STRC_MEMO_CNT, 0)
     }
     var z = __strc_memo_find(b, p, n)
     if z == 0 {
-        z = __strc_memo_pair(b, p, n)
-        if load64(z) != 0 && load64(z + 48) == 0 {
-            z += 48
+        if load64(b + STRC_MEMO_CNT) >= STRC_MEMO_K {
+            __strc_memo_evict(b)
         }
+        let m = load64(b + STRC_MEMO)
+        var h = __strc_memo_home(p, n)
+        // пустое место есть всегда: ключей меньше, чем мест
+        while load64(m + STRC_MEMO_W * h) != 0 {
+            h = (h + 1) & (STRC_MEMO_N - 1)
+        }
+        z = m + STRC_MEMO_W * h
+        store64(b + STRC_MEMO_CNT, load64(b + STRC_MEMO_CNT) + 1)
     }
     let x = b + 8 * e
-    store64(z, 0)
     store64(z + 16, load64(x + STRC_CNT))
     store64(z + 24, load64(x + STRC_VUP))
     store64(z + 32, load64(x + STRC_IX))
     store64(z + 40, load64(x + STRC_FAR))
+    store64(z + 48, load64(b + STRC_CLOCK))
     store64(z + 8, n)
     store64(z, p)
+}
+
+// Освободить место самого давнего ключа памяти фактов (меньшая отметка use).
+fn __strc_memo_evict(b: int) {
+    let m = load64(b + STRC_MEMO)
+    var v = 0
+    var vuse = 0
+    var i = 0
+    while i < STRC_MEMO_N {
+        let z = m + STRC_MEMO_W * i
+        if load64(z) != 0 && (v == 0 || load64(z + 48) < vuse) {
+            v = z
+            vuse = load64(z + 48)
+        }
+        i += 1
+    }
+    if v != 0 {
+        __strc_memo_del(b, v)
+    }
+}
+
+// Освободить место z памяти фактов. Поиск идёт до пустого места, поэтому ключи
+// дальше по кругу, которые без z не нашлись бы, сдвигаются назад: ключ места j
+// остаётся, если его место по хешу — между освобождённым i и j.
+fn __strc_memo_del(b: int, z: int) {
+    let m = load64(b + STRC_MEMO)
+    let mask = STRC_MEMO_N - 1
+    var i = (z - m) / STRC_MEMO_W
+    var j = i
+    while true {
+        j = (j + 1) & mask
+        let y = m + STRC_MEMO_W * j
+        let kp = load64(y)
+        if kp == 0 {
+            break
+        }
+        let h = __strc_memo_home(kp, load64(y + 8))
+        if ((j - h) & mask) >= ((j - i) & mask) {
+            __memcpy(m + STRC_MEMO_W * i, y, STRC_MEMO_W)
+            i = j
+        }
+    }
+    store64(m + STRC_MEMO_W * i, 0)
+    store64(b + STRC_MEMO_CNT, load64(b + STRC_MEMO_CNT) - 1)
 }
 
 // Запись, которую можно отдать другому ключу без потерь: самая старая из тех, у
@@ -392,7 +462,7 @@ fn __strc_drop(b: int, e: int) {
     let x = b + 8 * e
     let z = __strc_memo_find(b, load64(x + STRC_KP), load64(x + STRC_KN))
     if z != 0 {
-        store64(z, 0)
+        __strc_memo_del(b, z)
     }
     store64(x + STRC_KP, 0)
 }
