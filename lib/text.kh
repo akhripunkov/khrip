@@ -1021,6 +1021,66 @@ fn __text_find(self: str, sub: str) -> int? {
     return k
 }
 
+// s.find_from(sub, from): индекс символа первого вхождения, которое начинается не
+// раньше символа from, или -1. Отрицательное from — с начала строки (как у
+// срезов), за концом строки — -1. Начало from ищется как у срезов, дальше — как в
+// __text_find: поиск байтов и счёт символов между началом и вхождением; курсор
+// остаётся на вхождении, поэтому цикл поиска по длинной строке линеен.
+fn __text_find_from(self: str, sub: str, from: int) -> int {
+    let p = __str_ptr(self)
+    let n = __str_len(self)
+    var k0 = from
+    if k0 < 0 {
+        k0 = 0
+    }
+    let b = __strc_for(n)
+    var ob = 0
+    if k0 > 0 {
+        if b != 0 {
+            ob = __strc_off(b, p, n, k0)
+        } else {
+            let m = __utf8_scan(p, n)
+            if m == n {
+                ob = k0
+                if ob > n {
+                    ob = n
+                }
+            } else if m >= 0 {
+                ob = __utf8_skip(p, n, k0)
+            } else {
+                ob = __tx_go_skip(p, n, k0)
+            }
+        }
+    }
+    if ob >= n {
+        // символов не больше k0: пустой sub — только ровно в конце строки
+        if __str_len(sub) == 0 && k0 == __text_len(self) {
+            return k0
+        }
+        return -1
+    }
+    let bi = __str_byte_find_from(self, sub, ob)
+    if bi < 0 {
+        return -1
+    }
+    var c = __utf8_scan(p + ob, bi - ob)
+    let valid = c >= 0
+    if !valid {
+        c = __tx_go_count(p + ob, bi - ob)
+    }
+    let k = k0 + c
+    let sn = __str_len(sub)
+    if b != 0 && bi < n && sn > 0 && __utf8_scan(__str_ptr(sub), sn) >= 0 {
+        let e0 = __strc_entry(b, p, n)
+        let vup = load64(b + STRC_VUP + 8 * e0)
+        if valid && ob <= vup && bi > vup {
+            __strc_fact(b, e0, p, n, STRC_VUP, bi)
+        }
+        __strc_cursor(b, p, n, -1, e0, k, bi)
+    }
+    return k
+}
+
 // s.split(sep): с пустым sep — список символов (как в Go и JS), иначе по байтам.
 fn __text_split(self: str, sep: str) -> [str] {
     if __str_len(sep) != 0 {

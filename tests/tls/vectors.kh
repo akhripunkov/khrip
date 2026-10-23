@@ -5,9 +5,9 @@ fn unhex(s: str) -> int {
     if s == "-" {
         return __alloc(16)
     }
-    let p = __alloc(s.len() / 2 + 16)
-    for i in 0..s.len() / 2 {
-        store8(p + i, __hex_val(s[2 * i]) * 16 + __hex_val(s[2 * i + 1]))
+    let p = __alloc(s.byte_len() / 2 + 16)
+    for i in 0..s.byte_len() / 2 {
+        store8(p + i, __hex_val(s.byte(2 * i)) * 16 + __hex_val(s.byte(2 * i + 1)))
     }
     return p
 }
@@ -16,7 +16,7 @@ fn hlen(s: str) -> int {
     if s == "-" {
         return 0
     }
-    return s.len() / 2
+    return s.byte_len() / 2
 }
 
 fn check(f: [str]) -> bool {

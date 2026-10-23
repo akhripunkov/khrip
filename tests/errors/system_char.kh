@@ -1,6 +1,6 @@
 // flags: --system
 // expect: non-ASCII character literal in system code: write its UTF-8 bytes as numbers: 0xD1 0x8F
-// expect: system_char.kh:9:13: error: character literal must contain exactly one character
+// expect: system_char.kh:9:13: error: a character literal holds one character
 // expect: 2 errors
 // В системном коде символьный литерал — один байт ASCII.
 fn main() {

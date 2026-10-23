@@ -46,7 +46,7 @@ fn parse_headers(p: int, n: int) -> int {
 fn main() {
     let req = browser_request()
     let rp = __str_ptr(req)
-    let rn = req.len()
+    let rn = req.byte_len()
     var text = ""
     for i in 0..40 {
         text += "Khrip is a language for APIs; this paragraph is filler text number {i} for the benchmark. "
@@ -67,7 +67,7 @@ fn main() {
     t = now_ns()
     for k in 0..n2 {
         __arena_begin()
-        sum += to_json(a).len()
+        sum += to_json(a).byte_len()
         __arena_end()
     }
     let enc_ns = (now_ns() - t) / n2
@@ -77,10 +77,10 @@ fn main() {
         __arena_begin()
         let b: Article? = from_json(js)
         if let x = b {
-            sum += x.body.len()
+            sum += x.body.byte_len()
         }
         __arena_end()
     }
     let dec_ns = (now_ns() - t) / n2
-    print("{__simd_level} {http_ns} {enc_ns} {dec_ns} {rn} {js.len()} {sum % 7}")
+    print("{__simd_level} {http_ns} {enc_ns} {dec_ns} {rn} {js.byte_len()} {sum % 7}")
 }

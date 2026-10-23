@@ -1,0 +1,17 @@
+// expect: char_types.kh:13:18: error: operator - needs int operands, found str
+// expect: hint: c.to_int() ?? 0 gives the digit
+// expect: char_types.kh:14:18: error: cannot compare str with int
+// expect: hint: s[i] is a one-character str: compare with "A"
+// expect: char_types.kh:15:17: error: cannot order str and int
+// expect: hint: write n == 'a' to compare with its code
+// expect: 3 errors
+// Символ строки — str из одного символа: арифметика и сравнение с числом —
+// ошибки с подсказками; 'a' слева от int — тоже str.
+fn main() {
+    let s = "42"
+    let n = 97
+    let d = s[0] - '0'
+    let e = s[1] == 65
+    let f = 'a' < n
+    print("{d} {e} {f}")
+}

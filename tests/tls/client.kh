@@ -10,7 +10,7 @@ route GET "/get" (url: str) -> str {
     if at >= 0 {
         return "200 " + r.body[at + 10..].split("\n")[0]
     }
-    return "200 {r.body.len()} bytes"
+    return "200 {r.body.byte_len()} bytes"
 }
 
 // n запросов подряд; сервер отвечает числом принятых соединений

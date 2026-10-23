@@ -1,0 +1,134 @@
+// Работа со строкой по символам не квадратична: на 1 МБ кириллицы каждый
+// приём читает не больше 4·n байт (счётчик __strc_scanned; доступ вразнобой —
+// 2·n на индекс и не больше 64 символов по 4 байта на обращение) и укладывается
+// в 300 мс. Приёмы — индекс по порядку, два указателя, 100 000 обращений
+// вразнобой, поиск со срезом остатка, срезы по одному символу, доступ через
+// функцию-помощник и начало ста разных тел по 10 КБ (читается только начало).
+// Без кэша строк (KHRIP_STRCACHE=off) эти приёмы квадратичны — тест только с ним.
+// env:
+// env: KHRIP_SIMD=0
+
+type Post {
+    id: int
+    body: str
+}
+
+var bad: int = 0
+
+fn check(what: str, scanned: int, limit: int, ms: int) {
+    if scanned > limit {
+        print("{what}: {scanned} bytes scanned, limit {limit}")
+        bad += 1
+    }
+    if ms > 300 {
+        print("{what}: {ms} ms")
+        bad += 1
+    }
+}
+
+fn at(s: str, i: int) -> str {
+    return s[i..i + 1]
+}
+
+fn main() -> int {
+    let piece = "съешь же ещё этих мягких французских булок, да выпей чаю, "
+    let s = piece.repeat(1048576 / piece.byte_len())
+    let n = s.byte_len()
+    let count = s.len()
+    print("{count} characters, {n} bytes")
+
+    // индекс по порядку: while i < s.len() { s[i] }
+    var b0 = __strc_scanned()
+    var t0 = now_ms()
+    var spaces = 0
+    var i = 0
+    while i < s.len() {
+        if s[i] == " " {
+            spaces += 1
+        }
+        i += 1
+    }
+    check("index loop", __strc_scanned() - b0, 4 * n, now_ms() - t0)
+    print("spaces {spaces}")
+
+    // два указателя навстречу
+    b0 = __strc_scanned()
+    t0 = now_ms()
+    var same = 0
+    var lo = 0
+    var hi = count - 1
+    while lo < hi {
+        if s[lo] == s[hi] {
+            same += 1
+        }
+        lo += 1
+        hi -= 1
+    }
+    check("two pointers", __strc_scanned() - b0, 4 * n, now_ms() - t0)
+    print("same {same}")
+
+    // 100 000 обращений вразнобой
+    b0 = __strc_scanned()
+    t0 = now_ms()
+    var x = 12345
+    var commas = 0
+    for k in 0..100000 {
+        x = (x * 1103515245 + 12345) % 2147483648
+        if s[x % count] == "," {
+            commas += 1
+        }
+    }
+    check("random index", __strc_scanned() - b0, 2 * n + 100000 * 64 * 4, now_ms() - t0)
+    print("commas {commas}")
+
+    // поиск со срезом остатка
+    b0 = __strc_scanned()
+    t0 = now_ms()
+    var rest = s
+    var fields = 0
+    while true {
+        let j = rest.find(",") else {
+            break
+        }
+        fields += 1
+        rest = rest[j + 1..]
+    }
+    check("find and slice", __strc_scanned() - b0, 4 * n, now_ms() - t0)
+    print("fields {fields}, rest {rest.len()}")
+
+    // срезы по одному символу и функция-помощник
+    b0 = __strc_scanned()
+    t0 = now_ms()
+    var ye = 0
+    for k in 0..count {
+        if s[k..k + 1] == "е" {
+            ye += 1
+        }
+    }
+    check("one-character slices", __strc_scanned() - b0, 4 * n, now_ms() - t0)
+    b0 = __strc_scanned()
+    t0 = now_ms()
+    var ye2 = 0
+    for k in 0..count {
+        if at(s, k) == "е" {
+            ye2 += 1
+        }
+    }
+    check("helper function", __strc_scanned() - b0, 4 * n, now_ms() - t0)
+    print("е {ye} {ye2}")
+
+    // начало ста разных тел по 10 КБ: читается только начало
+    var posts: [Post] = []
+    for k in 0..100 {
+        posts.push(Post { id: k, body: "№{k} " + piece.repeat(10240 / piece.byte_len()) })
+    }
+    b0 = __strc_scanned()
+    t0 = now_ms()
+    var heads = 0
+    for p in posts {
+        heads += p.body[..100].len()
+    }
+    check("post heads", __strc_scanned() - b0, 100 * 1024, now_ms() - t0)
+    print("heads {heads}")
+    return bad
+}

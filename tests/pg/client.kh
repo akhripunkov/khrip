@@ -143,7 +143,7 @@ fn main() -> int {
     print("int8 {__pg_int(ty, 0)} bool {__pg_bool(ty, 1)} {__pg_bool(ty, 2)} float {__pg_float(ty, 3)} {__pg_float(ty, 4)}")
     print("timestamptz {time_iso(__pg_time(ty, 5))} timestamp {time_iso(__pg_time(ty, 6))}")
     let raw = __pg_bytes(ty, 7)
-    print("bytea {raw.len()} {raw[0]} {raw[1]} {raw[2]} json {__pg_str(ty, 8)} text {__pg_str(ty, 9)} null {__pg_null(ty, 10)} {__pg_null(ty, 9)}")
+    print("bytea {raw.byte_len()} {raw.byte(0)} {raw.byte(1)} {raw.byte(2)} json {__pg_str(ty, 8)} text {__pg_str(ty, 9)} null {__pg_null(ty, 10)} {__pg_null(ty, 9)}")
 
     // массивы и bytea: разбор ответа и параметры туда и обратно
     let tricky: [str?] = ["a", "b c", none, "d\"e\\f", "", "NULL", "\{x,y}"]
@@ -157,7 +157,7 @@ fn main() -> int {
         same = same && (back[k] ?? "<null>") == (tricky[k] ?? "<null>") && (back[k] == none) == (tricky[k] == none)
     }
     print("text[] {__pg_arr(ar, 0).map(x => x ?? "<null>").join("|")}")
-    print("int[] {__pg_arr(ar, 1).map(x => x ?? "?").join("+")} empty {__pg_arr(ar, 2).len()} roundtrip {same} bytea {__pg_bytes(ar, 4).len()}")
+    print("int[] {__pg_arr(ar, 1).map(x => x ?? "?").join("+")} empty {__pg_arr(ar, 2).len()} roundtrip {same} bytea {__pg_bytes(ar, 4).byte_len()}")
 
     // описание запроса без выполнения: типы параметров и столбцов, ошибки с местом
     let ds = __pg_describe(c2, "select id, email, age, now() as at from t_users where id = $1 and email = $2", d)

@@ -1,0 +1,132 @@
+// Символьный литерал 'x': str из одного символа или код символа (int) — по
+// тому, что ждут (docs/design/v0.13-utf8.md, §1.3). Строки таблицы по порядку.
+
+type Item {
+    mark: str
+    code: int
+}
+
+fn show(s: str) -> str {
+    return "<" + s + ">"
+}
+
+fn code_of(c: int) -> int {
+    return c
+}
+
+fn sep() -> str {
+    return ';'
+}
+
+fn first_code() -> int {
+    return 'я'
+}
+
+fn maybe_mark(on: bool) -> str? {
+    if on {
+        return '+'
+    }
+    return none
+}
+
+fn joined(xs: [str], by: str = ',') -> str {
+    return xs.join(by)
+}
+
+fn kind(c: str) -> str {
+    return match c {
+        'a' | 'e' | 'o' => "vowel"
+        'я' => "ya"
+        _ => "other"
+    }
+}
+
+fn digit(n: int) -> str {
+    return match n {
+        '0' => "zero"
+        '1' => "one"
+        _ => "?"
+    }
+}
+
+fn main() {
+    // ждут str: аргумент, результат, let x: str, +=, правый операнд == и < после
+    // str, + после str, образец match, элемент [str], ключ и значение словаря,
+    // поле, параметр по умолчанию
+    print(show('x'))
+    print(sep())
+    let s: str = 'ж'
+    print(s)
+    var acc = "a"
+    acc += 'b'
+    acc += 'ё'
+    print(acc)
+    let c = "q"
+    print(c == 'q')
+    print(c != 'q')
+    print(c < 'r')
+    print(c >= 'r')
+    print("x" + 'y' + 'z')
+    print(kind("e") + " " + kind("я") + " " + kind("z"))
+    let letters: [str] = ['a', 'b', 'в']
+    print(letters.join("-"))
+    var m: map[str, str] = {}
+    m['k'] = 'v'
+    print(m["k"] ?? "none")
+    let it = Item { mark: '*', code: '*' }
+    print("{it.mark} {it.code}")
+    print(joined(["1", "2"]))
+    print(maybe_mark(true) ?? "-")
+    let opt: str? = 'o'
+    print(opt == 'o')
+
+    // ждут int, int? или float: x == 'a' у int x, s.byte(i) == '\n', правый
+    // операнд арифметики после int
+    print(code_of('A'))
+    print(first_code())
+    let n: int = 'я'
+    print(n)
+    print(n == 'я')
+    print(n == 1103)
+    let t = "a\nb"
+    print(t.byte(1) == '\n')
+    print(t.byte(0) - 'a')
+    let k = 3
+    print(k + '0')
+    print(k * 'a')
+    let on: int? = 'Z'
+    print(on ?? 0)
+    let f: float = 'a'
+    print(f)
+    print(digit(48) + " " + digit(49) + " " + digit(50))
+    var w = 0
+    w += 'a'
+    print(w)
+    var codes: [int] = []
+    codes.push('a')
+    codes.push('я')
+    print(to_json(codes))
+
+    // не ждут ничего: перед арифметикой — число, иначе str
+    let comma = ','
+    print("1,2,3".split(comma).len())
+    print('a' + 'b')
+    print('a'.upper())
+    print('z' - 'a')
+    print('a' * 2)
+    print(-'a')
+    print('A')
+    print('\n'.byte_len())
+    print("[{'q'}]")
+    let pair = ['l', 'r']
+    print(pair[1])
+
+    // экранирования \u и символы вне ASCII
+    print('\u{1F600}' == "😀")
+    print('é' == "é")
+    print('\U0001F600'.len())
+    print("caf\u{e9} é\U0001F600")
+    print("\u{44F}".byte_len())
+    let e: int = '\u{e9}'
+    print(e)
+}
