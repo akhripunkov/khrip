@@ -378,11 +378,24 @@ fn __strc_light_cnt(f: int, n: int) -> int {
     return c1
 }
 
-// Смещение символа k (k >= 0) строки (p, n) через лёгкое место z или n, если
-// символов не больше k. Опора — курсор места, если он не дальше k, иначе начало;
+// Смещение символа k (k >= 0) строки (p, n) через лёгкое место z (0 — найти или
+// завести место пары) или n, если символов не больше k; место, если off < n, —
+// в STRC_LLAST. Опора — курсор места, если он не дальше k, иначе начало;
 // курсор — на (k, off), если off < n. Второй дальний переход делает место
 // записью.
-fn __strc_light_off(b: int, z: int, p: int, n: int, k: int) -> int {
+fn __strc_light_off(b: int, z0: int, p: int, n: int, k: int) -> int {
+    // z0 = 0: место ищется здесь же (или заводится) — как в __strc_key для
+    // средних строк, без лишнего вызова
+    var z = z0
+    if z == 0 {
+        z = b + STRC_LIGHT + STRC_LW * __strc_light_pair(p, n)
+        if load64(z) != p || load64(z + 8) != n {
+            z += STRC_LW
+            if load64(z) != p || load64(z + 8) != n {
+                z = __strc_light_new(b, p, n)
+            }
+        }
+    }
     store64(b + STRC_LLAST, 0)
     let f = load64(z + 16)
     let valid = f >= STRC_VALID
@@ -1161,18 +1174,41 @@ fn __text_at(self: str, i: int) -> str {
                 }
             }
         }
-        e = __strc_key(b, p, n)
-        if e >= 0 {
-            let x0 = b + 8 * e
-            if load64(x0 + STRC_IX) != 0 && load64(x0 + STRC_VUP) == n && i < load64(x0 + STRC_CNT) - 1 {
-                let o = __strc_at_ix(b, x0, p, n, i)
-                if o >= 0 {
-                    return __tx_char(p, o, __tx_lead_width(load8(p + o)))
+        if n < STRC_BIG && load64(b + STRC_MIDFULL) == 0 && __strc_mode != STRC_STRESS {
+            // средняя строка: записей нет, только лёгкие места (место ищет сам
+            // __strc_light_off)
+            off = __strc_light_off(b, 0, p, n, i)
+            let lz = load64(b + STRC_LLAST)
+            let zm = b + lz - 1
+            if lz != 0 {
+                e = -zm
+            }
+            // правильная строка: ширина — по первому байту, курсор места — сразу
+            // на следующий символ
+            if off < n && lz != 0 && load64(zm + 16) >= STRC_VALID {
+                let wm = __tx_lead_width(load8(p + off))
+                if wm > 0 && off + wm <= n {
+                    if off + wm < n {
+                        store64(zm + 24, i + 1)
+                        store64(zm + 32, off + wm)
+                    }
+                    return __tx_char(p, off, wm)
                 }
             }
-            off = __strc_off(b, e, p, n, i)
         } else {
-            off = __strc_light_off(b, -e, p, n, i)
+            e = __strc_key(b, p, n)
+            if e >= 0 {
+                let x0 = b + 8 * e
+                if load64(x0 + STRC_IX) != 0 && load64(x0 + STRC_VUP) == n && i < load64(x0 + STRC_CNT) - 1 {
+                    let o = __strc_at_ix(b, x0, p, n, i)
+                    if o >= 0 {
+                        return __tx_char(p, o, __tx_lead_width(load8(p + o)))
+                    }
+                }
+                off = __strc_off(b, e, p, n, i)
+            } else {
+                off = __strc_light_off(b, -e, p, n, i)
+            }
         }
     } else {
         off = __tx_seek(p, n, i)
@@ -1191,7 +1227,7 @@ fn __text_at(self: str, i: int) -> str {
         if off + w < n {
             __strc_move(b, p, n, i + 1, off + w)
         }
-    } else if b != 0 && off + w < n {
+    } else if b != 0 && e != -1 && off + w < n {
         // курсор лёгкого места — на следующий символ (если место не стало записью)
         let zl = -e
         if load64(zl) == p && load64(zl + 8) == n {
@@ -1218,8 +1254,12 @@ fn __text_slice(self: str, a0: int, b0: int) -> str {
     var ob = n
     let b = __strc_for(n)
     var e = -1
-    if b != 0 {
+    var z = 0
+    if b != 0 && (n >= STRC_BIG || load64(b + STRC_MIDFULL) != 0 || __strc_mode == STRC_STRESS) {
         e = __strc_key(b, p, n)
+        if e < 0 {
+            z = -e
+        }
     }
     if e >= 0 {
         oa = __strc_off(b, e, p, n, a)
@@ -1239,13 +1279,19 @@ fn __text_slice(self: str, a0: int, b0: int) -> str {
             }
         }
     } else if b != 0 {
-        // лёгкое место: начало — через него, конец — вперёд от начала
-        let z = -e
+        // лёгкое место (у средней строки z = 0: его найдёт __strc_light_off):
+        // начало — через него, конец — вперёд от начала
         oa = __strc_light_off(b, z, p, n, a)
         if oa >= n {
             return ""
         }
-        let f = load64(z + 16)
+        if z == 0 {
+            z = b + load64(b + STRC_LLAST) - 1
+        }
+        var f = 0
+        if z >= b {
+            f = load64(z + 16)
+        }
         let c1 = __strc_light_cnt(f, n)
         if b0 != TEXT_END && (c1 == 0 || b0 < c1 - 1) {
             if f >= STRC_VALID && c1 == n + 1 {
