@@ -12,7 +12,8 @@
 #                       «// flags: ...»; с --json (нужен python3) — правильный
 #                       JSON с теми же местами и сообщениями;
 #   tests/api/*.kh    — блоки test (khc test); вывод сравнивается с .out, и
-#                       ещё раз — с проверкой графа store (KHRIP_GC_VERIFY=1);
+#                       ещё раз — с проверками сборщика (KHRIP_GC_VERIFY=1:
+#                       граф и куча store после загрузки и каждого теста);
 #   tests/locks/*.kh  — какие маршруты берут store на чтение (khc check --locks);
 #   tests/sqlcheck/   — правильный SQL: khc check без базы не находит ошибок;
 #   khc check --all-lib — вся библиотека (и не вызванные функции) и исходники
@@ -33,7 +34,9 @@
 #                       запускается в docker; пропуски печатаются строками SKIP;
 #   tests/weather.sh  — погодный бэкенд: fetch, every, сохранение store;
 #   eval/solutions/*/khrip — решения задач проверки проходят eval/run.sh.
-# Компилятор берётся из $KHC (по умолчанию build/khc).
+# Компилятор берётся из $KHC (по умолчанию build/khc). С KHRIP_GC_VERIFY=1 в
+# окружении проверки сборщика идут во всех программах набора (tests/api без
+# них — только первый проход).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -153,7 +156,7 @@ fi
 
 for src in tests/api/*.kh; do
 	name=$(basename "$src" .kh)
-	"$KHC" test "$src" >"$tmp/$name.out" 2>&1
+	env -u KHRIP_GC_VERIFY "$KHC" test "$src" >"$tmp/$name.out" 2>&1
 	if ! diff -u "tests/api/$name.out" "$tmp/$name.out" >"$tmp/$name.diff"; then
 		failed "$src" "вывод тестов отличается от ожидаемого"
 		cat "$tmp/$name.diff"
@@ -162,9 +165,10 @@ for src in tests/api/*.kh; do
 	pass=$((pass + 1))
 done
 
-# KHRIP_GC_VERIFY=1: после загрузки store каждый указатель его графа — в STORE
-# или DATA (обход от корней, lib/gc.kh); вывод тестов тот же, плюс строка
-# проверки.
+# KHRIP_GC_VERIFY=1: после загрузки store и после каждого теста каждый
+# указатель его графа — в STORE или DATA, на начало выделенного объекта, с битом
+# PTRB, а куча согласована (lib/gc.kh); вывод тестов тот же, плюс строка
+# проверки после загрузки.
 for src in tests/api/*.kh; do
 	name=$(basename "$src" .kh)
 	KHRIP_GC_VERIFY=1 "$KHC" test "$src" >"$tmp/$name.vout" 2>&1

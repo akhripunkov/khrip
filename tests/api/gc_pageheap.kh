@@ -1,0 +1,14 @@
+// Кучка страниц store (lib/gc.kh, __ph_selftest): случайные взятия и возвраты
+// на отдельной кучке против простой модели — первая подходящая серия
+// перебором по массиву «страница занята». Сравниваются каждый ответ, граница
+// занятых, грязные страницы, карта свободных и дерево.
+
+test "the page heap matches the brute-force model (100 000 operations)" {
+    expect __ph_selftest(1, 100000) == ""
+}
+
+test "the page heap matches the brute-force model (19 more seeds)" {
+    for seed in 2..21 {
+        expect __ph_selftest(seed, 10000) == ""
+    }
+}

@@ -1,0 +1,27 @@
+// Заглушки кучи store для программ без store (src/main.kh выбирает между
+// этим файлом и lib/gc.kh). Ядро и рантайм ссылаются на кучу store, но без
+// store выделение из неё не включается (__gc_ready остаётся false), поэтому
+// здесь — простые версии с тем же смыслом, и код кучи в программу не попадает.
+
+// Недостижимо: без кучи store выделение из неё не включается (__pmode_on).
+fn __salloc(n: int, kind: int, mask: int) -> int {
+    syscall(SYS_EXIT_GROUP, 101)
+    return 0
+}
+
+fn __gc_kind_of(p: int) -> int {
+    return K_PTRS
+}
+
+fn __store_init() {
+    __panic_msg("internal: store in a program without store")
+}
+
+// Начало сервера или фоновых задач без store: глобальных пользователя у
+// такой программы нет (src/api.kh, check_api), восстанавливать нечего.
+fn __store_boot(load: bool) {
+    __store_rw_init()
+}
+
+fn __gc_verify_release() {
+}

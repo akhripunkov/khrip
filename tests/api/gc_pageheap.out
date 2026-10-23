@@ -1,0 +1,3 @@
+ok    the page heap matches the brute-force model (100 000 operations)
+ok    the page heap matches the brute-force model (19 more seeds)
+2 tests: 2 passed, 0 failed

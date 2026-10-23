@@ -281,6 +281,17 @@ fn main() -> int {
             lex_file(files.len() - 1)
         }
     }
+    // куча store (lib/gc.kh) — только программам со store и тестам; остальным —
+    // её заглушки (lib/nostore.kh): ядро ссылается на кучу, но без store в неё
+    // не попадает
+    var heap_lib = "nostore.kh"
+    if test_mode || uses_store() {
+        heap_lib = "gc.kh"
+    }
+    if !load_file(lib + "/" + heap_lib, true) {
+        return 2
+    }
+    lex_file(files.len() - 1)
     lx_file = files.len() - 1
     add_tok_text(T_EOF, 0, "", lx_p)
     let init_fn = gen_func("__init_globals", ty_void)

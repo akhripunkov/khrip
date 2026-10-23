@@ -83,7 +83,6 @@ fn lib_files() -> [str] {
 fn api_lib_files() -> [str] {
     var names: [str] = []
     names.push("api.kh")
-    names.push("gc.kh")
     names.push("http.kh")
     names.push("fetch.kh")
     names.push("x509.kh")
@@ -100,6 +99,16 @@ fn uses_api() -> bool {
             return true
         }
         if t.kind == T_IDENT && (t.text == "to_json" || t.text == "from_json" || t.text == "fetch" || t.text == "every" || t.text == "migration" || t.text.starts_with("__pg_")) {
+            return true
+        }
+    }
+    return false
+}
+
+// Есть ли в программе store: ей нужна куча store (lib/gc.kh).
+fn uses_store() -> bool {
+    for t in toks {
+        if t.kind == T_STORE && !files[t.file].is_lib {
             return true
         }
     }
@@ -642,7 +651,7 @@ fn type_desc(t: int) -> int {
         let si = types[t].a
         let st = structs[si]
         let n = st.fields.len()
-        off = desc_reserve(4 + 5 * n)
+        off = desc_reserve(5 + 5 * n)
         type_descs[t] = DATA_BASE + off
         desc_put(off, 0, D_STRUCT)
         desc_put(off, 1, n)
@@ -678,6 +687,7 @@ fn type_desc(t: int) -> int {
             }
             i += 1
         }
+        desc_put(off, 4 + 5 * n, ptr_mask(st))
         return DATA_BASE + off
     }
     if k == K_SUM {
@@ -706,6 +716,25 @@ fn type_desc(t: int) -> int {
         return DATA_BASE + off
     }
     return 0
+}
+
+// Какие поля структуры — ссылки (для кучи store, lib/gc.kh): бит i — поле i
+// хранит адрес (строка, список, словарь, структура, вариант, T?), а не число;
+// бит 63 — полей больше 63, и куча считает ссылкой каждое слово.
+fn ptr_mask(st: StructT) -> int {
+    let n = st.fields.len()
+    if n > 63 {
+        return 1 << 63
+    }
+    var m = 0
+    var i = 0
+    while i < n {
+        if !is_scalar_ty(st.fields[i].ty) {
+            m = m | (1 << i)
+        }
+        i += 1
+    }
+    return m
 }
 
 // Слово значения по умолчанию из литерала в позиции i.

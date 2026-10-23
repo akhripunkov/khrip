@@ -63,9 +63,10 @@ X
 for src in tests/pg/*.kh; do
 	name=$(basename "$src" .kh)
 	if grep -q '^test "' "$src"; then
-		# программа с блоками test: khc test на своей пустой базе
+		# программа с блоками test: khc test на своей пустой базе (строка
+		# проверки после загрузки с KHRIP_GC_VERIFY=1 — не часть вывода)
 		"${as_pg[@]}" "$pg_bin/psql" -q -h "$pg_dir" -p "$PG_PORT" -U postgres -d postgres -c "create database t_$name" >/dev/null 2>&1
-		DATABASE_URL="postgres://u_scram:pw-u_scram@127.0.0.1:$PG_PORT/t_$name?sslmode=disable" "$KHC" test "$src" >"$tmp/pg/$name.out" 2>&1
+		DATABASE_URL="postgres://u_scram:pw-u_scram@127.0.0.1:$PG_PORT/t_$name?sslmode=disable" "$KHC" test "$src" 2>&1 | grep -v '^khrip: gc verify (boot): ' >"$tmp/pg/$name.out"
 		if ! diff -u "tests/pg/$name.out" "$tmp/pg/$name.out" >"$tmp/pg/$name.diff"; then
 			failed "$src" "вывод тестов отличается от ожидаемого"
 			cat "$tmp/pg/$name.diff"

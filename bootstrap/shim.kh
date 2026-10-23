@@ -27,6 +27,16 @@ fn __store_lock() {
 fn __store_unlock() {
 }
 
+// Куча store (lib/gc.kh): ядро ссылается на неё, но без store в неё не попадает.
+fn __salloc(n: int, kind: int, mask: int) -> int {
+    exit(101)
+    return 0
+}
+
+fn __gc_kind_of(p: int) -> int {
+    return K_PTRS
+}
+
 // Точка входа: загрузчик вызывает её после инициализации глобальных переменных.
 fn __start(argc: int, argv: int) -> int {
     __argc = argc

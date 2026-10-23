@@ -1,0 +1,17 @@
+// exit: 101
+// env: KHRIP_GC_VERIFY=1
+// Куча store (lib/gc.kh): с KHRIP_GC_VERIFY=1 каждое выделение проверяет, что
+// метаданные кучи меняет владелец мьютекса писателей (I5). Выделение без
+// блокировки store останавливает программу.
+
+store hits: int
+
+fn main() {
+    __store_boot(false)
+    __store_lock()
+    let p = __salloc(40, K_PTRS, 0)
+    __store_unlock()
+    print("under the lock: {(p >> 40) == 0x10}")
+    __salloc(16, K_PTRS, 0)
+    print("not reached")
+}
