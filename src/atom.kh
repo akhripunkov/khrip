@@ -5,6 +5,12 @@
 var inline_depth: int
 var inline_stack: [int]
 var inline_rets: [int]
+// Открытый конец среза str: s[a..] передаёт его в __text_slice (TEXT_END в
+// lib/text.kh).
+const SLICE_END = 0x7FFFFFFFFFFFFFFF
+// Позиция сразу за последним символьным литералом, который стал str: для
+// подсказки «n == 'a'» к 'a' == n с int n (char_compare_hint).
+var char_lit_end: int
 
 fn parse_atom() -> int {
     let w = want
@@ -25,6 +31,20 @@ fn parse_atom() -> int {
         advance()
         emit_mov_imm(RAX, t.val)
         return ty_float
+    }
+    if k == T_CHAR {
+        advance()
+        if char_is_int(w) {
+            if is_float_want(w) {
+                emit_mov_imm(RAX, __int_to_f64_bits(t.val))
+                return ty_float
+            }
+            emit_mov_imm(RAX, t.val)
+            return ty_int
+        }
+        emit_mov_imm(RAX, const_str(char_text(t.val)))
+        char_lit_end = pos
+        return ty_str
     }
     if k == T_STR {
         advance()
@@ -90,6 +110,19 @@ fn parse_atom() -> int {
         advance()
     }
     return ty_err
+}
+
+// Символьный литерал 'x' (T_CHAR, текущий токен — за ним) — код символа (int),
+// если ждут int, int? или float или если за ним арифметика (- * / % & | ^ << >>:
+// у str их нет, поэтому print('z' - 'a') — 25). Иначе — str из одного символа:
+// c == 'a', s.split(','), print('A'), 'a' + 'b'.
+fn char_is_int(w: int) -> bool {
+    let t = ty_inner(w)
+    if t == ty_int || t == ty_float {
+        return true
+    }
+    let k = kind()
+    return k == '-' || k == '*' || k == '/' || k == '%' || k == '&' || k == '|' || k == '^' || k == T_SHL || k == T_SHR
 }
 
 // Похожее имя для подсказки «может быть, вы имели в виду».
@@ -302,8 +335,8 @@ fn parse_map_lit(want_ty: int) -> int {
         vt = types[w].b
         known = true
     }
-    // ключ-строка определяется по ожидаемому типу или первому ключу
-    let first_str = kind() == T_STR
+    // ключ-строка определяется по ожидаемому типу или первому ключу ('a': — тоже str)
+    let first_str = kind() == T_STR || (kind() == T_CHAR && kind_at(pos + 1) == ':')
     var is_str = first_str
     if known {
         is_str = kt == ty_str
@@ -758,7 +791,13 @@ fn field_load(t: int, nt: Token) -> int {
     }
     if tkind(t) != K_STRUCT {
         let bytes = tkind(t) == K_STR && system_code(nt)
-        var hint = method_hint(nt.text, bytes)
+        var hint = ""
+        if tkind(t) == K_STR {
+            hint = str_method_hint(nt.text, bytes)
+        }
+        if hint == "" {
+            hint = method_hint(nt.text, bytes)
+        }
         if nt.text == "len" {
             hint = "use .len()"
             if bytes {
@@ -829,6 +868,7 @@ fn parse_index(t: int) -> int {
         emit_mov_imm(RAX, 0)
         return finish_slice(t, at, saved)
     }
+    want = ty_int
     if peek_simple(1) && is_int_like(op_ty) && kind_at(pos + 1) == ']' {
         advance()
         load_operand(RCX)
@@ -850,6 +890,13 @@ fn parse_index(t: int) -> int {
     }
     expect_tok(']')
     no_struct = saved
+    if k == K_STR && !system_code(at) {
+        // символ i — строка из одного символа; вне [0, len) — паника
+        emit_mov_rr(RDI, RAX)
+        emit_mov_rr(RSI, RCX)
+        emit_call(rt_func("__text_at"))
+        return ty_str
+    }
     emit_bounds_check(at)
     emit_load(RAX, RAX, 0)
     if k == K_STR {
@@ -872,12 +919,17 @@ fn parse_index(t: int) -> int {
 }
 
 // Получатель в стеке, начало среза в rax; текущий токен — после «..».
+// Срез str в коде программы — в символах (__text_slice), в системном — в байтах.
 fn finish_slice(t: int, at: Token, saved: bool) -> int {
+    let text = tkind(t) == K_STR && !system_code(at)
     if tkind(t) == K_STR {
         system_str_error(at, "str slice", "s.byte_slice(a, b)")
     }
     emit_push(RAX)
-    if kind() == ']' {
+    if kind() == ']' && text {
+        // до конца: длину в символах считать незачем
+        emit_mov_imm(RAX, SLICE_END)
+    } else if kind() == ']' {
         // до конца: длина получателя
         emit_load(RAX, RSP, 8)
         emit_load(RAX, RAX, 8)
@@ -892,6 +944,10 @@ fn finish_slice(t: int, at: Token, saved: bool) -> int {
     emit_mov_rr(RDX, RAX)
     emit_pop(RSI)
     emit_pop(RDI)
+    if text {
+        emit_call(rt_func("__text_slice"))
+        return ty_str
+    }
     if tkind(t) == K_STR {
         emit_call(rt_func("__str_slice"))
         return ty_str
@@ -1605,11 +1661,21 @@ fn parse_builtin(t: Token, w: int) -> int {
     if name == "len" {
         advance()
         let a = tok()
+        let ai = pos
         let t1 = parse_expr(ty_err)
+        // аргумент из одного токена может быть литералом
+        var lit = -1
+        if pos == ai + 1 {
+            lit = ai
+        }
         expect_tok(')')
         let k = tkind(t1)
         if k == K_STR {
             system_str_error(t, "len(str)", "s.byte_len()")
+        }
+        if k == K_STR && !system_code(t) {
+            emit_text_len(lit)
+            return ty_int
         }
         if k == K_STR || k == K_LIST || k == K_MAP {
             emit_load(RAX, RAX, 8)
@@ -1724,10 +1790,15 @@ fn method_prefix(k: int) -> str {
     return ""
 }
 
-// Функция метода str. find, lower, upper и trim — пока те же байтовые функции,
-// что byte_find, ascii_lower, ascii_upper и ascii_trim; в системном коде эти
-// имена — ошибки (system_str_method).
-fn str_method_fn(name: str) -> str {
+// Функция метода str. В коде программы методы, которые считают символы, —
+// функции lib/text.kh (__text_find, __text_lower, ...); остальные __text_* —
+// не методы, их вызывает сам компилятор (s[i], срезы, for, сравнения). В
+// системном коде find, lower, upper и trim — ошибки (system_str_method), и
+// после ошибки — байтовые byte_find, ascii_lower, ascii_upper и ascii_trim.
+fn str_method_fn(name: str, system: bool) -> str {
+    if !system && (name == "find" || name == "find_from" || name == "lower" || name == "upper" || name == "trim" || name == "split" || name == "replace") {
+        return "__text_" + name
+    }
     if name == "find" || name == "find_from" {
         return "__str_byte_" + name
     }
@@ -1824,6 +1895,14 @@ fn parse_method(rt: int, nt: Token) -> int {
         last_was_call = false
         return ty_float
     }
+    if name == "len" && k == K_STR && !system_code(nt) && kind_at(pos + 1) == ')' {
+        // получатель — токен перед «.len»
+        let lit = pos - 3
+        advance()
+        advance()
+        emit_text_len(lit)
+        return ty_int
+    }
     if ((name == "len" && (k == K_STR || k == K_LIST || k == K_MAP)) || (name == "byte_len" && k == K_STR)) && kind_at(pos + 1) == ')' {
         advance()
         advance()
@@ -1834,6 +1913,7 @@ fn parse_method(rt: int, nt: Token) -> int {
     if k == K_STR && name == "byte" && kind_at(pos + 2) == ')' {
         // s.byte(i) с простым индексом: индекс сразу в rcx
         pos += 1
+        want = ty_int
         if peek_simple(1) && is_int_like(op_ty) {
             load_operand(RCX)
             pos += 2
@@ -1858,7 +1938,7 @@ fn parse_method(rt: int, nt: Token) -> int {
     var fi = -1
     let prefix = method_prefix(k)
     if k == K_STR {
-        fi = func_find(str_method_fn(name))
+        fi = func_find(str_method_fn(name, system_code(nt)))
     } else if prefix.byte_len() > 0 {
         fi = func_find(prefix + name)
         if k == K_LIST && name == "sum" && tt == ty_float {
@@ -1884,7 +1964,13 @@ fn parse_method(rt: int, nt: Token) -> int {
         }
     }
     if fi < 0 {
-        var hint = method_hint(name, k == K_STR && system_code(nt))
+        var hint = ""
+        if k == K_STR {
+            hint = str_method_hint(name, system_code(nt))
+        }
+        if hint == "" {
+            hint = method_hint(name, k == K_STR && system_code(nt))
+        }
         if hint.byte_len() == 0 {
             let uf = func_find(name)
             if uf >= 0 && funcs[uf].params.len() > 0 {
@@ -1930,6 +2016,22 @@ fn parse_method(rt: int, nt: Token) -> int {
     emit_call_args(fi, n)
     last_was_call = true
     return subst(f.ret, tt, ty_err, ty_err)
+}
+
+// Длина str в rax в символах (lib/text.kh); если получатель — литерал (токен
+// lit; -1 — не литерал), число известно при компиляции.
+fn emit_text_len(lit: int) {
+    last_was_call = false
+    if lit >= 0 && toks[lit].kind == T_STR {
+        emit_mov_imm(RAX, char_count(strlits[toks[lit].val]))
+        return
+    }
+    if lit >= 0 && toks[lit].kind == T_CHAR {
+        emit_mov_imm(RAX, 1)
+        return
+    }
+    emit_mov_rr(RDI, RAX)
+    emit_call(rt_func("__text_len"))
 }
 
 // s.byte(i): получатель в rax, индекс в rcx; байт с проверкой границ.

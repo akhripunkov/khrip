@@ -13,7 +13,7 @@ khc -o app app.kh         # build a static binary
 ## Types
 
 `int` (64-bit, overflow panics), `float` (64-bit), `bool`, `str` (immutable
-bytes), `[T]` list, `map[K, V]` (K is int or str), `T?` optional, and named types:
+UTF-8 text), `[T]` list, `map[K, V]` (K is int or str), `T?` optional, and named types:
 
 ```khrip
 type Point { x: int, y: int }
@@ -65,12 +65,12 @@ let area = match s {                                // exhaustive
 while i < n {
     i += 1                  // += -= *= /= %= ; there is no ++
 }
-for x in xs { }             // items, str bytes, map keys; for i, x in xs
+for x in xs { }             // items, characters, map keys; for i, x in xs
 for i in 0..n { }           // 0..n excludes n, 0..=n includes it
 ```
 
 Operators: `+ - * / %`, `== != < <= > >=`, `&& || !`, `& | ^ ~ << >>`; `+`
-also joins strings; comparisons do not chain. `'a'` is an int (byte). A block
+also joins strings; comparisons do not chain. A block
 used as a value ends with its value: `if c { let a = f(); a + 1 } else { 0 }`.
 `match` works on variants, int, str and bool (`200 | 201 => ...`), arms may be
 blocks or `return ...`, and must cover every case (or have `_ =>`).
@@ -78,8 +78,9 @@ blocks or `return ...`, and must cover every case (or have `_ =>`).
 Strings: `"Hi, {user.name}!"` interpolates an expression that does not start
 with a quote (`{2,5}` stays text). Escapes: `\n \t \r \0 \\ \" \' \{`. Raw
 strings in backticks have neither and may span lines: `` `\d{4}` ``,
-`` `{"id": 1}` ``. `s[i]` is a byte (int); slices `s[a..b]`, `xs[a..]`, `xs[..b]`
-are clamped to the bounds.
+`` `{"id": 1}` ``. `len`, `s[i]`, slices and `find` count characters (`s[i]` is a
+one-character str); `byte_len()` is the size in UTF-8 bytes. Slices `s[a..b]`,
+`xs[a..]`, `xs[..b]` are clamped to the bounds.
 
 ## Optionals
 

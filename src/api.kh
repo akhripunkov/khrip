@@ -148,6 +148,16 @@ fn path_name_ok(s: str) -> bool {
     return true
 }
 
+// В s только байты ASCII?
+fn is_ascii(s: str) -> bool {
+    for i in 0..s.byte_len() {
+        if s.byte(i) >= 0x80 {
+            return false
+        }
+    }
+    return true
+}
+
 // Сегменты пути "/users/{id}" → ["users", "{id}"].
 fn route_segments(path: str, at: Token) -> [str] {
     var segs: [str] = []
@@ -166,6 +176,10 @@ fn route_segments(path: str, at: Token) -> [str] {
                 }
             } else if seg.contains("\{") || seg.contains("}") || seg.contains(" ") || seg.contains("?") {
                 error_tok(at, "bad path segment '" + seg + "'", "a segment is either text or a parameter like \{id}")
+            } else if !is_ascii(seg) {
+                // клиенты шлют такой путь в %XX, а сегменты-текст сравниваются как есть;
+                // параметр пути раскодируется
+                error_tok(at, "write the route path in ASCII", "clients send '" + seg + "' percent-encoded; use an ASCII name or a parameter like \{name}")
             }
             segs.push(seg)
             start = i + 1
@@ -721,6 +735,14 @@ fn default_word(i: int, ty: int) -> int {
         v = t.val
     } else if t.kind == T_STR {
         return strlit(t.val)
+    } else if t.kind == T_CHAR {
+        if inner == ty_str {
+            return const_str(char_text(t.val))
+        }
+        v = t.val
+        if inner == ty_float {
+            v = __int_to_f64_bits(t.val)
+        }
     } else if t.kind == T_TRUE {
         v = 1
     } else if t.kind == T_IDENT {
@@ -812,7 +834,7 @@ fn starts_value(i: int) -> bool {
         return false
     }
     let k = kind_at(i)
-    return k == T_IDENT || k == T_STR || k == T_INT || k == '[' || k == '(' || k == T_TRUE || k == T_FALSE || k == T_NONE || k == '!' || k == T_SQL
+    return k == T_IDENT || k == T_STR || k == T_INT || k == T_CHAR || k == '[' || k == '(' || k == T_TRUE || k == T_FALSE || k == T_NONE || k == '!' || k == T_SQL
 }
 
 fn route_return(at: Token, has_value: bool) {
@@ -1121,7 +1143,7 @@ fn parse_expect() {
             let rt_tok = tok()
             want = lt
             let rt = parse_add()
-            compare_ok(lt, rt, false, op_tok)
+            compare_ok(lt, rt, false, op_tok, false)
             emit_to_str(rt, rt_tok)
             emit_mov_rr(RSI, RAX)
             emit_pop(RDI)
@@ -1352,8 +1374,9 @@ fn gen_param(b: Buf, r: Route, i: int) {
     buf_add(b, "                " + v + " = " + v + "_x\n            }\n")
 }
 
-// Текст литерала по умолчанию для сгенерированного кода.
-fn default_src(ti: int) -> str {
+// Текст литерала по умолчанию типа ty для сгенерированного кода (он системный:
+// символьный литерал там — байт, поэтому 'x' — строкой или числом).
+fn default_src(ti: int, ty: int) -> str {
     let t = toks[ti]
     if t.kind == '-' {
         return "-" + toks[ti + 1].text
@@ -1361,13 +1384,19 @@ fn default_src(ti: int) -> str {
     if t.kind == T_STR {
         return src_lit(strlits[t.val])
     }
+    if t.kind == T_CHAR {
+        if ty == ty_str {
+            return src_lit(char_text(t.val))
+        }
+        return t.val.to_str()
+    }
     return t.text
 }
 
 // Параметр строки запроса со значением по умолчанию: (page: int = 1).
 fn gen_default_param(b: Buf, p: Param, q: str, lit: str) {
     let v = "p_" + p.name
-    let dv = default_src(p.def)
+    let dv = default_src(p.def, p.ty)
     if p.ty == ty_str {
         buf_add(b, "            let " + v + " = " + q + " ?? " + dv + "\n")
         return

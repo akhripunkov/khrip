@@ -1,6 +1,6 @@
 // expect: char_line.kh:10:13: error: unterminated character literal
 // expect: char_line.kh:11:18: error: expected int, found str
-// expect: char_line.kh:12:13: error: character literal must contain exactly one character
+// expect: char_line.kh:12:13: error: a character literal holds one character
 // expect: char_line.kh:13:18: error: expected int, found str
 // expect: 4 errors
 // Незакрытый символьный литерал не съедает перевод строки: следующие ошибки —

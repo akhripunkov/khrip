@@ -12,6 +12,10 @@ const T_INT = 2
 const T_STR = 3
 // число с точкой или порядком; val — биты double
 const T_FLOAT = 4
+// символьный литерал 'я' в коде программы; val — код символа. Тип — по
+// ожидаемому (parse_atom): str из одного символа или int (код). В системном
+// коде символьный литерал — T_INT, один байт ASCII
+const T_CHAR = 5
 const T_FN = 10
 const T_LET = 11
 const T_VAR = 12
@@ -318,9 +322,16 @@ fn is_single(c: int) -> bool {
 }
 
 // Один символ литерала с экранированием; lx_p сдвигается.
+// Символ в lx_p — обычный или экранированный → его код; lx_p — за ним. Символ
+// вне ASCII читается целиком (текст файла — UTF-8, это проверил lex_file).
 fn lex_char(end: int) -> int {
     let start = lx_p
     let c = lx_text.byte(lx_p)
+    if c >= 0x80 {
+        let p = __str_ptr(lx_text)
+        lx_p += __utf8_width(p, end, start)
+        return __utf8_decode(p, end, start)
+    }
     lx_p += 1
     if c != '\\' {
         return c
@@ -346,8 +357,112 @@ fn lex_char(end: int) -> int {
     if e == '\\' || e == '\'' || e == '"' || e == '\{' || e == '}' {
         return e
     }
-    lex_error("unknown escape sequence; use \\n \\t \\r \\0 \\\\ \\\" \\' or \\\{ (for a regex, a raw string: `\\d+`)", start)
+    if e == 'u' || e == 'U' {
+        return lex_unicode_escape(e, start, end)
+    }
+    lex_error("unknown escape sequence; use \\n \\t \\r \\0 \\\\ \\\" \\' \\u\{...} or \\\{ (for a regex, a raw string: `\\d+`)", start)
     return e
+}
+
+// Значение шестнадцатеричной цифры c или -1.
+fn hex_digit(c: int) -> int {
+    if is_digit(c) {
+        return c - '0'
+    }
+    if c >= 'a' && c <= 'f' {
+        return c - 'a' + 10
+    }
+    if c >= 'A' && c <= 'F' {
+        return c - 'A' + 10
+    }
+    return -1
+}
+
+// Число в шестнадцатеричной записи, не короче min цифр: 1F600, 00E9.
+fn hex_text(v: int, min: int) -> str {
+    let d = "0123456789ABCDEF"
+    var s = ""
+    var x = v
+    var k = 0
+    while x > 0 || k < min {
+        s = d.byte_slice(x & 15, (x & 15) + 1) + s
+        x = x >> 4
+        k += 1
+    }
+    return s
+}
+
+// Символ cp строкой UTF-8.
+fn char_text(cp: int) -> str {
+    let b = buf_new(4)
+    buf_utf8(b, cp)
+    return buf_str(b)
+}
+
+// Число символов в s (правило Go, как у s.len() в программе).
+fn char_count(s: str) -> int {
+    return __utf8_go_count(__str_ptr(s), s.byte_len())
+}
+
+// Не больше n шестнадцатеричных цифр с lx_p → значение; сколько прочитано — в lx_hex_n.
+var lx_hex_n: int
+
+fn lex_hex(n: int, end: int) -> int {
+    var v = 0
+    lx_hex_n = 0
+    while lx_hex_n < n && lx_p < end && hex_digit(lx_text.byte(lx_p)) >= 0 {
+        v = v * 16 + hex_digit(lx_text.byte(lx_p))
+        lx_p += 1
+        lx_hex_n += 1
+    }
+    return v
+}
+
+// \uXXXX, \u{1–6 цифр} и \UXXXXXXXX (lx_p — за буквой u или U) → код символа.
+// Суррогаты UTF-16 — не символы: \uD83D\uDE00 — ошибка с подсказкой \u{1F600}.
+fn lex_unicode_escape(e: int, start: int, end: int) -> int {
+    var v = 0
+    if e == 'u' && lx_p < end && lx_text.byte(lx_p) == '\{' {
+        lx_p += 1
+        v = lex_hex(6, end)
+        if lx_hex_n == 0 || lx_p >= end || lx_text.byte(lx_p) != '}' {
+            lex_error("bad \\u\{...} escape: write 1 to 6 hex digits in braces, e.g. \\u\{e9}", start)
+            return 0xFFFD
+        }
+        lx_p += 1
+    } else {
+        var n = 4
+        if e == 'U' {
+            n = 8
+        }
+        v = lex_hex(n, end)
+        if lx_hex_n != n {
+            lex_error("bad \\" + __str_from_byte(e) + " escape: write \\u\{e9}, \\u00e9 or \\U0001F600", start)
+            return 0xFFFD
+        }
+    }
+    if v >= 0xD800 && v < 0xE000 {
+        var hint = "UTF-16 surrogates are not characters; write the code point, e.g. \\u\{1F600}"
+        // пара \uD83D\uDE00 — подсказка с её значением; вторая половина
+        // читается здесь же, чтобы ошибка была одна
+        let q = lx_p
+        if v < 0xDC00 && q + 6 <= end && lx_text.byte(q) == '\\' && lx_text.byte(q + 1) == 'u' {
+            lx_p = q + 2
+            let lo = lex_hex(4, end)
+            if lx_hex_n == 4 && lo >= 0xDC00 && lo < 0xE000 {
+                hint = "write \\u\{" + hex_text(0x10000 + ((v - 0xD800) << 10) + (lo - 0xDC00), 1) + "}"
+            } else {
+                lx_p = q
+            }
+        }
+        report_at(lx_file, lx_line, start - lx_line_start + 1, "surrogate escape \\u" + hex_text(v, 4), hint)
+        return 0xFFFD
+    }
+    if v > 0x10FFFF {
+        lex_error("escape \\u\{" + hex_text(v, 1) + "} is above U+10FFFF, the largest code point", start)
+        return 0xFFFD
+    }
+    return v
 }
 
 fn lex_number(end: int) -> int {
@@ -640,7 +755,7 @@ fn lex_string(end: int) {
             parts += 1
             continue
         }
-        buf_byte(b, lex_char(end))
+        buf_utf8(b, lex_char(end))
     }
     if parts == 0 {
         add_tok(T_STR, add_strlit(buf_str(b)), start, lx_p - start)
@@ -748,6 +863,12 @@ fn lex_sql(start: int, end: int) {
         var ch = c
         if c == '\\' && (!raw || (lx_p + 1 < end && lx_text.byte(lx_p + 1) == '\{')) {
             ch = lex_char(end)
+            if ch >= 0x80 {
+                // \u{...}: символ вне ASCII — его байты UTF-8; состояние SQL
+                // меняют только символы ASCII
+                buf_utf8(b, ch)
+                continue
+            }
         } else {
             lx_p += 1
         }
@@ -847,6 +968,39 @@ fn sql_array_literal(from: int, to: int) -> bool {
     return false
 }
 
+// В символьном литерале больше одного символа (первый — v, lx_p — за ним):
+// ошибка с подсказкой и пропуск до закрывающей кавычки или конца строки.
+// 'é', набранное как e + U+0301 (знак ударения отдельным символом), — тоже два
+// символа: подсказка называет их.
+fn char_lit_error(start: int, v: int, end: int) {
+    var q = lx_p
+    var n = 1
+    var second = -1
+    while q < end && lx_text.byte(q) != '\'' && lx_text.byte(q) != '\n' {
+        let save = lx_p
+        lx_p = q
+        let c = lex_char(end)
+        q = lx_p
+        lx_p = save
+        if n == 1 {
+            second = c
+        }
+        n += 1
+    }
+    let text = lx_text.byte_slice(start + 1, q)
+    var hint = "for text write \"" + text + "\""
+    if n == 2 && combining_mark(second) {
+        hint = "'" + text + "' here is " + lx_text.byte_slice(start + 1, lx_p) + " + U+" + hex_text(second, 4) + "; for text write \"" + text + "\""
+    }
+    report_at(lx_file, lx_line, start - lx_line_start + 1, "a character literal holds one character", hint)
+    lx_p = q
+}
+
+// Комбинируемый знак (ударение, тильда и т. п.): основные блоки Unicode.
+fn combining_mark(cp: int) -> bool {
+    return (cp >= 0x300 && cp < 0x370) || (cp >= 0x1AB0 && cp < 0x1B00) || (cp >= 0x1DC0 && cp < 0x1E00) || (cp >= 0x20D0 && cp < 0x2100) || (cp >= 0xFE20 && cp < 0xFE30)
+}
+
 fn lex_range(end: int) {
     while lx_p < end {
         let c = lx_text.byte(lx_p)
@@ -901,43 +1055,36 @@ fn lex_range(end: int) {
                 add_tok(T_INT, 0, start, 1)
                 continue
             }
-            let v = lex_char(end)
-            if v >= 0x80 && system_file(lx_file) {
+            var v = 0
+            if lx_text.byte(lx_p) == '\'' {
+                report_at(lx_file, lx_line, start - lx_line_start + 1, "empty character literal", "for an empty string write \"\"")
+            } else {
+                v = lex_char(end)
+            }
+            if lx_p >= end || lx_text.byte(lx_p) != '\'' {
+                char_lit_error(start, v, end)
+            } else if v >= 0x80 && system_file(lx_file) {
                 // в системном коде символ — один байт ASCII; в сообщении — байты
-                // первого символа (длина по ведущему байту), если он в литерале один
-                var w = 1
-                if v >= 0xC2 && v <= 0xDF {
-                    w = 2
-                } else if v >= 0xE0 && v <= 0xEF {
-                    w = 3
-                } else if v >= 0xF0 && v <= 0xF4 {
-                    w = 4
+                // символа в UTF-8
+                let ub = buf_new(4)
+                buf_utf8(ub, v)
+                var bytes = ""
+                var i = 0
+                while i < ub.len {
+                    bytes += " " + hex_byte(load8(ub.data + i))
+                    i += 1
                 }
-                var bytes = " " + hex_byte(v)
-                var q = start + 2
-                while q < end && q < start + 1 + w && lx_text.byte(q) >= 0x80 && lx_text.byte(q) < 0xC0 {
-                    bytes += " " + hex_byte(lx_text.byte(q))
-                    q += 1
-                }
-                if q < end && lx_text.byte(q) == '\'' {
-                    lex_error("non-ASCII character literal in system code: write its UTF-8 bytes as numbers:" + bytes, start)
-                } else {
-                    lex_error("character literal must contain exactly one character; use \"...\" for strings", start)
-                }
-                while lx_p < end && lx_text.byte(lx_p) != '\'' && lx_text.byte(lx_p) != '\n' {
-                    lx_p += 1
-                }
-            } else if lx_p >= end || lx_text.byte(lx_p) != '\'' {
-                lex_error("character literal must contain exactly one character; use \"...\" for strings", start)
-                while lx_p < end && lx_text.byte(lx_p) != '\'' && lx_text.byte(lx_p) != '\n' {
-                    lx_p += 1
-                }
+                lex_error("non-ASCII character literal in system code: write its UTF-8 bytes as numbers:" + bytes, start)
             }
             // закрывающая кавычка; на переводе строки — стоп: его считает основной цикл
             if lx_p < end && lx_text.byte(lx_p) == '\'' {
                 lx_p += 1
             }
-            add_tok(T_INT, v, start, lx_p - start)
+            if system_file(lx_file) {
+                add_tok(T_INT, v, start, lx_p - start)
+            } else {
+                add_tok(T_CHAR, v, start, lx_p - start)
+            }
             continue
         }
         if c == '"' {
@@ -1000,5 +1147,21 @@ fn lex_file(fi: int) {
     lx_p = 0
     lx_line = 1
     lx_line_start = 0
-    lex_range(lx_text.byte_len())
+    // исходник — текст UTF-8: иначе символы и строки в нём не прочитать
+    let n = lx_text.byte_len()
+    let bad = __utf8_bad_at(__str_ptr(lx_text), n)
+    if bad < n {
+        var line = 1
+        var ls = 0
+        var i = 0
+        while i < bad {
+            if lx_text.byte(i) == '\n' {
+                line += 1
+                ls = i + 1
+            }
+            i += 1
+        }
+        report_at(fi, line, bad - ls + 1, "file is not valid UTF-8: byte " + hex_byte(lx_text.byte(bad)), "save the file in UTF-8")
+    }
+    lex_range(n)
 }

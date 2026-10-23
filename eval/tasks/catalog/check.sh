@@ -49,4 +49,7 @@ check "bad per_page" 400 '' "$U/products?per_page=101"
 check "bad per_page 0" 400 '' "$U/products?per_page=0"
 check "categories" 200 '' $U/categories
 jtest "categories content" "[(c['name'], c['count'], c['avg_price']) for c in j] == [('bakery', 2, 2.7), ('dairy', 1, 8.5), ('fruit', 3, 1.38)]"
+# поиск без учёта регистра — и для кириллицы
+add 7 '{"name":"Молоко 3,2%","category":"dairy","price":1.1}'
+list "q cyrillic" "7 " "q=%D0%BC%D0%BE%D0%BB%D0%BE%D0%BA%D0%BE"
 finish

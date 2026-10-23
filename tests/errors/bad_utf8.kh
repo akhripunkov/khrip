@@ -1,0 +1,5 @@
+// expect: bad_utf8.kh:4:16: error: file is not valid UTF-8: byte 0xFF
+// expect: hint: save the file in UTF-8
+// Исходник — текст UTF-8.
+fn main() { // ��
+}

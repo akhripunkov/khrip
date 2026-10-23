@@ -400,14 +400,15 @@ fn tighter_follows(level: int, k: int) -> bool {
 }
 
 // Следующий токен — целый операнд для оператора уровня level (1 — умножение,
-// 2 — сложение, 3 — сравнение)? Ничего не потребляет.
+// 2 — сложение, 3 — сравнение)? Ничего не потребляет. Символьный литерал —
+// число, только когда ждут int (want).
 fn peek_simple(level: int) -> bool {
     op_kind = OPK_NONE
     let t = tok()
     if tighter_follows(level, kind_at(pos + 1)) {
         return false
     }
-    if t.kind == T_INT && fits_i32(t.val) {
+    if (t.kind == T_INT || (t.kind == T_CHAR && want == ty_int)) && fits_i32(t.val) {
         op_kind = OPK_IMM
         op_val = t.val
         op_ty = ty_int
@@ -566,7 +567,7 @@ fn emit_arith_rcx(op: int, at: Token) {
 
 // Правый операнд бинарной операции op над int: простой или через стек.
 fn arith_rhs(op: int, level: int, at: Token) {
-    want = ty_err
+    want = ty_int
     if peek_simple(level) && is_int_like(op_ty) {
         advance()
         if (op == '+' || op == '-' || op == '&' || op == '|' || op == '^') {
@@ -628,7 +629,12 @@ fn op_text(op: int) -> str {
 
 fn check_int(t: int, at: Token, op: int) {
     if t != ty_int && t != ty_err {
-        error_tok(at, "operator " + op_text(op) + " needs int operands, found " + ty_name(t), mismatch_hint(t, ty_int))
+        var hint = mismatch_hint(t, ty_int)
+        if t == ty_str {
+            // c - '0': символ — str из одного символа
+            hint = "c.to_int() ?? 0 gives the digit"
+        }
+        error_tok(at, "operator " + op_text(op) + " needs int operands, found " + ty_name(t), hint)
     }
 }
 
@@ -808,15 +814,27 @@ fn mixed_opt(a: int, b: int) -> bool {
 }
 
 fn emit_compare(op: int, lt: int, at: Token) -> int {
+    // символьный литерал справа — того же типа, что левый операнд: после str —
+    // str, после int — код символа
     want = ty_err
+    if lt == ty_int || lt == ty_str || (tkind(lt) == K_OPT && (ty_inner(lt) == ty_int || ty_inner(lt) == ty_str)) {
+        want = lt
+    }
     let left_lit = int_lit_end == pos - 1
+    let left_char = char_lit_end == pos - 1
     if lt == ty_float || (lt == ty_int && left_lit && float_follows()) {
         return float_compare(op, at, lt == ty_int)
     }
     let ordered = op != T_EQ && op != T_NE
+    if lt == ty_str {
+        let cc = str_lit_compare(op, ordered)
+        if cc >= 0 {
+            return cc
+        }
+    }
     if lt != ty_str && peek_simple(3) && !mixed_opt(lt, op_ty) {
         let rt = op_ty
-        if compare_ok(lt, rt, ordered, at) {
+        if compare_ok(lt, rt, ordered, at, left_char) {
             advance()
             if op_kind == OPK_IMM && op_val == 0 && !ordered {
                 emit_test_rax()
@@ -830,7 +848,7 @@ fn emit_compare(op: int, lt: int, at: Token) -> int {
     }
     emit_push(RAX)
     let rt = parse_add()
-    let ok = compare_ok(lt, rt, ordered, at)
+    let ok = compare_ok(lt, rt, ordered, at, left_char)
     if ok && mixed_opt(lt, rt) {
         // левое → rdi, правое → rsi; необязательное значение — первым
         emit_mov_rr(RSI, RAX)
@@ -874,7 +892,9 @@ fn emit_compare(op: int, lt: int, at: Token) -> int {
     return cmp_cc(op)
 }
 
-fn compare_ok(lt: int, rt: int, ordered: bool, at: Token) -> bool {
+// Сравнение типов lt и rt допустимо? Иначе ошибка. left_char — левый операнд
+// был символьным литералом ('a' == n).
+fn compare_ok(lt: int, rt: int, ordered: bool, at: Token, left_char: bool) -> bool {
     if lt == ty_err || rt == ty_err {
         return true
     }
@@ -882,7 +902,11 @@ fn compare_ok(lt: int, rt: int, ordered: bool, at: Token) -> bool {
         if (lt == ty_int && rt == ty_int) || (lt == ty_str && rt == ty_str) || (lt == ty_float && rt == ty_float) {
             return true
         }
-        error_tok(at, "cannot order " + ty_name(lt) + " and " + ty_name(rt), "< > <= >= work on int and str")
+        var hint = "< > <= >= work on int and str"
+        if lt == ty_str && rt == ty_int {
+            hint = char_compare_hint(left_char)
+        }
+        error_tok(at, "cannot order " + ty_name(lt) + " and " + ty_name(rt), hint)
         return false
     }
     if lt == rt && equatable(lt) {
@@ -907,8 +931,93 @@ fn compare_ok(lt: int, rt: int, ordered: bool, at: Token) -> bool {
         error_tok(at, "values of type " + ty_name(lt) + " cannot be compared with ==", "compare their fields instead")
         return false
     }
-    error_tok(at, "cannot compare " + ty_name(lt) + " with " + ty_name(rt), mismatch_hint(rt, lt))
+    var hint = mismatch_hint(rt, lt)
+    if lt == ty_str && rt == ty_int {
+        hint = char_compare_hint(left_char)
+    }
+    error_tok(at, "cannot compare " + ty_name(lt) + " with " + ty_name(rt), hint)
     return false
+}
+
+// Подсказка к сравнению str с int: символ строки — str из одного символа; 'a'
+// слева от int — str, а справа от int — код символа.
+fn char_compare_hint(left_char: bool) -> str {
+    if left_char {
+        return "write n == 'a' to compare with its code"
+    }
+    return "s[i] is a one-character str: compare with \"A\""
+}
+
+// x == "ab", x != 'я' (x — str), литерал до 4 байтов, и на нём операнд кончается:
+// сравнение на месте — длина, затем байты одним cmp, без вызова __str_eq.
+// x < 'a' с одним байтом ASCII — __text_cmp1, без литерала в памяти. Текущий
+// токен — за оператором. → условие или -1, если сравнение не такое.
+fn str_lit_compare(op: int, ordered: bool) -> int {
+    let t = tok()
+    if (t.kind != T_STR && t.kind != T_CHAR) || tighter_follows(3, kind_at(pos + 1)) {
+        return -1
+    }
+    var s = ""
+    if t.kind == T_STR {
+        s = strlits[t.val]
+    } else {
+        s = char_text(t.val)
+    }
+    let m = s.byte_len()
+    if ordered {
+        if m != 1 || s.byte(0) >= 0x80 {
+            return -1
+        }
+        advance()
+        emit_mov_rr(RDI, RAX)
+        emit_mov_imm(RSI, s.byte(0))
+        emit_call(rt_func("__text_cmp1"))
+        emit_alu_imm(7, RAX, 0)
+        return cmp_cc(op)
+    }
+    if m > 4 {
+        return -1
+    }
+    advance()
+    // cmp qword [rax+8], m
+    emit_hex("48 83 78 08")
+    emit8(m)
+    if m == 0 {
+        return cmp_cc(op)
+    }
+    // jne — длины разные, флаги уже «не равно»; mov rcx, [rax]
+    emit8(0x75)
+    let j = code_len
+    emit8(0)
+    emit_hex("48 8B 08")
+    var v = 0
+    var i = m - 1
+    while i >= 0 {
+        v = (v << 8) | s.byte(i)
+        i -= 1
+    }
+    if m == 1 {
+        // cmp byte [rcx], v
+        emit_hex("80 39")
+        emit8(v)
+    } else if m == 2 {
+        // cmp word [rcx], v
+        emit_hex("66 81 39")
+        emit8(v & 255)
+        emit8(v >> 8)
+    } else if m == 3 {
+        // три байта — в edx: movzx edx, word [rcx]; movzx ecx, byte [rcx+2];
+        // shl ecx, 16; or edx, ecx; cmp edx, v
+        emit_hex("0F B7 11 0F B6 49 02 C1 E1 10 09 CA 81 FA")
+        emit32(v)
+    } else {
+        // cmp dword [rcx], v
+        emit_hex("81 39")
+        emit32(v)
+    }
+    store8(code + j, code_len - j - 1)
+    here()
+    return cmp_cc(op)
 }
 
 fn parse_cmp() -> int {
@@ -948,7 +1057,7 @@ fn parse_add() -> int {
         }
         if op == '+' && lt == ty_str {
             emit_push(RAX)
-            want = ty_err
+            want = ty_str
             let rt = parse_mul()
             if rt != ty_str && rt != ty_err {
                 error_tok(at, "cannot add " + ty_name(rt) + " to str", mismatch_hint(rt, ty_str))
@@ -1005,7 +1114,8 @@ fn parse_unary() -> int {
         let w = want
         advance()
         want = ty_err
-        if kind() == T_INT {
+        if kind() == T_INT || kind() == T_CHAR {
+            // -5, -'a' (код символа)
             let v = tok().val
             advance()
             if is_float_want(w) {

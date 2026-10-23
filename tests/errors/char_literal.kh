@@ -1,0 +1,21 @@
+// expect: char_literal.kh:14:13: error: a character literal holds one character
+// expect: hint: for text write "ab"
+// expect: char_literal.kh:15:13: error: a character literal holds one character
+// expect: hint: 'é' here is e + U+0301; for text write "é"
+// expect: char_literal.kh:16:14: error: surrogate escape \uD83D
+// expect: char_literal.kh:17:14: error: surrogate escape \uD83D
+// expect: hint: write \u{1F600}
+// expect: char_literal.kh:18:14: error: escape \u{110000} is above U+10FFFF
+// expect: char_literal.kh:19:13: error: empty character literal
+// expect: 6 errors
+// Символьный литерал — один символ (é, набранное как e и знак U+0301, — два);
+// суррогаты UTF-16 — не символы.
+fn main() {
+    let a = 'ab'
+    let b = 'é'
+    let c = '\uD83D'
+    let d = "\uD83D\uDE00"
+    let e = '\u{110000}'
+    let f = ''
+    print("{a}{b}{c}{d}{e}{f}")
+}

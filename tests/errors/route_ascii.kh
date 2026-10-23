@@ -1,0 +1,11 @@
+// expect: route_ascii.kh:5:11: error: write the route path in ASCII
+// expect: hint: clients send 'товары' percent-encoded; use an ASCII name or a parameter like {name}
+// expect: 1 error
+// Путь маршрута — ASCII: остальное приходит в запросе как %XX.
+route GET "/товары/{id}" (id: int) -> str {
+    return "x"
+}
+
+route GET "/items/{name}" (name: str) -> str {
+    return name
+}

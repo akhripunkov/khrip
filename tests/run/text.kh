@@ -1,0 +1,113 @@
+// exit: 101
+// Строки — текст: len, s[i], срезы, find, for, split(""), replace("", x), trim,
+// lower и upper считают символы — на ASCII, кириллице, CJK, эмодзи и
+// комбинируемых знаках; неправильные байты — по символу U+FFFD на байт (правило
+// Go). Вывод один и тот же без кэша строк, с ним, в проверочном режиме и без
+// SIMD. В конце — s[i] за концом строки: паника.
+// env: KHRIP_STRCACHE=off
+// env:
+// env: KHRIP_STRCACHE=stress
+// env: KHRIP_SIMD=0
+
+fn show(xs: [str]) -> str {
+    return "[" + xs.join("|") + "]"
+}
+
+fn main() {
+    let words = ["hello", "привет", "日本語", "a😀b", "e\u{301}clair", ""]
+    for w in words {
+        print("{w}: len {w.len()} {len(w)} bytes {w.byte_len()} chars {show(w.split(""))}")
+    }
+
+    // индекс и срезы — в символах, границы срезов прижимаются
+    let s = "Привет, мир! 😀"
+    print("{s[0]} {s[7]} {s[13]} {s[s.len() - 1]}")
+    print("{s[0..6]}|{s[8..]}|{s[..6]}|{s[8..11]}|{s[..]}")
+    print("{s[-5..3]}|{s[12..100]}|{s[100..]}|{s[5..2]}|{s[..0]}|")
+    print(s[0..s.len()] == s)
+    let cjk = "東京タワー"
+    print("{cjk[1]} {cjk[2..]} {cjk[..2]} {cjk.len()}")
+
+    // find — номер символа; поиск со срезом
+    print(s.find("мир") ?? -1)
+    print(s.find("😀") ?? -1)
+    print(s.find("нет") ?? -1)
+    if let i = s.find("мир") {
+        print(s[i..i + 3])
+    }
+    print(s.find_from("и", 3))
+    print(s.find_from("и", -2))
+    print(s.find_from("", 14))
+    print(s.find_from("", 15))
+    var rest = "раз,два,три"
+    var parts: [str] = []
+    while true {
+        let i = rest.find(",") else {
+            break
+        }
+        parts.push(rest[..i])
+        rest = rest[i + 1..]
+    }
+    parts.push(rest)
+    print(show(parts))
+
+    // for и for i, c
+    var out = ""
+    for c in "ёж🦔" {
+        out += "<" + c + ">"
+    }
+    print(out)
+    for i, c in "мир" {
+        print("{i}: {c} {c.byte_len()}")
+    }
+    var vowels = 0
+    for c in "Арбуз и яблоко" {
+        if c == 'а' || c == 'А' || c == 'у' || c == 'и' || c == 'я' || c == 'о' {
+            vowels += 1
+        }
+    }
+    print(vowels)
+
+    // split("") и replace("", x)
+    print(show("абв".split("")))
+    print("абв".replace("", "-"))
+    print("".replace("", "-"))
+    print("a,б,c".split(",").len())
+    print("мама".replace("ма", "па"))
+
+    // trim: White_Space (NBSP, U+3000, \v, \f, U+2028) снимается; ZWSP и BOM — нет
+    print("[" + "\u{a0}\u{3000} текст \u{b}\u{c}\u{2028}".trim() + "]")
+    print("\u{200b}x\u{200b}".trim().len())
+    print("\u{feff}x".trim().len())
+    print("   ".trim() == "")
+
+    // регистр: простое отображение Unicode
+    print("ÉCOLE Ёж".lower() + " " + "straße".upper() + " " + "İ".lower())
+    print("Ёлка".lower().len() == "Ёлка".len())
+
+    // порядок и равенство — по байтам: на правильном тексте это порядок кодов
+    print("Ёж" < "арбуз" && "арбуз" < "яблоко" && "яблоко" < "ёлка")
+    var fruits = ["яблоко", "ёлка", "арбуз", "Ёж"]
+    fruits.sort()
+    print(fruits.join(" "))
+    print("я" == 'я')
+    print("ab" != "ab")
+    print("abc" == "abc" && "" == "" && "ab" != "abc" && "мир" == "мир")
+
+    // неправильные байты: каждый — отдельный символ
+    let bad = "₂".byte_slice(0, 2) + "A"
+    print("{bad.len()} {bad.byte_len()}")
+    print(bad[2])
+    let ga = "À" + "ŀ".byte_slice(1, 2)
+    print("{ga.len()} {ga[0]} {ga[1].byte_len()} {ga[1].byte(0)}")
+    var raw: [int] = []
+    for c in bad {
+        raw.push(c.byte(0))
+    }
+    print(to_json(raw))
+    print(bad[1..].byte_len())
+
+    // за концом строки — паника
+    let short = "ой"
+    print(short[2])
+}

@@ -541,6 +541,7 @@ fn fast_compound(li: int, op_k: int, at: Token) -> bool {
     if l.ty != ty_int || (op_k != T_PLUSEQ && op_k != T_MINUSEQ) {
         return false
     }
+    want = ty_int
     if !peek_simple(3) || kind_at(pos + 1) == T_QQ || !ends_stmt(pos + 1) {
         return false
     }
@@ -887,6 +888,7 @@ fn assign_index(t: int) {
 // xs[i] = v, где i и v — константы или локальные: без стека.
 // Получатель в rax, текущий токен — сразу после '['.
 fn fast_index_store(t: int, at: Token) -> bool {
+    want = ty_int
     if !peek_simple(1) || !is_int_like(op_ty) || kind_at(pos + 1) != ']' || kind_at(pos + 2) != '=' {
         return false
     }
@@ -895,6 +897,7 @@ fn fast_index_store(t: int, at: Token) -> bool {
     let iv = op_val
     let save = pos
     pos += 3
+    want = et
     if !peek_simple(1) || !ends_stmt(pos + 1) || !assignable(op_ty, et) || op_ty == ty_none {
         pos = save
         return false
@@ -1002,6 +1005,7 @@ fn try_reg_compare() -> int {
     let save = pos
     pos += 2
     let nk = kind_at(pos + 1)
+    want = ty_int
     if !peek_simple(3) || !is_int_like(op_ty) || (nk != '\{' && nk != T_ANDAND && nk != T_OROR) {
         pos = save
         return -1
@@ -1418,6 +1422,7 @@ fn for_range(n1: Token, inclusive: bool, saved_ns: bool) {
     var lim_imm = 0
     var lim = -1
     let lt = tok()
+    want = ty_int
     if peek_simple(3) && op_kind == OPK_IMM && op_ty == ty_int && kind_at(pos + 1) == '\{' {
         use_imm = true
         lim_imm = op_val
@@ -1450,11 +1455,15 @@ fn for_range(n1: Token, inclusive: bool, saved_ns: bool) {
     }
 }
 
-// for x in список / строка (байты); for i, x in ...
+// for x in список / строка (в системном коде — байты); for i, x in ...
 fn for_list(n1: Token, n2: Token, two: bool, t: int) {
     let is_str = tkind(t) == K_STR
     if is_str {
         system_str_error(n1, "for over a str", "for i in 0..s.byte_len() \{ s.byte(i) }")
+    }
+    if is_str && !system_code(n1) {
+        for_text(n1, n2, two, t)
+        return
     }
     let lst = hidden_local(t)
     emit_store_local(lst)
@@ -1517,6 +1526,110 @@ fn for_list(n1: Token, n2: Token, two: bool, t: int) {
     if !two {
         release_hidden(idx)
     }
+}
+
+// Локальная li и регистр r: op 0x8B — r = li, 0x89 — li = r, 0x01 — li += r.
+fn emit_local_op(op: int, r: int, li: int) {
+    let l = locals[li]
+    if l.reg < 0 {
+        emit_mem(op, r, RBP, l.off)
+    } else if op == 0x8B {
+        emit_mov_rr(r, l.reg)
+    } else if op == 0x89 {
+        emit_mov_rr(l.reg, r)
+    } else {
+        emit_rr(op, r, l.reg)
+    }
+}
+
+// for c in s, for i, c in s в коде программы: c — символ (str из одного
+// символа), i — его номер. Строка в rax. Скрытые: lst — строка, p и n — её
+// байты и длина (строка неизменна: читаются один раз), pos — смещение
+// следующего символа, tab — таблица символов U+0000–U+07FF (lib/text.kh,
+// __chars). ASCII и правильные два байта разбираются на месте и берутся из
+// таблицы без выделения памяти; остальное — __text_char_at (по правилу Go).
+fn for_text(n1: Token, n2: Token, two: bool, t: int) {
+    let pos = hidden_local(ty_int)
+    let pl = hidden_local(ty_int)
+    let nl = hidden_local(ty_int)
+    let tab = hidden_local(ty_int)
+    let lst = hidden_local(t)
+    emit_store_local(lst)
+    emit_load(RCX, RAX, 0)
+    emit_local_op(0x89, RCX, pl)
+    emit_load(RCX, RAX, 8)
+    emit_local_op(0x89, RCX, nl)
+    emit_mov_imm(RAX, 0)
+    emit_store_local(pos)
+    emit_call(rt_func("__chars"))
+    emit_store_local(tab)
+    var idx = -1
+    var xname = n1.text
+    if two {
+        idx = declare_local(n1.text, ty_int, false)
+        emit_mov_imm(RAX, 0)
+        emit_store_local(idx)
+        xname = n2.text
+    }
+    let x = declare_local(xname, ty_str, false)
+    let test_at = emit_jmp()
+    align16()
+    let top = here()
+    // rcx = p, rdx = pos, rsi — таблица; eax = p[pos]; cmp eax, 0x80
+    emit_local_op(0x8B, RCX, pl)
+    emit_local_op(0x8B, RDX, pos)
+    emit_local_op(0x8B, RSI, tab)
+    emit_hex("0F B6 04 11 3D 80 00 00 00")
+    let multi = emit_jcc(CC_AE)
+    // ASCII: заголовок tab + 16·байт (shl eax, 4; add rax, rsi); inc rdx
+    emit_hex("C1 E0 04 48 01 F0 48 FF C2")
+    let done1 = emit_jmp()
+    patch_here(multi)
+    // два байта C2..DF 80..BF, если pos + 1 < n: код < U+0800 — тоже из таблицы
+    emit_hex("3D C2 00 00 00")
+    let slow1 = emit_jcc(CC_B)
+    emit_hex("3D DF 00 00 00")
+    let slow2 = emit_jcc(CC_A)
+    // lea r8, [rdx+1]; cmp r8, n
+    emit_hex("4C 8D 42 01")
+    emit_local_op(0x8B, R9, nl)
+    emit_hex("4D 39 C8")
+    let slow3 = emit_jcc(CC_AE)
+    // movzx r8d, byte [rcx+rdx+1]; mov r9d, r8d; and r9d, 0xC0; cmp r9d, 0x80
+    emit_hex("44 0F B6 44 11 01 45 89 C1 41 81 E1 C0 00 00 00 41 81 F9 80 00 00 00")
+    let slow4 = emit_jcc(CC_NE)
+    // eax = ((eax & 0x1F) << 6) | (r8d & 0x3F); shl eax, 4; add rax, rsi; add rdx, 2
+    emit_hex("83 E0 1F C1 E0 06 41 83 E0 3F 44 09 C0 C1 E0 04 48 01 F0 48 83 C2 02")
+    let done2 = emit_jmp()
+    patch_here(slow1)
+    patch_rel(slow2, code_len)
+    patch_rel(slow3, code_len)
+    patch_rel(slow4, code_len)
+    // остальное: __text_char_at(lst, pos); rdx = pos + длина символа
+    emit_local_op(0x8B, RDI, lst)
+    emit_hex("48 89 D6")
+    emit_call(rt_func("__text_char_at"))
+    emit_local_op(0x8B, RDX, pos)
+    emit_hex("48 03 50 08")
+    patch_here(done1)
+    patch_rel(done2, code_len)
+    emit_local_op(0x89, RDX, pos)
+    emit_store_local(x)
+    let mark = loop_begin()
+    parse_block()
+    let cont = here()
+    if two {
+        emit_inc_local(idx)
+    }
+    patch_here(test_at)
+    emit_loop_test(pos, nl, 0, false, false, top)
+    let exit = here()
+    loop_end(mark, cont, exit)
+    release_hidden(lst)
+    release_hidden(tab)
+    release_hidden(nl)
+    release_hidden(pl)
+    release_hidden(pos)
 }
 
 // for k, v in словарь; for k in словарь. Записи хранятся по порядку вставки,

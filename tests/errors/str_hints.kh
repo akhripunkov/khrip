@@ -1,0 +1,25 @@
+// expect: str_hints.kh:16:7: error: str has no method 'charAt'
+// expect: hint: use s[i], a one-character str
+// expect: hint: use for c in s or s.split("")
+// expect: hint: use .len(), it counts characters
+// expect: hint: str is UTF-8 already: s.byte_len() is its size, s.byte(i) a byte
+// expect: hint: compare characters: c.matches(`\w`), c >= "0" && c <= "9", c.trim() == ""
+// expect: hint: compare characters directly: c >= "a" && c <= "z"
+// expect: hint: use .lower()
+// expect: str_hints.kh:24:13: error: unknown function 'ord'
+// expect: 8 errors
+// Привычки работы с символами из других языков — подсказки с формой Khrip.
+
+fn main() {
+    let s = "Ёж"
+    var n = 0
+    s.charAt(0)
+    s.chars()
+    n = s.length()
+    s.encode()
+    s.isdigit()
+    s.codePointAt(0)
+    s.casefold()
+    print(n)
+    let c = ord(s)
+}

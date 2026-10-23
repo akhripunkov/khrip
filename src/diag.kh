@@ -175,6 +175,48 @@ fn name_hint(name: str) -> str {
     if name == "self" || name == "this" {
         return "methods take the receiver as the first parameter named self: fn name(self: Type)"
     }
+    if name == "ord" || name == "chr" {
+        return "compare characters directly: c >= \"a\" && c <= \"z\""
+    }
+    return ""
+}
+
+// Подсказка для неизвестного метода str: привычки работы с символами из других
+// языков. bytes — системный код, там строка — байты.
+fn str_method_hint(name: str, bytes: bool) -> str {
+    if name == "char_len" || name == "length" || name == "Length" || name == "count" || name == "size" || name == "RuneCountInString" {
+        if bytes {
+            return "use .byte_len()"
+        }
+        return "use .len(), it counts characters"
+    }
+    if name == "charAt" || name == "char_at" || name == "at" {
+        if bytes {
+            return "use s.byte(i)"
+        }
+        return "use s[i], a one-character str"
+    }
+    if name == "chars" || name == "runes" || name == "ToCharArray" || name == "toCharArray" {
+        if bytes {
+            return "loop over the bytes: for i in 0..s.byte_len() \{ s.byte(i) }"
+        }
+        return "use for c in s or s.split(\"\")"
+    }
+    if name == "bytes" || name == "encode" || name == "as_bytes" || name == "getBytes" {
+        return "str is UTF-8 already: s.byte_len() is its size, s.byte(i) a byte"
+    }
+    if name == "isalpha" || name == "isdigit" || name == "isspace" || name == "is_digit" || name == "isalnum" || name == "IsLetter" || name == "is_alphabetic" {
+        return "compare characters: c.matches(`\\w`), c >= \"0\" && c <= \"9\", c.trim() == \"\""
+    }
+    if name == "ord" || name == "chr" || name == "charCodeAt" || name == "codePointAt" {
+        return "compare characters directly: c >= \"a\" && c <= \"z\""
+    }
+    if name == "casefold" {
+        if bytes {
+            return "use .ascii_lower()"
+        }
+        return "use .lower()"
+    }
     return ""
 }
 

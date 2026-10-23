@@ -295,11 +295,16 @@ fn parse_match(as_value: bool, w: int) -> int {
                     emit_cmp_imm(RAX, vsi)
                     body_holes.push(emit_jcc(CC_E))
                 }
-            } else if st == ty_str && pt.kind == T_STR {
+            } else if st == ty_str && (pt.kind == T_STR || pt.kind == T_CHAR) {
+                // 'x' при str — строка из одного символа
                 advance()
                 emit_load_local(sl)
                 emit_mov_rr(RDI, RAX)
-                emit_mov_imm(RSI, strlit(pt.val))
+                if pt.kind == T_CHAR {
+                    emit_mov_imm(RSI, const_str(char_text(pt.val)))
+                } else {
+                    emit_mov_imm(RSI, strlit(pt.val))
+                }
                 emit_call(rt_func("__str_eq"))
                 emit_test_rax()
                 body_holes.push(emit_jcc(CC_NE))
@@ -314,7 +319,7 @@ fn parse_match(as_value: bool, w: int) -> int {
                     seen_false = true
                     body_holes.push(emit_jcc(CC_E))
                 }
-            } else if st == ty_int && (pt.kind == T_INT || (pt.kind == '-' && kind_at(pos + 1) == T_INT)) {
+            } else if st == ty_int && (pt.kind == T_INT || pt.kind == T_CHAR || (pt.kind == '-' && kind_at(pos + 1) == T_INT)) {
                 var v = 0
                 if pt.kind == '-' {
                     advance()

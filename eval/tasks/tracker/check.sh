@@ -31,6 +31,7 @@ check "issue other project" 201 '"key":"WEB-1" && "number":1' "${J[@]}" -X POST 
 check "issue bad priority" 400 '' "${J[@]}" -X POST $U/projects/API/issues -d '{"title":"X","priority":"urgent"}'
 check "issue blank" 400 '' "${J[@]}" -X POST $U/projects/API/issues -d '{"title":"  "}'
 check "issue long" 400 '' "${J[@]}" -X POST $U/projects/API/issues -d "{\"title\":\"$(printf 'a%.0s' $(seq 201))\"}"
+check "issue long cyrillic" 400 '' "${J[@]}" -X POST $U/projects/API/issues -d "{\"title\":\"$(printf 'ж%.0s' $(seq 201))\"}"
 check "issue assignee" 404 '' "${J[@]}" -X POST $U/projects/API/issues -d '{"title":"X","assignee_id":999999}'
 check "issue project" 404 '' "${J[@]}" -X POST $U/projects/NOPE/issues -d '{"title":"X"}'
 check "issue 4 after errors" 201 '"key":"API-4" && "number":4' "${J[@]}" -X POST $U2/projects/API/issues -d "{\"title\":\"Slow search\",\"assignee_id\":$bob}"

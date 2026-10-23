@@ -2,9 +2,9 @@
 // (hashlib, hmac, cryptography). Случайные проверки — в tests/tls.sh.
 
 fn unhex(s: str) -> int {
-    let p = __alloc(s.len() / 2 + 16)
-    for i in 0..s.len() / 2 {
-        store8(p + i, __hex_val(s[2 * i]) * 16 + __hex_val(s[2 * i + 1]))
+    let p = __alloc(s.byte_len() / 2 + 16)
+    for i in 0..s.byte_len() / 2 {
+        store8(p + i, __hex_val(s.byte(2 * i)) * 16 + __hex_val(s.byte(2 * i + 1)))
     }
     return p
 }
@@ -23,15 +23,15 @@ fn main() -> int {
     let sizes = [32, 48, 64]
     for i in 0..3 {
         for msg in ["", "abc", "a".repeat(1000)] {
-            __hash(sizes[i], __str_ptr(msg), msg.len(), out)
-            print("{names[i]} {msg.len()}: {__hex_bytes(out, sizes[i])}")
+            __hash(sizes[i], __str_ptr(msg), msg.byte_len(), out)
+            print("{names[i]} {msg.byte_len()}: {__hex_bytes(out, sizes[i])}")
         }
     }
     let key = seq(0, 32)
     let msg = "Khrip TLS"
-    __hmac(32, key, 32, __str_ptr(msg), msg.len(), out)
+    __hmac(32, key, 32, __str_ptr(msg), msg.byte_len(), out)
     print("hmac sha256: {__hex_bytes(out, 32)}")
-    __hmac(48, key, 32, __str_ptr(msg), msg.len(), out)
+    __hmac(48, key, 32, __str_ptr(msg), msg.byte_len(), out)
     print("hmac sha384: {__hex_bytes(out, 48)}")
     __hkdf_label(32, key, "key", 0, 0, out, 16)
     print("hkdf label sha256: {__hex_bytes(out, 16)}")
@@ -46,7 +46,7 @@ fn main() -> int {
     let ct = __alloc(116)
     for kind in [AEAD_AES128, AEAD_AES256, AEAD_CHACHA] {
         let a = __aead_new(kind, key)
-        __aead_seal(a, nonce, __str_ptr(aad), aad.len(), pt, 100, ct)
+        __aead_seal(a, nonce, __str_ptr(aad), aad.byte_len(), pt, 100, ct)
         let name = match kind {
             1 => "aes128gcm"
             2 => "aes256gcm"

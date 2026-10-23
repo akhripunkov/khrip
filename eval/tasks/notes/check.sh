@@ -10,6 +10,11 @@ check "short password" 400 '' "${J[@]}" -X POST $U/register -d '{"username":"car
 check "no password" 400 '' "${J[@]}" -X POST $U/register -d '{"username":"carl"}'
 check "password not echoed" 201 '"username":"dora"' "${J[@]}" -X POST $U/register -d '{"username":"dora","password":"pa55word!"}'
 grep -q 'pa55word' <<<"$LAST" && { echo "FAIL password in response"; fails=$((fails + 1)); }
+# длины — в символах, а не в байтах UTF-8
+check "short cyrillic name" 400 '' "${J[@]}" -X POST $U/register -d '{"username":"Ян","password":"secret-yan"}'
+check "short cyrillic password" 400 '' "${J[@]}" -X POST $U/register -d '{"username":"carl","password":"пароль1"}'
+long_name=$(printf 'ж%.0s' $(seq 32))
+check "cyrillic name of 32" 201 "\"username\":\"$long_name\"" "${J[@]}" -X POST $U/register -d "{\"username\":\"$long_name\",\"password\":\"пароль12\"}"
 check "login" 200 '"token":"[^"]{20,}"' "${J[@]}" -X POST $U/login -d '{"username":"ann","password":"secret-ann"}'
 ta=$(field token)
 check "login again" 200 '"token":"[^"]{20,}"' "${J[@]}" -X POST $U/login -d '{"username":"ann","password":"secret-ann"}'
@@ -31,6 +36,7 @@ check "create" 201 '"id":1 && "title":"Shop" && "text":"milk, eggs" && "created_
 check "create bob" 201 '"id":2 && "title":"Bob'"'"'s"' "${J[@]}" "${B[@]}" -X POST $U/notes -d "{\"title\":\"Bob's\",\"text\":\"\"}"
 check "create 3" 201 '"id":3 && "title":"Ideas"' "${J[@]}" "${A2[@]}" -X POST $U/notes -d '{"title":"Ideas","text":"line 1\nline 2"}'
 check "blank title" 400 '' "${J[@]}" "${A[@]}" -X POST $U/notes -d '{"title":" ","text":"y"}'
+check "nbsp title" 400 '' "${J[@]}" "${A[@]}" -X POST $U/notes -d '{"title":"\u00a0\u00a0","text":"y"}'
 check "list ann" 200 '^\[\{[^{}]*"id":1[^{}]*\},\{[^{}]*"id":3[^{}]*"text":"line 1\\nline 2"[^{}]*\}\]$' "${A[@]}" $U/notes
 check "list bob" 200 '^\[\{[^{}]*"id":2[^{}]*\}\]$' "${B[@]}" $U/notes
 check "get own" 200 '"id":1 && "title":"Shop"' "${A[@]}" $U/notes/1

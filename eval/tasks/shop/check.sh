@@ -13,6 +13,7 @@ ct=$(jval "j['id']")
 check "category dup" 409 '' "${J[@]}" -X POST $U2/categories -d '{"name":"fruit"}'
 check "category blank" 400 '' "${J[@]}" -X POST $U/categories -d '{"name":"   "}'
 check "category long" 400 '' "${J[@]}" -X POST $U/categories -d "{\"name\":\"$(printf 'a%.0s' $(seq 51))\"}"
+check "category long cyrillic" 400 '' "${J[@]}" -X POST $U/categories -d "{\"name\":\"$(printf 'я%.0s' $(seq 51))\"}"
 check "categories" 200 '' $U/categories
 jtest "categories sorted" "[(c['id'], c['name']) for c in j] == [($cb, 'Bakery'), ($cf, 'Fruit'), ($ct, 'Toys')]"
 

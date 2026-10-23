@@ -1,0 +1,46 @@
+hello: len 5 5 bytes 5 chars [h|e|l|l|o]
+привет: len 6 6 bytes 12 chars [п|р|и|в|е|т]
+日本語: len 3 3 bytes 9 chars [日|本|語]
+a😀b: len 3 3 bytes 6 chars [a|😀|b]
+éclair: len 7 7 bytes 8 chars [e|́|c|l|a|i|r]
+: len 0 0 bytes 0 chars []
+П   😀 😀
+Привет|мир! 😀|Привет|мир|Привет, мир! 😀
+При| 😀||||
+true
+京 タワー 東京 5
+8
+13
+-1
+мир
+9
+2
+14
+-1
+[раз|два|три]
+<ё><ж><🦔>
+0: м 2
+1: и 2
+2: р 2
+6
+[а|б|в]
+-а-б-в-
+-
+3
+папа
+[текст]
+3
+2
+true
+école ёж STRAßE i
+true
+true
+Ёж арбуз яблоко ёлка
+true
+false
+true
+3 3
+A
+2 À 1 128
+[226,130,65]
+2

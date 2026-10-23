@@ -95,6 +95,9 @@ fn tok_desc(k: int) -> str {
     if k == T_INT {
         return "a number"
     }
+    if k == T_CHAR {
+        return "a character"
+    }
     if k == T_STR {
         return "a string"
     }
@@ -359,9 +362,9 @@ fn type_decl_end(i: int) -> int {
     return j
 }
 
-// Значение поля по умолчанию — литерал; токены литерала пропускаются.
+// Значение поля типа ft по умолчанию — литерал; токены литерала пропускаются.
 // → тип литерала или -1, если это не литерал.
-fn default_literal() -> int {
+fn default_literal(ft: int) -> int {
     let k = kind()
     if k == '-' && kind_at(pos + 1) == T_INT {
         advance()
@@ -383,6 +386,14 @@ fn default_literal() -> int {
     }
     if k == T_STR {
         advance()
+        return ty_str
+    }
+    if k == T_CHAR {
+        // 'x': код символа у поля int, иначе str (как в parse_atom)
+        advance()
+        if ty_inner(ft) == ty_int || ty_inner(ft) == ty_float {
+            return ty_int
+        }
         return ty_str
     }
     if k == T_TRUE || k == T_FALSE {
@@ -466,7 +477,7 @@ fn prescan_struct_fields(s: int) {
                     advance()
                     let at = tok()
                     def = pos
-                    let lt = default_literal()
+                    let lt = default_literal(ft)
                     if lt < 0 {
                         error_tok(at, "a field default must be a literal: a number, string, true, false, none, [], \{} or a variant without fields", "compute other values in the code that creates the value")
                         def = -1
@@ -531,7 +542,7 @@ fn parse_params() -> [Param] {
                 advance()
             }
             let dk = kind()
-            if dk == T_INT || dk == T_FLOAT || dk == T_STR || dk == T_TRUE || dk == T_FALSE || dk == T_NONE || dk == T_IDENT {
+            if dk == T_INT || dk == T_FLOAT || dk == T_STR || dk == T_CHAR || dk == T_TRUE || dk == T_FALSE || dk == T_NONE || dk == T_IDENT {
                 advance()
                 if kind() != ',' && kind() != ')' {
                     error_tok(toks[def], "a default value must be a single literal: 10, \"text\", true, none or an enum value", "compute it inside the function")
@@ -674,6 +685,15 @@ fn prescan_const() {
         t = ty_str
         val = strlit(v.val)
         lit = v.val
+    } else if v.kind == T_CHAR {
+        // const SEP = ',' — str из одного символа; const NEG = -'a' — число
+        if neg {
+            val = -val
+        } else {
+            t = ty_str
+            lit = add_strlit(char_text(v.val))
+            val = strlit(lit)
+        }
     } else if (v.kind == T_TRUE || v.kind == T_FALSE) && !neg {
         t = ty_bool
         val = 0
