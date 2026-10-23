@@ -26,6 +26,12 @@
 ; bytes at a page end / page start / mid-page with every k or a sample of k;
 ; every 1- and 2-byte sequence at offsets 0, 1, 29-33, 61-63 on an ASCII and a
 ; Cyrillic background; every 3-byte sequence at offsets 0, 30, 31, 32).
+; kh_case (added with seek): 77,682,688 checks against a per-character
+; reference (random mixes of ASCII, Cyrillic and other characters at a page end /
+; page start / mid-page, both modes, write and check; every byte pair at every
+; position of 33- and 66-byte buffers on three backgrounds): output, stop
+; position on a character boundary, nothing written past it but the lead of a
+; pair across the boundary, no early stop.
 ; Calling convention: rdi = p, rsi = n, rdx = k; result in rax; clobbers only
 ; rax rcx rdx rsi rdi r8-r11 ymm0-ymm15 (rbp is pushed and restored); no calls.
 default abs
@@ -50,8 +56,35 @@ MASKT: times 32 db 0xFF
 MAXV: times 29 db 255
       db 0xEF, 0xDF, 0xBF
 
+align 32
+global CASET
+; per mode 128 bytes: [0] lo (first letter to change), [32] TD (continuation
+; deltas: index 8..B after D0, 0..3 after D1), [64] TL (lead deltas: index 8..B
+; for D0, 0..3 for D1, by the high nibble of the next byte), [96] unused;
+; [256] 25 (letters lo..lo+25), [288] 0x0F, [320] 0xC0, [352] 0xA0, [384] 0xD0,
+; [416] 0xD1, [448] 0x20 (khc puts this 480-byte table 32-aligned into DATA:
+; case_consts)
+CASET:
+; lower
+times 32 db 0x41
+times 2 db 0,0,0,0, 0,0,0,0, 0x10,0x20,0xE0,0, 0,0,0,0
+times 2 db 0,0,0,0, 0,0,0,0, 1,0,1,0, 0,0,0,0
+times 32 db 0
+; upper
+times 32 db 0x61
+times 2 db 0x20,0xF0,0,0, 0,0,0,0, 0,0,0,0xE0, 0,0,0,0
+times 2 db 0xFF,0xFF,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0
+times 32 db 0
+KC25: times 32 db 25
+KC0F: times 32 db 0x0F
+KCC0: times 32 db 0xC0
+KCA0: times 32 db 0xA0
+KCD0: times 32 db 0xD0
+KCD1: times 32 db 0xD1
+KC20: times 32 db 0x20
+
 section .text
-global kh_utf8_scan, kh_utf8_skip, kh_utf8_seek, kh_find_json_hi
+global kh_utf8_scan, kh_utf8_skip, kh_utf8_seek, kh_find_json_hi, kh_case
 
 %define H8 0x8080808080808080
 
@@ -137,6 +170,102 @@ global kh_utf8_scan, kh_utf8_skip, kh_utf8_seek, kh_find_json_hi
     vpsubusb ymm8, ymm0, [MAXV]
     vmovdqa ymm6, ymm0
 %endif
+%%done:
+%endmacro
+
+; one block of kh_case: ymm0 = c (the bytes at rax), a = the bytes before them,
+; z = the bytes after them: loaded from rax + 1 (%1 = 0) or c shifted by one
+; byte with a zero after the end (%1 = 1, the last block)
+%macro CBLOCK 1
+    vpmovmskb ecx, ymm0
+    test ecx, ecx
+    jnz %%full
+    ; ASCII: only letters
+    vpsubb ymm1, ymm0, [r8]
+    vpminub ymm3, ymm1, [KC25]
+    vpcmpeqb ymm3, ymm3, ymm1
+    test rdi, rdi
+    jnz %%aw
+    vptest ymm3, ymm3
+    jnz .out
+    jmp %%done
+%%aw:
+    vpand ymm3, ymm3, ymm8
+    vpxor ymm2, ymm0, ymm3
+    vmovdqu [rdi+rax], ymm2
+    jmp %%done
+%%full:
+    ; a = the bytes before c (a zero before the first one)
+    test rax, rax
+    jnz %%aload
+    vperm2i128 ymm1, ymm0, ymm0, 0x08
+    vpalignr ymm2, ymm0, ymm1, 15
+    jmp %%ahave
+%%aload:
+    vmovdqu ymm2, [rsi+rax-1]
+%%ahave:
+    vpcmpeqb ymm3, ymm2, ymm11           ; a = D1
+    vpcmpeqb ymm4, ymm2, ymm12           ; a = D0
+    vpsrlw ymm1, ymm0, 4
+    vpand ymm1, ymm1, ymm15              ; high nibble of c
+    vpand ymm2, ymm3, ymm8
+    vpsrlw ymm2, ymm2, 2                 ; 8 after D1
+    vpxor ymm1, ymm1, ymm2               ; index into TD
+    vmovdqu ymm2, [r8+32]
+    vpshufb ymm2, ymm2, ymm1
+    vpor ymm1, ymm3, ymm4
+    vpand ymm2, ymm2, ymm1               ; continuation deltas
+    vpaddb ymm2, ymm2, ymm0              ; out = c + deltas
+    vpcmpgtb ymm1, ymm13, ymm0           ; c in 80..9F
+    vpand ymm3, ymm3, ymm1
+    vpor ymm3, ymm3, ymm4                ; after D0, or after D1 and c <= 9F
+    vpcmpgtb ymm1, ymm14, ymm0           ; c in 80..BF
+    vpand ymm3, ymm3, ymm1               ; good continuation bytes
+    vpmovmskb r9d, ymm3
+%if %1 == 0
+    vmovdqu ymm1, [rsi+rax+1]            ; z
+%else
+    vperm2i128 ymm1, ymm0, ymm0, 0x81
+    vpalignr ymm1, ymm1, ymm0, 1         ; z, 0 after the end
+%endif
+    vpcmpeqb ymm4, ymm0, ymm12           ; c = D0
+    vpcmpgtb ymm3, ymm14, ymm1           ; z in 80..BF
+    vpand ymm3, ymm3, ymm4
+    vpmovmskb r10d, ymm3
+    or r9d, r10d
+    vpcmpeqb ymm3, ymm0, ymm11           ; c = D1
+    vpcmpgtb ymm6, ymm13, ymm1           ; z in 80..9F
+    vpand ymm6, ymm6, ymm3
+    vpmovmskb r10d, ymm6
+    or r9d, r10d                         ; good bytes >= 0x80
+    not r9d
+    and ecx, r9d
+    jnz .out                             ; anything else: by characters
+    vpor ymm4, ymm4, ymm3                ; c = D0 or D1
+    vpand ymm3, ymm3, ymm8
+    vpsrlw ymm3, ymm3, 2                 ; 8 for D1
+    vpsrlw ymm1, ymm1, 4
+    vpand ymm1, ymm1, ymm15
+    vpxor ymm1, ymm1, ymm3               ; index into TL
+    vmovdqu ymm3, [r8+64]
+    vpshufb ymm3, ymm3, ymm1
+    vpand ymm3, ymm3, ymm4               ; lead deltas
+    vpaddb ymm2, ymm2, ymm3
+    vpsubb ymm1, ymm0, [r8]
+    vpminub ymm3, ymm1, [KC25]
+    vpcmpeqb ymm3, ymm3, ymm1
+    vpand ymm3, ymm3, ymm8
+    vpxor ymm2, ymm2, ymm3               ; ASCII letters
+    test rdi, rdi
+    jnz %%fw
+    vpcmpeqb ymm1, ymm2, ymm0
+    vpmovmskb ecx, ymm1
+    not ecx
+    test ecx, ecx
+    jnz .out
+    jmp %%done
+%%fw:
+    vmovdqu [rdi+rax], ymm2
 %%done:
 %endmacro
 
@@ -249,8 +378,8 @@ kh_utf8_scan:
     vpxor xmm7, xmm7, xmm7
     vpxor xmm6, xmm6, xmm6
     vpxor xmm8, xmm8, xmm8
-    vmovdqu ymm5, [C0F]
-    vmovdqu ymm10, [CC0]
+    vmovdqu ymm5, [KC0F]
+    vmovdqu ymm10, [KCC0]
     vmovdqu ymm11, [T1]
     vmovdqu ymm12, [T2]
     vmovdqu ymm13, [T3]
@@ -415,8 +544,8 @@ kh_utf8_seek:
     vpxor xmm7, xmm7, xmm7
     vpxor xmm6, xmm6, xmm6
     vpxor xmm8, xmm8, xmm8
-    vmovdqu ymm5, [C0F]
-    vmovdqu ymm10, [CC0]
+    vmovdqu ymm5, [KC0F]
+    vmovdqu ymm10, [KCC0]
     vmovdqu ymm11, [T1]
     vmovdqu ymm12, [T2]
     vmovdqu ymm13, [T3]
@@ -652,5 +781,59 @@ kh_find_json_hi:
     test r9d, r9d
     jz .ret
     bts rax, 62
+.ret:
+    ret
+
+; case mapping of ASCII and Cyrillic U+0400-045F in 32-byte blocks (lengths do
+; not change, so every byte maps in place from itself and its neighbours):
+; rdi = dst (0: only check that nothing changes), rsi = src, rdx = n, rcx = 1
+; for upper case. Returns how many bytes from the start are done: a block with
+; anything else (other leads, D1 A0-BF, lone continuation bytes, a lead without
+; its continuation), or, with rdi = 0, a block where something changes, is not
+; taken, and the answer is its start, or the lead before it when a pair crosses
+; the block boundary (that lead is already written; the caller rewrites it).
+; The last block overlaps up to n. n < 32: 0. AVX2 only.
+kh_case:
+    xor eax, eax
+    cmp rdx, 32
+    jb .ret
+    shl ecx, 7
+    lea r8, [rcx+CASET]
+    vmovdqu ymm8, [KC20]
+    vmovdqu ymm11, [KCD1]
+    vmovdqu ymm12, [KCD0]
+    vmovdqu ymm13, [KCA0]
+    vmovdqu ymm14, [KCC0]
+    vmovdqu ymm15, [KC0F]
+.blk:
+    mov r11, rax
+    lea rcx, [rax+33]
+    cmp rcx, rdx
+    ja .last
+    vmovdqu ymm0, [rsi+rax]
+    CBLOCK 0
+    add rax, 32
+    jmp .blk
+.last:
+    cmp rax, rdx
+    je .end
+    mov rax, rdx
+    sub rax, 32
+    vmovdqu ymm0, [rsi+rax]
+    CBLOCK 1
+    mov rax, rdx
+    jmp .end
+.out:
+    ; block not taken: a pair across its start goes by characters too
+    mov rax, r11
+    test rax, rax
+    jz .end
+    movzx ecx, byte [rsi+rax-1]
+    and ecx, 0xFE
+    cmp ecx, 0xD0
+    jne .end
+    dec rax
+.end:
+    vzeroupper
 .ret:
     ret

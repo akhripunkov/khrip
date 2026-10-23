@@ -1331,6 +1331,16 @@ fn parse_builtin(t: Token, w: int) -> int {
         }
         return ty_int
     }
+    if name == "__simd_case" {
+        advance()
+        builtin_args(4, t, name)
+        emit_pop(RCX)
+        emit_pop(RDX)
+        emit_pop(RSI)
+        emit_pop(RDI)
+        emit_simd_case()
+        return ty_int
+    }
     if name == "__data_hex" {
         // таблица из шестнадцатеричного литерала: байты кладутся в DATA при
         // компиляции, в программе — только адрес
