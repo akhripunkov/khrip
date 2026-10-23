@@ -98,9 +98,9 @@ const ARENA_RESERVE = 16777216
 // кэш строк потока (lib/text.kh) для кода вне арены: fn main, __init_globals,
 // загрузка store; у запроса кэш — в начале его арены (__arena_begin)
 const CTX_STRC = 1024
-const STRC_SIZE = 864
+const STRC_SIZE = 1024
 // байты строк, которые поток прочитал проверкой UTF-8 и обходами (__strc_scanned)
-const CTX_SCANNED = 1920
+const CTX_SCANNED = 2048
 // контекст — одна страница (__thread_init)
 const CTX_SIZE = 4096
 
