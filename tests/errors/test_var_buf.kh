@@ -1,0 +1,15 @@
+// flags: --test
+// expect: global 'b' holds Buf, which is a byte buffer of the library, not a value (in a program with tests, globals live in store)
+// expect: global 'log' holds Buf
+// expect: buf_str(b) gives a str
+// В программе с тестами var пользователя живёт в store (как store): Buf в нём
+// после теста указывал бы на освобождённую арену.
+type Log { lines: [Buf] }
+var b: Buf = buf_new(16)
+var log: Log = Log { lines: [] }
+
+test "fill" {
+    b = buf_new(16)
+    buf_add(b, "hello")
+    expect buf_str(b) == "hello"
+}

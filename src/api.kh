@@ -503,11 +503,16 @@ fn store_raw_type(t: int, seen: [int]) -> str {
 // Проверки программы-сервера после предварительного прохода.
 fn check_api() {
     for g in globals {
-        if g.is_store && !files[toks[g.tok].file].is_lib {
+        // var пользователя в программе с тестами тоже живёт в store
+        if global_in_store(g) && !files[toks[g.tok].file].is_lib {
             var seen: [int] = []
             let bad = store_raw_type(g.ty, seen)
             if bad.byte_len() > 0 {
-                error_tok(toks[g.tok], "store '" + g.name + "' holds " + bad + ", which is a byte buffer of the library, not a value", "store the text instead: buf_str(b) gives a str")
+                if g.is_store {
+                    error_tok(toks[g.tok], "store '" + g.name + "' holds " + bad + ", which is a byte buffer of the library, not a value", "store the text instead: buf_str(b) gives a str")
+                } else {
+                    error_tok(toks[g.tok], "global '" + g.name + "' holds " + bad + ", which is a byte buffer of the library, not a value (in a program with tests, globals live in store)", "keep the text instead: buf_str(b) gives a str")
+                }
             }
         }
     }

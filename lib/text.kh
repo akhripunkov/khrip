@@ -26,6 +26,7 @@ const STRC_LAST = 16
 const STRC_HI = 24
 const STRC_DUP = 32
 const STRC_MRU = 40
+const STRC_MEMO = 48
 const STRC_KP = 64
 const STRC_KN = 128
 const STRC_CNT = 192
@@ -35,6 +36,9 @@ const STRC_CB = 384
 const STRC_IX = 448
 const STRC_USE = 512
 const STRC_FAR = 576
+// Память фактов (STRC_MEMO): STRC_MEMO_N мест по 6 слов — kp, kn, cnt, vup, ix,
+// far; у ключа два места — пара 2h, 2h + 1, h — по хешу (p, n).
+const STRC_MEMO_N = 64
 // Открытый конец среза: s[a..] передаёт его вместо b.
 const TEXT_END = 0x7FFFFFFFFFFFFFFF
 
@@ -93,7 +97,7 @@ fn __strc_add(n: int) {
 //       могут быть заняты (новая запись берёт первое свободное место, поэтому
 //       обходить нужно только их), [32] 1 — у какого-то ключа может быть две
 //       записи (0 — точно нет: __strc_spare не ищет), [40] запись + 1, которую
-//       последней нашёл __strc_get;
+//       последней нашёл __strc_get, [48] память фактов или 0 (ниже);
 //   kp, kn — ключ (kp = 0 — запись свободна);
 //   cnt    — число символов + 1 (0 — неизвестно);
 //   vup    — [0, vup) — правильный UTF-8, vup — граница символа;
@@ -102,6 +106,17 @@ fn __strc_add(n: int) {
 //   use    — отметка LRU; far — сколько было дальних переходов.
 // У ключа не больше двух записей (два курсора — для двух указателей); факты
 // (cnt, vup, ix, far) пишутся во все записи ключа.
+//
+// Память фактов: дальние переходы (far) и индекс (ix) длинной строки
+// переживают вытеснение её записей. Без неё строка, которую вытесняют между
+// обращениями (девять строк и больше по кругу, длинная строка между восемью
+// другими), каждый раз начинала бы с нуля: пересчёт O(n), новый индекс в
+// памяти запроса — снова и снова — и проход по порядку O(n²). Память — таблица
+// STRC_MEMO_N мест в памяти запроса (арена) или потока; выделяется при первом
+// дальнем переходе, пишется при дальнем переходе и при постройке индекса,
+// читается, когда у ключа появляется новая запись (__strc_init). Как и записи,
+// хранит только числа и адрес индекса, всё проверяется перед чтением; уходит
+// вместе с блоком (обнуление блока стирает её адрес).
 //
 // KHRIP_STRCACHE=stress: кэшируется всё, кроме пустых строк, запись одна,
 // индекс строится на первом переходе любой длины, а испорченная запись —
@@ -160,7 +175,8 @@ fn __strc_more(b: int, hi: int) -> int {
 fn __strc_touch(b: int, e: int) {
     let t = load64(b + STRC_CLOCK) + 1
     store64(b + STRC_CLOCK, t)
-    store64(b + STRC_USE + 8 * e, t)
+    let x = b + 8 * e
+    store64(x + STRC_USE, t)
 }
 
 // Запись e — для ключа (p, n): факты — из записи from (или нули), курсор — на
@@ -176,16 +192,75 @@ fn __strc_init(b: int, e: int, p: int, n: int, from: int) {
         store64(x + STRC_IX, load64(y + STRC_IX))
         store64(x + STRC_FAR, load64(y + STRC_FAR))
     } else {
-        store64(x + STRC_CNT, 0)
-        store64(x + STRC_VUP, 0)
-        store64(x + STRC_IX, 0)
-        store64(x + STRC_FAR, 0)
+        let z = __strc_memo_find(b, p, n)
+        if z != 0 {
+            store64(x + STRC_CNT, load64(z + 16))
+            store64(x + STRC_VUP, load64(z + 24))
+            store64(x + STRC_IX, load64(z + 32))
+            store64(x + STRC_FAR, load64(z + 40))
+        } else {
+            store64(x + STRC_CNT, 0)
+            store64(x + STRC_VUP, 0)
+            store64(x + STRC_IX, 0)
+            store64(x + STRC_FAR, 0)
+        }
     }
     store64(x + STRC_CK, 0)
     store64(x + STRC_CB, 0)
     store64(x + STRC_USE, 0)
     store64(x + STRC_KN, n)
     store64(x + STRC_KP, p)
+}
+
+// Первое из двух мест ключа (p, n) в памяти фактов (адрес слова) или 0, если
+// памяти нет. Хеш — умножением (в библиотеке оно по модулю 2^64), старшие биты.
+fn __strc_memo_pair(b: int, p: int, n: int) -> int {
+    let m = load64(b + STRC_MEMO)
+    if m == 0 {
+        return 0
+    }
+    let h = (((p ^ (n << 24)) * 0x7F4A7C159E3779B1) >> 40) & (STRC_MEMO_N / 2 - 1)
+    return m + 96 * h
+}
+
+// Факты ключа (p, n) из памяти: адрес места или 0.
+fn __strc_memo_find(b: int, p: int, n: int) -> int {
+    var z = __strc_memo_pair(b, p, n)
+    if z == 0 {
+        return 0
+    }
+    if load64(z) == p && load64(z + 8) == n {
+        return z
+    }
+    z += 48
+    if load64(z) == p && load64(z + 8) == n {
+        return z
+    }
+    return 0
+}
+
+// Запомнить факты записи e ключа (p, n): в место ключа, иначе в свободное из
+// двух, иначе вместо первого. Ключ места обнуляется первым и пишется
+// последним, как в __strc_init.
+fn __strc_remember(b: int, e: int, p: int, n: int) {
+    if load64(b + STRC_MEMO) == 0 {
+        store64(b + STRC_MEMO, __alloc(48 * STRC_MEMO_N))
+    }
+    var z = __strc_memo_find(b, p, n)
+    if z == 0 {
+        z = __strc_memo_pair(b, p, n)
+        if load64(z) != 0 && load64(z + 48) == 0 {
+            z += 48
+        }
+    }
+    let x = b + 8 * e
+    store64(z, 0)
+    store64(z + 16, load64(x + STRC_CNT))
+    store64(z + 24, load64(x + STRC_VUP))
+    store64(z + 32, load64(x + STRC_IX))
+    store64(z + 40, load64(x + STRC_FAR))
+    store64(z + 8, n)
+    store64(z, p)
 }
 
 // Запись, которую можно отдать другому ключу без потерь: самая старая из тех, у
@@ -197,23 +272,29 @@ fn __strc_spare(b: int, m: int, p: int, n: int) -> int {
         return -1
     }
     var v = -1
+    var vuse = 0
     var dup = false
     var i = 0
+    var x = b
     while i < m {
-        let kp = load64(b + STRC_KP + 8 * i)
-        let kn = load64(b + STRC_KN + 8 * i)
+        let kp = load64(x + STRC_KP)
+        let kn = load64(x + STRC_KN)
         var j = 0
+        var y = b
         while kp != 0 && j < m {
-            if j != i && load64(b + STRC_KP + 8 * j) == kp && load64(b + STRC_KN + 8 * j) == kn {
+            if j != i && load64(y + STRC_KP) == kp && load64(y + STRC_KN) == kn {
                 dup = true
-                if (kp != p || kn != n) && (v < 0 || load64(b + STRC_USE + 8 * i) < load64(b + STRC_USE + 8 * v)) {
+                if (kp != p || kn != n) && (v < 0 || load64(x + STRC_USE) < vuse) {
                     v = i
+                    vuse = load64(x + STRC_USE)
                 }
                 j = m
             }
             j += 1
+            y += 8
         }
         i += 1
+        x += 8
     }
     if !dup {
         store64(b + STRC_DUP, 0)
@@ -226,22 +307,25 @@ fn __strc_spare(b: int, m: int, p: int, n: int) -> int {
 // другого ключа или вместо самой старой записи.
 fn __strc_get(b: int, p: int, n: int) -> int {
     var e = load64(b + STRC_MRU) - 1
-    if e >= 0 && load64(b + STRC_KP + 8 * e) == p && load64(b + STRC_KN + 8 * e) == n {
+    let u = b + 8 * e
+    if e >= 0 && load64(u + STRC_KP) == p && load64(u + STRC_KN) == n {
         __strc_touch(b, e)
         return e
     }
     let m = load64(b + STRC_HI)
     var free = -1
     e = 0
+    var x = b
     while e < m {
-        let kp = load64(b + STRC_KP + 8 * e)
-        if kp == p && load64(b + STRC_KN + 8 * e) == n {
+        let kp = load64(x + STRC_KP)
+        if kp == p && load64(x + STRC_KN) == n {
             break
         }
         if kp == 0 && free < 0 {
             free = e
         }
         e += 1
+        x += 8
     }
     if e >= m {
         e = free
@@ -254,12 +338,17 @@ fn __strc_get(b: int, p: int, n: int) -> int {
         if e < 0 {
             // самая старая запись
             e = 0
+            var oldest = load64(b + STRC_USE)
             var i = 1
+            var y = b + 8
             while i < m {
-                if load64(b + STRC_USE + 8 * i) < load64(b + STRC_USE + 8 * e) {
+                let use = load64(y + STRC_USE)
+                if use < oldest {
                     e = i
+                    oldest = use
                 }
                 i += 1
+                y += 8
             }
         }
         __strc_init(b, e, p, n, -1)
@@ -277,11 +366,13 @@ fn __strc_fact(b: int, e: int, p: int, n: int, f: int, v: int) {
     }
     let m = load64(b + STRC_HI)
     var i = 0
+    var x = b
     while i < m {
-        if load64(b + STRC_KP + 8 * i) == p && load64(b + STRC_KN + 8 * i) == n {
-            store64(b + f + 8 * i, v)
+        if load64(x + STRC_KP) == p && load64(x + STRC_KN) == n {
+            store64(x + f, v)
         }
         i += 1
+        x += 8
     }
 }
 
@@ -297,15 +388,22 @@ fn __strc_drop(b: int, e: int) {
     if __strc_mode == STRC_STRESS {
         __panic_msg("internal: string cache")
     }
-    store64(b + STRC_KP + 8 * e, 0)
+    // и в памяти фактов: иначе новая запись ключа взяла бы их снова
+    let x = b + 8 * e
+    let z = __strc_memo_find(b, load64(x + STRC_KP), load64(x + STRC_KN))
+    if z != 0 {
+        store64(z, 0)
+    }
+    store64(x + STRC_KP, 0)
 }
 
 // Запись ключа с проверенными фактами.
 fn __strc_entry(b: int, p: int, n: int) -> int {
     while true {
         let e = __strc_get(b, p, n)
-        let v = load64(b + STRC_VUP + 8 * e)
-        let c = load64(b + STRC_CNT + 8 * e)
+        let x = b + 8 * e
+        let v = load64(x + STRC_VUP)
+        let c = load64(x + STRC_CNT)
         if v >= 0 && v <= n && c >= 0 && c <= n + 1 {
             return e
         }
@@ -318,9 +416,21 @@ fn __strc_entry(b: int, p: int, n: int) -> int {
 fn __strc_count(b: int, p: int, n: int) -> int {
     // цикл вида while i < s.len() { s[i] }: запись — та, где курсор
     let t = load64(b + STRC_LAST) - 1
-    if t >= 0 && load64(b + STRC_KP + 8 * t) == p && load64(b + STRC_KN + 8 * t) == n {
-        let c = load64(b + STRC_CNT + 8 * t)
+    let x = b + 8 * t
+    if t >= 0 && load64(x + STRC_KP) == p && load64(x + STRC_KN) == n {
+        let c = load64(x + STRC_CNT)
         if c > 0 && c <= n + 1 {
+            return c - 1
+        }
+    }
+    // повторный len() той же строки: запись, что нашлась в прошлый раз
+    let u = load64(b + STRC_MRU) - 1
+    let y = b + 8 * u
+    if u >= 0 && load64(y + STRC_KP) == p && load64(y + STRC_KN) == n {
+        let c = load64(y + STRC_CNT)
+        let v = load64(y + STRC_VUP)
+        if c > 0 && c <= n + 1 && v >= 0 && v <= n {
+            __strc_touch(b, u)
             return c - 1
         }
     }
@@ -359,6 +469,7 @@ fn __strc_index(b: int, p: int, n: int) {
         j += 1
     }
     __strc_fact(b, e, p, n, STRC_IX, t)
+    __strc_remember(b, e, p, n)
 }
 
 // Вперёд от границы ab (символ ak) до символа k. Пропуск считает символы по
@@ -369,7 +480,8 @@ fn __strc_fwd(b: int, e: int, p: int, n: int, ak: int, ab: int, k: int) -> int {
     if k == ak {
         return ab
     }
-    let vup = load64(b + STRC_VUP + 8 * e)
+    let x = b + 8 * e
+    let vup = load64(x + STRC_VUP)
     let off = ab + __utf8_skip(p + ab, n - ab, k - ak)
     if off <= vup {
         return off
@@ -395,33 +507,56 @@ fn __strc_cursor(b: int, p: int, n: int, from: int, e0: int, k: int, off: int) {
         let m = load64(b + STRC_HI)
         var mine = 0
         var free = -1
+        var best = 0
         var i = 0
+        var x = b
         while i < m {
-            let kp = load64(b + STRC_KP + 8 * i)
-            if kp == p && load64(b + STRC_KN + 8 * i) == n {
+            let kp = load64(x + STRC_KP)
+            if kp == p && load64(x + STRC_KN) == n {
                 mine += 1
-                if t < 0 || (load64(b + STRC_CK + 8 * i) - k).abs() < (load64(b + STRC_CK + 8 * t) - k).abs() {
+                let d = (load64(x + STRC_CK) - k).abs()
+                if t < 0 || d < best {
                     t = i
+                    best = d
                 }
             } else if kp == 0 && free < 0 {
                 free = i
             }
             i += 1
+            x += 8
         }
-        if mine < 2 && free < 0 {
-            free = __strc_more(b, m)
-        }
-        if mine < 2 && free < 0 {
-            free = __strc_spare(b, m, p, n)
-        }
-        if mine < 2 && free >= 0 {
-            __strc_init(b, free, p, n, e0)
-            store64(b + STRC_DUP, 1)
-            t = free
-        }
+        t = __strc_place(b, p, n, m, t, mine, free, e0)
     }
-    store64(b + STRC_CK + 8 * t, k)
-    store64(b + STRC_CB + 8 * t, off)
+    __strc_put(b, t, k, off)
+}
+
+// Запись для курсора, когда шли не от курсора: вторая запись ключа (mine — их
+// сейчас; на свободном месте free, следующем или вместо второй записи другого
+// ключа), иначе near — та, чей курсор ближе.
+fn __strc_place(b: int, p: int, n: int, m: int, near: int, mine: int, free: int, e0: int) -> int {
+    if mine >= 2 {
+        return near
+    }
+    var f = free
+    if f < 0 {
+        f = __strc_more(b, m)
+    }
+    if f < 0 {
+        f = __strc_spare(b, m, p, n)
+    }
+    if f < 0 {
+        return near
+    }
+    __strc_init(b, f, p, n, e0)
+    store64(b + STRC_DUP, 1)
+    return f
+}
+
+// Курсор записи t — на (k, off); t — последняя передвинутая.
+fn __strc_put(b: int, t: int, k: int, off: int) {
+    let x = b + 8 * t
+    store64(x + STRC_CK, k)
+    store64(x + STRC_CB, off)
     __strc_touch(b, t)
     store64(b + STRC_LAST, t + 1)
 }
@@ -429,9 +564,10 @@ fn __strc_cursor(b: int, p: int, n: int, from: int, e0: int, k: int, off: int) {
 // Курсор, который передвинул последний поиск, — дальше на (k, off).
 fn __strc_move(b: int, p: int, n: int, k: int, off: int) {
     let t = load64(b + STRC_LAST) - 1
-    if t >= 0 && load64(b + STRC_KP + 8 * t) == p && load64(b + STRC_KN + 8 * t) == n {
-        store64(b + STRC_CK + 8 * t, k)
-        store64(b + STRC_CB + 8 * t, off)
+    let x = b + 8 * t
+    if t >= 0 && load64(x + STRC_KP) == p && load64(x + STRC_KN) == n {
+        store64(x + STRC_CK, k)
+        store64(x + STRC_CB, off)
     }
 }
 
@@ -439,22 +575,25 @@ fn __strc_move(b: int, p: int, n: int, k: int, off: int) {
 // Опоры: начало; конец, если строка правильная и число символов известно;
 // курсоры ключа; точка индекса. Путь вперёд стоит k − ak, назад — 8·(ak − k) и
 // только в известной правильной части. Дальний переход (путь больше 256
-// символов в строке от 4 КБ) отмечается; на втором по ключу строится индекс —
-// так записи, которые вытесняют, не платят O(n) снова и снова. Курсор — на
+// символов в строке от 4 КБ) отмечается; на втором по ключу строится индекс.
+// Счёт переходов и индекс помнит память фактов, поэтому записи, которые
+// вытесняют, не платят O(n) снова и снова и не строят индекс заново. Курсор — на
 // (k, off), если off < n: пропуск не отличает «k = числу символов» от «k больше».
 fn __strc_off(b: int, p: int, n: int, k: int) -> int {
     // проход по порядку: курсор, который передвинул прошлый поиск, — ровно на k
     let t = load64(b + STRC_LAST) - 1
-    if t >= 0 && load64(b + STRC_CK + 8 * t) == k && load64(b + STRC_KP + 8 * t) == p && load64(b + STRC_KN + 8 * t) == n {
-        let cb = load64(b + STRC_CB + 8 * t)
-        if __strc_ok(p, n, load64(b + STRC_VUP + 8 * t), cb) {
+    let x = b + 8 * t
+    if t >= 0 && load64(x + STRC_CK) == k && load64(x + STRC_KP) == p && load64(x + STRC_KN) == n {
+        let cb = load64(x + STRC_CB)
+        if __strc_ok(p, n, load64(x + STRC_VUP), cb) {
             __strc_touch(b, t)
             return cb
         }
     }
     let e0 = __strc_entry(b, p, n)
-    let vup = load64(b + STRC_VUP + 8 * e0)
-    let cnt1 = load64(b + STRC_CNT + 8 * e0)
+    let x0 = b + 8 * e0
+    let vup = load64(x0 + STRC_VUP)
+    let cnt1 = load64(x0 + STRC_CNT)
     store64(b + STRC_LAST, 0)
     if cnt1 != 0 && k >= cnt1 - 1 {
         return n
@@ -472,15 +611,30 @@ fn __strc_off(b: int, p: int, n: int, k: int) -> int {
         ab = n
         cost = 8 * (ak - k)
     }
+    // заодно — то, что нужно курсору, если пойдём не от курсора: запись ключа,
+    // чей курсор ближе к k, сколько у ключа записей, первое свободное место
+    // (до установки курсора записи не меняются)
     let m = load64(b + STRC_HI)
+    var near = -1
+    var neard = 0
+    var mine = 0
+    var free = -1
     var e = 0
+    var y = b
     while e < m {
-        if load64(b + STRC_KP + 8 * e) == p && load64(b + STRC_KN + 8 * e) == n {
-            let ck = load64(b + STRC_CK + 8 * e)
-            let cb = load64(b + STRC_CB + 8 * e)
+        let kp = load64(y + STRC_KP)
+        if kp == p && load64(y + STRC_KN) == n {
+            let ck = load64(y + STRC_CK)
+            let cb = load64(y + STRC_CB)
             if ck < 0 || !__strc_ok(p, n, vup, cb) {
                 __strc_drop(b, e)
                 return __strc_off(b, p, n, k)
+            }
+            mine += 1
+            let dd = (ck - k).abs()
+            if near < 0 || dd < neard {
+                near = e
+                neard = dd
             }
             var d = -1
             if k >= ck {
@@ -494,11 +648,14 @@ fn __strc_off(b: int, p: int, n: int, k: int) -> int {
                 cost = d
                 from = e
             }
+        } else if kp == 0 && free < 0 {
+            free = e
         }
         e += 1
+        y += 8
     }
     let stress = __strc_mode == STRC_STRESS
-    let ix = load64(b + STRC_IX + 8 * e0)
+    let ix = load64(x0 + STRC_IX)
     if ix != 0 {
         let sk = k & ~63
         if k - sk < cost {
@@ -513,12 +670,13 @@ fn __strc_off(b: int, p: int, n: int, k: int) -> int {
             from = -1
         }
     } else if (stress && cost > 0) || (cost > 256 && n >= 4096) {
-        let far = load64(b + STRC_FAR + 8 * e0) + 1
+        let far = load64(x0 + STRC_FAR) + 1
         __strc_fact(b, e0, p, n, STRC_FAR, far)
         if far >= 2 || stress {
             __strc_index(b, p, n)
             return __strc_off(b, p, n, k)
         }
+        __strc_remember(b, e0, p, n)
     }
     var off = ab
     if k >= ak {
@@ -536,7 +694,12 @@ fn __strc_off(b: int, p: int, n: int, k: int) -> int {
         __strc_add(ab - off)
     }
     if off < n {
-        __strc_cursor(b, p, n, from, e0, k, off)
+        // как __strc_cursor, без второго обхода записей
+        var c = from
+        if c < 0 {
+            c = __strc_place(b, p, n, m, near, mine, free, e0)
+        }
+        __strc_put(b, c, k, off)
     }
     return off
 }
@@ -652,6 +815,48 @@ fn __text_at(self: str, i: int) -> str {
     let b = __strc_for(n)
     var off = 0
     if b != 0 {
+        // проход по порядку: курсор прошлого поиска — ровно на i, в известной
+        // правильной части. Там граница символа — байт не 10xxxxxx, а ширина —
+        // по первому байту; курсор сразу — на следующий символ (как дальше
+        // делают __strc_off и __strc_move, только без них)
+        let t = load64(b + STRC_LAST) - 1
+        // x — запись t: её поле f — по адресу x + f
+        let x = b + 8 * t
+        if t >= 0 && load64(x + STRC_CK) == i && load64(x + STRC_KP) == p && load64(x + STRC_KN) == n {
+            let o = load64(x + STRC_CB)
+            let vup = load64(x + STRC_VUP)
+            if o >= 0 && o < vup && vup <= n {
+                let c0 = load8(p + o)
+                var w = 0
+                if c0 < 0x80 {
+                    w = 1
+                } else if c0 >= 0xC2 && c0 < 0xE0 {
+                    w = 2
+                } else if c0 >= 0xE0 && c0 < 0xF0 {
+                    w = 3
+                } else if c0 >= 0xF0 && c0 < 0xF5 {
+                    w = 4
+                }
+                if w > 0 && o + w <= vup {
+                    let clock = load64(b + STRC_CLOCK) + 1
+                    store64(b + STRC_CLOCK, clock)
+                    store64(x + STRC_USE, clock)
+                    if o + w < n {
+                        store64(x + STRC_CK, i + 1)
+                        store64(x + STRC_CB, o + w)
+                    }
+                    // символы до U+07FF — из таблицы, как в __tx_char
+                    let tab = __chars_tab
+                    if tab != 0 && w == 1 {
+                        return __cast(tab + 16 * c0)
+                    }
+                    if tab != 0 && w == 2 {
+                        return __cast(tab + 16 * (((c0 & 0x1F) << 6) | (load8(p + o + 1) & 0x3F)))
+                    }
+                    return __tx_char(p, o, w)
+                }
+            }
+        }
         off = __strc_off(b, p, n, i)
     } else {
         let m = __utf8_scan(p, n)
@@ -928,38 +1133,42 @@ fn __text_upper(self: str) -> str {
 
 // Простое отображение регистра (UnicodeData.txt, поля 12 и 13; как в Go и C#):
 // ß остаётся, "İ".lower() — "i", без правила конечной сигмы. Сначала ищется
-// первый символ, который меняется: слова по 8 байт ASCII — как в __str_case
-// (lib/core.kh), остальные символы — через __case_map. Если такого нет — сама
-// строка, без выделения. Иначе копия: отображения растут не больше чем в 1,5
-// раза (22 из 2 байт в 3, это проверяет tools/unicode_tables.kh), поэтому
+// первый символ, который меняется: слова по 8 байт ASCII — одной проверкой на
+// слово (SWAR на 64 битах: в библиотеке сложение по модулю 2^64, а в байтах
+// < 0x80 переносов между байтами нет), кириллица U+0400–045F (D0 xx, D1 80–9F) —
+// арифметикой на байтах, остальные символы — через __case_map. Если такого нет —
+// сама строка, без выделения. Иначе копия: отображения растут не больше чем в
+// 1,5 раза (22 из 2 байт в 3, это проверяет tools/unicode_tables.kh), поэтому
 // 1,5·n + 4 байт хватает; лишний хвост возвращается __alloc_trim.
 // Неправильные байты копируются как есть.
 fn __tx_case(self: str, up: bool) -> str {
     let p = __str_ptr(self)
     let n = __str_len(self)
+    // буквы lo..lo+25; в каждом байте below = 0x80 − lo, past = 0x80 − lo − 26:
+    // старший бит байта в (x + below) & ~(x + past) — буква
     var lo = 'A'
-    var below = 0x3F3F3F3F
-    var past = 0x25252525
+    var below = 0x3F3F3F3F3F3F3F3F
+    var past = 0x2525252525252525
     if up {
         lo = 'a'
-        below = 0x1F1F1F1F
-        past = 0x05050505
+        below = 0x1F1F1F1F1F1F1F1F
+        past = 0x0505050505050505
     }
     let high = ~0x7F7F7F7F7F7F7F7F
     var i = 0
     while i < n {
-        if i + 8 <= n {
-            let x = load64(p + i)
-            if (x & high) == 0 {
-                if (__case4(x & 0xFFFFFFFF, below, past) | __case4((x >> 32) & 0xFFFFFFFF, below, past)) != 0 {
-                    break
-                }
-                i += 8
-                continue
-            }
-        }
         let c = load8(p + i)
         if c < 0x80 {
+            if i + 8 <= n {
+                let x = load64(p + i)
+                if (x & high) == 0 {
+                    if ((x + below) & ~(x + past) & high) != 0 {
+                        break
+                    }
+                    i += 8
+                    continue
+                }
+            }
             if c >= lo && c < lo + 26 {
                 break
             }
@@ -968,7 +1177,12 @@ fn __tx_case(self: str, up: bool) -> str {
         }
         if c >= 0xC2 && c <= 0xDF && i + 1 < n && (load8(p + i + 1) & 0xC0) == 0x80 {
             let cp = ((c & 0x1F) << 6) | (load8(p + i + 1) & 0x3F)
-            if __case_map(cp, up) != cp {
+            if cp >= 0x400 && cp < 0x460 {
+                // как в __case_map: строчные — U+0430–045F
+                if (cp >= 0x430) == up {
+                    break
+                }
+            } else if __case_map(cp, up) != cp {
                 break
             }
             i += 2
@@ -991,17 +1205,18 @@ fn __tx_case(self: str, up: bool) -> str {
     __memcpy(q, p, i)
     var j = i
     while i < n {
-        if i + 8 <= n {
-            let x = load64(p + i)
-            if (x & high) == 0 {
-                store64(q + j, x ^ (__case4(x & 0xFFFFFFFF, below, past) | (__case4((x >> 32) & 0xFFFFFFFF, below, past) << 32)))
-                i += 8
-                j += 8
-                continue
-            }
-        }
         var c = load8(p + i)
         if c < 0x80 {
+            if i + 8 <= n {
+                let x = load64(p + i)
+                if (x & high) == 0 {
+                    // сдвиг знаковый: 0x20 — маской после него
+                    store64(q + j, x ^ ((((x + below) & ~(x + past) & high) >> 2) & 0x2020202020202020))
+                    i += 8
+                    j += 8
+                    continue
+                }
+            }
             if c >= lo && c < lo + 26 {
                 c = c ^ 32
             }
@@ -1012,7 +1227,23 @@ fn __tx_case(self: str, up: bool) -> str {
         }
         if c >= 0xC2 && c <= 0xDF && i + 1 < n && (load8(p + i + 1) & 0xC0) == 0x80 {
             // два байта — в два байта, без вызовов разбора
-            let m = __case_map(((c & 0x1F) << 6) | (load8(p + i + 1) & 0x3F), up)
+            var m = ((c & 0x1F) << 6) | (load8(p + i + 1) & 0x3F)
+            if m >= 0x400 && m < 0x460 {
+                // кириллица — арифметикой, как в __case_map
+                if up {
+                    if m >= 0x450 {
+                        m -= 0x50
+                    } else if m >= 0x430 {
+                        m -= 0x20
+                    }
+                } else if m < 0x410 {
+                    m += 0x50
+                } else if m < 0x430 {
+                    m += 0x20
+                }
+            } else {
+                m = __case_map(m, up)
+            }
             if m >= 0x80 && m < 0x800 {
                 store8(q + j, 0xC0 | (m >> 6))
                 store8(q + j + 1, 0x80 | (m & 63))

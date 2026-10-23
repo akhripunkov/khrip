@@ -27,6 +27,12 @@ store trees: [Tree]
 store boxes: [Box]
 store twos: [Two]
 store cyclic: map[int, Node]
+// начальные значения — в store с самого начала (__init_stores), а не в обычной
+// памяти: положить такую глобальную в другое значение store — общий объект
+store base: [int]
+store vals: [int] = [1, 2]
+store held: [Pair]
+store alias: Pair = Pair { a: base, b: vals }
 
 test "an arena value with a cycle is copied once" {
     let a = Node { name: "a", next: none }
@@ -200,4 +206,14 @@ test "deep values: shared is not a cycle, too deep is a 500" {
     let d = call GET "/chain/10000"
     expect d.status == 500
     expect d.body == "panic: value is nested deeper than 10000 levels"
+}
+
+test "a store global never reassigned is shared, not copied" {
+    held.push(Pair { a: base, b: vals })
+    base.push(1)
+    vals.push(3)
+    expect held[0].a.len() == 1
+    expect held[0].b.len() == 3
+    expect alias.a.len() == 1
+    expect alias.b.len() == 3
 }

@@ -121,6 +121,35 @@ else
 	failed "khc check --system --all-lib src/*.kh" "$(cat "$tmp/alllib.txt")"
 fi
 
+# __data_hex (есть только в библиотеке): литерал — пары шестнадцатеричных цифр,
+# пробелы — только между парами. Проверяется на копии библиотеки с двумя
+# функциями: правильные литералы проходят, у неправильных — по ошибке на каждый.
+mkdir -p "$tmp/hexlib"
+cp lib/*.kh "$tmp/hexlib/"
+cat >>"$tmp/hexlib/core.kh" <<'EOF'
+
+fn __hex_probe_ok() -> int {
+    let a = __data_hex("0f AB cd")
+    let b = __data_hex(" 12 34 ")
+    return a + b
+}
+
+fn __hex_probe_bad() -> int {
+    let a = __data_hex("A B")
+    let b = __data_hex("0 1 2 3")
+    let c = __data_hex("ABC")
+    let d = __data_hex("0G")
+    return a + b + c + d
+}
+EOF
+printf 'fn main() {\n}\n' >"$tmp/hexmain.kh"
+KHRIP_LIB="$tmp/hexlib" "$KHC" check --all-lib "$tmp/hexmain.kh" >"$tmp/hex.txt" 2>&1
+if [[ $(grep -c "__data_hex takes a string literal of hex digit pairs" "$tmp/hex.txt") -eq 4 ]] && grep -q "^4 errors" "$tmp/hex.txt"; then
+	pass=$((pass + 1))
+else
+	failed "__data_hex: проверка литералов" "$(cat "$tmp/hex.txt")"
+fi
+
 # Правильный SQL: проверка без базы не должна найти в нём ни одной ошибки.
 for src in tests/sqlcheck/*.kh; do
 	if "$KHC" check "$src" >"$tmp/sqlcheck.txt" 2>&1; then

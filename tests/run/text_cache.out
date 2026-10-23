@@ -9,4 +9,5 @@ find and slice: 107 parts
 find and slice: 107 parts
 field, helper, reassignment: ok
 mixed lookups: 600000 in strings of 296 379 494 544 656 782 856 1022 1174 1236 bytes, mismatches: 0
-checks: 660795, mismatches: 0
+eviction: ok
+checks: 685697, mismatches: 0

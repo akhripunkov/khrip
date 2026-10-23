@@ -160,9 +160,13 @@ fn __persist_copy(v: int, d: int) -> int {
     return r
 }
 
-// Память в арене, пока выделение идёт из store: через сохранённый курсор
-// CTX_PSAVE_PTR (вне store — обычное выделение). Нулевая, как у __alloc.
-fn __arena_alloc_saved(n: int) -> int {
+// Память под состояние копии st (st = 0 — под само состояние) в арене, пока
+// выделение идёт из store: через сохранённый курсор CTX_PSAVE_PTR (вне store —
+// обычное выделение). Нулевая, как у __alloc. Если в арене запроса до запаса
+// ARENA_RESERVE места уже нет, — отдельный кусок mmap (заголовок: следующий
+// кусок, размер; список — в st + 48), его вернёт системе __deep_copy: копия не
+// должна обрывать запрос паникой «нет памяти» там, где ей хватило бы своей.
+fn __dc_alloc(st: int, n: int) -> int {
     let c = __ctx()
     let p = load64(c + CTX_PSAVE_PTR)
     if p == 0 {
@@ -173,8 +177,17 @@ fn __arena_alloc_saved(n: int) -> int {
         store64(c + CTX_PSAVE_PTR, p + size)
         return p
     }
-    // место кончилось: обычный путь (он подключит память или сообщит о её
-    // конце), потом снова store
+    if __in_arena(p) && p + size > load64(c + CTX_ARENA) + ARENA_SIZE - ARENA_RESERVE {
+        let q = __mmap(size + 16)
+        store64(q + 8, size + 16)
+        if st != 0 {
+            store64(q, load64(st + 48))
+            store64(st + 48, q)
+        }
+        return q + 16
+    }
+    // место кончилось: обычный путь (он подключит память арены), потом снова
+    // store
     __pmode_off()
     let q = __alloc(size)
     __pmode_on()
@@ -194,10 +207,11 @@ fn __addr_hash(p: int) -> int {
 // общие части значения остаются общими, а циклы не зацикливают копирование.
 // В оболочку сначала ложатся исходные слова, слоты детей, которые надо
 // копировать, стек перезаписывает потом. Строки и ячейки T? — листья.
-// Состояние — в арене (через сохранённый курсор), не в store: [0] таблица
-// пересылки, [8] пар в ней, [16] её размер в парах, [24] стек, [32] троек в
-// нём, [40] его размер. До 16 пар таблица — перебор, дальше — открытая
-// адресация, заполненная не больше чем наполовину.
+// Состояние — в арене (через сохранённый курсор, __dc_alloc), не в store: [0]
+// таблица пересылки, [8] пар в ней, [16] её размер в парах, [24] стек, [32]
+// троек в нём, [40] его размер, [48] куски mmap, если арена кончилась. До 16
+// пар таблица — перебор, дальше — открытая адресация, заполненная не больше
+// чем наполовину.
 fn __deep_copy(v: int, d: int) -> int {
     if __dc_leaf(d) {
         // строка или ячейка T?: таблицы не нужны
@@ -205,10 +219,14 @@ fn __deep_copy(v: int, d: int) -> int {
     }
     let c = __ctx()
     let mark = load64(c + CTX_PSAVE_PTR)
-    let st = __arena_alloc_saved(48 + 16 * 16 + 8 * 24)
-    store64(st, st + 48)
+    let st = __dc_alloc(0, 64 + 16 * 16 + 8 * 24)
+    if __in_arena(mark) && !__in_arena(st) {
+        // само состояние — в куске mmap: он первый в списке
+        store64(st + 48, st - 16)
+    }
+    store64(st, st + 64)
     store64(st + 16, 16)
-    store64(st + 24, st + 48 + 16 * 16)
+    store64(st + 24, st + 64 + 16 * 16)
     store64(st + 40, 8)
     let r = __dc_copy(st, v, d)
     while load64(st + 32) > 0 {
@@ -219,8 +237,14 @@ fn __deep_copy(v: int, d: int) -> int {
         store64(slot, __dc_copy(st, load64(e + 8), load64(e + 16)))
     }
     // состояние больше не нужно: арена непрерывна, и место снова свободно (и
-    // снова нулевое, как обещает выделитель)
+    // снова нулевое, как обещает выделитель); куски mmap — системе
     if __in_arena(mark) {
+        var q = load64(st + 48)
+        while q != 0 {
+            let next = load64(q)
+            syscall(SYS_MUNMAP, q, load64(q + 8))
+            q = next
+        }
         __memset(mark, 0, load64(c + CTX_PSAVE_PTR) - mark)
         store64(c + CTX_PSAVE_PTR, mark)
     }
@@ -380,7 +404,7 @@ fn __dc_put(st: int, src: int, dst: int) {
             ncap = 64
         }
         let old = load64(st)
-        let t = __arena_alloc_saved(ncap * 16)
+        let t = __dc_alloc(st, ncap * 16)
         for i in 0..cap {
             let k = load64(old + i * 16)
             if k != 0 {
@@ -410,7 +434,7 @@ fn __dc_push(st: int, slot: int, src: int, d: int) {
     let n = load64(st + 32)
     let cap = load64(st + 40)
     if n == cap {
-        let s = __arena_alloc_saved(cap * 2 * 24)
+        let s = __dc_alloc(st, cap * 2 * 24)
         __memcpy(s, load64(st + 24), n * 24)
         store64(st + 24, s)
         store64(st + 40, cap * 2)
@@ -1625,6 +1649,10 @@ var __test_log: str
 fn __tests_init() {
     __store_init()
     __store_rw_init()
+    // начальные значения глобальных пользователя — в store
+    __store_lock()
+    __init_stores()
+    __store_unlock()
     __arena_init()
     let w = __worker_init()
     w.testing = true

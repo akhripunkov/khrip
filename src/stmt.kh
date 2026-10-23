@@ -1874,25 +1874,56 @@ fn gen_func(name: str, ret: int) -> int {
     return funcs.len() - 1
 }
 
-fn compile_init_globals(fi: int) {
-    let frame_at = begin_fn(fi)
+// Начальные значения глобальных переменных. В программе с API глобальные
+// пользователя живут в store (global_in_store), и их значения строит
+// __init_stores (sfi) — его вызывают __serve, __run_timers и __tests_init после
+// __store_init, под блокировкой store, а fn main программы с тестами — перед
+// main: значение-ссылка через store_write сразу копируется в store. Так
+// глобальная, которую ни разу не переприсваивали, тоже в store, и класть её в
+// другое значение store — общий объект, как после переприсваивания и после
+// восстановления из KHRIP_DATA, а не копия. Остальные — в __init_globals (fi).
+// sfi = -1 — программе __init_stores не нужен (нет библиотеки API).
+fn compile_init_globals(fi: int, sfi: int) {
+    var frame_at = begin_fn(fi)
     in_global_init = true
     for g in globals {
-        if g.init >= 0 {
-            pos = g.init
-            panic_mode = false
-            let at = tok()
-            let t = parse_expr(g.ty)
-            coerce(t, g.ty, at)
-            emit_store_abs(g.addr, RAX)
-        } else if tkind(g.ty) != K_INT && tkind(g.ty) != K_BOOL && tkind(g.ty) != K_OPT {
-            if zero_value(g.ty, toks[g.tok]) {
-                emit_store_abs(g.addr, RAX)
-            }
+        if !(sfi >= 0 && api_mode && !files[toks[g.tok].file].is_lib) {
+            init_global(g, false)
         }
     }
-    in_global_init = false
     end_fn(frame_at, false)
+    if sfi >= 0 {
+        frame_at = begin_fn(sfi)
+        if api_mode {
+            for g in globals {
+                if !files[toks[g.tok].file].is_lib {
+                    init_global(g, true)
+                }
+            }
+        }
+        end_fn(frame_at, false)
+    }
+    in_global_init = false
+}
+
+fn init_global(g: Global, persistent: bool) {
+    if g.init >= 0 {
+        pos = g.init
+        panic_mode = false
+        let at = tok()
+        let t = parse_expr(g.ty)
+        coerce(t, g.ty, at)
+    } else if tkind(g.ty) != K_INT && tkind(g.ty) != K_BOOL && tkind(g.ty) != K_OPT {
+        if !zero_value(g.ty, toks[g.tok]) {
+            return
+        }
+    } else {
+        return
+    }
+    if persistent {
+        store_write(g.ty)
+    }
+    emit_store_abs(g.addr, RAX)
 }
 
 fn compile_main_wrapper(fi: int, test_mode: bool) {
@@ -1913,6 +1944,11 @@ fn compile_main_wrapper(fi: int, test_mode: bool) {
         }
         if f.ret != ty_void && f.ret != ty_int {
             error_tok(toks[f.tok], "main may return nothing or int (the exit code)", "")
+        }
+        if api_mode && api_libs {
+            // программа с тестами, собранная как обычная: store нет, и
+            // __init_stores просто задаёт начальные значения
+            emit_call(rt_func("__init_stores"))
         }
         if uses_db {
             emit_call(rt_func("__db_init"))

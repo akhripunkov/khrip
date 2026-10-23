@@ -6,4 +6,5 @@ ok    a variant in its own list
 ok    structs without fields are distinct objects
 ok    JSON of a cycle is a 500
 ok    deep values: shared is not a cycle, too deep is a 500
-8 tests: 8 passed, 0 failed
+ok    a store global never reassigned is shared, not copied
+9 tests: 9 passed, 0 failed

@@ -272,6 +272,7 @@ fn main() -> int {
     add_tok_text(T_EOF, 0, "", lx_p)
     let init_fn = gen_func("__init_globals", ty_void)
     let main_fn = gen_func("__main", ty_int)
+    let stores_fn = gen_func("__init_stores", ty_void)
     prescan(1)
     prescan(2)
     sort_migrations()
@@ -307,7 +308,11 @@ fn main() -> int {
         }
         f += 1
     }
-    compile_init_globals(init_fn)
+    if api_libs {
+        compile_init_globals(init_fn, stores_fn)
+    } else {
+        compile_init_globals(init_fn, -1)
+    }
     compile_main_wrapper(main_fn, test_mode)
     var w = 0
     while w < work.len() {
