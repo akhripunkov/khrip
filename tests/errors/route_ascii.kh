@@ -1,0 +1,15 @@
+// expect: tests/errors/route_ascii.kh:9:11: error: a route path must be ASCII
+// expect: hint: take non-ASCII text as a path parameter like {name}: it arrives percent-decoded
+// expect: 1 error
+// Путь маршрута сравнивается с запросом побайтно, а клиенты кодируют не-ASCII
+// (%D0%BA...): маршрут с кириллицей в пути не совпал бы ни с одним запросом.
+// Текст из пути — параметр, он приходит уже раскодированным и проверенным
+// (правильный UTF-8).
+
+route GET "/книги/{id}" (id: int) -> str {
+    return "книга {id}"
+}
+
+route GET "/books/{title}" (title: str) -> str {
+    return "книга «{title}»"
+}

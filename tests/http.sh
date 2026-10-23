@@ -56,6 +56,7 @@ expect_count "plaintext: статус" "$r" "^HTTP/1.1 200 OK$" 1
 expect_count "plaintext: тело" "$r" "^Hello, World!$" 1
 expect_count "plaintext: длина" "$r" "^Content-Length: 13$" 1
 expect_count "plaintext: дата" "$r" "^Date: [A-Z][a-z][a-z], [0-9][0-9] [A-Z][a-z][a-z] 20[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] GMT$" 1
+expect_count "plaintext: тип" "$r" "^Content-Type: text/plain; charset=utf-8$" 1
 
 r=$(curl -s -i "$url/json" | tr -d '\r')
 expect_count "json: тело" "$r" '^{"message":"Hello, World!"}$' 1
@@ -200,4 +201,84 @@ elif "$KHC" -o "$tmp/fetch_store" tests/load/fetch_store.kh >"$tmp/fetch_store.e
 	fi
 else
 	failed "tests/load/fetch_store.kh" "$(cat "$tmp/fetch_store.err")"
+fi
+
+# Границы UTF-8 (docs/design/v0.13-utf8.md, §2). Снимок KHRIP_DATA с
+# неправильными байтами, суррогатом в WTF-8 (так писала v0.12) и одиноким
+# \uD800 читается мягко: 6 замен на U+FFFD, одна строка в журнале, сервер
+# работает; сохранённый снимок — правильный UTF-8, и второй запуск молчит.
+# Тело и параметр с неправильным UTF-8 — 400, ответ -> str — с charset.
+u8_port=$((HTTP_PORT + 5))
+if "$KHC" -o "$tmp/utf8_store" tests/load/utf8_store.kh >"$tmp/utf8_store.err" 2>&1; then
+	printf '{"notes":{"a":{"title":"x\xFFy"},"b":{"title":"\xED\xA0\x80"},"c":{"title":"\\uD800\\u0041"},"d\xFE":{"title":"ok"}}}' >"$tmp/utf8.json"
+	u8_url="http://127.0.0.1:$u8_port"
+	u8_start() {
+		PORT=$u8_port KHRIP_DATA="$tmp/utf8.json" "$tmp/utf8_store" 2>"$tmp/utf8.$1.log" &
+		u8_pid=$!
+		for _ in $(seq 100); do
+			curl -s -o /dev/null "$u8_url/keys" && break
+			sleep 0.05
+		done
+	}
+	u8_start 1
+	r=$(curl -s -i "$u8_url/title/a" | tr -d '\r')
+	expect_count "UTF-8: снимок, неправильный байт" "$r" $'^x\xEF\xBF\xBDy$' 1
+	expect_count "UTF-8: ответ -> str с charset" "$r" "^Content-Type: text/plain; charset=utf-8$" 1
+	r="$(curl -s "$u8_url/notes/b") $(curl -s "$u8_url/notes/c") $(curl -s "$u8_url/keys")"
+	expect_count "UTF-8: снимок, WTF-8, суррогат и ключ" "$r" '^{"title":"���"} {"title":"�A"} \["a","b","c","d�"\]$' 1
+	r=$(curl -s -w ' %{http_code}' -X PUT "$u8_url/notes/e" --data-binary $'{"title":"\xff"}')
+	expect_count "UTF-8: тело с неправильным байтом" "$r" '^invalid JSON body: title: invalid UTF-8 400$' 1
+	r=$(curl -s -w '%{http_code}' -X PUT "$u8_url/notes/e" --data-binary $'\xef\xbb\xbf{"title":"\xd0\xbe\xd0\xba"}')
+	r="$r $(curl -s "$u8_url/notes/e") $(curl -s -w ' %{http_code}' "$u8_url/notes/%D0")"
+	expect_count "UTF-8: BOM, параметр пути" "$r" "^204 {\"title\":\"ок\"} parameter 'id' is not valid UTF-8 400$" 1
+	kill -TERM "$u8_pid"
+	wait "$u8_pid" 2>/dev/null
+	expect_count "UTF-8: одна строка о заменах" "$(cat "$tmp/utf8.1.log")" "^khrip: KHRIP_DATA: 6 invalid UTF-8 sequences in .*utf8.json replaced with U+FFFD$" 1
+	if python3 -c 'import sys; open(sys.argv[1], "rb").read().decode("utf-8")' "$tmp/utf8.json" 2>/dev/null; then
+		http_ok
+	else
+		failed "http: UTF-8: снимок после сохранения" "$(od -c "$tmp/utf8.json" | head)"
+	fi
+	u8_start 2
+	r="$(curl -s "$u8_url/title/a") $(curl -s "$u8_url/notes/e")"
+	kill -TERM "$u8_pid"
+	wait "$u8_pid" 2>/dev/null
+	expect_count "UTF-8: второй запуск" "$r" '^x�y {"title":"ок"}$' 1
+	expect_count "UTF-8: второй запуск без замен" "$(cat "$tmp/utf8.2.log")" "replaced with U+FFFD" 0
+else
+	failed "tests/load/utf8_store.kh" "$(cat "$tmp/utf8_store.err")"
+fi
+
+# Четыре потока на общей блокировке store работают с одними длинными строками
+# (tests/load/text_threads.kh): ответы — те же, что у одного потока без кэша
+# строк, и с кэшем, и в его проверочном режиме (stress паникует при ошибке кэша).
+tt_port=$((HTTP_PORT + 6))
+if "$KHC" -o "$tmp/text_threads" tests/load/text_threads.kh >"$tmp/text_threads.err" 2>&1; then
+	tt_url="http://127.0.0.1:$tt_port"
+	for k in 0 1 2; do
+		for s in $(seq 40); do
+			echo "$tt_url/work/$k/$s"
+		done
+	done >"$tmp/tt.urls"
+	tt_run() {
+		PORT=$tt_port THREADS=$1 KHRIP_STRCACHE=$2 "$tmp/text_threads" 2>/dev/null &
+		tt_pid=$!
+		for _ in $(seq 100); do
+			curl -s -o /dev/null -X POST "$tt_url/init" && break
+			sleep 0.05
+		done
+		xargs -P "$3" -n 1 curl -s <"$tmp/tt.urls" | sort >"$tmp/tt.$4"
+		kill "$tt_pid"
+		wait "$tt_pid" 2>/dev/null
+	}
+	tt_run 1 off 1 off
+	tt_run 4 "" 16 on
+	tt_run 4 stress 16 stress
+	if [[ $(wc -l <"$tmp/tt.off") == 120 ]] && cmp -s "$tmp/tt.off" "$tmp/tt.on" && cmp -s "$tmp/tt.off" "$tmp/tt.stress"; then
+		http_ok
+	else
+		failed "http: строки в 4 потоках" "$(diff "$tmp/tt.off" "$tmp/tt.on" | head -5; diff "$tmp/tt.off" "$tmp/tt.stress" | head -5)"
+	fi
+else
+	failed "tests/load/text_threads.kh" "$(cat "$tmp/text_threads.err")"
 fi

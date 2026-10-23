@@ -278,7 +278,7 @@ fn __write_response(s: __Server, c: __Conn, w: __Worker) {
     if w.ctype == CT_JSON {
         __out_str(c, "\r\nContent-Type: application/json")
     } else if n > 0 {
-        __out_str(c, "\r\nContent-Type: text/plain")
+        __out_str(c, "\r\nContent-Type: text/plain; charset=utf-8")
     }
     __out_str(c, "\r\nContent-Length: ")
     __out_int(c, n)
@@ -1025,13 +1025,22 @@ fn __load_store() {
     syscall(SYS_MUNMAP, r, RESTORE_SIZE)
 }
 
+// Снимок читается мягко: неправильный UTF-8 и одинокие суррогаты становятся
+// U+FFFD (строки store — текст), и об этом — одна строка в журнал.
 fn __restore_from(path: str) {
     let text = read_file(path) else {
         return
     }
+    __json_replaced = 0
     if !__store_restore(text) {
         eprint("khrip: cannot read store from {path}: {json_error()}")
         exit(1)
+    }
+    let n = __json_replaced
+    if n == 1 {
+        eprint("khrip: KHRIP_DATA: 1 invalid UTF-8 sequence in {path} replaced with U+FFFD")
+    } else if n > 1 {
+        eprint("khrip: KHRIP_DATA: {n} invalid UTF-8 sequences in {path} replaced with U+FFFD")
     }
 }
 

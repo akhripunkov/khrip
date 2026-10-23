@@ -1,0 +1,61 @@
+// Длинные строки store, общие для потоков (tests/http.sh). Маршрут /work только
+// читает store (общая блокировка), и четыре потока одновременно берут длину,
+// символы по номеру (вперёд, назад, вразброс), срезы и lower() одних и тех же
+// строк. Кэш строк у каждого запроса свой (в арене), а таблицу символов U+0000–
+// U+07FF (__chars) строит первый успевший поток. Ответы при 4 потоках должны
+// совпасть с ответами одного потока. Пока пользовательская семантика строк
+// байтовая (шаг E docs/design/v0.13-utf8.md), вызовы __text_* — напрямую.
+
+store texts: [str] = []
+
+fn make(seed: int, n: int) -> str {
+    let parts = ["абв", "Ёж", "x", "😀", "日本", "ß", "Ω", " ", "яблоко", "Z", "ǅ", "İ"]
+    var out: [str] = []
+    var x = seed
+    for _ in 0..n {
+        x = (x * 1103515245 + 12345) % 2147483648
+        out.push(parts[(x >> 8) % parts.len()])
+    }
+    return out.join("")
+}
+
+fn mix(h: int, s: str) -> int {
+    var r = h
+    for i in 0..s.byte_len() {
+        r = (r * 31 + s.byte(i)) % 1000000007
+    }
+    return r
+}
+
+route POST "/init" -> int {
+    texts = [make(1, 4000), make(2, 9000), make(3, 300)]
+    return texts.len()
+}
+
+route GET "/work/{k}/{seed}" (k: int, seed: int) -> str {
+    let s = texts[k % texts.len()]
+    let n = __text_len(s)
+    var h = n
+    var i = seed % 5
+    while i < n {
+        h = mix(h, __text_at(s, i))
+        i += 7
+    }
+    i = n - 1 - seed % 3
+    while i >= 0 {
+        h = mix(h, __text_at(s, i))
+        i -= 13
+    }
+    var x = seed
+    for _ in 0..300 {
+        x = (x * 1103515245 + 12345) % 2147483648
+        let a = (x >> 4) % n
+        h = mix(h, __text_slice(s, a, a + (x >> 20) % 40))
+        h = mix(h, __text_at(s, (x >> 12) % n))
+    }
+    h = mix(h, __text_lower(s))
+    h = mix(h, __text_slice(s, n - 10, TEXT_END))
+    // перевод строки — в ответе: curl пишет тело одним write, и ответы
+    // параллельных curl не перемешиваются
+    return "{k} {seed} {n} {h}\n"
+}

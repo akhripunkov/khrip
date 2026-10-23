@@ -528,16 +528,28 @@ fn __hex_digit(x: int) -> int {
     return 'a' + x - 10
 }
 
-// Строка JSON в кавычках. Безопасные участки копируются целиком.
+// Ответ __find_json_hi: индекс находки — в младших битах, бит 62 — до неё был
+// байт >= 0x80.
+const JSON_AT = 0x3FFFFFFFFFFFFFFF
+const JSON_HI = 0x4000000000000000
+
+// Строка JSON в кавычках. Безопасные участки копируются целиком, не-ASCII — как
+// есть (без \u). Неправильного UTF-8 в JSON не бывает: если в строке был байт
+// >= 0x80 и проверка не прошла, запись откатывается и повторяется по копии, где
+// каждый неправильный байт (правило Go) — U+FFFD. Строка ASCII проверки не платит.
 fn __json_str(b: Buf, s: str) {
     let p = __str_ptr(s)
     let n = s.byte_len()
+    let mark = b.len
     buf_reserve(b, n + 2)
     buf_byte(b, '"')
     var start = 0
     var i = 0
+    var hi = 0
     while true {
-        i += __find_json_special(p + i, n - i)
+        let k = __find_json_hi(p + i, n - i)
+        hi = hi | k
+        i += k & JSON_AT
         if i >= n {
             break
         }
@@ -563,6 +575,10 @@ fn __json_str(b: Buf, s: str) {
     }
     buf_add_raw(b, p + start, n - start)
     buf_byte(b, '"')
+    if (hi & JSON_HI) != 0 && __utf8_scan(p, n) < 0 {
+        b.len = mark
+        __json_str(b, __utf8_sanitize(s))
+    }
 }
 
 // Стек на уровень вложенности — маленький кадр __json_enc и кадр функции
@@ -725,10 +741,15 @@ fn __json_encode(v: int, d: int) -> str {
 
 // ---- JSON: чтение ----
 
+// Строки JSON — текст UTF-8. Чтение строгое: неправильный UTF-8 и одинокий
+// суррогат \uD800 — ошибка. Мягкое (lenient) — только у восстановления
+// KHRIP_DATA: там они становятся U+FFFD, а replaced считает замены.
 type __Json {
     p: int
     end: int
     err: str
+    lenient: bool = false
+    replaced: int = 0
 }
 
 fn __jd_ws(j: __Json) {
@@ -749,15 +770,20 @@ fn __jd_peek(j: __Json) -> int {
     return load8(j.p)
 }
 
+// Непрочитанный текст для сообщения: до 12 символов, не дальше конца строки.
+// Символ не разрезается, неправильный байт — U+FFFD: сообщение — текст UTF-8.
 fn __jd_found(j: __Json) -> str {
     if j.p >= j.end {
         return "end of input"
     }
-    var n = 0
-    while j.p + n < j.end && n < 12 && load8(j.p + n) != '\n' {
-        n += 1
+    let n = j.end - j.p
+    var w = 0
+    var k = 0
+    while w < n && k < 12 && load8(j.p + w) != '\n' {
+        w += __utf8_width(j.p, n, w)
+        k += 1
     }
-    return "'" + __str_new(j.p, n) + "'"
+    return "'" + __utf8_sanitize(__str_new(j.p, w)) + "'"
 }
 
 fn __jd_fail(j: __Json, at: str, msg: str) {
@@ -800,7 +826,10 @@ fn __jd_hex4(j: __Json) -> int {
     return v
 }
 
-// Строка: без экранирования — без копирования (ссылка на входные байты).
+// Строка: без экранирования — без копирования (ссылка на входные байты). Если
+// в ней был байт >= 0x80 (это отмечает поиск __find_json_hi), она проверяется
+// на UTF-8 (__jd_utf8); экранированная — вся, после сборки: так ловится и
+// начало символа, оборванное экранированием. Сами \u дают правильный UTF-8.
 fn __jd_str(j: __Json, at: str) -> str {
     if __jd_peek(j) != '"' {
         __jd_expect(j, at, "a string")
@@ -808,25 +837,35 @@ fn __jd_str(j: __Json, at: str) -> str {
     }
     j.p += 1
     let start = j.p
-    j.p += __find_json_special(j.p, j.end - j.p)
+    let k0 = __find_json_hi(j.p, j.end - j.p)
+    var hi = k0 & JSON_HI
+    j.p += k0 & JSON_AT
     if j.p < j.end && load8(j.p) == '"' {
         let s = __str_new(start, j.p - start)
         j.p += 1
+        if hi != 0 {
+            return __jd_utf8(j, at, s)
+        }
         return s
     }
     let b = buf_new(j.p - start + 16)
     buf_add_raw(b, start, j.p - start)
     while j.p < j.end {
-        let k = __find_json_special(j.p, j.end - j.p)
-        buf_add_raw(b, j.p, k)
-        j.p += k
+        let k = __find_json_hi(j.p, j.end - j.p)
+        hi = hi | (k & JSON_HI)
+        buf_add_raw(b, j.p, k & JSON_AT)
+        j.p += k & JSON_AT
         if j.p >= j.end {
             break
         }
         let c = load8(j.p)
         if c == '"' {
             j.p += 1
-            return __str_new(b.data, b.len)
+            let s = __str_new(b.data, b.len)
+            if hi != 0 {
+                return __jd_utf8(j, at, s)
+            }
+            return s
         }
         if c < 0x20 {
             __jd_fail(j, at, "control character in a string")
@@ -850,16 +889,9 @@ fn __jd_str(j: __Json, at: str) -> str {
         } else if e == '"' || e == '\\' || e == '/' {
             buf_byte(b, e)
         } else if e == 'u' {
-            var cp = __jd_hex4(j)
+            let cp = __jd_u(j, at)
             if cp < 0 {
-                __jd_fail(j, at, "bad \\u escape")
                 return ""
-            }
-            if cp >= 0xD800 && cp < 0xDC00 && __jd_word(j, "\\u") {
-                let lo = __jd_hex4(j)
-                if lo >= 0xDC00 && lo < 0xE000 {
-                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
-                }
             }
             buf_utf8(b, cp)
         } else {
@@ -869,6 +901,74 @@ fn __jd_str(j: __Json, at: str) -> str {
     }
     __jd_fail(j, at, "unterminated string")
     return ""
+}
+
+// Строка с байтами >= 0x80: правильный UTF-8 — она сама. Иначе строгое чтение —
+// ошибка, мягкое — копия, где каждый неправильный байт (правило Go) — U+FFFD.
+fn __jd_utf8(j: __Json, at: str, s: str) -> str {
+    let p = __str_ptr(s)
+    let n = s.byte_len()
+    if __utf8_scan(p, n) >= 0 {
+        return s
+    }
+    if !j.lenient {
+        __jd_fail(j, at, "invalid UTF-8")
+        return ""
+    }
+    var off = 0
+    while off < n {
+        off += __utf8_bad_at(p + off, n - off) + 1
+        if off <= n {
+            j.replaced += 1
+        }
+    }
+    return __utf8_sanitize(s)
+}
+
+// Код символа \uXXXX (j.p — на первой цифре) или -1 (ошибка записана). Пара
+// суррогатов \uD83D\uDE00 — один символ. Одинокий суррогат — ошибка; при мягком
+// чтении — U+FFFD, а следующее за ним \uXXXX читается как своё, а не теряется.
+fn __jd_u(j: __Json, at: str) -> int {
+    let cp = __jd_hex4(j)
+    if cp < 0 {
+        __jd_fail(j, at, "bad \\u escape")
+        return -1
+    }
+    if cp >= 0xD800 && cp < 0xDC00 {
+        let back = j.p
+        if __jd_word(j, "\\u") {
+            let lo = __jd_hex4(j)
+            if lo >= 0xDC00 && lo < 0xE000 {
+                return 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+            }
+            if lo < 0 {
+                __jd_fail(j, at, "bad \\u escape")
+                return -1
+            }
+            j.p = back
+        }
+        return __jd_lone(j, at, cp)
+    }
+    if cp >= 0xDC00 && cp < 0xE000 {
+        return __jd_lone(j, at, cp)
+    }
+    return cp
+}
+
+fn __jd_lone(j: __Json, at: str, cp: int) -> int {
+    if !j.lenient {
+        let b = buf_new(4)
+        var sh = 12
+        while sh >= 0 {
+            let d = (cp >> sh) & 15
+            buf_byte(b, __hex_digit(d) - 32 * (d / 10))
+            sh -= 4
+        }
+        __jd_fail(j, at, "unpaired surrogate \\u" + buf_str(b))
+        return -1
+    }
+    j.replaced += 1
+    return 0xFFFD
 }
 
 fn __jd_int(j: __Json, at: str) -> int {
@@ -1287,8 +1387,31 @@ fn __jd_sum(j: __Json, d: int, at: str) -> int {
 // Значение типа T? из текста JSON: none, если текст не подходит (текст ошибки —
 // в __json_error()). Для int и bool результат — ячейка.
 fn __json_decode(s: str, d: int) -> int {
-    let j = __Json { p: __str_ptr(s), end: __str_ptr(s) + s.byte_len(), err: "" }
+    return __json_read(s, d, false)
+}
+
+// Сколько замен на U+FFFD сделало последнее мягкое чтение.
+var __json_replaced: int
+
+// Мягкое чтение — только снимок KHRIP_DATA (__from_json_lenient в
+// сгенерированном __store_restore): данные не теряются из-за байта, который
+// когда-то попал в store (снимки v0.12 хранили одинокие суррогаты как WTF-8).
+fn __json_decode_lenient(s: str, d: int) -> int {
+    return __json_read(s, d, true)
+}
+
+fn __json_read(s: str, d: int, lenient: bool) -> int {
+    var p = __str_ptr(s)
+    let end = p + s.byte_len()
+    // метка порядка байтов UTF-8 в начале — не часть значения
+    if end - p >= 3 && load8(p) == 0xEF && load8(p + 1) == 0xBB && load8(p + 2) == 0xBF {
+        p += 3
+    }
+    let j = __Json { p: p, end: end, err: "", lenient: lenient }
     let v = __jd(j, d, "")
+    if lenient {
+        __json_replaced = j.replaced
+    }
     if j.err.byte_len() == 0 && __jd_peek(j) != -1 {
         __jd_fail(j, "", "unexpected " + __jd_found(j) + " after the value")
     }
@@ -1509,9 +1632,21 @@ fn __query(q: str, name: str) -> str? {
     return none
 }
 
+// Параметр str пути или строки запроса (после __url_decode) — текст: байты
+// >= 0x80 должны составлять правильный UTF-8, иначе ответ 400 и none. На ASCII
+// проверка — один проход SIMD по старшим битам.
+fn __param_text(s: str, name: str) -> str? {
+    if __utf8_scan(__str_ptr(s), s.byte_len()) < 0 {
+        __reply_text(400, "parameter '" + name + "' is not valid UTF-8")
+        return none
+    }
+    return s
+}
+
+// В тексте ошибки значение параметра — с U+FFFD вместо неправильных байтов.
 fn __param_int(s: str, name: str) -> int? {
     let v = s.to_int() else {
-        __reply_text(400, "parameter '" + name + "' must be an integer, found '" + s + "'")
+        __reply_text(400, "parameter '" + name + "' must be an integer, found '" + __utf8_sanitize(s) + "'")
         return none
     }
     return v
@@ -1519,7 +1654,7 @@ fn __param_int(s: str, name: str) -> int? {
 
 fn __param_float(s: str, name: str) -> float? {
     let v = s.to_float() else {
-        __reply_text(400, "parameter '" + name + "' must be a number, found '" + s + "'")
+        __reply_text(400, "parameter '" + name + "' must be a number, found '" + __utf8_sanitize(s) + "'")
         return none
     }
     return v
@@ -1532,7 +1667,7 @@ fn __param_bool(s: str, name: str) -> bool? {
     if s == "false" || s == "0" {
         return false
     }
-    __reply_text(400, "parameter '" + name + "' must be true or false, found '" + s + "'")
+    __reply_text(400, "parameter '" + name + "' must be true or false, found '" + __utf8_sanitize(s) + "'")
     return none
 }
 

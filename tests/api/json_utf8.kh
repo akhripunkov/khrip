@@ -1,0 +1,169 @@
+// Границы UTF-8 (docs/design/v0.13-utf8.md, §2): тело JSON маршрута и from_json
+// читаются строго — неправильный UTF-8 и одинокий суррогат дают 400 (или none и
+// json_error()); параметры str пути и строки запроса — тоже; to_json никогда не
+// пишет неправильный UTF-8; ответ -> str отдаёт байты как есть. Байты, которых
+// не бывает в исходнике (он — правильный UTF-8), собирает raw.
+
+type Note {
+    title: str
+    tags: [str] = []
+}
+
+fn raw(xs: [int]) -> str {
+    let b = buf_new(xs.len())
+    for x in xs {
+        buf_byte(b, x)
+    }
+    return buf_str(b)
+}
+
+// Тело {"title":"<t>"} — t вставляется как есть, без экранирования.
+fn note(t: str) -> str {
+    return `{"title":"` + t + `"}`
+}
+
+route POST "/notes" (body: Note) -> 201 Note {
+    return 201 body
+}
+
+route POST "/counts" (body: map[str, int]) -> int {
+    return body.len()
+}
+
+route GET "/items/{name}" (name: str) -> str {
+    return "{name} {name.byte_len()}"
+}
+
+route GET "/search" (q: str) -> str {
+    return q
+}
+
+route GET "/find" (q: str?, sort: str = "name") -> str {
+    return "{q ?? "-"} {sort}"
+}
+
+route GET "/page" (n: int = 1) -> int {
+    return n
+}
+
+route GET "/raw" -> str {
+    return raw([0x61, 0xFF, 0x62])
+}
+
+route GET "/raw.json" -> Note {
+    return Note { title: raw([0x61, 0xFF, 0x62]), tags: [raw([0xD0]), "ок"] }
+}
+
+test "valid text and surrogate pairs" {
+    let r = call POST "/notes" note(`\uD83D\uDE00 и 😀 \u00e9\u0436`)
+    expect r.status == 201
+    // не-ASCII в ответе — как есть, без \u
+    expect r.body == `{"title":"😀 и 😀 éж","tags":[]}`
+    expect (call POST "/notes" note(`\ud83d\ude00`)).body == `{"title":"😀","tags":[]}`
+}
+
+test "unpaired surrogates" {
+    let lone_hi = call POST "/notes" note(`a\uD800`)
+    expect lone_hi.status == 400
+    expect lone_hi.body == "invalid JSON body: title: unpaired surrogate \\uD800"
+    expect (call POST "/notes" note(`\udc00`)).body == "invalid JSON body: title: unpaired surrogate \\uDC00"
+    expect (call POST "/notes" note(`\uD800B`)).body == "invalid JSON body: title: unpaired surrogate \\uD800"
+    // за старшим — не младший суррогат: ошибка про старший
+    expect (call POST "/notes" note(`\uD83D\u0041`)).body == "invalid JSON body: title: unpaired surrogate \\uD83D"
+    expect (call POST "/notes" note(`\uD800\uD800\uDC00`)).body == "invalid JSON body: title: unpaired surrogate \\uD800"
+    expect (call POST "/notes" note(`\uD800\uzzzz`)).body == "invalid JSON body: title: bad \\u escape"
+    expect (call POST "/notes" note(`\uDBFF\uDFFF`)).body == "\{\"title\":\"" + raw([0xF4, 0x8F, 0xBF, 0xBF]) + "\",\"tags\":[]}"
+}
+
+test "invalid UTF-8 bytes in a body" {
+    let r = call POST "/notes" note("a" + raw([0xFF]) + "b")
+    expect r.status == 400
+    expect r.body == "invalid JSON body: title: invalid UTF-8"
+    // путь до поля — как у других ошибок тела
+    let t = call POST "/notes" `{"title":"x","tags":["ок","` + raw([0xD0]) + `"]}`
+    expect t.body == "invalid JSON body: tags[1]: invalid UTF-8"
+    // лишне длинная форма, суррогат в UTF-8 (WTF-8), обрывок в конце строки
+    expect (call POST "/notes" note(raw([0xC0, 0x80]))).status == 400
+    expect (call POST "/notes" note(raw([0xED, 0xA0, 0x80]))).status == 400
+    expect (call POST "/notes" note("ж" + raw([0xE2, 0x82]))).status == 400
+    // начало символа, оборванное экранированием: проверяется собранная строка
+    expect (call POST "/notes" note(raw([0xD0]) + `\n`)).body == "invalid JSON body: title: invalid UTF-8"
+    expect (call POST "/notes" note(`\n` + raw([0xD0, 0xB6]) + `\t`)).status == 201
+    // имя поля и поле, которого нет в типе, — тоже текст
+    expect (call POST "/notes" `{"title":"x","ex` + raw([0xFF]) + `":1}`).body == "invalid JSON body: invalid UTF-8"
+    expect (call POST "/notes" `{"title":"x","extra":"` + raw([0xFF]) + `"}`).body == "invalid JSON body: extra: invalid UTF-8"
+    expect (call POST "/counts" `{"a":1,"` + raw([0xFE]) + `":2}`).body == "invalid JSON body: invalid UTF-8"
+    expect (call POST "/counts" `{"а":1,"б":2}`).body == "2"
+}
+
+test "BOM and NUL" {
+    let r = call POST "/notes" raw([0xEF, 0xBB, 0xBF]) + note("бом")
+    expect r.status == 201
+    expect r.body == `{"title":"бом","tags":[]}`
+    // метка — только в самом начале
+    expect (call POST "/notes" " " + raw([0xEF, 0xBB, 0xBF]) + note("x")).status == 400
+    let z = call POST "/notes" note(`a\u0000b`)
+    expect z.status == 201
+    expect z.body == `{"title":"a\u0000b","tags":[]}`
+}
+
+test "from_json is strict: none and json_error()" {
+    let bad: Note? = from_json(note("a" + raw([0x80])))
+    expect bad == none
+    expect json_error() == "title: invalid UTF-8"
+    let lone: str? = from_json(`"\uDE00"`)
+    expect lone == none
+    expect json_error() == "unpaired surrogate \\uDE00"
+    let s: str? = from_json(`"\uD83D\uDE00"`)
+    expect (s ?? "") == "😀"
+    let bom: Note? = from_json(raw([0xEF, 0xBB, 0xBF]) + note("ок"))
+    expect bom != none
+    expect bom.title == "ок"
+}
+
+test "error excerpts are whole characters" {
+    let a: Note? = from_json(note("x") + " яяяяяяяяяяяяя")
+    expect a == none
+    // 12 символов, а не 12 байтов
+    expect json_error() == "unexpected 'яяяяяяяяяяяя' after the value"
+    let b: Note? = from_json(note("x") + raw([0xFF, 0xD0]) + "ж")
+    expect b == none
+    expect json_error() == "unexpected '��ж' after the value"
+    let c: int? = from_json("😀😀")
+    expect c == none
+    expect json_error() == "expected an integer, found '😀😀'"
+}
+
+test "str parameters must be valid UTF-8" {
+    let p = call GET "/items/%D0"
+    expect p.status == 400
+    expect p.body == "parameter 'name' is not valid UTF-8"
+    expect (call GET "/items/%D0%BC%D0%BE").body == "мо 4"
+    expect (call GET "/items/ж").body == "ж 2"
+    let q = call GET "/search?q=%FF"
+    expect q.status == 400
+    expect q.body == "parameter 'q' is not valid UTF-8"
+    expect (call GET "/search?q=%D0%BC%D0%BE").body == "мо"
+    expect (call GET "/search?q=a+b%21").body == "a b!"
+    expect (call GET "/find?q=%C0%80").body == "parameter 'q' is not valid UTF-8"
+    expect (call GET "/find?sort=%ED%A0%80").body == "parameter 'sort' is not valid UTF-8"
+    expect (call GET "/find").body == "- name"
+    expect (call GET "/find?q=%D1%91&sort=%E2%82%AC").body == "ё €"
+    // текст ошибки — без неправильных байтов
+    expect (call GET "/page?n=%FF1").body == "parameter 'n' must be an integer, found '�1'"
+}
+
+test "to_json never writes invalid UTF-8" {
+    expect to_json(raw([0x61, 0xFF, 0x62])) == `"a�b"`
+    expect to_json("a\"" + raw([0xD0])) == `"a\"�"`
+    expect to_json(raw([0xED, 0xA0, 0x80, 0x0A])) == `"���\n"`
+    expect to_json("мир 😀") == `"мир 😀"`
+    var m: map[str, int] = {}
+    m[raw([0xFF])] = 1
+    expect to_json(m) == `{"�":1}`
+    // ответ JSON — тоже; ответ -> str отдаёт байты как есть
+    expect (call GET "/raw.json").body == `{"title":"a�b","tags":["�","ок"]}`
+    let r = call GET "/raw"
+    expect r.body.byte_len() == 3
+    expect r.body.byte(1) == 0xFF
+}
