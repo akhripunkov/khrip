@@ -2,9 +2,34 @@
 // Шаблон разбирается в дерево, дерево — в программу автомата, программа
 // исполняется на всех состояниях сразу (Томпсон, Пайк): время линейно по длине
 // строки, без возвратов, поэтому шаблон и ввод не могут «подвесить» сервер.
-// Поддерживается: литералы, . [abc] [a-z] [^...] \d \w \s \D \W \S, экранирование
-// \. \\ и т. п., группы ( ), | , * + ? {n} {n,} {n,m}; ^ и $ по краям допустимы.
-// Работает с байтами: . — один байт.
+//
+// Шаг — один символ (код Unicode): . — любой символ, [а-я] — диапазон кодов,
+// {n,m} считает символы. Неправильный байт строки — отдельный символ U+FFFD
+// (правило Go, как у s.len() и s[i]): его берут ., \W, \S, \D и классы [^...].
+//
+// Грамматика:
+//   шаблон — ветви через |; ветвь — части подряд (может быть пустой);
+//   часть  — атом и, может быть, повтор * + ? {n} {n,} {n,m} (n ≤ m ≤ 1000,
+//            числа без ведущих нулей);
+//            ? сразу после повтора — ленивый повтор (для строки целиком то же
+//            самое); повтор повтора (a**, a{2}{3}) — ошибка;
+//   атом   — символ; . ; ^ — начало строки; $ — конец строки; класс [...] или
+//            [^...] (] первым — сам символ, - первым или последним — сам символ,
+//            диапазоны a-z); \d \w \s \D \W \S; группа ( ) или (?: );
+//   \      — \n \t \r \f \v, \xHH, \x{H...} (код до 10FFFF, не суррогат) или
+//            знак ASCII, кроме букв и цифр: \. \\ \- \[ и т. п.
+// \d — только цифры ASCII 0–9 (как у to_int); \w — буквы, знаки, десятичные
+// цифры и соединители Unicode (L, M, Nd, Pc: имена по-кириллически — тоже \w+);
+// \s — White_Space Unicode (25 кодов, как у trim).
+// Ошибки с объяснением: (?i) и другие (?...), кроме (?:, просмотр вперёд и
+// назад, \b \B \A \z \Z \G, обратные ссылки \1, \p{...}, классы [:alpha:],
+// неизвестные экранирования вроде \y. Позиция в сообщении — номер символа
+// шаблона, с нуля.
+//
+// Литерал или const в s.matches(...) компилятор проверяет при компиляции
+// (src/rx.kh: та же грамматика, те же сообщения; tests/run/regex_grammar.kh и
+// tests/run.sh сверяют оба разбора), а программа такого шаблона строится один
+// раз на место вызова и остаётся в постоянной памяти (__text_matches_at).
 
 const RX_LIT = 1
 const RX_ANY = 2
@@ -13,27 +38,59 @@ const RX_CAT = 4
 const RX_ALT = 5
 const RX_REP = 6
 const RX_EMPTY = 7
+const RX_BOL = 8
+const RX_EOL = 9
 
 // инструкции программы
-const RI_BYTE = 1
+const RI_CHAR = 1
 const RI_ANY = 2
 const RI_CLASS = 3
 const RI_SPLIT = 4
 const RI_JMP = 5
 const RI_MATCH = 6
+const RI_BOL = 7
+const RI_EOL = 8
+
+// флаги класса: \w и \W вне ASCII (по таблице), отрицание [^...]
+const RC_W = 1
+const RC_NW = 2
+const RC_NEG = 4
+
+// флаги шага программы: позиция — начало строки, конец строки
+const RX_AT_START = 1
+const RX_AT_END = 2
+
+// пределы: инструкций в программе, вложенных групп, повторов в {n,m}
+const RX_MAX_PROG = 100000
+const RX_MAX_DEPTH = 1000
+const RX_MAX_COUNT = 1000
+// размер программы при подсчёте не растёт дальше (без переполнения)
+const RX_SIZE_CAP = 1099511627776
+
+const RX_MAX_CP = 0x10FFFF
 
 type __Rx {
-    pat: str
+    // шаблон — коды символов
+    cps: [int]
     p: int
     err: str
-    // узлы дерева: вид, a, b, c
+    at: int
+    depth: int
+    // узлы дерева: вид, a, b, c; у RX_CAT и RX_ALT дети — kids[a..a + b)
     kind: [int]
     a: [int]
     b: [int]
     c: [int]
-    // классы символов: по 256 байт (1 — входит)
-    classes: [int]
-    nclasses: int
+    kids: [int]
+    // классы: маска ASCII (по 2 слова), флаги, первый диапазон и их число;
+    // диапазоны — пары lo, hi кодов от 0x80, по возрастанию, без пересечений
+    cmask: [int]
+    cflags: [int]
+    cfirst: [int]
+    ccount: [int]
+    ranges: [int]
+    // диапазоны от 0x80 класса, который сейчас разбирается: (lo << 21) | hi
+    pend: [int]
     // программа
     op: [int]
     x: [int]
@@ -48,67 +105,219 @@ fn __rx_node(r: __Rx, kind: int, a: int, b: int, c: int) -> int {
     return r.kind.len() - 1
 }
 
-fn __rx_fail(r: __Rx, msg: str) -> int {
+// Ошибка в позиции at (номер символа); запоминается первая.
+fn __rx_fail(r: __Rx, msg: str, at: int) -> int {
     if r.err == "" {
-        r.err = msg + " at position {r.p}"
+        r.err = msg
+        r.at = at
     }
     return __rx_node(r, RX_EMPTY, 0, 0, 0)
 }
 
-fn __rx_peek(r: __Rx) -> int {
-    if r.p >= r.pat.byte_len() {
+// Символ шаблона в позиции r.p + d или -1 за концом.
+fn __rx_peek_at(r: __Rx, d: int) -> int {
+    let i = r.p + d
+    if i >= r.cps.len() {
         return -1
     }
-    return r.pat.byte(r.p)
+    return r.cps[i]
 }
 
-// Новый пустой класс: номер.
+fn __rx_peek(r: __Rx) -> int {
+    if r.p >= r.cps.len() {
+        return -1
+    }
+    return r.cps[r.p]
+}
+
+// Символ шаблона для сообщения об ошибке.
+fn __rx_show(cp: int) -> str {
+    let b = buf_new(4)
+    buf_utf8(b, cp)
+    return buf_str(b)
+}
+
+// ---- Классы ----
+
 fn __rx_class_new(r: __Rx) -> int {
-    let base = __alloc(256)
-    __memset(base, 0, 256)
-    r.classes.push(base)
-    r.nclasses += 1
-    return r.nclasses - 1
+    r.cmask.push(0)
+    r.cmask.push(0)
+    r.cflags.push(0)
+    r.cfirst.push(0)
+    r.ccount.push(0)
+    r.pend.clear()
+    return r.cflags.len() - 1
 }
 
-fn __rx_class_set(r: __Rx, k: int, from: int, to: int) {
-    let base = r.classes[k]
-    for c in from..=to {
-        store8(base + c, 1)
+// Коды lo..hi — в класс k: ASCII — в маску, остальное — в диапазоны.
+fn __rx_class_add(r: __Rx, k: int, lo: int, hi: int) {
+    var c = lo
+    while c <= hi && c < 128 {
+        let i = 2 * k + (c >> 6)
+        r.cmask[i] = r.cmask[i] | (1 << (c & 63))
+        c += 1
+    }
+    if hi >= 128 {
+        if c < 128 {
+            c = 128
+        }
+        r.pend.push((c << 21) | hi)
     }
 }
 
-// \d \w \s в класс k; false, если e — не класс.
-fn __rx_class_escape(r: __Rx, k: int, e: int) -> bool {
-    let lower = e | 32
-    if lower != 'd' && lower != 'w' && lower != 's' {
-        return false
-    }
-    let tmp = __rx_class_new(r)
-    if lower == 'd' {
-        __rx_class_set(r, tmp, '0', '9')
-    } else if lower == 'w' {
-        __rx_class_set(r, tmp, 'a', 'z')
-        __rx_class_set(r, tmp, 'A', 'Z')
-        __rx_class_set(r, tmp, '0', '9')
-        __rx_class_set(r, tmp, '_', '_')
+// Пробелы White_Space вне ASCII (как __cp_is_space в text.kh): 8 пар lo, hi —
+// u32: U+0085, U+00A0, U+1680, U+2000–200A, U+2028–2029, U+202F, U+205F, U+3000.
+const RX_NSPACES = 8
+
+fn __rx_spaces() -> int {
+    return __data_hex("85 00 00 00 85 00 00 00 A0 00 00 00 A0 00 00 00 80 16 00 00 80 16 00 00 00 20 00 00 0A 20 00 00 28 20 00 00 29 20 00 00 2F 20 00 00 2F 20 00 00 5F 20 00 00 5F 20 00 00 00 30 00 00 00 30 00 00")
+}
+
+fn __rx_is_class_esc(e: int) -> bool {
+    return e == 'd' || e == 'D' || e == 'w' || e == 'W' || e == 's' || e == 'S'
+}
+
+// Маски ASCII (биты кодов 0–63 и 64–127): \d — 0–9; \w — 0–9, A–Z, _, a–z;
+// \s — \t \n \v \f \r и пробел.
+const RX_DIGIT0 = 0x03FF000000000000
+const RX_WORD0 = 0x03FF000000000000
+const RX_WORD1 = 0x07FFFFFE87FFFFFE
+const RX_SPACE0 = 0x0000000100003E00
+
+fn __rx_class_or(r: __Rx, k: int, m0: int, m1: int) {
+    r.cmask[2 * k] = r.cmask[2 * k] | m0
+    r.cmask[2 * k + 1] = r.cmask[2 * k + 1] | m1
+}
+
+// \d \D \w \W \s \S — в класс k.
+fn __rx_class_esc(r: __Rx, k: int, e: int) {
+    if e == 'd' {
+        __rx_class_or(r, k, RX_DIGIT0, 0)
+    } else if e == 'D' {
+        __rx_class_or(r, k, ~RX_DIGIT0, -1)
+        __rx_class_add(r, k, 128, RX_MAX_CP)
+    } else if e == 'w' {
+        // вне ASCII — по таблице
+        __rx_class_or(r, k, RX_WORD0, RX_WORD1)
+        r.cflags[k] = r.cflags[k] | RC_W
+    } else if e == 'W' {
+        __rx_class_or(r, k, ~RX_WORD0, ~RX_WORD1)
+        r.cflags[k] = r.cflags[k] | RC_NW
     } else {
-        __rx_class_set(r, tmp, ' ', ' ')
-        __rx_class_set(r, tmp, 9, 13)
-    }
-    let src = r.classes[tmp]
-    let dst = r.classes[k]
-    let neg = e != lower
-    for c in 0..256 {
-        if (load8(src + c) == 1) != neg {
-            store8(dst + c, 1)
+        let sp = __rx_spaces()
+        if e == 's' {
+            __rx_class_or(r, k, RX_SPACE0, 0)
+            for i in 0..RX_NSPACES {
+                __rx_class_add(r, k, load32(sp + 8 * i), load32(sp + 8 * i + 4))
+            }
+        } else {
+            __rx_class_or(r, k, ~RX_SPACE0, -1)
+            var from = 128
+            for i in 0..RX_NSPACES {
+                __rx_class_add(r, k, from, load32(sp + 8 * i) - 1)
+                from = load32(sp + 8 * i + 4) + 1
+            }
+            __rx_class_add(r, k, from, RX_MAX_CP)
         }
     }
-    return true
 }
 
-// Байт после обратной косой черты вне класса: \n \t \r или сам символ.
-fn __rx_plain_escape(e: int) -> int {
+// Класс k разобран: диапазоны — по возрастанию, слитые; отрицание.
+fn __rx_class_done(r: __Rx, k: int, neg: bool) {
+    var sorted = true
+    for i in 1..r.pend.len() {
+        if r.pend[i - 1] > r.pend[i] {
+            sorted = false
+            break
+        }
+    }
+    if !sorted {
+        r.pend.sort()
+    }
+    r.cfirst[k] = r.ranges.len() / 2
+    var lo = -1
+    var hi = -1
+    for v in r.pend {
+        let a = v >> 21
+        let b = v & 0x1FFFFF
+        if lo >= 0 && a <= hi + 1 {
+            if b > hi {
+                hi = b
+            }
+            continue
+        }
+        if lo >= 0 {
+            r.ranges.push(lo)
+            r.ranges.push(hi)
+        }
+        lo = a
+        hi = b
+    }
+    if lo >= 0 {
+        r.ranges.push(lo)
+        r.ranges.push(hi)
+    }
+    r.ccount[k] = r.ranges.len() / 2 - r.cfirst[k]
+    r.pend.clear()
+    if neg {
+        r.cmask[2 * k] = ~r.cmask[2 * k]
+        r.cmask[2 * k + 1] = ~r.cmask[2 * k + 1]
+        r.cflags[k] = r.cflags[k] | RC_NEG
+    }
+}
+
+fn __rx_hex_digit(c: int) -> int {
+    if c >= '0' && c <= '9' {
+        return c - '0'
+    }
+    if c >= 'a' && c <= 'f' {
+        return c - 'a' + 10
+    }
+    if c >= 'A' && c <= 'F' {
+        return c - 'A' + 10
+    }
+    return -1
+}
+
+// \xHH или \x{H...}: r.p — после x → код или -1 (ошибка в позиции at).
+fn __rx_hex(r: __Rx, at: int) -> int {
+    if __rx_peek(r) == '{' {
+        r.p += 1
+        var v = 0
+        var digits = 0
+        while __rx_hex_digit(__rx_peek(r)) >= 0 {
+            if v <= RX_MAX_CP {
+                v = v * 16 + __rx_hex_digit(__rx_peek(r))
+            }
+            digits += 1
+            r.p += 1
+        }
+        if digits == 0 || __rx_peek(r) != '}' || v > RX_MAX_CP || (v >= 0xD800 && v <= 0xDFFF) {
+            __rx_fail(r, "bad \\x escape", at)
+            return -1
+        }
+        r.p += 1
+        return v
+    }
+    let h1 = __rx_hex_digit(__rx_peek(r))
+    let h2 = __rx_hex_digit(__rx_peek_at(r, 1))
+    if h1 < 0 || h2 < 0 {
+        __rx_fail(r, "bad \\x escape", at)
+        return -1
+    }
+    r.p += 2
+    return h1 * 16 + h2
+}
+
+// Экранирование: r.p — после \ (позиция \ — at) → код символа или -1, если
+// ошибка. \d \w \s и т. п. разбирает вызывающий.
+fn __rx_escape(r: __Rx, at: int) -> int {
+    let e = __rx_peek(r)
+    if e < 0 {
+        __rx_fail(r, "pattern ends with \\", at)
+        return -1
+    }
+    r.p += 1
     if e == 'n' {
         return 10
     }
@@ -118,11 +327,35 @@ fn __rx_plain_escape(e: int) -> int {
     if e == 'r' {
         return 13
     }
-    return e
+    if e == 'f' {
+        return 12
+    }
+    if e == 'v' {
+        return 11
+    }
+    if e == 'x' {
+        return __rx_hex(r, at)
+    }
+    let letter = (e >= 'a' && e <= 'z') || (e >= 'A' && e <= 'Z')
+    let digit = e >= '0' && e <= '9'
+    if e < 128 && !letter && !digit {
+        return e
+    }
+    if e == 'b' || e == 'B' || e == 'A' || e == 'z' || e == 'Z' || e == 'G' {
+        __rx_fail(r, "\\" + __rx_show(e) + " is not supported", at)
+    } else if e >= '1' && e <= '9' {
+        __rx_fail(r, "backreferences are not supported", at)
+    } else if e == 'p' || e == 'P' {
+        __rx_fail(r, "\\" + __rx_show(e) + "\{...} is not supported", at)
+    } else {
+        __rx_fail(r, "unknown escape \\" + __rx_show(e), at)
+    }
+    return -1
 }
 
 fn __rx_class(r: __Rx) -> int {
     // текущий символ — '['
+    let at = r.p
     r.p += 1
     let k = __rx_class_new(r)
     var neg = false
@@ -134,60 +367,104 @@ fn __rx_class(r: __Rx) -> int {
     while true {
         let c = __rx_peek(r)
         if c < 0 {
-            return __rx_fail(r, "unclosed [")
+            return __rx_fail(r, "unclosed [", at)
         }
         if c == ']' && !first {
             r.p += 1
             break
         }
         first = false
-        var lo = c
+        let start = r.p
+        if c == '[' && __rx_peek_at(r, 1) == ':' {
+            return __rx_fail(r, "[:name:] classes are not supported", start)
+        }
         r.p += 1
+        var lo = c
         if c == '\\' {
             let e = __rx_peek(r)
-            if e < 0 {
-                return __rx_fail(r, "pattern ends with \\")
-            }
-            r.p += 1
-            if __rx_class_escape(r, k, e) {
+            if __rx_is_class_esc(e) {
+                r.p += 1
+                __rx_class_esc(r, k, e)
                 continue
             }
-            lo = __rx_plain_escape(e)
+            lo = __rx_escape(r, start)
+            if lo < 0 {
+                return __rx_node(r, RX_EMPTY, 0, 0, 0)
+            }
         }
         var hi = lo
-        if __rx_peek(r) == '-' && r.p + 1 < r.pat.byte_len() && r.pat.byte(r.p + 1) != ']' {
+        let d = __rx_peek_at(r, 1)
+        if __rx_peek(r) == '-' && d >= 0 && d != ']' {
             r.p += 1
-            hi = __rx_peek(r)
+            let hs = r.p
+            hi = d
             r.p += 1
-            if hi == '\\' {
-                hi = __rx_plain_escape(__rx_peek(r))
-                r.p += 1
+            if d == '\\' {
+                if __rx_is_class_esc(__rx_peek(r)) {
+                    return __rx_fail(r, "bad range in []", start)
+                }
+                hi = __rx_escape(r, hs)
+                if hi < 0 {
+                    return __rx_node(r, RX_EMPTY, 0, 0, 0)
+                }
             }
             if hi < lo {
-                return __rx_fail(r, "bad range in []")
+                return __rx_fail(r, "bad range in []", start)
             }
         }
-        __rx_class_set(r, k, lo, hi)
+        __rx_class_add(r, k, lo, hi)
     }
-    if neg {
-        let base = r.classes[k]
-        for c in 0..256 {
-            store8(base + c, 1 - load8(base + c))
-        }
-    }
+    __rx_class_done(r, k, neg)
     return __rx_node(r, RX_CLASS, k, 0, 0)
 }
 
+// ---- Разбор ----
+
+// (? — какая группа: (?: разбирает __rx_atom, остальное — ошибки.
+fn __rx_group_fail(r: __Rx, at: int) -> int {
+    let c = __rx_peek_at(r, 2)
+    let d = __rx_peek_at(r, 3)
+    if c == '=' || c == '!' || (c == '<' && (d == '=' || d == '!')) {
+        return __rx_fail(r, "lookaround is not supported", at)
+    }
+    if c == '<' || c == '\'' || (c == 'P' && (d == '<' || d == '=' || d == '>')) {
+        return __rx_fail(r, "named groups are not supported", at)
+    }
+    // флаги: (?i) (?i:...) (?si) (?-i) ...
+    var i = 2
+    var e = c
+    while (e >= 'a' && e <= 'z') || (e >= 'A' && e <= 'Z') || e == '-' {
+        if e == 'i' {
+            return __rx_fail(r, "(?i) is not supported", at)
+        }
+        i += 1
+        e = __rx_peek_at(r, i)
+    }
+    return __rx_fail(r, "this (? group is not supported", at)
+}
+
 fn __rx_atom(r: __Rx) -> int {
+    let at = r.p
     let c = __rx_peek(r)
     if c == '(' {
-        r.p += 1
-        if __rx_peek(r) == '?' && r.p + 1 < r.pat.byte_len() && r.pat.byte(r.p + 1) == ':' {
+        if __rx_peek_at(r, 1) == '?' {
+            if __rx_peek_at(r, 2) != ':' {
+                return __rx_group_fail(r, at)
+            }
             r.p += 2
         }
+        r.p += 1
+        r.depth += 1
+        if r.depth > RX_MAX_DEPTH {
+            return __rx_fail(r, "pattern nests too deeply", at)
+        }
         let n = __rx_alt(r)
+        r.depth -= 1
+        if r.err != "" {
+            return n
+        }
         if __rx_peek(r) != ')' {
-            return __rx_fail(r, "unclosed (")
+            return __rx_fail(r, "unclosed (", at)
         }
         r.p += 1
         return n
@@ -195,104 +472,177 @@ fn __rx_atom(r: __Rx) -> int {
     if c == '[' {
         return __rx_class(r)
     }
+    if c == '*' || c == '+' || c == '?' || c == '{' {
+        return __rx_fail(r, "nothing to repeat", at)
+    }
     r.p += 1
     if c == '.' {
         return __rx_node(r, RX_ANY, 0, 0, 0)
     }
+    if c == '^' {
+        return __rx_node(r, RX_BOL, 0, 0, 0)
+    }
+    if c == '$' {
+        return __rx_node(r, RX_EOL, 0, 0, 0)
+    }
     if c == '\\' {
         let e = __rx_peek(r)
-        if e < 0 {
-            return __rx_fail(r, "pattern ends with \\")
-        }
-        r.p += 1
-        let k = __rx_class_new(r)
-        if __rx_class_escape(r, k, e) {
+        if __rx_is_class_esc(e) {
+            r.p += 1
+            let k = __rx_class_new(r)
+            __rx_class_esc(r, k, e)
+            __rx_class_done(r, k, false)
             return __rx_node(r, RX_CLASS, k, 0, 0)
         }
-        return __rx_node(r, RX_LIT, __rx_plain_escape(e), 0, 0)
-    }
-    if c == '*' || c == '+' || c == '?' || c == '{' {
-        r.p -= 1
-        return __rx_fail(r, "nothing to repeat")
+        let v = __rx_escape(r, at)
+        if v < 0 {
+            return __rx_node(r, RX_EMPTY, 0, 0, 0)
+        }
+        return __rx_node(r, RX_LIT, v, 0, 0)
     }
     return __rx_node(r, RX_LIT, c, 0, 0)
 }
 
+// Число в {n,m}: -1, если цифр нет; больше RX_MAX_COUNT или с ведущим нулём —
+// RX_MAX_COUNT + 1.
 fn __rx_int(r: __Rx) -> int {
     var v = -1
     while __rx_peek(r) >= '0' && __rx_peek(r) <= '9' {
-        if v < 0 {
+        if v == 0 {
+            // ведущий ноль: 01, 007 (у Go такие скобки — просто текст)
+            v = RX_MAX_COUNT + 1
+        } else if v < 0 {
             v = 0
         }
-        v = v * 10 + __rx_peek(r) - '0'
-        if v > 1000 {
-            return 1001
+        if v <= RX_MAX_COUNT {
+            v = v * 10 + __rx_peek(r) - '0'
         }
         r.p += 1
+    }
+    if v > RX_MAX_COUNT {
+        return RX_MAX_COUNT + 1
     }
     return v
 }
 
 fn __rx_repeat(r: __Rx) -> int {
-    var n = __rx_atom(r)
-    while true {
-        let c = __rx_peek(r)
-        if c == '*' {
-            n = __rx_node(r, RX_REP, n, 0, -1)
-        } else if c == '+' {
-            n = __rx_node(r, RX_REP, n, 1, -1)
-        } else if c == '?' {
-            n = __rx_node(r, RX_REP, n, 0, 1)
-        } else if c == '{' {
+    let n = __rx_atom(r)
+    if r.err != "" {
+        return n
+    }
+    let at = r.p
+    let c = __rx_peek(r)
+    var lo = 0
+    var hi = -1
+    if c == '+' {
+        lo = 1
+    } else if c == '?' {
+        hi = 1
+    } else if c == '{' {
+        r.p += 1
+        lo = __rx_int(r)
+        hi = lo
+        if __rx_peek(r) == ',' {
             r.p += 1
-            let lo = __rx_int(r)
-            var hi = lo
-            if __rx_peek(r) == ',' {
-                r.p += 1
-                hi = __rx_int(r)
-            }
-            if lo < 0 || __rx_peek(r) != '}' || (hi >= 0 && hi < lo) || lo > 1000 || hi > 1000 {
-                return __rx_fail(r, "bad \{n,m}")
-            }
-            n = __rx_node(r, RX_REP, n, lo, hi)
-        } else {
-            return n
+            hi = __rx_int(r)
         }
+        if lo < 0 || __rx_peek(r) != '}' || lo > RX_MAX_COUNT || hi > RX_MAX_COUNT || (hi >= 0 && hi < lo) {
+            return __rx_fail(r, "bad \{n,m}", at)
+        }
+    } else if c != '*' {
+        return n
+    }
+    r.p += 1
+    if __rx_peek(r) == '?' {
+        // ленивый повтор: для совпадения строки целиком — то же, что жадный
         r.p += 1
     }
-    return n
+    let d = __rx_peek(r)
+    if d == '*' || d == '+' || d == '?' || d == '{' {
+        return __rx_fail(r, "nested repetition", r.p)
+    }
+    return __rx_node(r, RX_REP, n, lo, hi)
+}
+
+// Узел RX_CAT или RX_ALT с детьми parts.
+fn __rx_list(r: __Rx, kind: int, parts: [int]) -> int {
+    let first = r.kids.len()
+    for p in parts {
+        r.kids.push(p)
+    }
+    return __rx_node(r, kind, first, parts.len(), 0)
 }
 
 fn __rx_concat(r: __Rx) -> int {
-    var n = -1
-    while true {
+    var parts: [int] = []
+    while r.err == "" {
         let c = __rx_peek(r)
         if c < 0 || c == '|' || c == ')' {
             break
         }
-        let m = __rx_repeat(r)
-        if n < 0 {
-            n = m
-        } else {
-            n = __rx_node(r, RX_CAT, n, m, 0)
-        }
+        parts.push(__rx_repeat(r))
     }
-    if n < 0 {
+    if parts.len() == 0 {
         return __rx_node(r, RX_EMPTY, 0, 0, 0)
     }
-    return n
+    if parts.len() == 1 {
+        return parts[0]
+    }
+    return __rx_list(r, RX_CAT, parts)
 }
 
 fn __rx_alt(r: __Rx) -> int {
-    var n = __rx_concat(r)
-    while __rx_peek(r) == '|' {
-        r.p += 1
-        n = __rx_node(r, RX_ALT, n, __rx_concat(r), 0)
+    let first = __rx_concat(r)
+    if __rx_peek(r) != '|' || r.err != "" {
+        return first
     }
-    return n
+    var parts = [first]
+    while __rx_peek(r) == '|' && r.err == "" {
+        r.p += 1
+        parts.push(__rx_concat(r))
+    }
+    return __rx_list(r, RX_ALT, parts)
 }
 
 // ---- Программа ----
+
+// Сколько инструкций даст узел n (не больше RX_SIZE_CAP). Та же формула —
+// в src/rx.kh: проверка «pattern is too large» при компиляции.
+fn __rx_size(r: __Rx, n: int) -> int {
+    let k = r.kind[n]
+    if k == RX_EMPTY {
+        return 0
+    }
+    if k == RX_CAT || k == RX_ALT {
+        var s = 0
+        for i in 0..r.b[n] {
+            s += __rx_size(r, r.kids[r.a[n] + i])
+            if k == RX_ALT && i > 0 {
+                s += 2
+            }
+            if s > RX_SIZE_CAP {
+                return RX_SIZE_CAP
+            }
+        }
+        return s
+    }
+    if k == RX_REP {
+        let a = __rx_size(r, r.a[n])
+        let lo = r.b[n]
+        let hi = r.c[n]
+        var s = lo * a
+        if hi < 0 {
+            s += a + 2
+        } else {
+            s += (hi - lo) * (a + 1)
+        }
+        if s > RX_SIZE_CAP {
+            return RX_SIZE_CAP
+        }
+        return s
+    }
+    return 1
+}
 
 fn __rx_emit(r: __Rx, op: int, x: int, y: int) -> int {
     r.op.push(op)
@@ -304,22 +654,34 @@ fn __rx_emit(r: __Rx, op: int, x: int, y: int) -> int {
 fn __rx_gen(r: __Rx, n: int) {
     let k = r.kind[n]
     if k == RX_LIT {
-        __rx_emit(r, RI_BYTE, r.a[n], 0)
+        __rx_emit(r, RI_CHAR, r.a[n], 0)
     } else if k == RX_ANY {
         __rx_emit(r, RI_ANY, 0, 0)
     } else if k == RX_CLASS {
         __rx_emit(r, RI_CLASS, r.a[n], 0)
+    } else if k == RX_BOL {
+        __rx_emit(r, RI_BOL, 0, 0)
+    } else if k == RX_EOL {
+        __rx_emit(r, RI_EOL, 0, 0)
     } else if k == RX_CAT {
-        __rx_gen(r, r.a[n])
-        __rx_gen(r, r.b[n])
+        for i in 0..r.b[n] {
+            __rx_gen(r, r.kids[r.a[n] + i])
+        }
     } else if k == RX_ALT {
-        let split = __rx_emit(r, RI_SPLIT, 0, 0)
-        r.x[split] = r.op.len()
-        __rx_gen(r, r.a[n])
-        let jmp = __rx_emit(r, RI_JMP, 0, 0)
-        r.y[split] = r.op.len()
-        __rx_gen(r, r.b[n])
-        r.x[jmp] = r.op.len()
+        // split L1, L2; L1: ветвь 1; jmp конец; L2: split ...; последняя ветвь
+        var jmps: [int] = []
+        let last = r.b[n] - 1
+        for i in 0..last {
+            let split = __rx_emit(r, RI_SPLIT, 0, 0)
+            r.x[split] = r.op.len()
+            __rx_gen(r, r.kids[r.a[n] + i])
+            jmps.push(__rx_emit(r, RI_JMP, 0, 0))
+            r.y[split] = r.op.len()
+        }
+        __rx_gen(r, r.kids[r.a[n] + last])
+        for j in jmps {
+            r.x[j] = r.op.len()
+        }
     } else if k == RX_REP {
         let lo = r.b[n]
         let hi = r.c[n]
@@ -347,90 +709,286 @@ fn __rx_gen(r: __Rx, n: int) {
     }
 }
 
+// Разбор шаблона и программа; ошибка — в r.err (позиция — r.at).
 fn __rx_compile(pattern: str) -> __Rx {
-    var pat = pattern
-    // ^ и $ по краям ничего не меняют: совпадение всегда целиком
-    if pat.starts_with("^") {
-        pat = pat.byte_slice(1, pat.byte_len())
+    let r = __Rx { cps: [], p: 0, err: "", at: 0, depth: 0, kind: [], a: [], b: [], c: [], kids: [], cmask: [], cflags: [], cfirst: [], ccount: [], ranges: [], pend: [], op: [], x: [], y: [] }
+    let p = __str_ptr(pattern)
+    let n = __str_len(pattern)
+    var i = 0
+    while i < n {
+        let w = __utf8_width(p, n, i)
+        if w == 1 && load8(p + i) >= 0x80 {
+            __rx_fail(r, "pattern is not valid UTF-8", r.cps.len())
+            return r
+        }
+        r.cps.push(__utf8_decode(p, n, i))
+        i += w
     }
-    if pat.ends_with("$") && !pat.ends_with("\\$") {
-        pat = pat.byte_slice(0, pat.byte_len() - 1)
-    }
-    let r = __Rx { pat, p: 0, err: "", kind: [], a: [], b: [], c: [], classes: [], nclasses: 0, op: [], x: [], y: [] }
     let root = __rx_alt(r)
-    if r.p < pat.byte_len() && r.err == "" {
-        __rx_fail(r, "unexpected )")
+    if r.err == "" && r.p < r.cps.len() {
+        __rx_fail(r, "unexpected )", r.p)
     }
-    if r.op.len() > 100000 {
-        __rx_fail(r, "pattern is too large")
+    if r.err == "" && __rx_size(r, root) >= RX_MAX_PROG {
+        __rx_fail(r, "pattern is too large", 0)
+    }
+    if r.err != "" {
+        return r
     }
     __rx_gen(r, root)
     __rx_emit(r, RI_MATCH, 0, 0)
     return r
 }
 
-// Добавить состояние pc и всё, что достижимо из него без чтения байта.
-fn __rx_add(r: __Rx, list: [int], mark: [int], gen: int, pc: int) {
-    if mark[pc] == gen {
-        return
-    }
-    mark[pc] = gen
-    let op = r.op[pc]
-    if op == RI_JMP {
-        __rx_add(r, list, mark, gen, r.x[pc])
-    } else if op == RI_SPLIT {
-        __rx_add(r, list, mark, gen, r.x[pc])
-        __rx_add(r, list, mark, gen, r.y[pc])
+// ---- Готовая программа ----
+// Один блок памяти: [0] — число инструкций n; с байта 16 — по 16 байт на
+// инструкцию: op | (x << 8), y; за ними — классы: маска ASCII (2 слова), флаги,
+// число диапазонов, пары lo, hi. У RI_CLASS x — адрес класса. В блок попадает
+// только то, что нужно для исполнения; perm — блок в постоянной памяти (для
+// места вызова с литералом), иначе — в текущей (арена запроса).
+
+fn __rx_freeze(r: __Rx, perm: bool) -> int {
+    let n = r.op.len()
+    let size = 16 + 16 * n + 32 * r.cflags.len() + 8 * r.ranges.len()
+    var blk = 0
+    if perm {
+        blk = __perm_alloc(size)
     } else {
-        list.push(pc)
+        blk = __alloc(size)
     }
+    store64(blk, n)
+    var addrs: [int] = []
+    var q = blk + 16 + 16 * n
+    for k in 0..r.cflags.len() {
+        addrs.push(q)
+        store64(q, r.cmask[2 * k])
+        store64(q + 8, r.cmask[2 * k + 1])
+        store64(q + 16, r.cflags[k])
+        store64(q + 24, r.ccount[k])
+        q += 32
+        let first = 2 * r.cfirst[k]
+        for j in 0..2 * r.ccount[k] {
+            store64(q, r.ranges[first + j])
+            q += 8
+        }
+    }
+    for pc in 0..n {
+        var x = r.x[pc]
+        if r.op[pc] == RI_CLASS {
+            x = addrs[x]
+        }
+        store64(blk + 16 + 16 * pc, r.op[pc] | (x << 8))
+        store64(blk + 24 + 16 * pc, r.y[pc])
+    }
+    return blk
 }
 
-fn __rx_run(r: __Rx, s: str) -> bool {
-    let n = r.op.len()
-    var mark = [0] * n
-    var cur: [int] = []
-    var next: [int] = []
-    var gen = 1
-    __rx_add(r, cur, mark, gen, 0)
-    for i in 0..s.byte_len() {
-        let c = s.byte(i)
-        gen += 1
-        next.clear()
-        for pc in cur {
-            let op = r.op[pc]
+// Символ c — в классе по адресу k?
+fn __rx_in_class(k: int, c: int) -> bool {
+    if c < 128 {
+        return ((load64(k + 8 * (c >> 6)) >> (c & 63)) & 1) != 0
+    }
+    let fl = load64(k + 16)
+    var hit = false
+    // двоичный поиск по диапазонам
+    var lo = 0
+    var hi = load64(k + 24)
+    while lo < hi {
+        let mid = (lo + hi) >> 1
+        let a = k + 32 + 16 * mid
+        if c > load64(a + 8) {
+            lo = mid + 1
+        } else if c < load64(a) {
+            hi = mid
+        } else {
+            hit = true
+            break
+        }
+    }
+    if !hit && (fl & (RC_W | RC_NW)) != 0 {
+        let word = __cp_is_word(c)
+        hit = ((fl & RC_W) != 0 && word) || ((fl & RC_NW) != 0 && !word)
+    }
+    return hit != ((fl & RC_NEG) != 0)
+}
+
+// Добавить в список list (в нём cnt состояний) состояние pc и всё, что
+// достижимо из него без чтения символа → новая длина списка. В st: [0] —
+// номер шага, [8] — флаги RX_AT_*, с 16 — отметки (номер шага, на котором
+// состояние уже добавлено) и стек обхода, по слову на инструкцию.
+fn __rx_add(code: int, st: int, list: int, cnt: int, pc: int) -> int {
+    let gen = load64(st)
+    let mark = st + 16
+    if load64(mark + 8 * pc) == gen {
+        return cnt
+    }
+    let at = load64(st + 8)
+    let stack = mark + 8 * load64(code - 16)
+    var k = cnt
+    store64(mark + 8 * pc, gen)
+    store64(stack, pc)
+    var sp = 1
+    while sp > 0 {
+        sp -= 1
+        let i = load64(stack + 8 * sp)
+        let w = load64(code + 16 * i)
+        let op = w & 255
+        var t1 = -1
+        var t2 = -1
+        if op == RI_JMP {
+            t1 = w >> 8
+        } else if op == RI_SPLIT {
+            t1 = w >> 8
+            t2 = load64(code + 16 * i + 8)
+        } else if op == RI_BOL {
+            if (at & RX_AT_START) != 0 {
+                t1 = i + 1
+            }
+        } else if op == RI_EOL {
+            if (at & RX_AT_END) != 0 {
+                t1 = i + 1
+            }
+        } else {
+            store64(list + 8 * k, i)
+            k += 1
+        }
+        if t2 >= 0 && load64(mark + 8 * t2) != gen {
+            store64(mark + 8 * t2, gen)
+            store64(stack + 8 * sp, t2)
+            sp += 1
+        }
+        if t1 >= 0 && load64(mark + 8 * t1) != gen {
+            store64(mark + 8 * t1, gen)
+            store64(stack + 8 * sp, t1)
+            sp += 1
+        }
+    }
+    return k
+}
+
+// Строка s целиком подходит под программу prog (__rx_freeze)? Состояние
+// исполнения — блок в текущей памяти; после него обнуляется и возвращается
+// (__alloc_trim), так что matches в цикле не растит арену запроса. Большой
+// блок вне арены __alloc берёт отдельным mmap — его возвращает munmap.
+fn __rx_exec(prog: int, s: str) -> bool {
+    let size = 16 + 32 * load64(prog)
+    let st = __alloc(size)
+    let bumped = load64(__ctx() + CTX_PTR) == st + ((size + 15) & ~15)
+    let ok = __rx_run(prog, st, s)
+    if bumped {
+        __memset(st, 0, size)
+        __alloc_trim(st, size, 0)
+    } else {
+        syscall(SYS_MUNMAP, st, size)
+    }
+    return ok
+}
+
+// Исполнение программы prog на строке s; st — обнулённый блок 16 + 32n байт:
+// номер шага, флаги, отметки, стек, два списка состояний.
+fn __rx_run(prog: int, st: int, s: str) -> bool {
+    let n = load64(prog)
+    let code = prog + 16
+    let p = __str_ptr(s)
+    let len = __str_len(s)
+    var cur = st + 16 + 16 * n
+    var next = cur + 8 * n
+    store64(st, 1)
+    if len == 0 {
+        store64(st + 8, RX_AT_START | RX_AT_END)
+    } else {
+        store64(st + 8, RX_AT_START)
+    }
+    var nc = __rx_add(code, st, cur, 0, 0)
+    var i = 0
+    while i < len {
+        if nc == 0 {
+            return false
+        }
+        // символ в байте i: ASCII — сам байт, иначе — декодирование по правилу Go
+        var c = load8(p + i)
+        var w = 1
+        if c >= 0x80 {
+            w = __utf8_width(p, len, i)
+            if w == 1 {
+                c = 0xFFFD
+            } else {
+                c = c & (0x7F >> w)
+                for j in 1..w {
+                    c = (c << 6) | (load8(p + i + j) & 0x3F)
+                }
+            }
+        }
+        i += w
+        store64(st, load64(st) + 1)
+        if i == len {
+            store64(st + 8, RX_AT_END)
+        } else {
+            store64(st + 8, 0)
+        }
+        var nn = 0
+        for t in 0..nc {
+            let pc = load64(cur + 8 * t)
+            let ins = load64(code + 16 * pc)
+            let op = ins & 255
             var ok = false
-            if op == RI_BYTE {
-                ok = r.x[pc] == c
+            if op == RI_CHAR {
+                ok = (ins >> 8) == c
             } else if op == RI_ANY {
                 ok = true
             } else if op == RI_CLASS {
-                ok = load8(r.classes[r.x[pc]] + c) == 1
+                ok = __rx_in_class(ins >> 8, c)
             }
             if ok {
-                __rx_add(r, next, mark, gen, pc + 1)
+                nn = __rx_add(code, st, next, nn, pc + 1)
             }
         }
         let t = cur
         cur = next
         next = t
-        if cur.len() == 0 {
-            return false
-        }
+        nc = nn
     }
-    for pc in cur {
-        if r.op[pc] == RI_MATCH {
+    for t in 0..nc {
+        if (load64(code + 16 * load64(cur + 8 * t)) & 255) == RI_MATCH {
             return true
         }
     }
     return false
 }
 
-// Строка целиком подходит под шаблон. Неверный шаблон — паника с объяснением.
-fn __str_matches(self: str, pattern: str) -> bool {
+// ---- s.matches ----
+
+// Программа шаблона; неверный шаблон — паника с объяснением.
+fn __rx_program(pattern: str, perm: bool) -> int {
     let r = __rx_compile(pattern)
     if r.err != "" {
-        __panic_msg("invalid pattern \"" + pattern + "\": " + r.err)
+        __panic_msg("invalid pattern \"" + pattern + "\": " + r.err + " at position " + r.at.to_str())
     }
-    return __rx_run(r, self)
+    return __rx_freeze(r, perm)
+}
+
+// s.matches(p), где p — не литерал и не const: разбор при каждом вызове.
+fn __text_matches(self: str, pattern: str) -> bool {
+    return __rx_exec(__rx_program(pattern, false), self)
+}
+
+// s.matches(литерал или const): у места вызова — свой слот slot (8 байт в
+// DATA, сначала 0). Первый вызов разбирает шаблон в текущей памяти (арена:
+// паника здесь — обычная 500), копирует программу в постоянную память и
+// публикует её в слоте; дальше каждый вызов сразу исполняет её. Несколько
+// потоков могут разобрать шаблон одновременно: в слоте остаётся первая
+// программа, остальные копии (такие же) просто не используются.
+fn __text_matches_at(self: str, pattern: str, slot: int) -> bool {
+    var prog = load64(slot)
+    if prog == 0 {
+        prog = __rx_site(pattern, slot)
+    }
+    return __rx_exec(prog, self)
+}
+
+fn __rx_site(pattern: str, slot: int) -> int {
+    let prog = __rx_program(pattern, true)
+    if __cas(slot, 0, prog) {
+        return prog
+    }
+    return load64(slot)
 }

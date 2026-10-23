@@ -1,0 +1,1598 @@
+// Создано tools/regex_go.go — не править руками: поменяйте генератор и
+// запустите go run tools/regex_go.go. Сверка с Go regexp: каждый шаблон — на
+// общем наборе строк и своих строках; строка вывода — номер шаблона и биты
+// совпадений (1 — строка целиком подходит). regex_go.out посчитал Go.
+// Литерал в s.matches — программа в слоте места вызова; ответы сверяются с
+// программой, разобранной в арене (__rx_program), и с s.matches(переменная).
+
+fn unhex(h: str) -> str {
+    let b = buf_new(h.byte_len() / 2 + 1)
+    var i = 0
+    while i + 1 < h.byte_len() {
+        buf_byte(b, hexd(h.byte(i)) * 16 + hexd(h.byte(i + 1)))
+        i += 2
+    }
+    return buf_str(b)
+}
+
+fn hexd(c: int) -> int {
+    if c >= 'a' {
+        return c - 'a' + 10
+    }
+    return c - '0'
+}
+
+fn cat(a: [str], b: [str]) -> [str] {
+    var r: [str] = []
+    for s in a {
+        r.push(s)
+    }
+    for s in b {
+        r.push(s)
+    }
+    return r
+}
+
+fn bit(v: bool) -> str {
+    if v {
+        return "1"
+    }
+    return "0"
+}
+
+// Ответы литерала got сверяются с программой в арене и с s.matches(pat).
+fn report(i: int, pat: str, ins: [str], got: str) {
+    let prog = __rx_program(pat, false)
+    var arena = ""
+    var dyn = ""
+    for s in ins {
+        arena += bit(__rx_exec(prog, s))
+        dyn += bit(s.matches(pat))
+    }
+    if arena != got || dyn != got {
+        print("{i} {got} literal/arena/dynamic differ: {arena} {dyn}")
+        return
+    }
+    print("{i} {got}")
+}
+
+fn main() {
+    let pool = ["", "a", "b", "c", "x", "aa", "ab", "ba", "abc", "aaa", "aab", "abb", "abab", "xy", "xyz", "A", "Z", "z", "Ab", "Ab Cd", "0", "1", "9", "12", "123", "1234", "a1", "_", "-", ".", "@", "x@y.z", "ann@x.io", "a b", " ", "  ", unhex("09"), unhex("0a"), unhex("0d0a"), unhex("0b"), unhex("0c"), unhex("7b"), unhex("7d"), "[", "]", "(", ")", "|", "^", "$", "*", "+", "?", unhex("5c"), "/", "#a0B1c2", "dogs", "cat", "2024-01-15", "aaaaaaaaaaaaaaaaaaaaaaaaab", "я", "Я", "яя", "ян", "ё", "Ё", "привет", "Иван_1", "Анна-Мария", "é", unhex("65cc81"), "日本語", "😀", "😀😀", "😂", "١٢", "Ⅻ", " ", " ", "　", unhex("e2808b"), unhex("efbbbf"), unhex("c285"), unhex("e280a8"), unhex("00"), unhex("1f"), unhex("7f"), unhex("ff"), unhex("d0"), unhex("e282"), unhex("61ff62"), unhex("eda080"), unhex("f4908080"), unhex("c0af"), "�", "􏿿", "Ѐ", "ӿ"]
+    // 0
+    let in0 = pool
+    var m0 = ""
+    for s in in0 {
+        m0 += bit(s.matches(``))
+    }
+    report(0, ``, in0, m0)
+    // 1
+    let in1 = pool
+    var m1 = ""
+    for s in in1 {
+        m1 += bit(s.matches(`a`))
+    }
+    report(1, `a`, in1, m1)
+    // 2
+    let in2 = pool
+    var m2 = ""
+    for s in in2 {
+        m2 += bit(s.matches(`abc`))
+    }
+    report(2, `abc`, in2, m2)
+    // 3
+    let in3 = pool
+    var m3 = ""
+    for s in in3 {
+        m3 += bit(s.matches(`a|b`))
+    }
+    report(3, `a|b`, in3, m3)
+    // 4
+    let in4 = pool
+    var m4 = ""
+    for s in in4 {
+        m4 += bit(s.matches(`a|`))
+    }
+    report(4, `a|`, in4, m4)
+    // 5
+    let in5 = pool
+    var m5 = ""
+    for s in in5 {
+        m5 += bit(s.matches(`|a`))
+    }
+    report(5, `|a`, in5, m5)
+    // 6
+    let in6 = pool
+    var m6 = ""
+    for s in in6 {
+        m6 += bit(s.matches(`|`))
+    }
+    report(6, `|`, in6, m6)
+    // 7
+    let in7 = pool
+    var m7 = ""
+    for s in in7 {
+        m7 += bit(s.matches(`a|b|c|d`))
+    }
+    report(7, `a|b|c|d`, in7, m7)
+    // 8
+    let in8 = pool
+    var m8 = ""
+    for s in in8 {
+        m8 += bit(s.matches(`()`))
+    }
+    report(8, `()`, in8, m8)
+    // 9
+    let in9 = pool
+    var m9 = ""
+    for s in in9 {
+        m9 += bit(s.matches(`(a)`))
+    }
+    report(9, `(a)`, in9, m9)
+    // 10
+    let in10 = pool
+    var m10 = ""
+    for s in in10 {
+        m10 += bit(s.matches(`(?:a)`))
+    }
+    report(10, `(?:a)`, in10, m10)
+    // 11
+    let in11 = pool
+    var m11 = ""
+    for s in in11 {
+        m11 += bit(s.matches(`(?:)`))
+    }
+    report(11, `(?:)`, in11, m11)
+    // 12
+    let in12 = pool
+    var m12 = ""
+    for s in in12 {
+        m12 += bit(s.matches(`(a|b)c`))
+    }
+    report(12, `(a|b)c`, in12, m12)
+    // 13
+    let in13 = pool
+    var m13 = ""
+    for s in in13 {
+        m13 += bit(s.matches(`(a|b|)`))
+    }
+    report(13, `(a|b|)`, in13, m13)
+    // 14
+    let in14 = pool
+    var m14 = ""
+    for s in in14 {
+        m14 += bit(s.matches(`((a))`))
+    }
+    report(14, `((a))`, in14, m14)
+    // 15
+    let in15 = pool
+    var m15 = ""
+    for s in in15 {
+        m15 += bit(s.matches(`(?:(?:a))`))
+    }
+    report(15, `(?:(?:a))`, in15, m15)
+    // 16
+    let in16 = pool
+    var m16 = ""
+    for s in in16 {
+        m16 += bit(s.matches(`(((a|b)*c)+d)?`))
+    }
+    report(16, `(((a|b)*c)+d)?`, in16, m16)
+    // 17
+    let in17 = pool
+    var m17 = ""
+    for s in in17 {
+        m17 += bit(s.matches(`a*`))
+    }
+    report(17, `a*`, in17, m17)
+    // 18
+    let in18 = pool
+    var m18 = ""
+    for s in in18 {
+        m18 += bit(s.matches(`a+`))
+    }
+    report(18, `a+`, in18, m18)
+    // 19
+    let in19 = pool
+    var m19 = ""
+    for s in in19 {
+        m19 += bit(s.matches(`a?`))
+    }
+    report(19, `a?`, in19, m19)
+    // 20
+    let in20 = pool
+    var m20 = ""
+    for s in in20 {
+        m20 += bit(s.matches(`a{2}`))
+    }
+    report(20, `a{2}`, in20, m20)
+    // 21
+    let in21 = pool
+    var m21 = ""
+    for s in in21 {
+        m21 += bit(s.matches(`a{2,}`))
+    }
+    report(21, `a{2,}`, in21, m21)
+    // 22
+    let in22 = pool
+    var m22 = ""
+    for s in in22 {
+        m22 += bit(s.matches(`a{2,5}`))
+    }
+    report(22, `a{2,5}`, in22, m22)
+    // 23
+    let in23 = pool
+    var m23 = ""
+    for s in in23 {
+        m23 += bit(s.matches(`a{0}`))
+    }
+    report(23, `a{0}`, in23, m23)
+    // 24
+    let in24 = pool
+    var m24 = ""
+    for s in in24 {
+        m24 += bit(s.matches(`a{0,0}`))
+    }
+    report(24, `a{0,0}`, in24, m24)
+    // 25
+    let in25 = pool
+    var m25 = ""
+    for s in in25 {
+        m25 += bit(s.matches(`a{0,1000}`))
+    }
+    report(25, `a{0,1000}`, in25, m25)
+    // 26
+    let in26 = pool
+    var m26 = ""
+    for s in in26 {
+        m26 += bit(s.matches(`a{10}`))
+    }
+    report(26, `a{10}`, in26, m26)
+    // 27
+    let in27 = pool
+    var m27 = ""
+    for s in in27 {
+        m27 += bit(s.matches(`a{10,100}`))
+    }
+    report(27, `a{10,100}`, in27, m27)
+    // 28
+    let in28 = pool
+    var m28 = ""
+    for s in in28 {
+        m28 += bit(s.matches(`a*?`))
+    }
+    report(28, `a*?`, in28, m28)
+    // 29
+    let in29 = pool
+    var m29 = ""
+    for s in in29 {
+        m29 += bit(s.matches(`a+?`))
+    }
+    report(29, `a+?`, in29, m29)
+    // 30
+    let in30 = pool
+    var m30 = ""
+    for s in in30 {
+        m30 += bit(s.matches(`a??`))
+    }
+    report(30, `a??`, in30, m30)
+    // 31
+    let in31 = pool
+    var m31 = ""
+    for s in in31 {
+        m31 += bit(s.matches(`a{2}?`))
+    }
+    report(31, `a{2}?`, in31, m31)
+    // 32
+    let in32 = pool
+    var m32 = ""
+    for s in in32 {
+        m32 += bit(s.matches(`a{2,}?`))
+    }
+    report(32, `a{2,}?`, in32, m32)
+    // 33
+    let in33 = pool
+    var m33 = ""
+    for s in in33 {
+        m33 += bit(s.matches(`a{2,5}?`))
+    }
+    report(33, `a{2,5}?`, in33, m33)
+    // 34
+    let in34 = pool
+    var m34 = ""
+    for s in in34 {
+        m34 += bit(s.matches(`.`))
+    }
+    report(34, `.`, in34, m34)
+    // 35
+    let in35 = pool
+    var m35 = ""
+    for s in in35 {
+        m35 += bit(s.matches(`.*`))
+    }
+    report(35, `.*`, in35, m35)
+    // 36
+    let in36 = pool
+    var m36 = ""
+    for s in in36 {
+        m36 += bit(s.matches(`.+`))
+    }
+    report(36, `.+`, in36, m36)
+    // 37
+    let in37 = pool
+    var m37 = ""
+    for s in in37 {
+        m37 += bit(s.matches(`.{2}`))
+    }
+    report(37, `.{2}`, in37, m37)
+    // 38
+    let in38 = pool
+    var m38 = ""
+    for s in in38 {
+        m38 += bit(s.matches(`^`))
+    }
+    report(38, `^`, in38, m38)
+    // 39
+    let in39 = pool
+    var m39 = ""
+    for s in in39 {
+        m39 += bit(s.matches(`$`))
+    }
+    report(39, `$`, in39, m39)
+    // 40
+    let in40 = pool
+    var m40 = ""
+    for s in in40 {
+        m40 += bit(s.matches(`^$`))
+    }
+    report(40, `^$`, in40, m40)
+    // 41
+    let in41 = pool
+    var m41 = ""
+    for s in in41 {
+        m41 += bit(s.matches(`^a$`))
+    }
+    report(41, `^a$`, in41, m41)
+    // 42
+    let in42 = pool
+    var m42 = ""
+    for s in in42 {
+        m42 += bit(s.matches(`a^`))
+    }
+    report(42, `a^`, in42, m42)
+    // 43
+    let in43 = pool
+    var m43 = ""
+    for s in in43 {
+        m43 += bit(s.matches(`$a`))
+    }
+    report(43, `$a`, in43, m43)
+    // 44
+    let in44 = pool
+    var m44 = ""
+    for s in in44 {
+        m44 += bit(s.matches(`^*`))
+    }
+    report(44, `^*`, in44, m44)
+    // 45
+    let in45 = pool
+    var m45 = ""
+    for s in in45 {
+        m45 += bit(s.matches(`^+`))
+    }
+    report(45, `^+`, in45, m45)
+    // 46
+    let in46 = pool
+    var m46 = ""
+    for s in in46 {
+        m46 += bit(s.matches(`$*`))
+    }
+    report(46, `$*`, in46, m46)
+    // 47
+    let in47 = pool
+    var m47 = ""
+    for s in in47 {
+        m47 += bit(s.matches(`(^a|b$)`))
+    }
+    report(47, `(^a|b$)`, in47, m47)
+    // 48
+    let in48 = pool
+    var m48 = ""
+    for s in in48 {
+        m48 += bit(s.matches(`[a]`))
+    }
+    report(48, `[a]`, in48, m48)
+    // 49
+    let in49 = pool
+    var m49 = ""
+    for s in in49 {
+        m49 += bit(s.matches(`[abc]`))
+    }
+    report(49, `[abc]`, in49, m49)
+    // 50
+    let in50 = pool
+    var m50 = ""
+    for s in in50 {
+        m50 += bit(s.matches(`[a-z]`))
+    }
+    report(50, `[a-z]`, in50, m50)
+    // 51
+    let in51 = pool
+    var m51 = ""
+    for s in in51 {
+        m51 += bit(s.matches(`[^a]`))
+    }
+    report(51, `[^a]`, in51, m51)
+    // 52
+    let in52 = pool
+    var m52 = ""
+    for s in in52 {
+        m52 += bit(s.matches(`[]a]`))
+    }
+    report(52, `[]a]`, in52, m52)
+    // 53
+    let in53 = pool
+    var m53 = ""
+    for s in in53 {
+        m53 += bit(s.matches(`[^]a]`))
+    }
+    report(53, `[^]a]`, in53, m53)
+    // 54
+    let in54 = pool
+    var m54 = ""
+    for s in in54 {
+        m54 += bit(s.matches(`[a-]`))
+    }
+    report(54, `[a-]`, in54, m54)
+    // 55
+    let in55 = pool
+    var m55 = ""
+    for s in in55 {
+        m55 += bit(s.matches(`[-a]`))
+    }
+    report(55, `[-a]`, in55, m55)
+    // 56
+    let in56 = pool
+    var m56 = ""
+    for s in in56 {
+        m56 += bit(s.matches(`[a-a]`))
+    }
+    report(56, `[a-a]`, in56, m56)
+    // 57
+    let in57 = pool
+    var m57 = ""
+    for s in in57 {
+        m57 += bit(s.matches(`[\]]`))
+    }
+    report(57, `[\]]`, in57, m57)
+    // 58
+    let in58 = pool
+    var m58 = ""
+    for s in in58 {
+        m58 += bit(s.matches(`[\-]`))
+    }
+    report(58, `[\-]`, in58, m58)
+    // 59
+    let in59 = pool
+    var m59 = ""
+    for s in in59 {
+        m59 += bit(s.matches(`[\\]`))
+    }
+    report(59, `[\\]`, in59, m59)
+    // 60
+    let in60 = pool
+    var m60 = ""
+    for s in in60 {
+        m60 += bit(s.matches(`[\^]`))
+    }
+    report(60, `[\^]`, in60, m60)
+    // 61
+    let in61 = pool
+    var m61 = ""
+    for s in in61 {
+        m61 += bit(s.matches(`[^^]`))
+    }
+    report(61, `[^^]`, in61, m61)
+    // 62
+    let in62 = pool
+    var m62 = ""
+    for s in in62 {
+        m62 += bit(s.matches(`[\d]`))
+    }
+    report(62, `[\d]`, in62, m62)
+    // 63
+    let in63 = pool
+    var m63 = ""
+    for s in in63 {
+        m63 += bit(s.matches(`[\D]`))
+    }
+    report(63, `[\D]`, in63, m63)
+    // 64
+    let in64 = pool
+    var m64 = ""
+    for s in in64 {
+        m64 += bit(s.matches(`[\w-]`))
+    }
+    report(64, `[\w-]`, in64, m64)
+    // 65
+    let in65 = pool
+    var m65 = ""
+    for s in in65 {
+        m65 += bit(s.matches(`[\s\S]`))
+    }
+    report(65, `[\s\S]`, in65, m65)
+    // 66
+    let in66 = pool
+    var m66 = ""
+    for s in in66 {
+        m66 += bit(s.matches(`[\d-z]`))
+    }
+    report(66, `[\d-z]`, in66, m66)
+    // 67
+    let in67 = pool
+    var m67 = ""
+    for s in in67 {
+        m67 += bit(s.matches(`[\d-\w]`))
+    }
+    report(67, `[\d-\w]`, in67, m67)
+    // 68
+    let in68 = pool
+    var m68 = ""
+    for s in in68 {
+        m68 += bit(s.matches(`[\d-]`))
+    }
+    report(68, `[\d-]`, in68, m68)
+    // 69
+    let in69 = pool
+    var m69 = ""
+    for s in in69 {
+        m69 += bit(s.matches(`[a\-z]`))
+    }
+    report(69, `[a\-z]`, in69, m69)
+    // 70
+    let in70 = pool
+    var m70 = ""
+    for s in in70 {
+        m70 += bit(s.matches(`[.]`))
+    }
+    report(70, `[.]`, in70, m70)
+    // 71
+    let in71 = pool
+    var m71 = ""
+    for s in in71 {
+        m71 += bit(s.matches(`[*+?]`))
+    }
+    report(71, `[*+?]`, in71, m71)
+    // 72
+    let in72 = pool
+    var m72 = ""
+    for s in in72 {
+        m72 += bit(s.matches(`[(]`))
+    }
+    report(72, `[(]`, in72, m72)
+    // 73
+    let in73 = pool
+    var m73 = ""
+    for s in in73 {
+        m73 += bit(s.matches(`[)]`))
+    }
+    report(73, `[)]`, in73, m73)
+    // 74
+    let in74 = pool
+    var m74 = ""
+    for s in in74 {
+        m74 += bit(s.matches(`[|]`))
+    }
+    report(74, `[|]`, in74, m74)
+    // 75
+    let in75 = pool
+    var m75 = ""
+    for s in in75 {
+        m75 += bit(s.matches(`[{}]`))
+    }
+    report(75, `[{}]`, in75, m75)
+    // 76
+    let in76 = pool
+    var m76 = ""
+    for s in in76 {
+        m76 += bit(s.matches(`[$^]`))
+    }
+    report(76, `[$^]`, in76, m76)
+    // 77
+    let in77 = pool
+    var m77 = ""
+    for s in in77 {
+        m77 += bit(s.matches(`[[]`))
+    }
+    report(77, `[[]`, in77, m77)
+    // 78
+    let in78 = pool
+    var m78 = ""
+    for s in in78 {
+        m78 += bit(s.matches(`[a[]`))
+    }
+    report(78, `[a[]`, in78, m78)
+    // 79
+    let in79 = pool
+    var m79 = ""
+    for s in in79 {
+        m79 += bit(s.matches(`[\[]`))
+    }
+    report(79, `[\[]`, in79, m79)
+    // 80
+    let in80 = pool
+    var m80 = ""
+    for s in in80 {
+        m80 += bit(s.matches(`[\n-\r]`))
+    }
+    report(80, `[\n-\r]`, in80, m80)
+    // 81
+    let in81 = pool
+    var m81 = ""
+    for s in in81 {
+        m81 += bit(s.matches(`[\x41-\x5A]`))
+    }
+    report(81, `[\x41-\x5A]`, in81, m81)
+    // 82
+    let in82 = pool
+    var m82 = ""
+    for s in in82 {
+        m82 += bit(s.matches(`[а-я]`))
+    }
+    report(82, `[а-я]`, in82, m82)
+    // 83
+    let in83 = pool
+    var m83 = ""
+    for s in in83 {
+        m83 += bit(s.matches(`[ёЁ]`))
+    }
+    report(83, `[ёЁ]`, in83, m83)
+    // 84
+    let in84 = pool
+    var m84 = ""
+    for s in in84 {
+        m84 += bit(s.matches(`[^а-яё]`))
+    }
+    report(84, `[^а-яё]`, in84, m84)
+    // 85
+    let in85 = pool
+    var m85 = ""
+    for s in in85 {
+        m85 += bit(s.matches(`[а-яА-ЯёЁ\-\s]`))
+    }
+    report(85, `[а-яА-ЯёЁ\-\s]`, in85, m85)
+    // 86
+    let in86 = pool
+    var m86 = ""
+    for s in in86 {
+        m86 += bit(s.matches(`[😀-😂]`))
+    }
+    report(86, `[😀-😂]`, in86, m86)
+    // 87
+    let in87 = pool
+    var m87 = ""
+    for s in in87 {
+        m87 += bit(s.matches(`[\x00-\x1F]`))
+    }
+    report(87, `[\x00-\x1F]`, in87, m87)
+    // 88
+    let in88 = pool
+    var m88 = ""
+    for s in in88 {
+        m88 += bit(s.matches(`[^\x00-\x{10FFFF}]`))
+    }
+    report(88, `[^\x00-\x{10FFFF}]`, in88, m88)
+    // 89
+    let in89 = pool
+    var m89 = ""
+    for s in in89 {
+        m89 += bit(s.matches(`\.`))
+    }
+    report(89, `\.`, in89, m89)
+    // 90
+    let in90 = pool
+    var m90 = ""
+    for s in in90 {
+        m90 += bit(s.matches(`\\`))
+    }
+    report(90, `\\`, in90, m90)
+    // 91
+    let in91 = pool
+    var m91 = ""
+    for s in in91 {
+        m91 += bit(s.matches(`\*`))
+    }
+    report(91, `\*`, in91, m91)
+    // 92
+    let in92 = pool
+    var m92 = ""
+    for s in in92 {
+        m92 += bit(s.matches(`\+`))
+    }
+    report(92, `\+`, in92, m92)
+    // 93
+    let in93 = pool
+    var m93 = ""
+    for s in in93 {
+        m93 += bit(s.matches(`\?`))
+    }
+    report(93, `\?`, in93, m93)
+    // 94
+    let in94 = pool
+    var m94 = ""
+    for s in in94 {
+        m94 += bit(s.matches(`\(`))
+    }
+    report(94, `\(`, in94, m94)
+    // 95
+    let in95 = pool
+    var m95 = ""
+    for s in in95 {
+        m95 += bit(s.matches(`\)`))
+    }
+    report(95, `\)`, in95, m95)
+    // 96
+    let in96 = pool
+    var m96 = ""
+    for s in in96 {
+        m96 += bit(s.matches(`\[`))
+    }
+    report(96, `\[`, in96, m96)
+    // 97
+    let in97 = pool
+    var m97 = ""
+    for s in in97 {
+        m97 += bit(s.matches(`\]`))
+    }
+    report(97, `\]`, in97, m97)
+    // 98
+    let in98 = pool
+    var m98 = ""
+    for s in in98 {
+        m98 += bit(s.matches(`\{`))
+    }
+    report(98, `\{`, in98, m98)
+    // 99
+    let in99 = pool
+    var m99 = ""
+    for s in in99 {
+        m99 += bit(s.matches(`\}`))
+    }
+    report(99, `\}`, in99, m99)
+    // 100
+    let in100 = pool
+    var m100 = ""
+    for s in in100 {
+        m100 += bit(s.matches(`\|`))
+    }
+    report(100, `\|`, in100, m100)
+    // 101
+    let in101 = pool
+    var m101 = ""
+    for s in in101 {
+        m101 += bit(s.matches(`\^`))
+    }
+    report(101, `\^`, in101, m101)
+    // 102
+    let in102 = pool
+    var m102 = ""
+    for s in in102 {
+        m102 += bit(s.matches(`\$`))
+    }
+    report(102, `\$`, in102, m102)
+    // 103
+    let in103 = pool
+    var m103 = ""
+    for s in in103 {
+        m103 += bit(s.matches(`\-`))
+    }
+    report(103, `\-`, in103, m103)
+    // 104
+    let in104 = pool
+    var m104 = ""
+    for s in in104 {
+        m104 += bit(s.matches(`\/`))
+    }
+    report(104, `\/`, in104, m104)
+    // 105
+    let in105 = pool
+    var m105 = ""
+    for s in in105 {
+        m105 += bit(s.matches(`\_`))
+    }
+    report(105, `\_`, in105, m105)
+    // 106
+    let in106 = pool
+    var m106 = ""
+    for s in in106 {
+        m106 += bit(s.matches(`\ `))
+    }
+    report(106, `\ `, in106, m106)
+    // 107
+    let in107 = pool
+    var m107 = ""
+    for s in in107 {
+        m107 += bit(s.matches(`\@`))
+    }
+    report(107, `\@`, in107, m107)
+    // 108
+    let in108 = pool
+    var m108 = ""
+    for s in in108 {
+        m108 += bit(s.matches(`\#`))
+    }
+    report(108, `\#`, in108, m108)
+    // 109
+    let in109 = pool
+    var m109 = ""
+    for s in in109 {
+        m109 += bit(s.matches(`\~`))
+    }
+    report(109, `\~`, in109, m109)
+    // 110
+    let in110 = pool
+    var m110 = ""
+    for s in in110 {
+        m110 += bit(s.matches(`\"`))
+    }
+    report(110, `\"`, in110, m110)
+    // 111
+    let in111 = pool
+    var m111 = ""
+    for s in in111 {
+        m111 += bit(s.matches(`\'`))
+    }
+    report(111, `\'`, in111, m111)
+    // 112
+    let in112 = pool
+    var m112 = ""
+    for s in in112 {
+        m112 += bit(s.matches(`\<`))
+    }
+    report(112, `\<`, in112, m112)
+    // 113
+    let in113 = pool
+    var m113 = ""
+    for s in in113 {
+        m113 += bit(s.matches(`\>`))
+    }
+    report(113, `\>`, in113, m113)
+    // 114
+    let in114 = pool
+    var m114 = ""
+    for s in in114 {
+        m114 += bit(s.matches(`\=`))
+    }
+    report(114, `\=`, in114, m114)
+    // 115
+    let in115 = pool
+    var m115 = ""
+    for s in in115 {
+        m115 += bit(s.matches(`\!`))
+    }
+    report(115, `\!`, in115, m115)
+    // 116
+    let in116 = pool
+    var m116 = ""
+    for s in in116 {
+        m116 += bit(s.matches(`\:`))
+    }
+    report(116, `\:`, in116, m116)
+    // 117
+    let in117 = pool
+    var m117 = ""
+    for s in in117 {
+        m117 += bit(s.matches(`\,`))
+    }
+    report(117, `\,`, in117, m117)
+    // 118
+    let in118 = pool
+    var m118 = ""
+    for s in in118 {
+        m118 += bit(s.matches(`\&`))
+    }
+    report(118, `\&`, in118, m118)
+    // 119
+    let in119 = pool
+    var m119 = ""
+    for s in in119 {
+        m119 += bit(s.matches(`\%`))
+    }
+    report(119, `\%`, in119, m119)
+    // 120
+    let in120 = pool
+    var m120 = ""
+    for s in in120 {
+        m120 += bit(s.matches(`\;`))
+    }
+    report(120, `\;`, in120, m120)
+    // 121
+    let in121 = pool
+    var m121 = ""
+    for s in in121 {
+        m121 += bit(s.matches(`\n`))
+    }
+    report(121, `\n`, in121, m121)
+    // 122
+    let in122 = pool
+    var m122 = ""
+    for s in in122 {
+        m122 += bit(s.matches(`\t`))
+    }
+    report(122, `\t`, in122, m122)
+    // 123
+    let in123 = pool
+    var m123 = ""
+    for s in in123 {
+        m123 += bit(s.matches(`\r`))
+    }
+    report(123, `\r`, in123, m123)
+    // 124
+    let in124 = pool
+    var m124 = ""
+    for s in in124 {
+        m124 += bit(s.matches(`\f`))
+    }
+    report(124, `\f`, in124, m124)
+    // 125
+    let in125 = pool
+    var m125 = ""
+    for s in in125 {
+        m125 += bit(s.matches(`\v`))
+    }
+    report(125, `\v`, in125, m125)
+    // 126
+    let in126 = pool
+    var m126 = ""
+    for s in in126 {
+        m126 += bit(s.matches(`\x41`))
+    }
+    report(126, `\x41`, in126, m126)
+    // 127
+    let in127 = pool
+    var m127 = ""
+    for s in in127 {
+        m127 += bit(s.matches(`\x{41}`))
+    }
+    report(127, `\x{41}`, in127, m127)
+    // 128
+    let in128 = pool
+    var m128 = ""
+    for s in in128 {
+        m128 += bit(s.matches(`\x{1F600}`))
+    }
+    report(128, `\x{1F600}`, in128, m128)
+    // 129
+    let in129 = pool
+    var m129 = ""
+    for s in in129 {
+        m129 += bit(s.matches(`\x{10FFFF}`))
+    }
+    report(129, `\x{10FFFF}`, in129, m129)
+    // 130
+    let in130 = pool
+    var m130 = ""
+    for s in in130 {
+        m130 += bit(s.matches(`[\x{D7FF}-\x{E000}]`))
+    }
+    report(130, `[\x{D7FF}-\x{E000}]`, in130, m130)
+    // 131
+    let in131 = pool
+    var m131 = ""
+    for s in in131 {
+        m131 += bit(s.matches(`\x00`))
+    }
+    report(131, `\x00`, in131, m131)
+    // 132
+    let in132 = pool
+    var m132 = ""
+    for s in in132 {
+        m132 += bit(s.matches(`\xff`))
+    }
+    report(132, `\xff`, in132, m132)
+    // 133
+    let in133 = pool
+    var m133 = ""
+    for s in in133 {
+        m133 += bit(s.matches(`\xFF`))
+    }
+    report(133, `\xFF`, in133, m133)
+    // 134
+    let in134 = pool
+    var m134 = ""
+    for s in in134 {
+        m134 += bit(s.matches(`\d`))
+    }
+    report(134, `\d`, in134, m134)
+    // 135
+    let in135 = pool
+    var m135 = ""
+    for s in in135 {
+        m135 += bit(s.matches(`\D`))
+    }
+    report(135, `\D`, in135, m135)
+    // 136
+    let in136 = pool
+    var m136 = ""
+    for s in in136 {
+        m136 += bit(s.matches(`\w`))
+    }
+    report(136, `\w`, in136, m136)
+    // 137
+    let in137 = pool
+    var m137 = ""
+    for s in in137 {
+        m137 += bit(s.matches(`\W`))
+    }
+    report(137, `\W`, in137, m137)
+    // 138
+    let in138 = pool
+    var m138 = ""
+    for s in in138 {
+        m138 += bit(s.matches(`\s`))
+    }
+    report(138, `\s`, in138, m138)
+    // 139
+    let in139 = pool
+    var m139 = ""
+    for s in in139 {
+        m139 += bit(s.matches(`\S`))
+    }
+    report(139, `\S`, in139, m139)
+    // 140
+    let x140 = ["0123456789", "١٢", "０"]
+    let in140 = cat(pool, x140)
+    var m140 = ""
+    for s in in140 {
+        m140 += bit(s.matches(`\d+`))
+    }
+    report(140, `\d+`, in140, m140)
+    // 141
+    let in141 = pool
+    var m141 = ""
+    for s in in141 {
+        m141 += bit(s.matches(`\w{3,32}`))
+    }
+    report(141, `\w{3,32}`, in141, m141)
+    // 142
+    let in142 = pool
+    var m142 = ""
+    for s in in142 {
+        m142 += bit(s.matches(`я`))
+    }
+    report(142, `я`, in142, m142)
+    // 143
+    let in143 = pool
+    var m143 = ""
+    for s in in143 {
+        m143 += bit(s.matches(`я+`))
+    }
+    report(143, `я+`, in143, m143)
+    // 144
+    let in144 = pool
+    var m144 = ""
+    for s in in144 {
+        m144 += bit(s.matches(`привет`))
+    }
+    report(144, `привет`, in144, m144)
+    // 145
+    let in145 = pool
+    var m145 = ""
+    for s in in145 {
+        m145 += bit(s.matches(`😀`))
+    }
+    report(145, `😀`, in145, m145)
+    // 146
+    let in146 = pool
+    var m146 = ""
+    for s in in146 {
+        m146 += bit(s.matches(`日本語`))
+    }
+    report(146, `日本語`, in146, m146)
+    // 147
+    let in147 = pool
+    var m147 = ""
+    for s in in147 {
+        m147 += bit(s.matches(`}`))
+    }
+    report(147, `}`, in147, m147)
+    // 148
+    let in148 = pool
+    var m148 = ""
+    for s in in148 {
+        m148 += bit(s.matches(`]`))
+    }
+    report(148, `]`, in148, m148)
+    // 149
+    let in149 = pool
+    var m149 = ""
+    for s in in149 {
+        m149 += bit(s.matches(`a}`))
+    }
+    report(149, `a}`, in149, m149)
+    // 150
+    let in150 = pool
+    var m150 = ""
+    for s in in150 {
+        m150 += bit(s.matches(`a]`))
+    }
+    report(150, `a]`, in150, m150)
+    // 151
+    let in151 = pool
+    var m151 = ""
+    for s in in151 {
+        m151 += bit(s.matches(`[^@\s]+@[^@\s]+\.[a-z]{2,}`))
+    }
+    report(151, `[^@\s]+@[^@\s]+\.[a-z]{2,}`, in151, m151)
+    // 152
+    let x152 = ["user_1", "юзер", "ab"]
+    let in152 = cat(pool, x152)
+    var m152 = ""
+    for s in in152 {
+        m152 += bit(s.matches(`[A-Za-z0-9_-]{3,32}`))
+    }
+    report(152, `[A-Za-z0-9_-]{3,32}`, in152, m152)
+    // 153
+    let in153 = pool
+    var m153 = ""
+    for s in in153 {
+        m153 += bit(s.matches(`(cat|dog)s?`))
+    }
+    report(153, `(cat|dog)s?`, in153, m153)
+    // 154
+    let in154 = pool
+    var m154 = ""
+    for s in in154 {
+        m154 += bit(s.matches(`\d{4}-\d{2}-\d{2}`))
+    }
+    report(154, `\d{4}-\d{2}-\d{2}`, in154, m154)
+    // 155
+    let in155 = pool
+    var m155 = ""
+    for s in in155 {
+        m155 += bit(s.matches(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z`))
+    }
+    report(155, `\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z`, in155, m155)
+    // 156
+    let in156 = pool
+    var m156 = ""
+    for s in in156 {
+        m156 += bit(s.matches(`[A-Z]{2,5}`))
+    }
+    report(156, `[A-Z]{2,5}`, in156, m156)
+    // 157
+    let in157 = pool
+    var m157 = ""
+    for s in in157 {
+        m157 += bit(s.matches(`[a-z0-9]{1,20}`))
+    }
+    report(157, `[a-z0-9]{1,20}`, in157, m157)
+    // 158
+    let in158 = pool
+    var m158 = ""
+    for s in in158 {
+        m158 += bit(s.matches(`(\d{1,3}\.){3}\d{1,3}`))
+    }
+    report(158, `(\d{1,3}\.){3}\d{1,3}`, in158, m158)
+    // 159
+    let in159 = pool
+    var m159 = ""
+    for s in in159 {
+        m159 += bit(s.matches(`\+?\d[\d\s()-]{6,}`))
+    }
+    report(159, `\+?\d[\d\s()-]{6,}`, in159, m159)
+    // 160
+    let in160 = pool
+    var m160 = ""
+    for s in in160 {
+        m160 += bit(s.matches(`[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`))
+    }
+    report(160, `[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`, in160, m160)
+    // 161
+    let in161 = pool
+    var m161 = ""
+    for s in in161 {
+        m161 += bit(s.matches(`https?://[^\s/]+(/.*)?`))
+    }
+    report(161, `https?://[^\s/]+(/.*)?`, in161, m161)
+    // 162
+    let in162 = pool
+    var m162 = ""
+    for s in in162 {
+        m162 += bit(s.matches(`#[0-9a-fA-F]{6}`))
+    }
+    report(162, `#[0-9a-fA-F]{6}`, in162, m162)
+    // 163
+    let in163 = pool
+    var m163 = ""
+    for s in in163 {
+        m163 += bit(s.matches(`[A-Z][a-z]+( [A-Z][a-z]+)*`))
+    }
+    report(163, `[A-Z][a-z]+( [A-Z][a-z]+)*`, in163, m163)
+    // 164
+    let x164 = ["Анна", "Анна-Мария", "анна", "Анна-", "Ёлка-Ель"]
+    let in164 = cat(pool, x164)
+    var m164 = ""
+    for s in in164 {
+        m164 += bit(s.matches(`[А-ЯЁ][а-яё]+(-[А-ЯЁ][а-яё]+)?`))
+    }
+    report(164, `[А-ЯЁ][а-яё]+(-[А-ЯЁ][а-яё]+)?`, in164, m164)
+    // 165
+    let in165 = pool
+    var m165 = ""
+    for s in in165 {
+        m165 += bit(s.matches(`(a*)*`))
+    }
+    report(165, `(a*)*`, in165, m165)
+    // 166
+    let in166 = pool
+    var m166 = ""
+    for s in in166 {
+        m166 += bit(s.matches(`(a+)+b`))
+    }
+    report(166, `(a+)+b`, in166, m166)
+    // 167
+    let in167 = pool
+    var m167 = ""
+    for s in in167 {
+        m167 += bit(s.matches(`(a|aa)*`))
+    }
+    report(167, `(a|aa)*`, in167, m167)
+    // 168
+    let in168 = pool
+    var m168 = ""
+    for s in in168 {
+        m168 += bit(s.matches(`(a{2}){3}`))
+    }
+    report(168, `(a{2}){3}`, in168, m168)
+    // 169
+    let x169 = ["привет", "Привет", "ёлка", "ель", "мир!"]
+    let in169 = cat(pool, x169)
+    var m169 = ""
+    for s in in169 {
+        m169 += bit(s.matches(`[а-яё]+`))
+    }
+    report(169, `[а-яё]+`, in169, m169)
+    // 170
+    let x170 = ["abc", "abя", "Я", "ё"]
+    let in170 = cat(pool, x170)
+    var m170 = ""
+    for s in in170 {
+        m170 += bit(s.matches(`[^а-я]+`))
+    }
+    report(170, `[^а-я]+`, in170, m170)
+    // 171
+    let x171 = ["Анна-Мария", "Ёж ёж", "Ёж ёж", "Ёж_ёж"]
+    let in171 = cat(pool, x171)
+    var m171 = ""
+    for s in in171 {
+        m171 += bit(s.matches(`[А-ЯЁа-яё\s-]+`))
+    }
+    report(171, `[А-ЯЁа-яё\s-]+`, in171, m171)
+    // 172
+    let x172 = ["Иван_1", "naïve", "日本", "a-b", unhex("78cc81"), "٣", "a‿b", "Ⅻ"]
+    let in172 = cat(pool, x172)
+    var m172 = ""
+    for s in in172 {
+        m172 += bit(s.matches(`\w+`))
+    }
+    report(172, `\w+`, in172, m172)
+    // 173
+    let x173 = ["!?", " - ", " ", "é"]
+    let in173 = cat(pool, x173)
+    var m173 = ""
+    for s in in173 {
+        m173 += bit(s.matches(`\W+`))
+    }
+    report(173, `\W+`, in173, m173)
+    // 174
+    let x174 = [unhex("20090a"), "  　", unhex("e2808b"), unhex("efbbbf"), unhex("0b0c0d")]
+    let in174 = cat(pool, x174)
+    var m174 = ""
+    for s in in174 {
+        m174 += bit(s.matches(`\s+`))
+    }
+    report(174, `\s+`, in174, m174)
+    // 175
+    let x175 = ["a ", unhex("e2808befbbbf"), unhex("ff")]
+    let in175 = cat(pool, x175)
+    var m175 = ""
+    for s in in175 {
+        m175 += bit(s.matches(`\S+`))
+    }
+    report(175, `\S+`, in175, m175)
+    // 176
+    let x176 = ["abc", "١٢", "1a"]
+    let in176 = cat(pool, x176)
+    var m176 = ""
+    for s in in176 {
+        m176 += bit(s.matches(`\D+`))
+    }
+    report(176, `\D+`, in176, m176)
+    // 177
+    let x177 = ["Иван Петров", "a_b c", "a-b"]
+    let in177 = cat(pool, x177)
+    var m177 = ""
+    for s in in177 {
+        m177 += bit(s.matches(`[\w\s]+`))
+    }
+    report(177, `[\w\s]+`, in177, m177)
+    // 178
+    let x178 = ["1!2", "a1", "١"]
+    let in178 = cat(pool, x178)
+    var m178 = ""
+    for s in in178 {
+        m178 += bit(s.matches(`[\W\d]+`))
+    }
+    report(178, `[\W\d]+`, in178, m178)
+    // 179
+    let x179 = ["я", " "]
+    let in179 = cat(pool, x179)
+    var m179 = ""
+    for s in in179 {
+        m179 += bit(s.matches(`[\S\s]`))
+    }
+    report(179, `[\S\s]`, in179, m179)
+    // 180
+    let x180 = [unhex("ff00d18f")]
+    let in180 = cat(pool, x180)
+    var m180 = ""
+    for s in in180 {
+        m180 += bit(s.matches(`[\w\W]+`))
+    }
+    report(180, `[\w\W]+`, in180, m180)
+    // 181
+    let x181 = ["я", "!", " "]
+    let in181 = cat(pool, x181)
+    var m181 = ""
+    for s in in181 {
+        m181 += bit(s.matches(`[^\w]`))
+    }
+    report(181, `[^\w]`, in181, m181)
+    // 182
+    let x182 = ["я", "　", unhex("e2808b")]
+    let in182 = cat(pool, x182)
+    var m182 = ""
+    for s in in182 {
+        m182 += bit(s.matches(`[^\s]`))
+    }
+    report(182, `[^\s]`, in182, m182)
+    // 183
+    let x183 = ["5", "٥"]
+    let in183 = cat(pool, x183)
+    var m183 = ""
+    for s in in183 {
+        m183 += bit(s.matches(`[^\d]`))
+    }
+    report(183, `[^\d]`, in183, m183)
+    // 184
+    let x184 = ["5", "٥"]
+    let in184 = cat(pool, x184)
+    var m184 = ""
+    for s in in184 {
+        m184 += bit(s.matches(`[^\D]`))
+    }
+    report(184, `[^\D]`, in184, m184)
+    // 185
+    let x185 = ["a1", " 1"]
+    let in185 = cat(pool, x185)
+    var m185 = ""
+    for s in in185 {
+        m185 += bit(s.matches(`[\S\d]+`))
+    }
+    report(185, `[\S\d]+`, in185, m185)
+    // 186
+    let in186 = pool
+    var m186 = ""
+    for s in in186 {
+        m186 += bit(s.matches(`..`))
+    }
+    report(186, `..`, in186, m186)
+    // 187
+    let x187 = ["ябв", unhex("d18fff")]
+    let in187 = cat(pool, x187)
+    var m187 = ""
+    for s in in187 {
+        m187 += bit(s.matches(`.{2,3}`))
+    }
+    report(187, `.{2,3}`, in187, m187)
+    // 188
+    let in188 = pool
+    var m188 = ""
+    for s in in188 {
+        m188 += bit(s.matches(`\x{FFFD}`))
+    }
+    report(188, `\x{FFFD}`, in188, m188)
+    // 189
+    let x189 = [unhex("fffe"), unhex("efbfbdff")]
+    let in189 = cat(pool, x189)
+    var m189 = ""
+    for s in in189 {
+        m189 += bit(s.matches(`[\x{FFFD}]+`))
+    }
+    report(189, `[\x{FFFD}]+`, in189, m189)
+    // 190
+    let in190 = pool
+    var m190 = ""
+    for s in in190 {
+        m190 += bit(s.matches(`[^\x{FFFD}]`))
+    }
+    report(190, `[^\x{FFFD}]`, in190, m190)
+    // 191
+    let x191 = ["яё😀", "яa"]
+    let in191 = cat(pool, x191)
+    var m191 = ""
+    for s in in191 {
+        m191 += bit(s.matches(`[\x80-\x{10FFFF}]+`))
+    }
+    report(191, `[\x80-\x{10FFFF}]+`, in191, m191)
+    // 192
+    let x192 = [unhex("6162637f"), unhex("616280")]
+    let in192 = cat(pool, x192)
+    var m192 = ""
+    for s in in192 {
+        m192 += bit(s.matches(`[\x00-\x7F]+`))
+    }
+    report(192, `[\x00-\x7F]+`, in192, m192)
+    // 193
+    let x193 = ["яё😀", unhex("fffe")]
+    let in193 = cat(pool, x193)
+    var m193 = ""
+    for s in in193 {
+        m193 += bit(s.matches(`[^\x00-\x7F]+`))
+    }
+    report(193, `[^\x00-\x7F]+`, in193, m193)
+    // 194
+    let in194 = pool
+    var m194 = ""
+    for s in in194 {
+        m194 += bit(s.matches(`😀+`))
+    }
+    report(194, `😀+`, in194, m194)
+    // 195
+    let x195 = ["😀😂🙏", "😀🚀"]
+    let in195 = cat(pool, x195)
+    var m195 = ""
+    for s in in195 {
+        m195 += bit(s.matches(`[😀-🙏]+`))
+    }
+    report(195, `[😀-🙏]+`, in195, m195)
+    // 196
+    let x196 = ["яяян", "янян", "ня"]
+    let in196 = cat(pool, x196)
+    var m196 = ""
+    for s in in196 {
+        m196 += bit(s.matches(`(я|ян)+`))
+    }
+    report(196, `(я|ян)+`, in196, m196)
+    // 197
+    let x197 = ["abab", "aab", "abbb"]
+    let in197 = cat(pool, x197)
+    var m197 = ""
+    for s in in197 {
+        m197 += bit(s.matches(`(?:ab|a)*b?`))
+    }
+    report(197, `(?:ab|a)*b?`, in197, m197)
+    // 198
+    let x198 = ["aabb", "babb", "abab"]
+    let in198 = cat(pool, x198)
+    var m198 = ""
+    for s in in198 {
+        m198 += bit(s.matches(`(a|b)*abb`))
+    }
+    report(198, `(a|b)*abb`, in198, m198)
+    // 199
+    let x199 = ["aaaaa", "aaaaaaaaaa", "aaaaaaaaaaa"]
+    let in199 = cat(pool, x199)
+    var m199 = ""
+    for s in in199 {
+        m199 += bit(s.matches(`(a?){5}a{5}`))
+    }
+    report(199, `(a?){5}a{5}`, in199, m199)
+    // 200
+    let x200 = ["aab", "aaabb", "aaaabb", "abbb"]
+    let in200 = cat(pool, x200)
+    var m200 = ""
+    for s in in200 {
+        m200 += bit(s.matches(`a{2,3}b{0,2}`))
+    }
+    report(200, `a{2,3}b{0,2}`, in200, m200)
+    // 201
+    let x201 = ["xxyyzz", "xzy"]
+    let in201 = cat(pool, x201)
+    var m201 = ""
+    for s in in201 {
+        m201 += bit(s.matches(`x*y*z*`))
+    }
+    report(201, `x*y*z*`, in201, m201)
+    // 202
+    let x202 = ["xzy", "xzya"]
+    let in202 = cat(pool, x202)
+    var m202 = ""
+    for s in in202 {
+        m202 += bit(s.matches(`(x|y|z)*`))
+    }
+    report(202, `(x|y|z)*`, in202, m202)
+    // 203
+    let in203 = pool
+    var m203 = ""
+    for s in in203 {
+        m203 += bit(s.matches(`^a|b$`))
+    }
+    report(203, `^a|b$`, in203, m203)
+    // 204
+    let in204 = pool
+    var m204 = ""
+    for s in in204 {
+        m204 += bit(s.matches(`a$|^b`))
+    }
+    report(204, `a$|^b`, in204, m204)
+    // 205
+    let x205 = ["b", "ab", "aab"]
+    let in205 = cat(pool, x205)
+    var m205 = ""
+    for s in in205 {
+        m205 += bit(s.matches(`(^|a)b`))
+    }
+    report(205, `(^|a)b`, in205, m205)
+    // 206
+    let x206 = ["a", "ab", "abb"]
+    let in206 = cat(pool, x206)
+    var m206 = ""
+    for s in in206 {
+        m206 += bit(s.matches(`a(b|$)`))
+    }
+    report(206, `a(b|$)`, in206, m206)
+    // 207
+    let in207 = pool
+    var m207 = ""
+    for s in in207 {
+        m207 += bit(s.matches(`$^`))
+    }
+    report(207, `$^`, in207, m207)
+    // 208
+    let in208 = pool
+    var m208 = ""
+    for s in in208 {
+        m208 += bit(s.matches(`^^a$$`))
+    }
+    report(208, `^^a$$`, in208, m208)
+    // 209
+    let in209 = pool
+    var m209 = ""
+    for s in in209 {
+        m209 += bit(s.matches(`(a$)?b`))
+    }
+    report(209, `(a$)?b`, in209, m209)
+    // 210
+    let x210 = [unhex("61cc81"), "á"]
+    let in210 = cat(pool, x210)
+    var m210 = ""
+    for s in in210 {
+        m210 += bit(s.matches(`a\x{301}?`))
+    }
+    report(210, `a\x{301}?`, in210, m210)
+    // 211
+    let x211 = ["яя", "я", "яяя", "яa"]
+    let in211 = cat(pool, x211)
+    var m211 = ""
+    for s in in211 {
+        m211 += bit(s.matches(`[а-я]{2}`))
+    }
+    report(211, `[а-я]{2}`, in211, m211)
+    // 212
+    let x212 = ["ann@x.io", "ан@пример.рф", "a b@c", "a@b@c", "a b@c"]
+    let in212 = cat(pool, x212)
+    var m212 = ""
+    for s in in212 {
+        m212 += bit(s.matches(`[^@\s]+@[^@\s]+`))
+    }
+    report(212, `[^@\s]+@[^@\s]+`, in212, m212)
+    // 213
+    let x213 = ["Ѐӿ", "Ԁ"]
+    let in213 = cat(pool, x213)
+    var m213 = ""
+    for s in in213 {
+        m213 += bit(s.matches(`[\x{400}-\x{4FF}]+`))
+    }
+    report(213, `[\x{400}-\x{4FF}]+`, in213, m213)
+}

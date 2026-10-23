@@ -1,0 +1,499 @@
+// ============================================================================
+// Регулярные выражения при компиляции: s.matches(литерал или const).
+//
+// Шаблон-литерал проверяется сейчас, а не при первом запросе: rx_check знает ту
+// же грамматику и пишет те же сообщения с той же позицией (номер символа), что
+// разбор в lib/regex.kh, — только дерево не строит, а считает размер программы
+// (предел «pattern is too large»). Чтобы два разбора не разошлись,
+// tests/run/regex_grammar.kh печатает ответы библиотеки на наборе шаблонов, а
+// tests/run.sh сверяет с ними ответы этой проверки на том же наборе.
+//
+// У места вызова с литералом — свой слот (8 байт в DATA): первый вызов кладёт
+// туда готовую программу (__text_matches_at), остальные сразу её исполняют.
+// ============================================================================
+
+const RXC_MAX_PROG = 100000
+const RXC_MAX_DEPTH = 1000
+const RXC_MAX_COUNT = 1000
+const RXC_SIZE_CAP = 1099511627776
+const RXC_MAX_CP = 0x10FFFF
+
+type RxCheck {
+    // шаблон — коды символов
+    cps: [int]
+    p: int
+    // первая ошибка ("" — шаблон правильный) и её позиция
+    err: str
+    at: int
+    depth: int
+}
+
+fn rxc_fail(r: RxCheck, msg: str, at: int) -> int {
+    if r.err.byte_len() == 0 {
+        r.err = msg
+        r.at = at
+    }
+    return 0
+}
+
+fn rxc_failed(r: RxCheck) -> bool {
+    return r.err.byte_len() > 0
+}
+
+// Символ шаблона в позиции r.p + d или -1 за концом.
+fn rxc_peek_at(r: RxCheck, d: int) -> int {
+    let i = r.p + d
+    if i >= r.cps.len() {
+        return -1
+    }
+    return r.cps[i]
+}
+
+fn rxc_peek(r: RxCheck) -> int {
+    return rxc_peek_at(r, 0)
+}
+
+fn rxc_show(cp: int) -> str {
+    let b = buf_new(4)
+    buf_utf8(b, cp)
+    return buf_str(b)
+}
+
+fn rxc_cap(s: int) -> int {
+    if s > RXC_SIZE_CAP {
+        return RXC_SIZE_CAP
+    }
+    return s
+}
+
+fn rxc_is_class_esc(e: int) -> bool {
+    return e == 'd' || e == 'D' || e == 'w' || e == 'W' || e == 's' || e == 'S'
+}
+
+fn rxc_hex_digit(c: int) -> int {
+    if c >= '0' && c <= '9' {
+        return c - '0'
+    }
+    if c >= 'a' && c <= 'f' {
+        return c - 'a' + 10
+    }
+    if c >= 'A' && c <= 'F' {
+        return c - 'A' + 10
+    }
+    return -1
+}
+
+// \xHH или \x{H...}: r.p — после x → код или -1.
+fn rxc_hex(r: RxCheck, at: int) -> int {
+    if rxc_peek(r) == '{' {
+        r.p += 1
+        var v = 0
+        var digits = 0
+        while rxc_hex_digit(rxc_peek(r)) >= 0 {
+            if v <= RXC_MAX_CP {
+                v = v * 16 + rxc_hex_digit(rxc_peek(r))
+            }
+            digits += 1
+            r.p += 1
+        }
+        if digits == 0 || rxc_peek(r) != '}' || v > RXC_MAX_CP || (v >= 0xD800 && v <= 0xDFFF) {
+            rxc_fail(r, "bad \\x escape", at)
+            return -1
+        }
+        r.p += 1
+        return v
+    }
+    let h1 = rxc_hex_digit(rxc_peek(r))
+    let h2 = rxc_hex_digit(rxc_peek_at(r, 1))
+    if h1 < 0 || h2 < 0 {
+        rxc_fail(r, "bad \\x escape", at)
+        return -1
+    }
+    r.p += 2
+    return h1 * 16 + h2
+}
+
+// Экранирование: r.p — после \ (позиция \ — at) → код символа или -1.
+fn rxc_escape(r: RxCheck, at: int) -> int {
+    let e = rxc_peek(r)
+    if e < 0 {
+        rxc_fail(r, "pattern ends with \\", at)
+        return -1
+    }
+    r.p += 1
+    if e == 'n' {
+        return 10
+    }
+    if e == 't' {
+        return 9
+    }
+    if e == 'r' {
+        return 13
+    }
+    if e == 'f' {
+        return 12
+    }
+    if e == 'v' {
+        return 11
+    }
+    if e == 'x' {
+        return rxc_hex(r, at)
+    }
+    let letter = (e >= 'a' && e <= 'z') || (e >= 'A' && e <= 'Z')
+    let digit = e >= '0' && e <= '9'
+    if e < 128 && !letter && !digit {
+        return e
+    }
+    if e == 'b' || e == 'B' || e == 'A' || e == 'z' || e == 'Z' || e == 'G' {
+        rxc_fail(r, "\\" + rxc_show(e) + " is not supported", at)
+    } else if e >= '1' && e <= '9' {
+        rxc_fail(r, "backreferences are not supported", at)
+    } else if e == 'p' || e == 'P' {
+        rxc_fail(r, "\\" + rxc_show(e) + "\{...} is not supported", at)
+    } else {
+        rxc_fail(r, "unknown escape \\" + rxc_show(e), at)
+    }
+    return -1
+}
+
+fn rxc_class(r: RxCheck) -> int {
+    let at = r.p
+    r.p += 1
+    if rxc_peek(r) == '^' {
+        r.p += 1
+    }
+    var first = true
+    while true {
+        let c = rxc_peek(r)
+        if c < 0 {
+            return rxc_fail(r, "unclosed [", at)
+        }
+        if c == ']' && !first {
+            r.p += 1
+            break
+        }
+        first = false
+        let start = r.p
+        if c == '[' && rxc_peek_at(r, 1) == ':' {
+            return rxc_fail(r, "[:name:] classes are not supported", start)
+        }
+        r.p += 1
+        var lo = c
+        if c == '\\' {
+            if rxc_is_class_esc(rxc_peek(r)) {
+                r.p += 1
+                continue
+            }
+            lo = rxc_escape(r, start)
+            if lo < 0 {
+                return 0
+            }
+        }
+        let d = rxc_peek_at(r, 1)
+        if rxc_peek(r) == '-' && d >= 0 && d != ']' {
+            r.p += 1
+            let hs = r.p
+            var hi = d
+            r.p += 1
+            if d == '\\' {
+                if rxc_is_class_esc(rxc_peek(r)) {
+                    return rxc_fail(r, "bad range in []", start)
+                }
+                hi = rxc_escape(r, hs)
+                if hi < 0 {
+                    return 0
+                }
+            }
+            if hi < lo {
+                return rxc_fail(r, "bad range in []", start)
+            }
+        }
+    }
+    return 1
+}
+
+// (? — какая группа (кроме (?:).
+fn rxc_group_fail(r: RxCheck, at: int) -> int {
+    let c = rxc_peek_at(r, 2)
+    let d = rxc_peek_at(r, 3)
+    if c == '=' || c == '!' || (c == '<' && (d == '=' || d == '!')) {
+        return rxc_fail(r, "lookaround is not supported", at)
+    }
+    if c == '<' || c == '\'' || (c == 'P' && (d == '<' || d == '=' || d == '>')) {
+        return rxc_fail(r, "named groups are not supported", at)
+    }
+    var i = 2
+    var e = c
+    while (e >= 'a' && e <= 'z') || (e >= 'A' && e <= 'Z') || e == '-' {
+        if e == 'i' {
+            return rxc_fail(r, "(?i) is not supported", at)
+        }
+        i += 1
+        e = rxc_peek_at(r, i)
+    }
+    return rxc_fail(r, "this (? group is not supported", at)
+}
+
+// Атом → сколько инструкций он даст.
+fn rxc_atom(r: RxCheck) -> int {
+    let at = r.p
+    let c = rxc_peek(r)
+    if c == '(' {
+        if rxc_peek_at(r, 1) == '?' {
+            if rxc_peek_at(r, 2) != ':' {
+                return rxc_group_fail(r, at)
+            }
+            r.p += 2
+        }
+        r.p += 1
+        r.depth += 1
+        if r.depth > RXC_MAX_DEPTH {
+            return rxc_fail(r, "pattern nests too deeply", at)
+        }
+        let s = rxc_alt(r)
+        r.depth -= 1
+        if rxc_failed(r) {
+            return s
+        }
+        if rxc_peek(r) != ')' {
+            return rxc_fail(r, "unclosed (", at)
+        }
+        r.p += 1
+        return s
+    }
+    if c == '[' {
+        return rxc_class(r)
+    }
+    if c == '*' || c == '+' || c == '?' || c == '{' {
+        return rxc_fail(r, "nothing to repeat", at)
+    }
+    r.p += 1
+    if c == '\\' {
+        if rxc_is_class_esc(rxc_peek(r)) {
+            r.p += 1
+            return 1
+        }
+        if rxc_escape(r, at) < 0 {
+            return 0
+        }
+    }
+    return 1
+}
+
+fn rxc_int(r: RxCheck) -> int {
+    var v = -1
+    while rxc_peek(r) >= '0' && rxc_peek(r) <= '9' {
+        if v == 0 {
+            // ведущий ноль: 01, 007 (у Go такие скобки — просто текст)
+            v = RXC_MAX_COUNT + 1
+        } else if v < 0 {
+            v = 0
+        }
+        if v <= RXC_MAX_COUNT {
+            v = v * 10 + rxc_peek(r) - '0'
+        }
+        r.p += 1
+    }
+    if v > RXC_MAX_COUNT {
+        return RXC_MAX_COUNT + 1
+    }
+    return v
+}
+
+fn rxc_repeat(r: RxCheck) -> int {
+    let a = rxc_atom(r)
+    if rxc_failed(r) {
+        return a
+    }
+    let at = r.p
+    let c = rxc_peek(r)
+    var lo = 0
+    var hi = -1
+    if c == '+' {
+        lo = 1
+    } else if c == '?' {
+        hi = 1
+    } else if c == '{' {
+        r.p += 1
+        lo = rxc_int(r)
+        hi = lo
+        if rxc_peek(r) == ',' {
+            r.p += 1
+            hi = rxc_int(r)
+        }
+        if lo < 0 || rxc_peek(r) != '}' || lo > RXC_MAX_COUNT || hi > RXC_MAX_COUNT || (hi >= 0 && hi < lo) {
+            return rxc_fail(r, "bad \{n,m}", at)
+        }
+    } else if c != '*' {
+        return a
+    }
+    r.p += 1
+    if rxc_peek(r) == '?' {
+        r.p += 1
+    }
+    let d = rxc_peek(r)
+    if d == '*' || d == '+' || d == '?' || d == '{' {
+        return rxc_fail(r, "nested repetition", r.p)
+    }
+    var s = lo * a
+    if hi < 0 {
+        s += a + 2
+    } else {
+        s += (hi - lo) * (a + 1)
+    }
+    return rxc_cap(s)
+}
+
+fn rxc_concat(r: RxCheck) -> int {
+    var s = 0
+    while !rxc_failed(r) {
+        let c = rxc_peek(r)
+        if c < 0 || c == '|' || c == ')' {
+            break
+        }
+        s = rxc_cap(s + rxc_repeat(r))
+    }
+    return s
+}
+
+fn rxc_alt(r: RxCheck) -> int {
+    var s = rxc_concat(r)
+    while rxc_peek(r) == '|' && !rxc_failed(r) {
+        r.p += 1
+        s = rxc_cap(s + rxc_concat(r) + 2)
+    }
+    return s
+}
+
+// Проверка шаблона: r.err — первая ошибка ("" — шаблон правильный), r.at — её
+// позиция (номер символа).
+fn rx_check(pat: str) -> RxCheck {
+    var cps: [int] = []
+    let r = RxCheck { cps: cps, p: 0, err: "", at: 0, depth: 0 }
+    let p = __str_ptr(pat)
+    let n = pat.byte_len()
+    var i = 0
+    while i < n {
+        let w = __utf8_width(p, n, i)
+        if w == 1 && pat.byte(i) >= 0x80 {
+            rxc_fail(r, "pattern is not valid UTF-8", r.cps.len())
+            return r
+        }
+        r.cps.push(__utf8_decode(p, n, i))
+        i += w
+    }
+    let size = rxc_alt(r)
+    if !rxc_failed(r) && r.p < r.cps.len() {
+        rxc_fail(r, "unexpected )", r.p)
+    }
+    if !rxc_failed(r) && size >= RXC_MAX_PROG {
+        rxc_fail(r, "pattern is too large", 0)
+    }
+    return r
+}
+
+// Подсказка к ошибке шаблона.
+fn rx_hint(msg: str) -> str {
+    if msg == "nothing to repeat" {
+        return "put what to repeat before it, or escape the character: \\* \\+ \\? \\\{"
+    }
+    if msg == "nested repetition" {
+        return "group the inner part, e.g. (a+)*"
+    }
+    if msg == "bad \{n,m}" {
+        return "write \{3}, \{3,} or \{3,32} with counts up to 1000; a literal \{ is \\\{"
+    }
+    if msg == "unclosed (" {
+        return "close the group with ), or escape a literal ( as \\("
+    }
+    if msg == "unexpected )" {
+        return "remove it, or escape a literal ) as \\)"
+    }
+    if msg == "unclosed [" {
+        return "close the class with ], or escape a literal [ as \\["
+    }
+    if msg == "bad range in []" {
+        return "write ranges low to high, e.g. [a-z]; a literal - goes first or last: [a-z-]"
+    }
+    if msg == "pattern ends with \\" {
+        return "a literal backslash is \\\\"
+    }
+    if msg == "bad \\x escape" {
+        return "write \\x41 (two hex digits) or \\x\{1F600}"
+    }
+    if msg.starts_with("unknown escape") {
+        return "escape only punctuation, e.g. \\. or \\+; letters and digits need no \\"
+    }
+    if msg == "backreferences are not supported" {
+        return "check the repeated part in code, e.g. compare two slices"
+    }
+    if msg.ends_with("\{...} is not supported") {
+        return "use `\\w` or list the ranges, e.g. [a-zA-Zа-яА-ЯёЁ]"
+    }
+    if msg.ends_with(" is not supported") && msg.starts_with("\\") {
+        return "matches() always tests the whole string; for a part, write .*word.* or use contains()"
+    }
+    if msg == "(?i) is not supported" {
+        return "compare s.lower() with a lower-case pattern"
+    }
+    if msg == "lookaround is not supported" {
+        return "test the parts with separate matches() or contains() calls"
+    }
+    if msg == "named groups are not supported" || msg == "this (? group is not supported" {
+        return "use ( ) or (?: )"
+    }
+    if msg == "[:name:] classes are not supported" {
+        return "use \\d, \\w, \\s or ranges like a-z; a literal [ in a class is \\["
+    }
+    if msg == "pattern is too large" {
+        return "use smaller counts in \{n,m}"
+    }
+    return ""
+}
+
+// s.matches(шаблон); получатель в rax, текущий токен — '('. Литерал или const:
+// шаблон проверяется сейчас, а у места вызова — свой слот для программы
+// (__text_matches_at); иначе шаблон разбирается при каждом вызове.
+fn parse_matches(nt: Token) -> int {
+    let a = toks[pos + 1]
+    var lit = -1
+    if kind_at(pos + 2) == ')' {
+        if a.kind == T_STR {
+            lit = a.val
+        } else if a.kind == T_IDENT && find_local(a.text) < 0 {
+            let s = sym_find(a.text)
+            if s >= 0 && sym_kind(s) == SK_CONST && consts[sym_idx(s)].lit >= 0 {
+                lit = consts[sym_idx(s)].lit
+            }
+        }
+    }
+    emit_push(RAX)
+    if lit < 0 {
+        let fi = rt_func("__text_matches")
+        advance()
+        let n = compile_args(funcs[fi].params, 1, ty_err, ty_err, ty_err, "matches", nt) + 1
+        if n != funcs[fi].params.len() {
+            emit_alu_imm(0, RSP, n * 8)
+            return ty_bool
+        }
+        emit_call_args(fi, n)
+        last_was_call = true
+        return ty_bool
+    }
+    if !system_code(nt) {
+        let r = rx_check(strlits[lit])
+        if rxc_failed(r) {
+            error_tok(a, "invalid pattern: " + r.err + " at position " + r.at.to_str(), rx_hint(r.err))
+        }
+    }
+    advance()
+    advance()
+    advance()
+    emit_mov_imm(RAX, strlit(lit))
+    emit_push(RAX)
+    emit_mov_imm(RAX, global_slot())
+    emit_push(RAX)
+    emit_call_args(rt_func("__text_matches_at"), 3)
+    last_was_call = true
+    return ty_bool
+}

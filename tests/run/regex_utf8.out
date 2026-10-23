@@ -1,0 +1,35 @@
+привет [а-я]+ 1
+я . 1 0
+ян .{2} 1 0
+Иван_1 \w+ 1
+я+ 1 0
+😀 . 1 [😀-🙏]+ 1
+[^а-я] 101
+e + U+0301: 1 0 1
+\s: 111001
+\S: 01 [^\s]: 01
+١٢ \d+ 0 \w+ 1 \D+ 1
+12 \d+ 1
+\w: 11101
+\W: 101
+\xFF: . 1 \W 1 \S 1 \D 1 [^a] 1 \w 0 \x{FFFD} 1
+E2 82: . 0 .{2} 1 a.b 1
+surrogate ED A0 80: .{3} 1
+^ $: 10111
+lazy: 0111
+\x: 1111
+NAME_RE 1101001
+lambda 10
+literal 1001001000 1101001100 1011001100 0001001000 0100100010 0011001000 0011011010 0100001011 0010001010 1001001100 0010001010 0000000000 0000000000 0100001010 
+same 11
+slot 111
+slot kept 11
+error: unclosed ( at position 2
+error: nested repetition at position 7
+error: bad range in [] at position 1
+error: \p{...} is not supported at position 0
+error: (?i) is not supported at position 0
+error: pattern is not valid UTF-8 at position 1
+error: pattern is not valid UTF-8 at position 1
+long 11010
+loop 100000
