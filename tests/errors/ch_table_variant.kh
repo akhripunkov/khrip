@@ -1,0 +1,5 @@
+// expect: a ClickHouse table holds a struct type; Shape is a variant type
+type Shape = Circle { r: int } | Square { a: int }
+table shapes: Shape
+fn main() {
+}

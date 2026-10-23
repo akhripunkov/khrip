@@ -1,0 +1,8 @@
+// expect: r is never checked, so the failures it holds are ignored
+// expect: read r.ok (or r.status); reading only r.count is not a check — or drop ": DbResult" to let failures end the request
+type Event { ts: int, page: str }
+table events: Event
+fn main() {
+    let r: DbResult = events.insert([Event { ts: 1, page: "/" }])
+    print(r.count)
+}

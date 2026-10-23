@@ -1,0 +1,5 @@
+// expect: with wait_for_async_insert = 0 a failed insert is lost silently
+// expect: drop the setting; async_insert in the table block waits for the flush
+fn main() {
+    ch "INSERT INTO events SELECT * FROM staged SETTINGS async_insert = 1, wait_for_async_insert = 0"
+}

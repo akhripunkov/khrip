@@ -1,0 +1,8 @@
+// expect: {country} may be none, and a comparison with NULL is never true: rows would silently not match
+// expect: write ({country} IS NULL OR column = {country}), or unwrap it first: let v = country else { return 400 }
+type Row { n: int }
+fn main() {
+    let country: str? = env("COUNTRY")
+    let rows: [Row] = ch "SELECT count() AS n FROM clicks WHERE country = {country}"
+    print(rows.len())
+}

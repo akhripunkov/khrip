@@ -1,0 +1,33 @@
+// Сервис кликов судей (docs/design/v0.13-drivers.md §11.3, b_clicks.kh).
+migration ch 1 `CREATE TABLE clicks (ts DateTime, user_id UInt64, url String,
+    country LowCardinality(String), ms UInt32) ENGINE = MergeTree ORDER BY (url, ts)`
+
+type ClickIn { user_id: int, url: str, country: str, ms: int }
+type Click { ts: int, ...ClickIn }
+type UrlStat { url: str, hits: int, users: int, p95_ms: float }
+type DayStat { day: str, hits: int }
+type Accepted { inserted: int }
+
+table clicks: Click
+
+route POST "/clicks" (body: [ClickIn]) -> 202 Accepted | 400 str {
+    if body.len() == 0 || body.len() > 5000 {
+        return 400 "send 1..5000 clicks"
+    }
+    let t = now()
+    return 202 Accepted { inserted: clicks.insert(body.map(c => Click { ts: t, ...c })) }
+}
+
+route GET "/top" (from: int, to: int, n: int = 10, country: str?) -> [UrlStat] | 400 str {
+    if from >= to || n < 1 || n > 100 {
+        return 400 "need from < to and n in 1..100"
+    }
+    return ch `SELECT url, count() AS hits, uniq(user_id) AS users, quantile(0.95)(ms) AS p95_ms
+        FROM clicks WHERE ts >= {from} AND ts < {to} AND ({country} IS NULL OR country = {country})
+        GROUP BY url ORDER BY hits DESC LIMIT {n}`
+}
+
+route GET "/daily" (from: int, to: int) -> [DayStat] {
+    return ch `SELECT toDate(ts) AS day, count() AS hits FROM clicks
+        WHERE ts >= {from} AND ts < {to} GROUP BY day ORDER BY day`
+}

@@ -1,0 +1,9 @@
+// expect: a struct cannot be a ClickHouse parameter
+// expect: insert rows with events.insert(rows)
+type Filter { page: str }
+type Row { n: int }
+fn main() {
+    let f = Filter { page: "/" }
+    let rows: [Row] = ch "SELECT count() AS n FROM events WHERE page = {f}"
+    print(rows.len())
+}

@@ -1,0 +1,7 @@
+// expect: ORDER BY {sort}: a parameter here is a constant and sorts nothing
+type Row { page: str, n: int }
+fn main() {
+    let sort = env("SORT") ?? "n"
+    let rows: [Row] = ch "SELECT page, count() AS n FROM events GROUP BY page ORDER BY {sort}"
+    print(rows.len())
+}

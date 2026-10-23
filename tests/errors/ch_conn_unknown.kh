@@ -1,0 +1,7 @@
+// expect: unknown connection archive
+// expect: declare it: clickhouse archive = env("ARCHIVE_CLICKHOUSE_URL")
+type Row { n: int }
+fn main() {
+    let rows: [Row] = ch archive "SELECT count() AS n FROM events"
+    print(rows.len())
+}

@@ -1,0 +1,8 @@
+// expect: {table} cannot name a table: values are sent as parameters, never as SQL text
+// expect: choose between whole queries with if/match
+type Row { n: int }
+fn main() {
+    let table = "events"
+    let rows: [Row] = ch "SELECT count() AS n FROM {table}"
+    print(rows.len())
+}

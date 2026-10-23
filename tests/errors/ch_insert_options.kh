@@ -1,0 +1,7 @@
+// expect: options are written in place: Insert { dedup: key }
+type Event { ts: int, page: str }
+table events: Event
+fn main() {
+    let opts = Insert { dedup: "k" }
+    events.insert([Event { ts: 1, page: "/" }], opts)
+}

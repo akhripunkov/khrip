@@ -1,0 +1,5 @@
+// expect: ch runs one statement; this one has several separated by ;
+// expect: write one ch per statement
+fn main() {
+    ch "ALTER TABLE events DELETE WHERE ts < 5; ALTER TABLE events DELETE WHERE ts > 9"
+}

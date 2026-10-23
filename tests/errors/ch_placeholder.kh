@@ -1,0 +1,7 @@
+// expect: {from:Int64} is ClickHouse's placeholder; in ch "..." write {from}
+// expect: the type comes from the Khrip value: int is sent as Int64
+type Row { n: int }
+fn main() {
+    let rows: [Row] = ch "SELECT count() AS n FROM events WHERE ts >= {from:Int64}"
+    print(rows.len())
+}

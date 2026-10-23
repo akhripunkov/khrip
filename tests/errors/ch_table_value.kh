@@ -1,0 +1,7 @@
+// expect: events is a ClickHouse table, not a value
+// expect: insert rows with events.insert(rows); read with ch "SELECT ... FROM events"
+type Event { ts: int }
+table events: Event
+fn main() {
+    let t = events
+}

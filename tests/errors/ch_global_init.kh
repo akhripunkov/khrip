@@ -1,0 +1,6 @@
+// expect: ch in the initial value of a global runs before the database is connected
+// expect: compute it in main, a route or an every task
+var total: int = ch "SELECT count() FROM events"
+fn main() {
+    print(total)
+}

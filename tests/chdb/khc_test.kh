@@ -1,0 +1,33 @@
+// khc test с ClickHouse: своя временная база на запуск (миграции и проверки —
+// в ней), удаляется в конце.
+migration ch 1 `CREATE TABLE visits (ts DateTime, page String) ENGINE = MergeTree ORDER BY ts`
+
+type Visit { ts: int, page: str }
+type PageCount { page: str, n: int }
+
+table visits: Visit
+
+route POST "/visits" (body: Visit) -> 201 | 400 str {
+    if body.page == "" {
+        return 400 "page is required"
+    }
+    visits.insert(body)
+    return 201
+}
+
+route GET "/pages" -> [PageCount] {
+    return ch "SELECT page, count() AS n FROM visits GROUP BY page ORDER BY page"
+}
+
+test "insert and count" {
+    expect visits.insert([Visit { ts: 1, page: "/" }, Visit { ts: 2, page: "/" }]) == 2
+    let n: int = ch "SELECT count() FROM visits"
+    expect n == 2
+}
+
+test "routes" {
+    expect (call POST "/visits" Visit { ts: 3, page: "/a" }).status == 201
+    expect (call POST "/visits" Visit { ts: 4, page: "" }).status == 400
+    expect (call POST "/visits" Visit { ts: -1, page: "/b" }).body == "bad value: visits.ts: -1 is out of range for DateTime"
+    expect (call GET "/pages").body == "[\{\"page\":\"/\",\"n\":2},\{\"page\":\"/a\",\"n\":1}]"
+}

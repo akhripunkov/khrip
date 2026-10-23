@@ -1,0 +1,8 @@
+// expect: LIMIT without ORDER BY returns rows in no fixed order: pages repeat or skip rows
+// expect: ORDER BY id (or another unique key last)
+type Row { page: str }
+fn main() {
+    let n = 10
+    let rows: [Row] = ch "SELECT page FROM events LIMIT {n}"
+    print(rows.len())
+}

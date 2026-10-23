@@ -1,0 +1,29 @@
+// Столбцы с именами разделов (format, settings, values, limit, offset) — не
+// разделы: FORMAT, SETTINGS, VALUES и LIMIT узнаются только на своём месте.
+type File { name: str, format: str }
+type Quota { user_id: int, limit: int }
+
+fn files(f: str) -> [File] {
+    return ch "SELECT name, format FROM files WHERE format = {f} ORDER BY name"
+}
+
+fn quotas(lo: int) -> [Quota] {
+    return ch "SELECT user_id, limit FROM quotas WHERE limit > {lo} AND offset = 0"
+}
+
+fn tuned(s: str) -> int {
+    return ch "SELECT count() FROM configs WHERE settings = {s} SETTINGS max_threads = 2"
+}
+
+fn copy_values(day: int) {
+    ch "INSERT INTO archive SELECT id, values, format FROM configs WHERE day = {day}"
+}
+
+route GET "/quota/{id}" (id: int) -> Quota {
+    return ch "SELECT {id} AS user_id, max(limit) AS limit FROM quotas WHERE user_id = {id}"
+}
+
+route POST "/archive/{day}" (day: int) -> int {
+    copy_values(day)
+    return files("csv").len() + quotas(1).len() + tuned("x")
+}

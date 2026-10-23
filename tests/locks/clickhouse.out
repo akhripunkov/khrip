@@ -1,0 +1,5 @@
+POST /visits: read
+GET /pages: read
+POST /seen: write
+POST /queue: write
+GET /queue: read

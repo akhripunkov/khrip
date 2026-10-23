@@ -1,0 +1,122 @@
+// ch "..." против настоящего ClickHouse: отчёты P3 и clicks, параметры всех
+// типов, внедрение в строки, LIKE с %, _ и \, IN со списком и пустым
+// списком, Nullable за IS NULL, ORDER BY из вариантов, KILL QUERY в int,
+// INSERT ... SELECT (число строк), мутация с mutations_sync, именованное
+// соединение ch other "...".
+type PageStat { page: str, views: int, users: int, avg_ms: float }
+type UrlStat { url: str, hits: int, users: int, p95_ms: float }
+type DayStat { day: str, hits: int }
+type Click { ts: int, user_id: int, url: str, country: str, ms: int }
+type Typed { at: str, day: int, amount: str, flag: bool, maybe: int?, tags: [str], kind: Kind }
+type Kind = Viewed | Clicked
+type Echo { i: int, f: float, b: bool, s: str, e: str, xs: [int], m: map[str, int], o: str?, nested: [[str]] }
+
+clickhouse other = env("OTHER_CLICKHOUSE_URL")
+
+fn top(from: int, to: int, n: int, country: str?) -> [UrlStat] {
+    return ch `SELECT url, count() AS hits, uniq(user_id) AS users, quantile(0.95)(ms) AS p95_ms
+        FROM clicks WHERE ts >= {from} AND ts < {to} AND ({country} IS NULL OR country = {country})
+        GROUP BY url ORDER BY hits DESC, url LIMIT {n}`
+}
+
+fn sorted(order: str) -> [str] {
+    let o = match order {
+        "url" => "url, ts"
+        _ => "ts DESC, url"
+    }
+    let rows: [Click] = ch "SELECT * FROM clicks WHERE user_id = 1 ORDER BY {o} LIMIT 3"
+    var out: [str] = []
+    for r in rows {
+        out.push(r.url + "@" + r.ts.to_str())
+    }
+    return out
+}
+
+fn main() {
+    let written: int = ch "INSERT INTO clicks SELECT toDateTime(1792700000 + number * 3600), number % 5, concat('/p', toString(number % 4)), if(number % 3 = 0, 'DE', 'US'), toUInt32(number * 10) FROM numbers(48)"
+    print("written " + written.to_str())
+    let from = 1792700000
+    let to = from + 48 * 3600
+    print(to_json(top(from, to, 2, none)))
+    print(to_json(top(from, to, 2, "DE")))
+    let daily: [DayStat] = ch `SELECT toDate(ts) AS day, count() AS hits FROM clicks
+        WHERE ts >= {from} AND ts < {to} GROUP BY day ORDER BY day`
+    print(to_json(daily))
+    let n_pages = 3
+    let pages: [PageStat] = ch `SELECT url AS page, count() AS views, uniq(user_id) AS users, avg(ms) AS avg_ms
+        FROM clicks WHERE ts >= {from} AND ts < {to} GROUP BY page ORDER BY views DESC, page LIMIT {n_pages}`
+    print(pages.len())
+    let n: int = ch "SELECT count() FROM clicks WHERE user_id = {from - from + 1}"
+    print("user 1: " + n.to_str())
+    // внедрение: значение — всегда параметр
+    for evil in ["'; DROP TABLE clicks; --", "\\' OR 1 = 1 --", "x\\", "a\nb\tc\0d", "\\N", "\{p1:String}"] {
+        let same: str = ch "SELECT {evil} AS v"
+        let hits: int = ch "SELECT count() FROM clicks WHERE url = {evil}"
+        print((same == evil).to_str() + " " + hits.to_str())
+    }
+    // LIKE: %, _ и \ значения — буквы
+    let one = "/p1"
+    let like: int = ch "SELECT count() FROM clicks WHERE url LIKE '{one}%'"
+    let under = "/p_"
+    let like_under: int = ch "SELECT count() FROM clicks WHERE url LIKE '%{under}%'"
+    let pct = "%"
+    let like_pct: int = ch "SELECT count() FROM clicks WHERE url ILIKE '%{pct}'"
+    print(like.to_str() + " " + like_under.to_str() + " " + like_pct.to_str())
+    // и в функциях like, notLike: «_» значения — буква
+    let fn_like: int = ch "SELECT like('/px1', '%{under}%') AS v"
+    let fn_not: int = ch "SELECT notLike('/px1', '%{under}%') AS v"
+    let fn_not_i: int = ch "SELECT notILike('/PX1', '%{under}%') AS v"
+    print(fn_like.to_str() + " " + fn_not.to_str() + " " + fn_not_i.to_str())
+    // IN со списком и пустым списком
+    let urls = ["/p1", "/p3", "/nope"]
+    let none_urls: [str] = []
+    let in_list: int = ch "SELECT count() FROM clicks WHERE url IN ({urls})"
+    let in_empty: int = ch "SELECT count() FROM clicks WHERE url IN {none_urls}"
+    let not_in: int = ch "SELECT count() FROM clicks WHERE url NOT IN {urls}"
+    print(in_list.to_str() + " " + in_empty.to_str() + " " + not_in.to_str())
+    // Nullable: none — все строки; значение — фильтр
+    let us: str? = "US"
+    let nobody: str? = none
+    let c1: int = ch "SELECT count() FROM clicks WHERE ({us} IS NULL OR country = {us})"
+    let c2: int = ch "SELECT count() FROM clicks WHERE ({nobody} IS NULL OR country = {nobody})"
+    print(c1.to_str() + " " + c2.to_str())
+    // ORDER BY {o} из вариантов
+    print(sorted("url").join(","))
+    print(sorted("new").join(","))
+    // значения всех видов: числа, bool, строки, перечисления, списки, словари
+    let e = Clicked
+    let i = 7
+    let f = 2.5
+    let b = true
+    let s = "s'\\"
+    let xs = [3, -1]
+    let m = {"a": 1, "it's": 2}
+    let o: str? = none
+    let nested = [["x", "y'z"], []]
+    let echo: Echo = ch "SELECT {i} AS i, {f} AS f, {b} AS b, {s} AS s, {e} AS e, {xs} AS xs, {m} AS m, {o} AS o, {nested} AS nested"
+    print(to_json(echo))
+    let nan = 0.0 / 0.0
+    let isnan: bool = ch "SELECT isNaN({nan}) AS v"
+    print(isnan)
+    // типы чтения: DateTime64 в ISO, Date в секундах, Decimal текстом, Enum, Nullable
+    let typed: Typed = ch "SELECT toDateTime64(1700000000.123, 3, 'UTC') AS at, toDate('2026-10-23') AS day, toDecimal64(12.3, 2) AS amount, true AS flag, CAST(NULL AS Nullable(Int32)) AS maybe, ['a', 'b'] AS tags, CAST('Clicked' AS Enum8('Viewed' = 1, 'Clicked' = 2)) AS kind"
+    print(to_json(typed))
+    let maybe: int? = ch "SELECT max(user_id) FROM clicks WHERE ts < 0"
+    print(to_json(maybe))
+    let zero = 0
+    let missing: Click? = ch "SELECT * FROM clicks WHERE ts = {zero}"
+    print(to_json(missing))
+    // мутация: mutations_sync — следующий запрос уже не видит удалённое
+    ch "ALTER TABLE clicks DELETE WHERE user_id = 4"
+    let left: int = ch "SELECT count() FROM clicks WHERE user_id = 4"
+    print("after delete: " + left.to_str())
+    // KILL QUERY в int — сколько запросов найдено
+    let killed: int = ch "KILL QUERY WHERE query_id = 'khrip-none' ASYNC"
+    print("killed " + killed.to_str())
+    // именованное соединение — своя база
+    let there: int = ch other "SELECT count() FROM marker"
+    print("other: " + there.to_str())
+    // log_comment и session_timezone на сервере
+    let day: str = ch "SELECT toString(toDate(toDateTime(1792782805))) AS v"
+    print(day)
+}

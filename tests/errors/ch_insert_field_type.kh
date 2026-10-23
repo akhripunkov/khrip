@@ -1,0 +1,7 @@
+// expect: EventIn.ts is str, but Event.ts is int
+type Event { ts: int, page: str }
+type EventIn { ts: str, page: str }
+table events: Event
+fn main() {
+    events.insert(EventIn { ts: "now", page: "/" })
+}

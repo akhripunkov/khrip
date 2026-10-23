@@ -1,0 +1,6 @@
+// expect: ch needs to know the result type of this query
+// expect: let rows: [Row] = ch ...
+fn main() {
+    let rows = ch "SELECT page, count() AS n FROM events GROUP BY page"
+    print(rows)
+}

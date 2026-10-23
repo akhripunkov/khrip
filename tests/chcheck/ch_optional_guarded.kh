@@ -1,0 +1,21 @@
+// Необязательные значения с проверкой на none: IS NULL, isNull(), coalesce,
+// ifNull — запрос сам решает, что делать с NULL; в списке SELECT NULL — ответ.
+type Row { n: int }
+type Echo { v: str? }
+
+fn counts(q: str?, lo: int?, prefix: str?) -> int {
+    let a: [Row] = ch "SELECT count() AS n FROM clicks WHERE ({q} IS NULL OR url LIKE '%{q}%')"
+    let b: [Row] = ch "SELECT count() AS n FROM clicks WHERE ({lo} IS NULL OR ts BETWEEN {lo} AND 100)"
+    let c: [Row] = ch "SELECT count() AS n FROM clicks WHERE (isNull({prefix}) OR startsWith(url, {prefix}))"
+    let d: [Row] = ch "SELECT count() AS n FROM clicks WHERE startsWith(url, coalesce({q}, ''))"
+    let e: [Row] = ch "SELECT count() AS n FROM clicks WHERE ts > ifNull({lo}, 0)"
+    return a.len() + b.len() + c.len() + d.len() + e.len()
+}
+
+fn echo(q: str?) -> [Echo] {
+    return ch "SELECT concat('/', {q}) AS v, '{q}' AS w FROM clicks ORDER BY ts LIMIT 1"
+}
+
+route GET "/n" (q: str?, lo: int?) -> int {
+    return counts(q, lo, q) + echo(q).len()
+}

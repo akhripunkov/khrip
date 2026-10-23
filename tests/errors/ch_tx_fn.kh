@@ -1,0 +1,11 @@
+// expect: note_paid() runs ch, and the tx block may run again after a conflict
+fn note_paid(id: int) {
+    ch "ALTER TABLE order_events UPDATE paid = 1 WHERE order_id = {id}"
+}
+route POST "/orders/{id}/pay" (id: int) -> 204 {
+    tx {
+        sql "UPDATE orders SET paid = true WHERE id = {id}"
+        note_paid(id)
+    }
+    return 204
+}

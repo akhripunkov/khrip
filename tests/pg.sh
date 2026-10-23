@@ -99,6 +99,28 @@ for src in docs/tutorial/db/*.kh docs/tutorial/db/answers/*.kh; do
 	fi
 done
 
+# khc test, миграция не прошла: временная схема всё равно удалена.
+cat >"$tmp/pg/migfail.kh" <<'X'
+migration 1 `
+CREATE TABLE t (id bigint PRIMARY KEY);
+CREATE TABLE t (id bigint PRIMARY KEY);
+`
+test "never runs" {
+    expect true
+}
+X
+"${as_pg[@]}" "$pg_bin/psql" -q -h "$pg_dir" -p "$PG_PORT" -U postgres -d postgres -c "create database t_migfail" >/dev/null 2>&1
+if DATABASE_URL="postgres://u_scram:pw-u_scram@127.0.0.1:$PG_PORT/t_migfail?sslmode=disable" "$KHC" test "$tmp/pg/migfail.kh" >"$tmp/pg/migfail.out" 2>&1; then
+	failed "khc test: failed migration" "khc test passed"
+else
+	left=$("${as_pg[@]}" "$pg_bin/psql" -tA -h "$pg_dir" -p "$PG_PORT" -U postgres -d t_migfail -c "select count(*) from information_schema.schemata where schema_name like 'khrip_test_%'")
+	if [[ $left == 0 ]] && grep -q "migration failed" "$tmp/pg/migfail.out"; then
+		pass=$((pass + 1))
+	else
+		failed "khc test: failed migration" "the test schema was left ($left): $(cat "$tmp/pg/migfail.out")"
+	fi
+fi
+
 # Корпус правильного SQL: PostgreSQL подтверждает каждый запрос (khc test).
 for src in tests/sqlcheck/*.kh; do
 	name=$(basename "$src" .kh)

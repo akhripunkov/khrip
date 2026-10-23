@@ -1,0 +1,6 @@
+// expect: insert rows with events.insert(rows)
+// expect: declare the table: table events: Event
+fn main() {
+    let id = 5
+    ch "INSERT INTO events (id) VALUES ({id})"
+}

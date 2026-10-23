@@ -1,0 +1,7 @@
+// expect: EventIn.color is not a field of Event
+type Event { ts: int, page: str }
+type EventIn { page: str, color: str }
+table events: Event
+fn main() {
+    events.insert([EventIn { page: "/", color: "red" }])
+}

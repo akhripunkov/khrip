@@ -1,0 +1,8 @@
+// expect: ch names database analytics: one connection is one database (khc test replaces it)
+// expect: declare a connection: clickhouse analytics = env("ANALYTICS_CLICKHOUSE_URL"), then ch analytics "..."
+type Row { n: int }
+fn main() {
+    let rows: [Row] = ch "SELECT count() AS n FROM analytics.events"
+    let parts: [Row] = ch "SELECT count() AS n FROM system.parts"
+    print(rows.len() + parts.len())
+}

@@ -1,0 +1,9 @@
+// expect: the DbResult of this call is never checked, so the failures it holds are ignored
+type Event { ts: int, page: str }
+table events: Event
+fn flush(rows: [Event]) -> DbResult {
+    return events.insert(rows)
+}
+fn main() {
+    flush([Event { ts: 1, page: "/" }])
+}

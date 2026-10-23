@@ -1,0 +1,7 @@
+// expect: {page} is str and is never none, so IS NULL is always false here
+type Row { n: int }
+fn main() {
+    let page = "/"
+    let rows: [Row] = ch "SELECT count() AS n FROM events WHERE ({page} IS NULL OR page = {page})"
+    print(rows.len())
+}

@@ -12,6 +12,9 @@
 // драйверов не конфликтует с библиотекой. Тексты библиотек читаются, только
 // если имя программы похоже на имя драйвера (driver_like), поэтому программа
 // без драйверов не платит за них ни временем компиляции, ни размером.
+// Типизированный слой ClickHouse (lib/chdb.kh, lib/dbtyped.kh) — исключение:
+// его подключают формы и объявления программы (uses_ch: ch "...", table,
+// clickhouse ИМЯ =, migration ch), и вместе с ним — lib/clickhouse.kh.
 
 type DriverLib {
     file: str
@@ -231,8 +234,8 @@ fn driver_libs(lib: str, api: bool, all: bool) -> [str] {
         }
         i += 1
     }
-    if wanted.keys.len() == 0 && !all {
-        // ни одного похожего имени: тексты библиотек не читаются
+    if wanted.keys.len() == 0 && !all && !uses_ch {
+        // ни одного похожего имени и нет слоя ch: тексты библиотек не читаются
         drv_bson = false
         drv_mongo = false
         drv_ch = false
@@ -242,6 +245,15 @@ fn driver_libs(lib: str, api: bool, all: bool) -> [str] {
     libs.push(driver_lib(lib, "bson.kh", "MongoDB", ["to_bson", "from_bson"]))
     libs.push(driver_lib(lib, "mongo.kh", "MongoDB", []))
     libs.push(driver_lib(lib, "clickhouse.kh", "ClickHouse", ["ch_encode", "ch_decode"]))
+    // типизированный слой ClickHouse (ch "...", table, clickhouse ИМЯ =,
+    // migration ch) подключается по объявлениям и формам программы (uses_ch),
+    // а не по именам; его имена (DbResult, Insert) — имена слоя баз данных.
+    // Тексты читаются, только когда слой нужен или проверяется (--all-lib).
+    let typed = uses_ch || all
+    if typed {
+        libs.push(driver_lib(lib, "chdb.kh", "ClickHouse", []))
+        libs.push(driver_lib(lib, "dbtyped.kh", "database", []))
+    }
     var w = 0
     while w < wanted.keys.len() {
         for d in libs {
@@ -252,6 +264,14 @@ fn driver_libs(lib: str, api: bool, all: bool) -> [str] {
             }
         }
         w += 1
+    }
+    if typed {
+        libs[3].used = uses_ch
+        libs[4].used = uses_ch
+    }
+    // слой ch строится на низкоуровневом драйвере
+    if uses_ch {
+        libs[2].used = true
     }
     if all && (api || libs[0].used || libs[1].used || libs[2].used) {
         for d in libs {
@@ -271,6 +291,16 @@ fn driver_libs(lib: str, api: bool, all: bool) -> [str] {
     while k < own.keys.len() {
         let name = own.keys[k]
         for d in libs {
+            if d.used && smap_get(d.names, name) >= 0 && smap_get(drv_clash, name) < 0 && (d.file == "chdb.kh" || d.file == "dbtyped.kh") {
+                // E-D9: имена типизированного слоя баз данных
+                smap_put(drv_clash, name, 1)
+                var what = "function"
+                let at = toks[own.vals[k]]
+                if at.file >= 0 && own.vals[k] > 0 && toks[own.vals[k] - 1].kind == T_TYPE {
+                    what = "type"
+                }
+                error_tok(at, "'" + name + "' is a " + what + " of the database layer; choose another name", "")
+            }
             if d.used && smap_get(d.names, name) >= 0 && smap_get(drv_clash, name) < 0 {
                 smap_put(drv_clash, name, 1)
                 var other = "my_" + name
@@ -292,6 +322,12 @@ fn driver_libs(lib: str, api: bool, all: bool) -> [str] {
     if drv_ch {
         out.push("db_http.kh")
         out.push("clickhouse.kh")
+    }
+    if typed && libs[4].used {
+        out.push("dbtyped.kh")
+    }
+    if typed && libs[3].used {
+        out.push("chdb.kh")
     }
     return out
 }

@@ -215,6 +215,13 @@ fn parse_ident(w: int) -> int {
     let s = sym_find(name)
     if s >= 0 {
         let sk = sym_kind(s)
+        if sk == SK_TABLE && kind() == '.' {
+            return parse_table_method(t, sym_idx(s), w)
+        }
+        if sk == SK_CONN || sk == SK_TABLE {
+            db_name_not_value(t, sk)
+            return ty_err
+        }
         if sk == SK_GLOBAL {
             let g = globals[sym_idx(s)]
             if global_in_store(g) {
@@ -1462,6 +1469,13 @@ fn parse_builtin(t: Token, w: int) -> int {
             return ty_err
         }
         return w
+    }
+    if name == "__chdb_root" && files[t.file].is_lib {
+        // корень мест ch, соединений и таблиц ClickHouse (src/coll.kh)
+        advance()
+        expect_tok(')')
+        emit_mov_imm(RAX, ch_root())
+        return ty_int
     }
     if name == "__db_root" && files[t.file].is_lib {
         // корень таблиц мест sql и миграций (src/sql.kh)

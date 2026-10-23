@@ -32,6 +32,24 @@ type ChResult {
     // The server may have applied a write whose response was lost. Never retry
     // solely because ok is false; use idempotency/deduplication at application level.
     unknown_outcome: bool = false
+    // Код исключения ClickHouse (X-ClickHouse-Exception-Code или «Code: N.» в
+    // начале тела ошибки); 0 — сервер кода не назвал.
+    code: int = 0
+    // Записано строк (written_rows из X-ClickHouse-Summary): INSERT, INSERT SELECT.
+    written_rows: int = 0
+}
+
+// Настройки одного вызова типизированного слоя (lib/chdb.kh): свой query_id
+// (по нему KILL QUERY после срока клиента), настройки запроса (log_comment,
+// session_timezone, mutations_sync, insert_deduplication_token, ...) и
+// параметры, уже записанные в текстовом формате ClickHouse. Пользователь с
+// readonly=1 не меняет настроек: для него settings пусты.
+type __ChCall {
+    query_id: str = ""
+    settings: map[str, str] = {}
+    // значения params — готовый текст ClickHouse (массивы и словари в своих
+    // кавычках): __ch_param их не экранирует
+    raw: bool = false
 }
 
 fn __ch_urlencode(s: str) -> str {
@@ -65,10 +83,17 @@ fn __ch_is_null(s: str) -> bool {
 
 // Значения параметров ClickHouse разбирает в формате escaped (как TabSeparated):
 // \N — NULL, обратная косая черта и управляющие символы экранируются.
+// Метка ch_null() — только у низкоуровневого ch_query_params: типизированный
+// слой (lib/chdb.kh) берёт __ch_escaped, и никакая строка данных не становится NULL.
 fn __ch_param(s: str) -> str {
     if __ch_is_null(s) {
         return "\\N"
     }
+    return __ch_escaped(s)
+}
+
+// Строка в формате escaped — всегда строка, никогда не NULL.
+fn __ch_escaped(s: str) -> str {
     let b = buf_new(s.byte_len() + 16)
     for i in 0..s.byte_len() {
         let c = s.byte(i)
@@ -157,7 +182,7 @@ fn __ch_boundary(query: str, values: [str]) -> str {
 // __dh_exchange по свежим строкам арены.
 // Настройки — только нужные операции: insert добавляет input_format_*, и
 // пользователь с readonly=1 выполняет SELECT (server_timeout: false).
-fn __ch_run(c: ChConfig, query: str, payload: str, params: map[str, str], insert: bool, cancel: bool, until: int) -> ChResult {
+fn __ch_run(c: ChConfig, query: str, payload: str, params: map[str, str], insert: bool, cancel: bool, until: int, opts: __ChCall) -> ChResult {
     let conferr = __ch_config_error(c)
     if conferr.byte_len() > 0 {
         return ChResult { error: conferr }
@@ -178,8 +203,11 @@ fn __ch_run(c: ChConfig, query: str, payload: str, params: map[str, str], insert
     let u = __parse_url(c.url) else {
         return ChResult { error: "invalid ClickHouse URL" }
     }
-    let id = "khrip-" + random_str(24)
-    var target = u.target + "?database=" + __ch_urlencode(c.database) + "&query_id=" + id
+    var id = opts.query_id
+    if id.byte_len() == 0 {
+        id = "khrip-" + random_str(24)
+    }
+    var target = u.target + "?database=" + __ch_urlencode(c.database) + "&query_id=" + __ch_urlencode(id)
     // параметры обработчика HTTP, а не настройки: их принимает и readonly=1
     target += "&default_format=RowBinaryWithNamesAndTypes&wait_end_of_query=1&buffer_size=" + max.to_str()
     // Настройки, от которых зависит разбор ответа, — со значениями по умолчанию:
@@ -193,6 +221,12 @@ fn __ch_run(c: ChConfig, query: str, payload: str, params: map[str, str], insert
     if c.async_insert && !cancel {
         target += "&async_insert=1&wait_for_async_insert=1"
     }
+    for k, v in opts.settings {
+        if !__ch_identifier(k) || v.byte_len() > 4096 {
+            return ChResult { error: "invalid ClickHouse setting: " + k }
+        }
+        target += "&" + k + "=" + __ch_urlencode(v)
+    }
     var sql = query
     var body = payload
     var ctype = "application/octet-stream"
@@ -205,10 +239,14 @@ fn __ch_run(c: ChConfig, query: str, payload: str, params: map[str, str], insert
         }
         var values: [str] = []
         for k, v in params {
-            if !__ch_identifier(k) || v.byte_len() > 65536 {
-                return ChResult { error: "invalid ClickHouse parameter name or value over 65536 bytes: " + k }
+            if !__ch_identifier(k) || v.byte_len() > CH_PARAM_MAX {
+                return ChResult { error: "invalid ClickHouse parameter name or value over 131072 bytes: " + k }
             }
-            values.push(__ch_param(v))
+            if opts.raw {
+                values.push(v)
+            } else {
+                values.push(__ch_param(v))
+            }
         }
         let boundary = __ch_boundary(query, values)
         if boundary == "" {
@@ -250,13 +288,57 @@ fn __ch_run(c: ChConfig, query: str, payload: str, params: map[str, str], insert
         if budget && (code == "164" || code == "452") && error.byte_find("max_execution_time") != none {
             error = error.ascii_trim() + " (ChConfig server_timeout: false sends no max_execution_time)"
         }
-        return ChResult { status: r.status, error, query_id: id }
+        var number = code.to_int() ?? 0
+        if number == 0 {
+            number = __ch_code_of(r.body)
+        }
+        return ChResult { status: r.status, error, query_id: id, code: number }
     }
     if r.headers.has("x-khrip-eof-framing") {
         // длины нет, конец — закрытие соединения: обрыв выглядел бы как конец
         return ChResult { status: r.status, body: r.body, error: "ClickHouse response is framed only by connection close; the body may be truncated", query_id: id, unknown_outcome: true }
     }
-    return ChResult { ok: true, status: r.status, body: r.body, query_id: id }
+    let written = __ch_summary_int(r.headers["x-clickhouse-summary"] ?? "", "written_rows")
+    return ChResult { ok: true, status: r.status, body: r.body, query_id: id, written_rows: written }
+}
+
+// Код исключения из текста ошибки ClickHouse: «Code: 241. DB::Exception: ...».
+// Наибольшее значение параметра: поле multipart, сервер принимает до 128 КиБ
+// (http_max_field_value_size).
+const CH_PARAM_MAX = 131072
+
+fn __ch_code_of(body: str) -> int {
+    let at = body.byte_find("Code: ") ?? -1
+    if at < 0 || at > 64 {
+        return 0
+    }
+    var n = 0
+    var i = at + 6
+    while i < body.byte_len() && i < at + 12 && body.byte(i) >= '0' && body.byte(i) <= '9' {
+        n = n * 10 + body.byte(i) - '0'
+        i += 1
+    }
+    return n
+}
+
+// Число из X-ClickHouse-Summary: {"read_rows":"1",...,"written_rows":"3",...};
+// -1 — ключа нет.
+fn __ch_summary_int(summary: str, key: str) -> int {
+    let at = summary.byte_find("\"" + key + "\":\"") ?? -1
+    if at < 0 {
+        return -1
+    }
+    var i = at + key.byte_len() + 4
+    var n = 0
+    let start = i
+    while i < summary.byte_len() && summary.byte(i) >= '0' && summary.byte(i) <= '9' && i < start + 18 {
+        n = n * 10 + summary.byte(i) - '0'
+        i += 1
+    }
+    if i == start {
+        return -1
+    }
+    return n
 }
 
 // SELECT without FORMAT defaults to RowBinaryWithNamesAndTypes, for ch_decode.
@@ -265,11 +347,11 @@ fn __ch_run(c: ChConfig, query: str, payload: str, params: map[str, str], insert
 // Запрос — литерал или const (компилятор: src/drivers.kh): значения — только
 // параметрами {name:Type} через ch_query_params.
 fn ch_query(c: ChConfig, query: str) -> ChResult {
-    return __ch_run(c, query, "", {}, false, false, 0)
+    return __ch_run(c, query, "", {}, false, false, 0, __ChCall {})
 }
 
 fn ch_query_params(c: ChConfig, query: str, params: map[str, str]) -> ChResult {
-    return __ch_run(c, query, "", params, false, false, 0)
+    return __ch_run(c, query, "", params, false, false, 0, __ChCall {})
 }
 
 fn __ch_error_set(message: str) {
@@ -500,6 +582,12 @@ const CHT_DT64 = 12
 const CHT_ENUM = 13
 const CHT_NULLABLE = 14
 const CHT_ARRAY = 15
+// Map(K, V): key — __ChType ключа, inner — значения
+const CHT_MAP = 16
+const CHT_IPV4 = 17
+const CHT_IPV6 = 18
+// Nothing (тип NULL без столбца: SELECT NULL — Nullable(Nothing))
+const CHT_NOTHING = 19
 
 type __ChType {
     op: int
@@ -509,13 +597,17 @@ type __ChType {
     // Decimal(P, S) — P и S; DateTime64(n) — n
     precision: int = 0
     scale: int = 0
-    // Nullable, Array: __ChType элемента
+    // Nullable, Array: __ChType элемента; Map: значения
     inner: int = 0
+    // Map: __ChType ключа
+    key: int = 0
     // Enum: имена и значения
     names: [str] = []
     values: [int] = []
     // запись типа как есть; у LowCardinality(T) — вместе с обёрткой
     text: str = ""
+    // запись без обёртки LowCardinality
+    plain: str = ""
 }
 
 type __ChTypeParser {
@@ -725,6 +817,7 @@ fn __cht_parse(t: __ChTypeParser, depth: int) -> __ChType {
         __cht_expect(t, ')')
         if name == "LowCardinality" {
             // в RowBinary LowCardinality(T) записывается как T
+            inner.plain = inner.text
             inner.text = t.s.byte_slice(start, t.p)
             return inner
         }
@@ -748,6 +841,26 @@ fn __cht_parse(t: __ChTypeParser, depth: int) -> __ChType {
     } else if name == "UUID" {
         ty.op = CHT_UUID
         ty.width = 16
+    } else if name == "IPv4" {
+        ty.op = CHT_IPV4
+        ty.width = 4
+    } else if name == "IPv6" {
+        ty.op = CHT_IPV6
+        ty.width = 16
+    } else if name == "Nothing" {
+        ty.op = CHT_NOTHING
+        ty.width = 0
+    } else if name == "Map" {
+        if !__cht_expect(t, '(') {
+            return ty
+        }
+        let key = __cht_parse(t, depth + 1)
+        __cht_expect(t, ',')
+        let value = __cht_parse(t, depth + 1)
+        __cht_expect(t, ')')
+        ty.op = CHT_MAP
+        ty.key = __cast(key)
+        ty.inner = __cast(value)
     } else if name == "Date" {
         ty.op = CHT_DATE
         ty.width = 2
@@ -832,6 +945,7 @@ fn __cht_parse(t: __ChTypeParser, depth: int) -> __ChType {
         __cht_skip_args(t)
     }
     ty.text = t.s.byte_slice(start, t.p)
+    ty.plain = ty.text
     return ty
 }
 
@@ -1047,149 +1161,309 @@ fn __ch_decimal_float(r: __ChReader, width: int, scale: int) -> int {
     return __cast(v)
 }
 
-// Кратчайшая десятичная запись float (её печатает Khrip: 1.005 — это 1.005, а
-// не 1.00499...): знак, цифры без ведущих и хвостовых нулей (count штук, до 17)
-// и порядок: 12345678901234567000 — это 12345678901234567 · 10^3.
-type __ChDigits {
-    neg: bool = false
-    digits: int = 0
-    count: int = 0
-    exp: int = 0
-}
+// ---- Decimal и числа произвольной ширины ----
+// Общие для ch_insert и типизированного слоя. Int128/Int256, Decimal128/256:
+// дополнительный код, младший байт первым.
+// Текст — делением на 10^9 по 32-битным словам (частное и остаток помещаются
+// в int).
 
-// none — NaN или ±Inf.
-fn __ch_digits(x: float) -> __ChDigits? {
-    let d = __ChDigits {}
-    let text = x.to_str()
-    var i = 0
-    if text.byte(0) == '-' {
-        d.neg = true
-        i = 1
-    }
-    var point = false
-    // нули после значащих цифр: войдут в digits, только если за ними есть цифра
-    var zeros = 0
-    while i < text.byte_len() {
-        let c = text.byte(i)
-        if c >= '0' && c <= '9' {
-            if c == '0' && d.digits > 0 {
-                zeros += 1
-            } else if c != '0' {
-                if d.count + zeros >= 17 {
-                    return none
-                }
-                for k in 0..zeros {
-                    d.digits = d.digits * 10
-                }
-                d.digits = d.digits * 10 + c - '0'
-                d.count += zeros + 1
-                zeros = 0
-            }
-            if point {
-                d.exp -= 1
-            }
-        } else if c == '.' {
-            point = true
-        } else if c == 'e' {
-            // e+21, e-7
-            var e = 0
-            var j = i + 2
-            while j < text.byte_len() {
-                e = e * 10 + text.byte(j) - '0'
-                j += 1
-            }
-            if text.byte(i + 1) == '-' {
-                e = 0 - e
-            }
-            d.exp += e
-            break
-        } else {
-            // NaN, Infinity
-            return none
-        }
-        i += 1
-    }
-    d.exp += zeros
-    return d
-}
-
-// float → целое без запятой для Decimal(P, S): по кратчайшей десятичной записи
-// числа, половина — от нуля. none — NaN, ±Inf, |значение| ≥ 10^P или не
-// помещается в int (Decimal128/256 тогда пишет __ch_decimal_wide).
-fn __ch_decimal_units(x: float, scale: int, precision: int) -> int? {
-    let d = __ch_digits(x) else {
-        return none
-    }
-    let neg = d.neg
-    let digits = d.digits
-    let shift = d.exp + scale
-    var units = digits
-    if shift >= 0 {
-        for k in 0..shift {
-            if units > 922337203685477580 {
-                return none
-            }
-            units = units * 10
-        }
-    } else if shift < -18 {
-        units = 0
-    } else {
-        let div = __pow10i(0 - shift)
-        units = digits / div
-        if (digits % div) * 2 >= div {
-            units += 1
-        }
-    }
-    if precision <= 18 && units >= __pow10i(precision) {
-        return none
-    }
-    if neg {
-        return 0 - units
-    }
-    return units
-}
-
-// Decimal128/256, целое без запятой которого больше int: цифры числа · 10^сдвиг
-// по 32 бита в слове (умножение на 10 не переполняет int), затем width байт
-// младшими вперёд, отрицательное — в дополнительном коде. Сдвиг здесь ≥ 0: с
-// отрицательным значение меньше цифр и поместилось в int. false — не
-// помещается в Decimal(P, S): цифр с нулями сдвига больше P.
-fn __ch_decimal_wide(b: Buf, x: float, scale: int, precision: int, width: int) -> bool {
-    let d = __ch_digits(x) else {
-        return false
-    }
-    let shift = d.exp + scale
-    if width < 16 || shift < 0 || d.count + shift > precision {
-        return false
-    }
+// Десятичный текст целого из width байт по адресу p.
+fn __ch_wide_text(p: int, width: int, signed: bool) -> str {
     let n = width / 4
-    let limbs = __alloc(n * 8)
-    __memset(limbs, 0, n * 8)
-    store64(limbs, d.digits & 0xFFFFFFFF)
-    store64(limbs + 8, d.digits >> 32)
-    for k in 0..shift {
-        var carry = 0
-        for i in 0..n {
-            let v = load64(limbs + i * 8) * 10 + carry
-            store64(limbs + i * 8, v & 0xFFFFFFFF)
-            carry = v >> 32
-        }
+    let words = __alloc(n * 8)
+    for i in 0..n {
+        store64(words + i * 8, load32(p + i * 4))
     }
-    if d.neg {
-        // −v = ~v + 1
+    var negative = false
+    if signed && (load8(p + width - 1) & 128) != 0 {
+        negative = true
+        // модуль: инверсия и +1
         var carry = 1
         for i in 0..n {
-            let v = (load64(limbs + i * 8) ^ 0xFFFFFFFF) + carry
-            store64(limbs + i * 8, v & 0xFFFFFFFF)
-            carry = v >> 32
+            let w = ((~load64(words + i * 8)) & 0xFFFFFFFF) + carry
+            store64(words + i * 8, w & 0xFFFFFFFF)
+            carry = w >> 32
+        }
+    }
+    var parts: [int] = []
+    while true {
+        var zero = true
+        for i in 0..n {
+            if load64(words + i * 8) != 0 {
+                zero = false
+            }
+        }
+        if zero {
+            break
+        }
+        var rem = 0
+        var i = n
+        while i > 0 {
+            i -= 1
+            let cur = (rem << 32) | load64(words + i * 8)
+            store64(words + i * 8, cur / 1000000000)
+            rem = cur % 1000000000
+        }
+        parts.push(rem)
+    }
+    if parts.len() == 0 {
+        return "0"
+    }
+    let b = buf_new(80)
+    if negative {
+        buf_byte(b, '-')
+    }
+    var k = parts.len() - 1
+    buf_add(b, parts[k].to_str())
+    while k > 0 {
+        k -= 1
+        buf_add(b, __pad(parts[k], 9))
+    }
+    return buf_str(b)
+}
+
+// Цифры (без знака и ведущих нулей) → width байт дополнительного кода в b;
+// false — не помещается.
+// signed: Int128/Int256 и Decimal — от −2^(8w−1) до 2^(8w−1)−1; иначе
+// (UInt128/UInt256) — от 0 до 2^(8w)−1.
+fn __ch_wide_put(b: Buf, negative: bool, digits: str, width: int, signed: bool) -> bool {
+    let n = width / 4
+    let words = __alloc(n * 8)
+    for i in 0..n {
+        store64(words + i * 8, 0)
+    }
+    for j in 0..digits.byte_len() {
+        var carry = digits.byte(j) - '0'
+        for i in 0..n {
+            let w = load64(words + i * 8) * 10 + carry
+            store64(words + i * 8, w & 0xFFFFFFFF)
+            carry = w >> 32
+        }
+        if carry != 0 {
+            return false
+        }
+    }
+    var zero = true
+    for i in 0..n {
+        if load64(words + i * 8) != 0 {
+            zero = false
+        }
+    }
+    if !signed && negative && !zero {
+        return false
+    }
+    if signed && (load64(words + (n - 1) * 8) & 0x80000000) != 0 {
+        // модуль ≥ 2^(8w−1): можно только −2^(8w−1) ровно
+        var exact = negative && load64(words + (n - 1) * 8) == 0x80000000
+        for i in 0..n - 1 {
+            if load64(words + i * 8) != 0 {
+                exact = false
+            }
+        }
+        if !exact {
+            return false
+        }
+    }
+    if negative && !zero {
+        var carry = 1
+        for i in 0..n {
+            let w = ((~load64(words + i * 8)) & 0xFFFFFFFF) + carry
+            store64(words + i * 8, w & 0xFFFFFFFF)
+            carry = w >> 32
         }
     }
     buf_reserve(b, width)
     for i in 0..n {
-        store32(b.data + b.len + i * 4, load64(limbs + i * 8))
+        store32(b.data + b.len + i * 4, load64(words + i * 8))
     }
     b.len += width
     return true
+}
+
+// Текст Decimal: целое без запятой (width байт) и S знаков после точки.
+fn __ch_decimal_text(p: int, width: int, scale: int) -> str {
+    var digits = ""
+    if width <= 8 {
+        var v = 0
+        if width == 4 {
+            v = (load32(p) << 32) >> 32
+        } else {
+            v = load64(p)
+        }
+        digits = v.to_str()
+    } else {
+        digits = __ch_wide_text(p, width, true)
+    }
+    if scale == 0 {
+        return digits
+    }
+    var sign = ""
+    if digits.byte(0) == '-' {
+        sign = "-"
+        digits = digits.byte_slice(1, digits.byte_len())
+    }
+    while digits.byte_len() <= scale {
+        digits = "0" + digits
+    }
+    let cut = digits.byte_len() - scale
+    return sign + digits.byte_slice(0, cut) + "." + digits.byte_slice(cut, digits.byte_len())
+}
+
+// Десятичный текст ("-12.345", "1e+21", "1.5e-7") → цифры целого без запятой
+// для Decimal(P, S). Округление (round):
+// - CHD_EXACT — str типизированного слоя: лишние ненулевые знаки после S — ошибка;
+// - CHD_EVEN — float типизированного слоя: к ближайшему, половина — к чётному;
+// - CHD_AWAY — float низкоуровневого ch_insert: половина — от нуля.
+// float приходит своей кратчайшей десятичной записью (её печатает Khrip: 1.005
+// — это 1.005, а не 1.00499...). Ответ: знак и цифры; error — почему нельзя.
+const CHD_EXACT = 0
+const CHD_EVEN = 1
+const CHD_AWAY = 2
+
+type __ChDecimal {
+    negative: bool = false
+    digits: str = ""
+    error: str = ""
+}
+
+fn __ch_decimal_digits(text: str, scale: int, precision: int, round: int) -> __ChDecimal {
+    let out = __ChDecimal {}
+    var i = 0
+    let n = text.byte_len()
+    if n > 0 && (text.byte(0) == '-' || text.byte(0) == '+') {
+        out.negative = text.byte(0) == '-'
+        i = 1
+    }
+    let all = buf_new(n + scale + 4)
+    var point = -1
+    var seen = 0
+    while i < n {
+        let c = text.byte(i)
+        if c >= '0' && c <= '9' {
+            buf_byte(all, c)
+            seen += 1
+        } else if c == '.' && point < 0 {
+            point = all.len
+        } else {
+            break
+        }
+        i += 1
+    }
+    var exp = 0
+    if i < n && (text.byte(i) == 'e' || text.byte(i) == 'E') {
+        i += 1
+        var eneg = false
+        if i < n && (text.byte(i) == '-' || text.byte(i) == '+') {
+            eneg = text.byte(i) == '-'
+            i += 1
+        }
+        let es = i
+        while i < n && text.byte(i) >= '0' && text.byte(i) <= '9' && exp < 100000 {
+            exp = exp * 10 + text.byte(i) - '0'
+            i += 1
+        }
+        if i == es {
+            seen = 0
+        }
+        if eneg {
+            exp = 0 - exp
+        }
+    }
+    if seen == 0 || i != n || n > 400 {
+        out.error = "is not a decimal number"
+        return out
+    }
+    let ds = buf_str(all)
+    if point < 0 {
+        point = ds.byte_len()
+    }
+    // позиция точки после сдвига на экспоненту и на S
+    let at = point + exp + scale
+    var whole = ""
+    var rest = ""
+    if at <= 0 {
+        rest = "0".repeat(0 - at) + ds
+    } else if at >= ds.byte_len() {
+        whole = ds + "0".repeat(at - ds.byte_len())
+    } else {
+        whole = ds.byte_slice(0, at)
+        rest = ds.byte_slice(at, ds.byte_len())
+    }
+    var nonzero = false
+    for k in 0..rest.byte_len() {
+        if rest.byte(k) != '0' {
+            nonzero = true
+        }
+    }
+    if nonzero && round == CHD_EXACT {
+        out.error = "has more than " + scale.to_str() + " decimal places"
+        return out
+    }
+    if nonzero {
+        let first = rest.byte(0)
+        var tail = false
+        for k in 1..rest.byte_len() {
+            if rest.byte(k) != '0' {
+                tail = true
+            }
+        }
+        var last = 0
+        if whole.byte_len() > 0 {
+            last = whole.byte(whole.byte_len() - 1) - '0'
+        }
+        // половина — от нуля (CHD_AWAY) или к чётному (CHD_EVEN)
+        if first > '5' || (first == '5' && (round == CHD_AWAY || tail || last % 2 == 1)) {
+            whole = __ch_digits_inc(whole)
+        }
+    }
+    var start = 0
+    while start < whole.byte_len() && whole.byte(start) == '0' {
+        start += 1
+    }
+    out.digits = whole.byte_slice(start, whole.byte_len())
+    if out.digits.byte_len() == 0 {
+        out.digits = "0"
+        out.negative = false
+    }
+    if out.digits.byte_len() > precision {
+        out.error = "does not fit Decimal(" + precision.to_str() + ", " + scale.to_str() + ")"
+    }
+    return out
+}
+
+// Цифры + 1.
+fn __ch_digits_inc(s: str) -> str {
+    let b = buf_new(s.byte_len() + 1)
+    buf_add(b, s)
+    var i = s.byte_len()
+    while i > 0 {
+        i -= 1
+        let c = load8(b.data + i)
+        if c < '9' {
+            store8(b.data + i, c + 1)
+            return buf_str(b)
+        }
+        store8(b.data + i, '0')
+    }
+    return "1" + buf_str(b)
+}
+
+// Цифры Decimal (__ch_decimal_digits) → целое без запятой в width байт:
+// Decimal32/64 (P ≤ 18 — значение в int) или словами у Decimal128/256 и
+// Int/UInt128/256 (signed — знаковое). false — не помещается в width байт.
+fn __ch_decimal_put(b: Buf, dec: __ChDecimal, width: int, signed: bool) -> bool {
+    if width <= 8 {
+        if dec.digits.byte_len() > 18 {
+            return false
+        }
+        var units = dec.digits.to_int() ?? 0
+        if dec.negative {
+            units = 0 - units
+        }
+        __ch_put_int(b, units, width)
+        return true
+    }
+    return __ch_wide_put(b, dec.negative, dec.digits, width, signed)
 }
 
 // ---- UUID ----
@@ -1616,6 +1890,61 @@ fn __ch_decode(body: str, d: int) -> int {
 // настоящие типы: сервер сверяет их со схемой (input_format_with_types_use_header),
 // так что устаревший кэш даёт ошибку, а не неверные байты.
 
+// Описание столбца из ответа DESCRIBE.
+type __ChCol {
+    name: str
+    ty: str
+    // DEFAULT, MATERIALIZED, ALIAS, EPHEMERAL или ""
+    kind: str = ""
+    expr: str = ""
+}
+
+// Строки ответа DESCRIBE (все столбцы String); none — ответ не разобрать.
+fn __ch_describe_cols(body: str) -> [__ChCol]? {
+    let r = __ChReader { p: __str_ptr(body), end: __str_ptr(body) + body.byte_len() }
+    let width = __ch_read_varint(r)
+    if r.error.byte_len() > 0 || width < 2 || width > 64 {
+        return none
+    }
+    var heads: [str] = []
+    for i in 0..width {
+        heads.push(__ch_read_str(r))
+    }
+    for i in 0..width {
+        if __ch_read_str(r) != "String" {
+            return none
+        }
+    }
+    let at_name = heads.index_of("name") ?? -1
+    let at_type = heads.index_of("type") ?? -1
+    let at_kind = heads.index_of("default_type") ?? -1
+    let at_expr = heads.index_of("default_expression") ?? -1
+    if at_name < 0 || at_type < 0 {
+        return none
+    }
+    var out: [__ChCol] = []
+    while r.p < r.end && r.error.byte_len() == 0 {
+        let col = __ChCol { name: "", ty: "" }
+        for i in 0..width {
+            let v = __ch_read_str(r)
+            if i == at_name {
+                col.name = v
+            } else if i == at_type {
+                col.ty = v
+            } else if i == at_kind {
+                col.kind = v
+            } else if i == at_expr {
+                col.expr = v
+            }
+        }
+        out.push(col)
+    }
+    if r.error.byte_len() > 0 {
+        return none
+    }
+    return out
+}
+
 // Перевод значения: из типа пакета ch_encode в тип столбца.
 const CHC_COPY = 1
 const CHC_INT = 2
@@ -1900,13 +2229,12 @@ fn __ch_conv_value(r: __ChReader, b: Buf, v: __ChConv) -> bool {
         }
         let x: float = __cast(load64(r.p))
         r.p += 8
-        let units = __ch_decimal_units(x, v.scale, v.precision) else {
-            if __ch_decimal_wide(b, x, v.scale, v.precision, v.width) {
-                return true
-            }
+        // по кратчайшей десятичной записи, половина — от нуля; NaN и ±Inf — не
+        // числа, Decimal128/256 (Decimal(38, 18) денег и токенов) — до 10^P
+        let dec = __ch_decimal_digits(x.to_str(), v.scale, v.precision, CHD_AWAY)
+        if dec.error.byte_len() > 0 || !__ch_decimal_put(b, dec, v.width, true) {
             return __ch_conv_fail(r, v, "value " + x.to_str() + " does not fit Decimal(" + v.precision.to_str() + ", " + v.scale.to_str() + ")")
         }
-        __ch_put_int(b, units, v.width)
         return true
     }
     // остальные — из строки
@@ -1953,43 +2281,13 @@ type __ChInsertPlan {
 
 fn __ch_insert_plan(schema: str, cols: [str], srcs: [str]) -> __ChInsertPlan {
     let plan = __ChInsertPlan {}
-    // ответ DESCRIBE: name, type, default_type, ... — все String
-    let r = __ChReader { p: __str_ptr(schema), end: __str_ptr(schema) + schema.byte_len() }
-    let width = __ch_read_varint(r)
-    if r.error.byte_len() > 0 || width < 3 || width > 64 {
+    let described = __ch_describe_cols(schema) else {
         plan.error = "unexpected DESCRIBE result"
         return plan
     }
-    var heads: [str] = []
-    for i in 0..width {
-        heads.push(__ch_read_str(r))
-    }
-    for i in 0..width {
-        if __ch_read_str(r) != "String" {
-            r.error = "unexpected DESCRIBE column type"
-        }
-    }
-    let at_name = heads.index_of("name") ?? -1
-    let at_type = heads.index_of("type") ?? -1
-    let at_kind = heads.index_of("default_type") ?? -1
     var names: [str] = []
-    var types: [str] = []
-    var kinds: [str] = []
-    while r.p < r.end && r.error.byte_len() == 0 {
-        for i in 0..width {
-            let v = __ch_read_str(r)
-            if i == at_name {
-                names.push(v)
-            } else if i == at_type {
-                types.push(v)
-            } else if i == at_kind {
-                kinds.push(v)
-            }
-        }
-    }
-    if r.error.byte_len() > 0 || at_name < 0 || at_type < 0 || at_kind < 0 || names.len() != types.len() || names.len() != kinds.len() {
-        plan.error = "unexpected DESCRIBE result"
-        return plan
+    for d in described {
+        names.push(d.name)
     }
     let error = buf_new(64)
     for i in 0..cols.len() {
@@ -1998,7 +2296,7 @@ fn __ch_insert_plan(schema: str, cols: [str], srcs: [str]) -> __ChInsertPlan {
             plan.error = "table has no column '" + col + "'"
             return plan
         }
-        let kind = kinds[at]
+        let kind = described[at].kind
         if kind == "MATERIALIZED" || kind == "ALIAS" {
             plan.error = "column '" + col + "' is " + kind + " and cannot be inserted"
             return plan
@@ -2007,8 +2305,9 @@ fn __ch_insert_plan(schema: str, cols: [str], srcs: [str]) -> __ChInsertPlan {
             plan.error = "invalid RowBinary type header " + srcs[i]
             return plan
         }
-        let dst = __ch_type_of(types[at]) else {
-            plan.error = "column '" + col + "' has unsupported ClickHouse type " + types[at]
+        let ty = described[at].ty
+        let dst = __ch_type_of(ty) else {
+            plan.error = "column '" + col + "' has unsupported ClickHouse type " + ty
             return plan
         }
         let conv = __ch_conv_plan(col, src, dst, 0, error) else {
@@ -2016,8 +2315,8 @@ fn __ch_insert_plan(schema: str, cols: [str], srcs: [str]) -> __ChInsertPlan {
             return plan
         }
         plan.convs.push(__cast(conv))
-        plan.types.push(types[at])
-        if srcs[i] != types[at] {
+        plan.types.push(ty)
+        if srcs[i] != ty {
             plan.same = false
         }
     }
@@ -2219,20 +2518,25 @@ fn __ch_describe(c: ChConfig, table: str, key: int, deadline: int) -> ChResult {
     if blk != 0 {
         __xadd(blk + 24, 1)
     }
-    let d = __ch_run(c, "DESCRIBE TABLE " + table, "", {}, false, false, deadline)
+    let d = __ch_run(c, "DESCRIBE TABLE " + table, "", {}, false, false, deadline, __ChCall {})
     if d.ok {
         __ch_schema_put(key, d.body)
     }
     return d
 }
 
-// Сервер отверг заголовок пакета до чтения строк — тип столбца сменился (Code
-// 117 «while reading header») или столбца нет (Code 16): ничего не записано.
+// Сервер отверг вставку на заголовке пакета, до первой строки: столбца нет
+// (Code 8, 10, 16, 47) или тип столбца в заголовке не тот (Code 117 «while
+// reading header»). Ничего не записано: так бывает, когда таблицу изменили
+// (ALTER) после того, как её схема попала в кэш (ch_insert) или план вставки
+// построен при запуске (t.insert, lib/chdb.kh). Тогда вставка спрашивает
+// DESCRIBE и пробует ещё раз — один раз.
 fn __ch_header_rejected(r: ChResult) -> bool {
     if r.ok || r.unknown_outcome || r.status < 400 {
         return false
     }
-    return (r.error.starts_with("Code: 117.") && r.error.byte_find("(while reading header)") != none) || r.error.starts_with("Code: 16.")
+    let c = r.code
+    return c == 8 || c == 10 || c == 16 || c == 47 || (c == 117 && r.error.byte_find("while reading header") != none)
 }
 
 // Вставка строк body с адреса rows под схему schema (ответ DESCRIBE). none —
@@ -2260,7 +2564,7 @@ fn __ch_insert_with(c: ChConfig, table: str, target: str, cols: [str], quoted: [
         }
     }
     let query = "INSERT INTO " + target + " (" + quoted.join(",") + ") FORMAT RowBinaryWithNamesAndTypes\n"
-    let result = __ch_run(c, query, payload, {}, true, false, deadline)
+    let result = __ch_run(c, query, payload, {}, true, false, deadline, __ChCall {})
     if !result.ok && result.status >= 400 {
         // схема в кэше могла устареть: следующая вставка спросит DESCRIBE снова
         __ch_schema_drop(key)
@@ -2337,5 +2641,1558 @@ fn ch_insert(c: ChConfig, table: str, body: str) -> ChResult {
 // Cancellation is explicit and requires KILL QUERY privileges. A cancelled
 // INSERT may already have committed: cancellation is never a rollback promise.
 fn ch_cancel(c: ChConfig, query_id: str) -> ChResult {
-    return __ch_run(c, "KILL QUERY WHERE query_id = \{id:String} SYNC", "", {"id": query_id}, false, true, 0)
+    return __ch_run(c, "KILL QUERY WHERE query_id = \{id:String} SYNC", "", {"id": query_id}, false, true, 0, __ChCall {})
+}
+
+// ============================================================================
+// Типизированный слой (lib/chdb.kh): планы столбцов в смысле Khrip. Время —
+// секунды Unix (Date — полночь UTC, DateTime64(p) пишется как секунды × 10^p),
+// Decimal — точный текст в str, Enum — перечисление Khrip, Map — словарь.
+// Низкоуровневые ch_decode и ch_insert остаются в сырых единицах.
+// ============================================================================
+
+// DESCRIBE TABLE (запрос) с параметрами: типы столбцов результата без
+// выполнения запроса.
+fn __ch_describe_query(c: ChConfig, query: str, params: map[str, str], opts: __ChCall, deadline: int) -> ChResult {
+    // скобка — с новой строки: комментарий -- или # в конце запроса её не съест
+    return __ch_run(c, "DESCRIBE TABLE (" + query + "\n)", "", params, false, false, deadline, opts)
+}
+
+// Отмена запроса после срока клиента: KILL QUERY ... ASYNC по другому
+// соединению, не дольше секунды; ответ не важен (best effort).
+fn __ch_kill_async(c: ChConfig, query_id: str) {
+    __ch_run(ChConfig { ...c, timeout_ms: 1000, async_insert: false }, "KILL QUERY WHERE query_id = \{id:String} ASYNC", "", {"id": query_id}, false, true, now_ms() + 1000, __ChCall {})
+}
+
+// ---- Время ----
+
+// ISO 8601 → единицы 10^-scale секунды с 1970-01-01 UTC: «YYYY-MM-DD»,
+// «YYYY-MM-DD hh:mm:ss», «...Thh:mm:ss.fff», с Z или ±hh:mm (без пояса — UTC).
+// Знаков дробной части больше scale (ненулевых) — ошибка; none — не дата.
+fn __ch_iso_units(s: str, scale: int) -> int? {
+    let days = __parse_ymd(s) else {
+        return none
+    }
+    let unit = __pow10i(scale)
+    if s.byte_len() == 10 {
+        return days * 86400 * unit
+    }
+    let sep = s.byte(10)
+    if s.byte_len() < 19 || (sep != 'T' && sep != 't' && sep != ' ') || s.byte(13) != ':' || s.byte(16) != ':' {
+        return none
+    }
+    let h = __digits(s, 11, 2)
+    let mi = __digits(s, 14, 2)
+    let sec = __digits(s, 17, 2)
+    if h < 0 || h > 23 || mi < 0 || mi > 59 || sec < 0 || sec > 59 {
+        return none
+    }
+    var i = 19
+    var frac = 0
+    var places = 0
+    if i < s.byte_len() && s.byte(i) == '.' {
+        i += 1
+        let fs = i
+        while i < s.byte_len() && s.byte(i) >= '0' && s.byte(i) <= '9' {
+            let d = s.byte(i) - '0'
+            if places < scale {
+                frac = frac * 10 + d
+                places += 1
+            } else if d != 0 {
+                return none
+            }
+            i += 1
+        }
+        if i == fs {
+            return none
+        }
+    }
+    while places < scale {
+        frac *= 10
+        places += 1
+    }
+    var offset = 0
+    if i < s.byte_len() {
+        let z = s.byte(i)
+        if (z == 'Z' || z == 'z') && i + 1 == s.byte_len() {
+            i += 1
+        } else if (z == '+' || z == '-') && i + 6 == s.byte_len() && s.byte(i + 3) == ':' {
+            let oh = __digits(s, i + 1, 2)
+            let om = __digits(s, i + 4, 2)
+            if oh < 0 || oh > 23 || om < 0 || om > 59 {
+                return none
+            }
+            offset = oh * 3600 + om * 60
+            if z == '-' {
+                offset = 0 - offset
+            }
+            i += 6
+        } else {
+            return none
+        }
+    }
+    let secs = days * 86400 + h * 3600 + mi * 60 + sec - offset
+    return secs * unit + frac
+}
+
+// Дни с 1970-01-01 → «YYYY-MM-DD».
+fn __ch_day_text(days: int) -> str {
+    return time_iso(days * 86400).byte_slice(0, 10)
+}
+
+// Единицы 10^-scale секунды → ISO 8601 с scale знаками дробной части.
+fn __ch_dt64_text(v: int, scale: int) -> str {
+    if scale == 0 {
+        return time_iso(v)
+    }
+    let unit = __pow10i(scale)
+    var secs = v / unit
+    var frac = v % unit
+    if frac < 0 {
+        frac += unit
+        secs -= 1
+    }
+    let t = time_iso(secs)
+    return t.byte_slice(0, 19) + "." + __pad(frac, scale) + "Z"
+}
+
+// ---- IP ----
+
+fn __ch_ipv4_text(v: int) -> str {
+    return ((v >> 24) & 255).to_str() + "." + ((v >> 16) & 255).to_str() + "." + ((v >> 8) & 255).to_str() + "." + (v & 255).to_str()
+}
+
+// «a.b.c.d» → UInt32 или -1.
+fn __ch_ipv4_parse(s: str) -> int {
+    var v = 0
+    var parts = 0
+    var i = 0
+    let n = s.byte_len()
+    while parts < 4 {
+        let start = i
+        var x = 0
+        while i < n && s.byte(i) >= '0' && s.byte(i) <= '9' && i - start < 3 {
+            x = x * 10 + s.byte(i) - '0'
+            i += 1
+        }
+        if i == start || x > 255 || (i - start > 1 && s.byte(start) == '0') {
+            return -1
+        }
+        v = (v << 8) | x
+        parts += 1
+        if parts < 4 {
+            if i >= n || s.byte(i) != '.' {
+                return -1
+            }
+            i += 1
+        }
+    }
+    if i != n {
+        return -1
+    }
+    return v
+}
+
+// 16 байт адреса (сетевой порядок) → канонический текст (RFC 5952).
+fn __ch_ipv6_text(p: int) -> str {
+    var groups: [int] = []
+    for i in 0..8 {
+        groups.push((load8(p + i * 2) << 8) | load8(p + i * 2 + 1))
+    }
+    // ::ffff:a.b.c.d
+    if groups[0] == 0 && groups[1] == 0 && groups[2] == 0 && groups[3] == 0 && groups[4] == 0 && groups[5] == 0xFFFF {
+        return "::ffff:" + __ch_ipv4_text((groups[6] << 16) | groups[7])
+    }
+    var best = -1
+    var best_len = 1
+    var i = 0
+    while i < 8 {
+        if groups[i] == 0 {
+            var j = i
+            while j < 8 && groups[j] == 0 {
+                j += 1
+            }
+            if j - i > best_len {
+                best = i
+                best_len = j - i
+            }
+            i = j
+        } else {
+            i += 1
+        }
+    }
+    let hex = "0123456789abcdef"
+    let b = buf_new(40)
+    var k = 0
+    while k < 8 {
+        if k == best {
+            buf_add(b, "::")
+            k += best_len
+            continue
+        }
+        if k > 0 && k != best + best_len {
+            buf_byte(b, ':')
+        }
+        let g = groups[k]
+        var started = false
+        var shift = 12
+        while shift >= 0 {
+            let d = (g >> shift) & 15
+            if d != 0 || started || shift == 0 {
+                buf_byte(b, hex.byte(d))
+                started = true
+            }
+            shift -= 4
+        }
+        k += 1
+    }
+    return buf_str(b)
+}
+
+// Текст IPv6 (или IPv4 — как ::ffff:a.b.c.d) → 16 байт в b; false — не адрес.
+fn __ch_ipv6_put(b: Buf, s: str) -> bool {
+    let v4 = __ch_ipv4_parse(s)
+    var groups: [int] = []
+    if v4 >= 0 {
+        groups = [0, 0, 0, 0, 0, 0xFFFF, (v4 >> 16) & 0xFFFF, v4 & 0xFFFF]
+    } else {
+        let n = s.byte_len()
+        if n < 2 || n > 45 {
+            return false
+        }
+        var head: [int] = []
+        var tail: [int] = []
+        var gap = false
+        var i = 0
+        if s.byte_slice(0, 2) == "::" {
+            gap = true
+            i = 2
+        }
+        while i < n {
+            // хвост a.b.c.d
+            let dot = s.byte_slice(i, n).byte_find(".") ?? -1
+            let colon = s.byte_slice(i, n).byte_find(":") ?? -1
+            if dot >= 0 && (colon < 0 || colon > dot) {
+                let x = __ch_ipv4_parse(s.byte_slice(i, n))
+                if x < 0 {
+                    return false
+                }
+                if gap {
+                    tail.push((x >> 16) & 0xFFFF)
+                    tail.push(x & 0xFFFF)
+                } else {
+                    head.push((x >> 16) & 0xFFFF)
+                    head.push(x & 0xFFFF)
+                }
+                i = n
+                break
+            }
+            var g = 0
+            let start = i
+            while i < n && __hex_val(s.byte(i)) >= 0 && i - start < 4 {
+                g = (g << 4) | __hex_val(s.byte(i))
+                i += 1
+            }
+            if i == start {
+                return false
+            }
+            if gap {
+                tail.push(g)
+            } else {
+                head.push(g)
+            }
+            if i < n {
+                if s.byte(i) != ':' {
+                    return false
+                }
+                i += 1
+                if i < n && s.byte(i) == ':' {
+                    if gap {
+                        return false
+                    }
+                    gap = true
+                    i += 1
+                } else if i == n {
+                    return false
+                }
+            }
+        }
+        let used = head.len() + tail.len()
+        if (gap && used > 7) || (!gap && used != 8) {
+            return false
+        }
+        for g in head {
+            groups.push(g)
+        }
+        if gap {
+            for k in 0..8 - used {
+                groups.push(0)
+            }
+        }
+        for g in tail {
+            groups.push(g)
+        }
+    }
+    buf_reserve(b, 16)
+    for k in 0..8 {
+        store8(b.data + b.len + k * 2, groups[k] >> 8)
+        store8(b.data + b.len + k * 2 + 1, groups[k] & 255)
+    }
+    b.len += 16
+    return true
+}
+
+// ---- Типизированное чтение ----
+// План столбца: из типа ClickHouse (заголовок ответа или DESCRIBE) и типа
+// Khrip. Строится, пока не прочитано ни одного значения: несовпадение типов —
+// ошибка до разбора, а не неверные данные.
+
+const CHR_INT = 1
+const CHR_INT_F = 2
+const CHR_F64 = 3
+const CHR_F32 = 4
+const CHR_BOOL = 5
+const CHR_STR = 6
+const CHR_FIXED = 7
+const CHR_UUID = 8
+// Date/Date32 → секунды полуночи UTC; → «YYYY-MM-DD»
+const CHR_DAYS = 9
+const CHR_DAYS_STR = 10
+// DateTime → секунды; → ISO
+const CHR_SECS = 11
+const CHR_SECS_STR = 12
+// DateTime64(p): p = 0 → int; → float секунды; → ISO с p знаками
+const CHR_DT64 = 13
+const CHR_DT64_F = 14
+const CHR_DT64_STR = 15
+// Decimal → float; → точный текст; Decimal(P, 0) → int
+const CHR_DEC_F = 16
+const CHR_DEC_STR = 17
+const CHR_DEC_INT = 18
+// Int128/256, UInt128/256 → текст
+const CHR_BIG_STR = 19
+// Enum → имя; Enum → вариант Khrip; String → вариант Khrip по имени
+const CHR_ENUM_STR = 20
+const CHR_ENUM_SUM = 21
+const CHR_STR_SUM = 22
+const CHR_IPV4 = 23
+const CHR_IPV6 = 24
+const CHR_ARRAY = 25
+const CHR_MAP = 26
+// Nullable(Nothing): только NULL
+const CHR_NOTHING = 27
+
+type __ChTRead {
+    op: int
+    width: int = 8
+    signed: bool = false
+    scale: int = 0
+    nullable: bool = false
+    // T? над скаляром: значение — в своей ячейке
+    box: bool = false
+    // Array: размер элемента списка; Map: 1 — ключи-строки
+    es: int = 8
+    // Array — элемент, Map — значение (__ChTRead)
+    item: int = 0
+    // Map: ключ (__ChTRead)
+    key: int = 0
+    // Enum: имена и коды; ENUM_SUM, STR_SUM: значения вариантов Khrip по именам
+    names: [str] = []
+    values: [int] = []
+    words: [int] = []
+}
+
+// Перечисление Khrip (вариант без полей у каждого значения).
+fn __ch_desc_enum(d: int) -> bool {
+    if load64(d) != D_SUM || load64(d + 24) == 0 {
+        return false
+    }
+    return true
+}
+
+// Значение варианта перечисления d по имени или 0.
+fn __ch_enum_word(d: int, label: str) -> int {
+    for j in 0..load64(d + 8) {
+        let e = d + 32 + j * 24
+        let name: str = __cast(load64(e))
+        if name == label {
+            return load64(e + 16)
+        }
+    }
+    return 0
+}
+
+// Имя варианта перечисления d по значению или "".
+fn __ch_enum_label(d: int, v: int) -> str {
+    for j in 0..load64(d + 8) {
+        let e = d + 32 + j * 24
+        if load64(e + 16) == v {
+            let name: str = __cast(load64(e))
+            return name
+        }
+    }
+    return ""
+}
+
+// План чтения столбца ty в значение типа d; none — нельзя (why — подсказка).
+fn __ch_tread_plan(ty: __ChType, d: int, depth: int, why: Buf) -> __ChTRead? {
+    if depth > 32 {
+        return none
+    }
+    let k = load64(d)
+    if k == D_OPT {
+        let inner = load64(d + 8)
+        var t = ty
+        if ty.op == CHT_NULLABLE {
+            t = __cast(ty.inner)
+            if t.op == CHT_NOTHING {
+                return __ChTRead { op: CHR_NOTHING, nullable: true }
+            }
+        }
+        let p = __ch_tread_plan(t, inner, depth + 1, why) else {
+            return none
+        }
+        if p.nullable {
+            return none
+        }
+        p.nullable = ty.op == CHT_NULLABLE
+        p.box = __is_scalar(inner)
+        return p
+    }
+    let op = ty.op
+    if op == CHT_NULLABLE {
+        buf_add(why, "nullable")
+        return none
+    }
+    if k == D_LIST {
+        if op != CHT_ARRAY {
+            return none
+        }
+        let inner = load64(d + 8)
+        let item = __ch_tread_plan(__cast(ty.inner), inner, depth + 1, why) else {
+            return none
+        }
+        var es = 8
+        if load64(inner) == D_BOOL {
+            es = 1
+        }
+        return __ChTRead { op: CHR_ARRAY, es, item: __cast(item) }
+    }
+    if k == D_MAP {
+        if op != CHT_MAP {
+            return none
+        }
+        let kd = load64(d + 8)
+        let key = __ch_tread_plan(__cast(ty.key), kd, depth + 1, why) else {
+            return none
+        }
+        let value = __ch_tread_plan(__cast(ty.inner), load64(d + 16), depth + 1, why) else {
+            return none
+        }
+        var sk = 0
+        if load64(kd) == D_STR {
+            sk = 1
+        }
+        return __ChTRead { op: CHR_MAP, es: sk, key: __cast(key), item: __cast(value) }
+    }
+    if k == D_INT {
+        if op == CHT_INT && ty.width <= 8 {
+            return __ChTRead { op: CHR_INT, width: ty.width, signed: ty.signed }
+        }
+        if op == CHT_INT {
+            buf_add(why, "select toString(...) into str")
+            return none
+        }
+        if op == CHT_DATE || op == CHT_DATE32 {
+            return __ChTRead { op: CHR_DAYS, width: ty.width, signed: op == CHT_DATE32 }
+        }
+        if op == CHT_DATETIME {
+            return __ChTRead { op: CHR_SECS, width: 4 }
+        }
+        if op == CHT_DT64 {
+            if ty.scale == 0 {
+                return __ChTRead { op: CHR_DT64, width: 8, signed: true }
+            }
+            buf_add(why, "dt64")
+            return none
+        }
+        if op == CHT_DEC {
+            if ty.scale == 0 {
+                return __ChTRead { op: CHR_DEC_INT, width: ty.width }
+            }
+            buf_add(why, "decimal")
+            return none
+        }
+        return none
+    }
+    if k == D_FLOAT {
+        if op == CHT_F64 || op == CHT_F32 {
+            return __ChTRead { op: if op == CHT_F64 { CHR_F64 } else { CHR_F32 } }
+        }
+        if op == CHT_INT && ty.width <= 8 {
+            return __ChTRead { op: CHR_INT_F, width: ty.width, signed: ty.signed }
+        }
+        if op == CHT_DEC {
+            return __ChTRead { op: CHR_DEC_F, width: ty.width, scale: ty.scale }
+        }
+        if op == CHT_DT64 {
+            return __ChTRead { op: CHR_DT64_F, width: 8, scale: ty.scale }
+        }
+        return none
+    }
+    if k == D_BOOL {
+        if op == CHT_BOOL || (op == CHT_INT && ty.width == 1 && !ty.signed) {
+            return __ChTRead { op: CHR_BOOL, width: 1 }
+        }
+        return none
+    }
+    if k == D_STR {
+        if op == CHT_STR {
+            return __ChTRead { op: CHR_STR }
+        }
+        if op == CHT_FIXED {
+            return __ChTRead { op: CHR_FIXED, width: ty.width }
+        }
+        if op == CHT_UUID {
+            return __ChTRead { op: CHR_UUID, width: 16 }
+        }
+        if op == CHT_IPV4 {
+            return __ChTRead { op: CHR_IPV4, width: 4 }
+        }
+        if op == CHT_IPV6 {
+            return __ChTRead { op: CHR_IPV6, width: 16 }
+        }
+        if op == CHT_ENUM {
+            return __ChTRead { op: CHR_ENUM_STR, width: ty.width, signed: true, names: ty.names, values: ty.values }
+        }
+        if op == CHT_DATE || op == CHT_DATE32 {
+            return __ChTRead { op: CHR_DAYS_STR, width: ty.width, signed: op == CHT_DATE32 }
+        }
+        if op == CHT_DATETIME {
+            return __ChTRead { op: CHR_SECS_STR, width: 4 }
+        }
+        if op == CHT_DT64 {
+            return __ChTRead { op: CHR_DT64_STR, width: 8, scale: ty.scale }
+        }
+        if op == CHT_DEC {
+            return __ChTRead { op: CHR_DEC_STR, width: ty.width, scale: ty.scale }
+        }
+        if op == CHT_INT && ty.width > 8 {
+            return __ChTRead { op: CHR_BIG_STR, width: ty.width, signed: ty.signed }
+        }
+        return none
+    }
+    if __ch_desc_enum(d) {
+        if op == CHT_ENUM {
+            var words: [int] = []
+            for name in ty.names {
+                let w = __ch_enum_word(d, name)
+                if w == 0 {
+                    buf_add(why, "label " + name)
+                    return none
+                }
+                words.push(w)
+            }
+            return __ChTRead { op: CHR_ENUM_SUM, width: ty.width, signed: true, values: ty.values, words }
+        }
+        if op == CHT_STR || op == CHT_FIXED {
+            var names: [str] = []
+            var words: [int] = []
+            for j in 0..load64(d + 8) {
+                let e = d + 32 + j * 24
+                names.push(__cast(load64(e)))
+                words.push(load64(e + 16))
+            }
+            var width = 0
+            if op == CHT_FIXED {
+                width = ty.width
+            }
+            return __ChTRead { op: CHR_STR_SUM, width, names, words }
+        }
+        return none
+    }
+    return none
+}
+
+// Пропустить значение столбца ty (столбец, которого нет в типе Khrip).
+fn __ch_skip(r: __ChReader, ty: __ChType, depth: int) -> bool {
+    if depth > 32 {
+        r.error = "RowBinary nesting too deep"
+        return false
+    }
+    let op = ty.op
+    if op == CHT_NULLABLE {
+        if !__ch_need(r, 1) {
+            return false
+        }
+        let flag = load8(r.p)
+        r.p += 1
+        if flag == 1 {
+            return true
+        }
+        return __ch_skip(r, __cast(ty.inner), depth + 1)
+    }
+    if op == CHT_STR {
+        let n = __ch_read_varint(r)
+        if !__ch_need(r, n) {
+            return false
+        }
+        r.p += n
+        return true
+    }
+    if op == CHT_ARRAY || op == CHT_MAP {
+        let n = __ch_read_varint(r)
+        if r.error.byte_len() > 0 || n > r.end - r.p {
+            r.error = "RowBinary array length exceeds the response"
+            return false
+        }
+        for i in 0..n {
+            if op == CHT_MAP && !__ch_skip(r, __cast(ty.key), depth + 1) {
+                return false
+            }
+            if !__ch_skip(r, __cast(ty.inner), depth + 1) {
+                return false
+            }
+        }
+        return true
+    }
+    var width = ty.width
+    if op == CHT_F32 {
+        width = 4
+    } else if op == CHT_F64 {
+        width = 8
+    }
+    if op == CHT_OTHER {
+        r.error = "RowBinary column of type " + ty.text + " cannot be skipped"
+        return false
+    }
+    if !__ch_need(r, width) {
+        return false
+    }
+    r.p += width
+    return true
+}
+
+// Значение по плану (слово Khrip).
+fn __ch_tget(r: __ChReader, p: __ChTRead) -> int {
+    if p.nullable {
+        if !__ch_need(r, 1) {
+            return 0
+        }
+        let flag = load8(r.p)
+        r.p += 1
+        if flag == 1 {
+            return 0
+        }
+        if flag != 0 {
+            r.error = "invalid RowBinary nullable flag"
+            return 0
+        }
+    }
+    let op = p.op
+    var v = 0
+    if op == CHR_INT || op == CHR_BOOL {
+        v = __ch_get_int(r, p.width, p.signed)
+        if op == CHR_BOOL && v != 0 && v != 1 {
+            r.error = "ClickHouse UInt8 value " + v.to_str() + " is not a boolean"
+            return 0
+        }
+    } else if op == CHR_STR {
+        let n = __ch_read_varint(r)
+        if !__ch_need(r, n) {
+            return 0
+        }
+        v = __cast(__str_new(r.p, n))
+        r.p += n
+        __ch_cost(r, 16)
+    } else if op == CHR_F64 {
+        if !__ch_need(r, 8) {
+            return 0
+        }
+        v = load64(r.p)
+        r.p += 8
+    } else if op == CHR_F32 {
+        if !__ch_need(r, 4) {
+            return 0
+        }
+        v = __ch_f32_to_f64(load32(r.p))
+        r.p += 4
+    } else if op == CHR_INT_F {
+        let x = __ch_get_int(r, p.width, p.signed)
+        let f = x.to_float()
+        v = __cast(f)
+    } else if op == CHR_ARRAY {
+        let n = __ch_read_varint(r)
+        if r.error.byte_len() > 0 || n > r.end - r.p {
+            r.error = "RowBinary array length exceeds the response"
+            return 0
+        }
+        let es = p.es
+        __ch_cost(r, 48 + n * es)
+        if r.error.byte_len() > 0 {
+            return 0
+        }
+        let h = __list_new(n, es)
+        let data = load64(h)
+        let item: __ChTRead = __cast(p.item)
+        for i in 0..n {
+            let x = __ch_tget(r, item)
+            if r.error.byte_len() > 0 {
+                return 0
+            }
+            if es == 1 {
+                store8(data + i, x)
+            } else {
+                store64(data + i * 8, x)
+            }
+        }
+        store64(h + 8, n)
+        v = h
+    } else if op == CHR_MAP {
+        let n = __ch_read_varint(r)
+        if r.error.byte_len() > 0 || n > r.end - r.p {
+            r.error = "RowBinary map size exceeds the response"
+            return 0
+        }
+        __ch_cost(r, 64 + n * 48)
+        let m = __map_new(p.es)
+        let kp: __ChTRead = __cast(p.key)
+        let vp: __ChTRead = __cast(p.item)
+        for i in 0..n {
+            let key = __ch_tget(r, kp)
+            let value = __ch_tget(r, vp)
+            if r.error.byte_len() > 0 {
+                return 0
+            }
+            __map_set(m, key, value)
+        }
+        v = m
+    } else if op == CHR_FIXED {
+        if !__ch_need(r, p.width) {
+            return 0
+        }
+        v = __cast(__str_new(r.p, p.width))
+        r.p += p.width
+        __ch_cost(r, 16)
+    } else if op == CHR_UUID {
+        v = __cast(__ch_uuid_text(r))
+        __ch_cost(r, 64)
+    } else if op == CHR_DAYS || op == CHR_DAYS_STR {
+        let days = __ch_get_int(r, p.width, p.signed)
+        if op == CHR_DAYS {
+            v = days * 86400
+        } else {
+            v = __cast(__ch_day_text(days))
+            __ch_cost(r, 32)
+        }
+    } else if op == CHR_SECS || op == CHR_SECS_STR {
+        let secs = __ch_get_int(r, 4, false)
+        if op == CHR_SECS {
+            v = secs
+        } else {
+            v = __cast(time_iso(secs))
+            __ch_cost(r, 40)
+        }
+    } else if op == CHR_DT64 || op == CHR_DT64_F || op == CHR_DT64_STR {
+        let units = __ch_get_int(r, 8, true)
+        if op == CHR_DT64 {
+            v = units
+        } else if op == CHR_DT64_F {
+            let unit = __pow10i(p.scale)
+            let secs = units / unit
+            let f = secs.to_float() + (units - secs * unit).to_float() / unit.to_float()
+            v = __cast(f)
+        } else {
+            v = __cast(__ch_dt64_text(units, p.scale))
+            __ch_cost(r, 48)
+        }
+    } else if op == CHR_DEC_F {
+        v = __ch_decimal_float(r, p.width, p.scale)
+    } else if op == CHR_DEC_STR || op == CHR_BIG_STR {
+        if !__ch_need(r, p.width) {
+            return 0
+        }
+        if op == CHR_DEC_STR {
+            v = __cast(__ch_decimal_text(r.p, p.width, p.scale))
+        } else {
+            v = __cast(__ch_wide_text(r.p, p.width, p.signed))
+        }
+        r.p += p.width
+        __ch_cost(r, 96)
+    } else if op == CHR_DEC_INT {
+        v = __ch_get_int(r, p.width, true)
+    } else if op == CHR_ENUM_STR || op == CHR_ENUM_SUM {
+        let code = __ch_get_int(r, p.width, true)
+        var found = -1
+        for i in 0..p.values.len() {
+            if p.values[i] == code {
+                found = i
+                break
+            }
+        }
+        if found < 0 {
+            r.error = "ClickHouse Enum value " + code.to_str() + " has no name"
+            return 0
+        }
+        if op == CHR_ENUM_STR {
+            v = __cast(p.names[found])
+        } else {
+            v = p.words[found]
+        }
+    } else if op == CHR_STR_SUM {
+        var s = ""
+        if p.width > 0 {
+            if !__ch_need(r, p.width) {
+                return 0
+            }
+            s = __str_new(r.p, p.width)
+            r.p += p.width
+        } else {
+            s = __ch_read_str(r)
+        }
+        if r.error.byte_len() > 0 {
+            return 0
+        }
+        for i in 0..p.names.len() {
+            if p.names[i] == s {
+                v = p.words[i]
+            }
+        }
+        if v == 0 {
+            r.error = "ClickHouse value '" + s + "' is not a variant of the Khrip enum"
+            return 0
+        }
+    } else if op == CHR_IPV4 {
+        v = __cast(__ch_ipv4_text(__ch_get_int(r, 4, false)))
+        __ch_cost(r, 32)
+    } else if op == CHR_IPV6 {
+        if !__ch_need(r, 16) {
+            return 0
+        }
+        v = __cast(__ch_ipv6_text(r.p))
+        r.p += 16
+        __ch_cost(r, 64)
+    } else if op == CHR_NOTHING {
+        r.error = "ClickHouse Nothing value"
+        return 0
+    }
+    if p.box {
+        let cell = __alloc(8)
+        store64(cell, v)
+        __ch_cost(r, 16)
+        return cell
+    }
+    return v
+}
+
+// Результат типизированного чтения: строки или ошибка с именем столбца.
+type __ChRows {
+    rows: int = 0
+    count: int = 0
+    error: str = ""
+    // ошибка — в заголовке (типы не совпали), а не в данных
+    header: bool = false
+}
+
+// Ответ RowBinaryWithNamesAndTypes → список строк типа row (структура:
+// столбцы по именам — сначала точно, затем без учёта регистра; лишние столбцы
+// пропускаются; поле без столбца — значение по умолчанию или none). Не
+// структура — ровно один столбец. Типы сверяются с заголовком до первого
+// значения.
+fn __ch_tdecode(body: str, row: int) -> __ChRows {
+    let out = __ChRows {}
+    let kind = load64(row)
+    let r = __ChReader { p: __str_ptr(body), end: __str_ptr(body) + body.byte_len() }
+    let count = __ch_read_varint(r)
+    if r.error.byte_len() > 0 || count <= 0 || count > 1024 {
+        out.error = "unexpected RowBinaryWithNamesAndTypes header"
+        out.header = true
+        return out
+    }
+    var names: [str] = []
+    for i in 0..count {
+        names.push(__ch_read_str(r))
+    }
+    var types: [__ChType] = []
+    for i in 0..count {
+        let text = __ch_read_str(r)
+        let ty = __ch_type_of(text) else {
+            out.error = "column " + names[i] + " has an unknown ClickHouse type " + text
+            out.header = true
+            return out
+        }
+        types.push(ty)
+    }
+    if r.error.byte_len() > 0 {
+        out.error = r.error
+        out.header = true
+        return out
+    }
+    let is_struct = kind == D_STRUCT
+    var nf = 1
+    if is_struct {
+        nf = load64(row + 8)
+    } else if count != 1 {
+        out.error = "one column is expected, but the query returns " + names.join(", ")
+        out.header = true
+        return out
+    }
+    // поле каждого столбца (-1 — пропустить) и план
+    let fields = __alloc(count * 8)
+    let plans = __alloc(count * 8)
+    var taken: [bool] = []
+    for j in 0..nf {
+        taken.push(false)
+    }
+    for i in 0..count {
+        var field = 0
+        var desc = row
+        if is_struct {
+            field = -1
+            for j in 0..nf {
+                let fname: str = __cast(load64(__field(row, j)))
+                if field < 0 && !taken[j] && fname == names[i] {
+                    field = j
+                }
+            }
+            for j in 0..nf {
+                let fname: str = __cast(load64(__field(row, j)))
+                if field < 0 && !taken[j] && fname.ascii_lower() == names[i].ascii_lower() {
+                    field = j
+                }
+            }
+            if field >= 0 {
+                taken[field] = true
+                desc = __field_desc(row, field)
+            }
+        }
+        store64(fields + i * 8, field)
+        var plan = 0
+        if field >= 0 {
+            let why = buf_new(16)
+            if let p = __ch_tread_plan(types[i], desc, 0, why) {
+                plan = __cast(p)
+            } else {
+                out.error = "column " + names[i] + " is " + types[i].text + ", but the Khrip type is " + __desc_name(desc)
+                out.header = true
+                return out
+            }
+        } else {
+            plan = __cast(types[i])
+        }
+        store64(plans + i * 8, plan)
+    }
+    if is_struct {
+        for j in 0..nf {
+            let f = __field(row, j)
+            if !taken[j] && load64(f + 24) == 0 && load64(__field_desc(row, j)) != D_OPT {
+                let fname: str = __cast(load64(f))
+                out.error = "field " + fname + " has no column: the query returns " + names.join(", ")
+                out.header = true
+                return out
+            }
+        }
+    }
+    var es = 8
+    if kind == D_BOOL {
+        es = 1
+    }
+    let rows: [int] = __cast(__list_new(((r.end - r.p) / 8).max(4).min(1048576), es))
+    if is_struct {
+        let size = nf * 8 + 16
+        while r.p < r.end && r.error.byte_len() == 0 {
+            let value = __struct_alloc(row)
+            // поля без столбца: значение по умолчанию (none — 0)
+            for j in 0..nf {
+                if !taken[j] {
+                    let f = __field(row, j)
+                    let dk = load64(f + 24)
+                    if dk == 1 {
+                        store64(value + j * 8, load64(f + 32))
+                    } else if dk == 2 {
+                        store64(value + j * 8, __list_new(4, load64(f + 32)))
+                    } else if dk == 3 {
+                        store64(value + j * 8, __map_new(load64(f + 32)))
+                    }
+                }
+            }
+            for i in 0..count {
+                let field = load64(fields + i * 8)
+                if field >= 0 {
+                    store64(value + field * 8, __ch_tget(r, __cast(load64(plans + i * 8))))
+                } else {
+                    __ch_skip(r, __cast(load64(plans + i * 8)), 0)
+                }
+                if r.error.byte_len() > 0 {
+                    out.error = "column " + names[i] + ": " + r.error
+                    return out
+                }
+            }
+            rows.push(value)
+            __ch_cost(r, size)
+        }
+    } else {
+        let plan: __ChTRead = __cast(load64(plans))
+        while r.p < r.end && r.error.byte_len() == 0 {
+            rows.push(__ch_tget(r, plan))
+            __ch_cost(r, es)
+        }
+    }
+    if r.error.byte_len() > 0 {
+        out.error = "column " + names[0] + ": " + r.error
+        return out
+    }
+    out.rows = __cast(rows)
+    out.count = rows.len()
+    return out
+}
+
+// ---- Типизированная запись (t.insert) ----
+// План столбца: значение Khrip → байты столбца его настоящего типа, с проверкой
+// диапазона и формата. Строится при запуске по DESCRIBE TABLE (lib/chdb.kh).
+
+const CHW_INT = 1
+const CHW_F64 = 2
+const CHW_F32 = 3
+const CHW_BOOL = 4
+// int 0/1 → Bool
+const CHW_INT_BOOL = 5
+const CHW_STR = 6
+const CHW_FIXED = 7
+const CHW_UUID = 8
+// int секунды → Date/Date32 (дни, вниз), DateTime, DateTime64(p) (× 10^p)
+const CHW_DAYS = 9
+const CHW_SECS = 10
+const CHW_DT64 = 11
+// str ISO 8601 → Date/Date32, DateTime, DateTime64(p)
+const CHW_ISO_DAYS = 12
+const CHW_ISO_SECS = 13
+const CHW_ISO_DT64 = 14
+// int → Decimal(P, 0); float → Decimal(P, S) (половина — к чётному);
+// str → Decimal точно (и Int128/256 из текста)
+const CHW_DEC_INT = 15
+const CHW_DEC_F = 16
+const CHW_DEC_STR = 17
+// str → Enum по имени; перечисление Khrip → Enum; перечисление → String
+const CHW_ENUM_STR = 18
+const CHW_ENUM_SUM = 19
+const CHW_SUM_STR = 20
+const CHW_IPV4 = 21
+const CHW_IPV6 = 22
+const CHW_ARRAY = 23
+const CHW_MAP = 24
+
+type __ChTWrite {
+    op: int
+    width: int = 8
+    lo: int = 0
+    hi: int = 0
+    scale: int = 0
+    precision: int = 0
+    // значение Khrip — T?: none возможен
+    src_null: bool = false
+    // перед значением — флаг NULL (Nullable, или none → DEFAULT столбца)
+    dst_null: bool = false
+    // T? над скаляром: значение — в ячейке
+    box: bool = false
+    // Array: размер элемента списка
+    es: int = 8
+    // Array — элемент, Map — значение; Map — ключ (__ChTWrite)
+    item: int = 0
+    key: int = 0
+    // Enum: имена и коды; ENUM_SUM, SUM_STR: значения вариантов Khrip и их имена
+    names: [str] = []
+    values: [int] = []
+    words: [int] = []
+    // тип столбца (для сообщений)
+    target: str = ""
+    // Int128/256, UInt128/256 из текста: знак столбца
+    signed: bool = true
+    wide: bool = false
+}
+
+// План записи значения типа d в столбец ty; none_default — d это T?, столбец
+// не Nullable, но с DEFAULT: none пишется как NULL и становится DEFAULT
+// (заголовок — Nullable(T), вставка через input()). none — нельзя.
+fn __ch_twrite_plan(ty: __ChType, d: int, none_default: bool, depth: int) -> __ChTWrite? {
+    if depth > 32 {
+        return none
+    }
+    let k = load64(d)
+    if k == D_OPT {
+        let inner = load64(d + 8)
+        var t = ty
+        if ty.op == CHT_NULLABLE {
+            t = __cast(ty.inner)
+        } else if !none_default {
+            return none
+        }
+        let p = __ch_twrite_plan(t, inner, false, depth + 1) else {
+            return none
+        }
+        if p.src_null {
+            return none
+        }
+        p.src_null = true
+        p.dst_null = true
+        p.box = __is_scalar(inner)
+        return p
+    }
+    var t = ty
+    var dst_null = false
+    if t.op == CHT_NULLABLE {
+        // значение не бывает none, а столбец допускает NULL: флаг 0
+        dst_null = true
+        t = __cast(ty.inner)
+    }
+    let p = __ch_twrite_base(t, d, depth) else {
+        return none
+    }
+    p.dst_null = dst_null
+    return p
+}
+
+fn __ch_twrite_base(t: __ChType, d: int, depth: int) -> __ChTWrite? {
+    let k = load64(d)
+    let op = t.op
+    let text = t.text
+    if k == D_LIST {
+        if op != CHT_ARRAY {
+            return none
+        }
+        let inner = load64(d + 8)
+        let item = __ch_twrite_plan(__cast(t.inner), inner, false, depth + 1) else {
+            return none
+        }
+        var es = 8
+        if load64(inner) == D_BOOL {
+            es = 1
+        }
+        return __ChTWrite { op: CHW_ARRAY, es, item: __cast(item), target: text }
+    }
+    if k == D_MAP {
+        if op != CHT_MAP {
+            return none
+        }
+        let key = __ch_twrite_plan(__cast(t.key), load64(d + 8), false, depth + 1) else {
+            return none
+        }
+        let value = __ch_twrite_plan(__cast(t.inner), load64(d + 16), false, depth + 1) else {
+            return none
+        }
+        return __ChTWrite { op: CHW_MAP, key: __cast(key), item: __cast(value), target: text }
+    }
+    if k == D_INT {
+        if op == CHT_INT {
+            let p = __ChTWrite { op: CHW_INT, width: t.width, target: text }
+            if t.width > 8 {
+                p.lo = -9223372036854775807 - 1
+                p.hi = 9223372036854775807
+                if !t.signed {
+                    p.lo = 0
+                }
+            } else if t.signed {
+                p.hi = 9223372036854775807
+                p.lo = -9223372036854775807 - 1
+                if t.width < 8 {
+                    p.hi = (1 << (t.width * 8 - 1)) - 1
+                    p.lo = 0 - p.hi - 1
+                }
+            } else {
+                p.hi = 9223372036854775807
+                if t.width < 8 {
+                    p.hi = (1 << (t.width * 8)) - 1
+                }
+            }
+            return p
+        }
+        if op == CHT_DATE {
+            return __ChTWrite { op: CHW_DAYS, width: 2, lo: 0, hi: 65535, target: text }
+        }
+        if op == CHT_DATE32 {
+            return __ChTWrite { op: CHW_DAYS, width: 4, lo: -25567, hi: 120529, target: text }
+        }
+        if op == CHT_DATETIME {
+            return __ChTWrite { op: CHW_SECS, width: 4, lo: 0, hi: 4294967295, target: text }
+        }
+        if op == CHT_DT64 {
+            let range = __ch_dt64_range(t.scale)
+            let unit = __pow10i(t.scale)
+            return __ChTWrite { op: CHW_DT64, width: 8, scale: t.scale, lo: range[0] / unit, hi: range[1] / unit, target: text }
+        }
+        if op == CHT_DEC && t.scale == 0 {
+            return __ChTWrite { op: CHW_DEC_INT, width: t.width, precision: t.precision, target: text }
+        }
+        if op == CHT_BOOL {
+            return __ChTWrite { op: CHW_INT_BOOL, width: 1, target: text }
+        }
+        return none
+    }
+    if k == D_FLOAT {
+        if op == CHT_F64 {
+            return __ChTWrite { op: CHW_F64, target: text }
+        }
+        if op == CHT_F32 {
+            return __ChTWrite { op: CHW_F32, width: 4, target: text }
+        }
+        if op == CHT_DEC {
+            return __ChTWrite { op: CHW_DEC_F, width: t.width, scale: t.scale, precision: t.precision, target: text }
+        }
+        return none
+    }
+    if k == D_BOOL {
+        if op == CHT_BOOL || (op == CHT_INT && t.width == 1 && !t.signed) {
+            return __ChTWrite { op: CHW_BOOL, width: 1, target: text }
+        }
+        return none
+    }
+    if k == D_STR {
+        if op == CHT_STR {
+            return __ChTWrite { op: CHW_STR, target: text }
+        }
+        if op == CHT_FIXED {
+            return __ChTWrite { op: CHW_FIXED, width: t.width, target: text }
+        }
+        if op == CHT_ENUM {
+            return __ChTWrite { op: CHW_ENUM_STR, width: t.width, names: t.names, values: t.values, target: text }
+        }
+        if op == CHT_UUID {
+            return __ChTWrite { op: CHW_UUID, width: 16, target: text }
+        }
+        if op == CHT_IPV4 {
+            return __ChTWrite { op: CHW_IPV4, width: 4, target: text }
+        }
+        if op == CHT_IPV6 {
+            return __ChTWrite { op: CHW_IPV6, width: 16, target: text }
+        }
+        if op == CHT_DATE {
+            return __ChTWrite { op: CHW_ISO_DAYS, width: 2, lo: 0, hi: 65535, target: text }
+        }
+        if op == CHT_DATE32 {
+            return __ChTWrite { op: CHW_ISO_DAYS, width: 4, lo: -25567, hi: 120529, target: text }
+        }
+        if op == CHT_DATETIME {
+            return __ChTWrite { op: CHW_ISO_SECS, width: 4, lo: 0, hi: 4294967295, target: text }
+        }
+        if op == CHT_DT64 {
+            let range = __ch_dt64_range(t.scale)
+            return __ChTWrite { op: CHW_ISO_DT64, width: 8, scale: t.scale, lo: range[0], hi: range[1], target: text }
+        }
+        if op == CHT_DEC {
+            return __ChTWrite { op: CHW_DEC_STR, width: t.width, scale: t.scale, precision: t.precision, target: text }
+        }
+        if op == CHT_INT && t.width > 8 {
+            // цифр у наибольшего значения: UInt128 — 39, UInt256 — 78
+            var digits = 39
+            if t.width == 32 {
+                digits = 78
+            }
+            return __ChTWrite { op: CHW_DEC_STR, width: t.width, precision: digits, target: text, signed: t.signed, wide: true }
+        }
+        return none
+    }
+    if __ch_desc_enum(d) {
+        var names: [str] = []
+        var words: [int] = []
+        for j in 0..load64(d + 8) {
+            let e = d + 32 + j * 24
+            names.push(__cast(load64(e)))
+            words.push(load64(e + 16))
+        }
+        if op == CHT_ENUM {
+            // у каждого варианта Khrip — имя в Enum
+            var codes: [int] = []
+            for name in names {
+                let at = t.names.index_of(name) else {
+                    return none
+                }
+                codes.push(t.values[at])
+            }
+            return __ChTWrite { op: CHW_ENUM_SUM, width: t.width, names, values: codes, words, target: text }
+        }
+        if op == CHT_STR || op == CHT_FIXED {
+            var width = 0
+            if op == CHT_FIXED {
+                width = t.width
+            }
+            return __ChTWrite { op: CHW_SUM_STR, width, names, words, target: text }
+        }
+        return none
+    }
+    return none
+}
+
+// Биты float — конечное число (у NaN и ±Inf показатель из одних единиц).
+fn __ch_finite(bits: int) -> bool {
+    return ((bits >> 52) & 2047) != 2047
+}
+
+fn __ch_tbad(err: Buf, what: str) -> bool {
+    if err.len == 0 {
+        buf_add(err, what)
+    }
+    return false
+}
+
+// Значение v по плану p → байты в b; false — значение не подходит (err).
+fn __ch_twrite(b: Buf, p: __ChTWrite, v0: int, err: Buf) -> bool {
+    var v = v0
+    if p.src_null {
+        if v == 0 {
+            buf_byte(b, 1)
+            return true
+        }
+        if p.box {
+            v = load64(v)
+        }
+        buf_byte(b, 0)
+    } else if p.dst_null {
+        buf_byte(b, 0)
+    }
+    let op = p.op
+    if op == CHW_INT || op == CHW_DAYS || op == CHW_SECS || op == CHW_DT64 {
+        // Date — дни (вниз), остальное — секунды; диапазон — в этих единицах
+        var x = v
+        if op == CHW_DAYS {
+            x = v / 86400
+            if v % 86400 < 0 {
+                x -= 1
+            }
+        }
+        if x < p.lo || x > p.hi {
+            return __ch_tbad(err, v.to_str() + " is out of range for " + p.target)
+        }
+        if op == CHW_DT64 {
+            x = v * __pow10i(p.scale)
+        }
+        __ch_put_int(b, x, p.width)
+        return true
+    }
+    if op == CHW_STR {
+        let s: str = __cast(v)
+        __ch_varint(b, s.byte_len())
+        buf_add(b, s)
+        return true
+    }
+    if (op == CHW_F64 || op == CHW_F32 || op == CHW_DEC_F) && !__ch_finite(v) {
+        // NaN и бесконечность в столбец не пишутся (§4.7)
+        let x: float = __cast(v)
+        return __ch_tbad(err, x.to_str() + " is not a finite number")
+    }
+    if op == CHW_F64 {
+        buf_reserve(b, 8)
+        store64(b.data + b.len, v)
+        b.len += 8
+        return true
+    }
+    if op == CHW_F32 {
+        let bits = __ch_f64_to_f32(v)
+        if bits < 0 {
+            let x: float = __cast(v)
+            return __ch_tbad(err, x.to_str() + " is out of range for Float32")
+        }
+        buf_reserve(b, 4)
+        store32(b.data + b.len, bits)
+        b.len += 4
+        return true
+    }
+    if op == CHW_BOOL {
+        buf_byte(b, v & 1)
+        return true
+    }
+    if op == CHW_INT_BOOL {
+        if v != 0 && v != 1 {
+            return __ch_tbad(err, v.to_str() + " is not 0 or 1 for Bool")
+        }
+        buf_byte(b, v)
+        return true
+    }
+    if op == CHW_ARRAY {
+        let n = load64(v + 8)
+        __ch_varint(b, n)
+        let item: __ChTWrite = __cast(p.item)
+        for i in 0..n {
+            if !__ch_twrite(b, item, __lget(v, i), err) {
+                return false
+            }
+        }
+        return true
+    }
+    if op == CHW_MAP {
+        let keys: [int] = __cast(__map_keys(v))
+        let values: [int] = __cast(__map_values(v, 8))
+        __ch_varint(b, keys.len())
+        let kp: __ChTWrite = __cast(p.key)
+        let vp: __ChTWrite = __cast(p.item)
+        for i in 0..keys.len() {
+            if !__ch_twrite(b, kp, keys[i], err) || !__ch_twrite(b, vp, values[i], err) {
+                return false
+            }
+        }
+        return true
+    }
+    if op == CHW_DEC_INT {
+        if p.precision <= 18 && (v >= __pow10i(p.precision) || v <= 0 - __pow10i(p.precision)) {
+            return __ch_tbad(err, v.to_str() + " does not fit " + p.target)
+        }
+        __ch_put_int(b, v, p.width)
+        return true
+    }
+    if op == CHW_DEC_F || op == CHW_DEC_STR {
+        var text = ""
+        if op == CHW_DEC_F {
+            let x: float = __cast(v)
+            text = x.to_str()
+        } else {
+            text = __cast(v)
+        }
+        var round = CHD_EVEN
+        if op == CHW_DEC_STR {
+            round = CHD_EXACT
+        }
+        let dec = __ch_decimal_digits(text, p.scale, p.precision, round)
+        if dec.error.byte_len() > 0 {
+            if op == CHW_DEC_STR {
+                return __ch_tbad(err, "'" + text + "' " + dec.error)
+            }
+            return __ch_tbad(err, text + " " + dec.error)
+        }
+        if !__ch_decimal_put(b, dec, p.width, p.signed) {
+            if p.wide {
+                return __ch_tbad(err, "'" + text + "' is out of range for " + p.target)
+            }
+            return __ch_tbad(err, "'" + text + "' does not fit " + p.target)
+        }
+        return true
+    }
+    if op == CHW_ENUM_SUM || op == CHW_SUM_STR {
+        var at = -1
+        for i in 0..p.words.len() {
+            if p.words[i] == v {
+                at = i
+            }
+        }
+        if at < 0 {
+            return __ch_tbad(err, "unknown enum value")
+        }
+        if op == CHW_ENUM_SUM {
+            __ch_put_int(b, p.values[at], p.width)
+            return true
+        }
+        let name = p.names[at]
+        if p.width > 0 {
+            if name.byte_len() > p.width {
+                return __ch_tbad(err, "'" + name + "' is longer than " + p.target)
+            }
+            buf_add(b, name)
+            for i in name.byte_len()..p.width {
+                buf_byte(b, 0)
+            }
+            return true
+        }
+        __ch_varint(b, name.byte_len())
+        buf_add(b, name)
+        return true
+    }
+    // остальные — из строки
+    let s: str = __cast(v)
+    if op == CHW_FIXED {
+        if s.byte_len() > p.width {
+            return __ch_tbad(err, s.byte_len().to_str() + " bytes do not fit " + p.target)
+        }
+        buf_add(b, s)
+        for i in s.byte_len()..p.width {
+            buf_byte(b, 0)
+        }
+        return true
+    }
+    if op == CHW_ENUM_STR {
+        let at = p.names.index_of(s) ?? -1
+        if at < 0 {
+            return __ch_tbad(err, "'" + s + "' is not a value of " + p.target)
+        }
+        __ch_put_int(b, p.values[at], p.width)
+        return true
+    }
+    if op == CHW_UUID {
+        if !__ch_uuid_put(b, s) {
+            return __ch_tbad(err, "'" + s + "' is not a UUID (8-4-4-4-12 hex digits)")
+        }
+        return true
+    }
+    if op == CHW_IPV4 {
+        let x = __ch_ipv4_parse(s)
+        if x < 0 {
+            return __ch_tbad(err, "'" + s + "' is not an IPv4 address")
+        }
+        __ch_put_int(b, x, 4)
+        return true
+    }
+    if op == CHW_IPV6 {
+        if !__ch_ipv6_put(b, s) {
+            return __ch_tbad(err, "'" + s + "' is not an IP address")
+        }
+        return true
+    }
+    if op == CHW_ISO_DAYS || op == CHW_ISO_SECS || op == CHW_ISO_DT64 {
+        let units = __ch_iso_units(s, p.scale) else {
+            var want = "an ISO 8601 date and time"
+            if op == CHW_ISO_DAYS {
+                want = "an ISO 8601 date"
+            }
+            return __ch_tbad(err, "'" + s + "' is not " + want + " for " + p.target)
+        }
+        var x = units
+        if op == CHW_ISO_DAYS {
+            x = units / 86400
+            if units % 86400 < 0 {
+                x -= 1
+            }
+        }
+        if x < p.lo || x > p.hi {
+            return __ch_tbad(err, "'" + s + "' is out of range for " + p.target)
+        }
+        __ch_put_int(b, x, p.width)
+        return true
+    }
+    return __ch_tbad(err, "unsupported value for " + p.target)
+}
+
+// Имя ClickHouse в обратных кавычках.
+fn __ch_quote_name(name: str) -> str {
+    return "`" + name.replace("\\", "\\\\").replace("`", "\\`") + "`"
+}
+
+// Текст типизированной вставки. types — типы заголовка RowBinaryWithNamesAndTypes
+// (как в DESCRIBE; у столбцов, где none становится DEFAULT, — Nullable(T)).
+// via_input: такие столбцы есть — вставка идёт через input(), и сервер
+// заменяет NULL значением DEFAULT столбца (insert_null_as_default).
+fn __ch_tinsert_sql(table: str, names: [str], types: [str], via_input: bool) -> str {
+    var cols: [str] = []
+    for name in names {
+        cols.push(__ch_quote_name(name))
+    }
+    let head = "INSERT INTO " + __ch_quote_name(table) + " (" + cols.join(", ") + ")"
+    // перевод строки отделяет FORMAT от данных: иначе первый байт заголовка
+    // (число столбцов, например 12 — \f) сервер прочёл бы как пробел
+    if !via_input {
+        return head + " FORMAT RowBinaryWithNamesAndTypes\n"
+    }
+    var structure: [str] = []
+    for i in 0..names.len() {
+        structure.push(cols[i] + " " + types[i])
+    }
+    let text = structure.join(", ").replace("\\", "\\\\").replace("'", "\\'")
+    return head + " SELECT " + cols.join(", ") + " FROM input('" + text + "') FORMAT RowBinaryWithNamesAndTypes\n"
+}
+
+// Заголовок RowBinaryWithNamesAndTypes.
+fn __ch_rb_header(b: Buf, names: [str], types: [str]) {
+    __ch_varint(b, names.len())
+    for name in names {
+        __ch_string(b, name)
+    }
+    for t in types {
+        __ch_string(b, t)
+    }
 }

@@ -1,0 +1,6 @@
+// expect: unknown connection metrics
+// expect: declare it: clickhouse metrics = env("METRICS_CLICKHOUSE_URL")
+type Hit { ts: int }
+table hits: Hit in metrics
+fn main() {
+}

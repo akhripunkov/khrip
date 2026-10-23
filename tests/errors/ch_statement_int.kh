@@ -1,0 +1,6 @@
+// expect: this ch statement gives no row count: ClickHouse does not count the rows of ALTER UPDATE/DELETE, DELETE FROM, TRUNCATE and the like
+// expect: write it as a statement, or let r: DbResult = ch ... to check the outcome
+fn main() {
+    let n: int = ch "ALTER TABLE events DELETE WHERE ts < 5"
+    print(n)
+}

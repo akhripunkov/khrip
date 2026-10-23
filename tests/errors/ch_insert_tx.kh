@@ -1,0 +1,11 @@
+// expect: events.insert inside tx: the block may run again after a conflict, and ClickHouse is not part of it
+// expect: call it before or after the tx block
+type Event { ts: int, page: str }
+table events: Event
+route POST "/pay/{id}" (id: int) -> 204 {
+    tx {
+        sql "UPDATE orders SET paid = true WHERE id = {id}"
+        events.insert(Event { ts: now(), page: "/pay" })
+    }
+    return 204
+}

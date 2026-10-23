@@ -1,0 +1,9 @@
+// Два соединения к одной базе: у каждого своя migration 1 (записи не путаются).
+clickhouse metrics = env("METRICS_CLICKHOUSE_URL")
+migration ch 1 `CREATE TABLE a (id UInt64) ENGINE = MergeTree ORDER BY id`
+migration metrics 1 `CREATE TABLE m (id UInt64) ENGINE = MergeTree ORDER BY id`
+fn main() {
+    let x: int = ch "SELECT count() FROM a"
+    let y: int = ch metrics "SELECT count() FROM m"
+    print(x + y)
+}

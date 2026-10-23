@@ -1,0 +1,7 @@
+// expect: ClickHouse tables have no method find
+// expect: events.insert(rows) writes rows; read them with ch "SELECT ... FROM events"
+type Event { ts: int }
+table events: Event
+fn main() {
+    let rows = events.find(1)
+}

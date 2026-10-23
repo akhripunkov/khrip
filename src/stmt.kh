@@ -172,6 +172,11 @@ fn parse_stmt() -> bool {
     if ty == ty_never {
         return true
     }
+    if is_db_result(ty) && !panic_mode {
+        // flush() -> DbResult как оператор: неудача пропала бы молча (E-M32)
+        error_tok(t, "the DbResult of this call is never checked, so the failures it holds are ignored", "let r = ...; then read r.ok (or r.status) — or let failures end the request")
+        return false
+    }
     if !last_was_call && ty != ty_err && !panic_mode {
         var hint = ""
         if ty == ty_bool {
@@ -351,6 +356,9 @@ fn parse_let() {
     var w = ty_err
     if t >= 0 {
         w = t
+        if is_db_result(t) {
+            db_result_check(name)
+        }
     }
     // набор строк-литералов, которые может принять неизменяемая локальная
     let saved_on = lit_on
@@ -361,6 +369,10 @@ fn parse_let() {
     lit_ok = true
     lit_vals = []
     var et = parse_expr(w)
+    if t < 0 && is_db_result(et) {
+        // let r = flush(), где flush() -> DbResult: r тоже нужно проверить
+        db_result_check(name)
+    }
     var lits: [str] = []
     if !mutable && kind() != T_ELSE {
         if lit_on {
@@ -2161,7 +2173,7 @@ fn compile_main_wrapper(fi: int, test_mode: bool) {
             // __init_stores просто задаёт начальные значения
             emit_call(rt_func("__init_stores"))
         }
-        if uses_db {
+        if uses_db || uses_ch {
             emit_call(rt_func("__db_init"))
         }
         emit_call(m)

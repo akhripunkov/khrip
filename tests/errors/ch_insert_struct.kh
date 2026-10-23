@@ -1,0 +1,7 @@
+// expect: insert rows with events.insert(rows)
+// expect: declare the table: table events: Event
+type Event { id: int, page: str }
+fn main() {
+    let rows = [Event { id: 1, page: "/" }]
+    ch "INSERT INTO events {rows}"
+}

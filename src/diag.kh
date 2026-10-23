@@ -112,6 +112,13 @@ fn src_col(file: int, line: int, col: int) -> int {
     return char_col(source_line(file, line), col)
 }
 
+// Место лексемы для сообщений программы при запуске и в работе
+// (файл:строка:столбец, столбец — номер символа): места sql и ch, таблицы,
+// соединения и миграции ClickHouse.
+fn src_place(t: Token) -> str {
+    return files[t.file].path + ":" + t.line.to_str() + ":" + src_col(t.file, t.line, t.col).to_str()
+}
+
 // ---- Указатель ^ под строкой ----
 // Указатель стоит под первым байтом места ошибки, если в терминале каждый
 // символ строки занимает столько клеток, сколько у wcwidth: табуляция
