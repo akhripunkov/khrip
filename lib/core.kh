@@ -737,6 +737,130 @@ fn __str_from_c(p: int) -> str {
     return __str_new(p, n)
 }
 
+// ---- UTF-8 без SIMD ----
+// Этот файл компилирует и загрузчик, поэтому здесь — только простые чтения и
+// циклы. Символ — по правилу Go: правильная последовательность (таблица 3-7
+// Unicode: без лишне длинных форм, суррогатов и значений больше U+10FFFF) — один
+// символ, любой другой байт — отдельный символ U+FFFD. Нужны лексеру и как
+// запасной путь там, где текст неправильный. ~0x7F7F7F7F7F7F7F7F — старшие биты
+// всех восьми байтов слова: слово без них — 8 байтов ASCII.
+
+// Ширина символа в байте i (i < n): 1–4.
+fn __utf8_width(p: int, n: int, i: int) -> int {
+    let c = load8(p + i)
+    if c < 0xC2 || c > 0xF4 {
+        return 1
+    }
+    var w = 2
+    var lo = 0x80
+    var hi = 0xBF
+    if c >= 0xF0 {
+        w = 4
+        if c == 0xF0 {
+            lo = 0x90
+        } else if c == 0xF4 {
+            hi = 0x8F
+        }
+    } else if c >= 0xE0 {
+        w = 3
+        if c == 0xE0 {
+            lo = 0xA0
+        } else if c == 0xED {
+            hi = 0x9F
+        }
+    }
+    if i + w > n {
+        return 1
+    }
+    let c1 = load8(p + i + 1)
+    if c1 < lo || c1 > hi {
+        return 1
+    }
+    var j = 2
+    while j < w {
+        if (load8(p + i + j) & 0xC0) != 0x80 {
+            return 1
+        }
+        j += 1
+    }
+    return w
+}
+
+// Код символа в байте i (i < n) или 0xFFFD, если там неправильный байт.
+fn __utf8_decode(p: int, n: int, i: int) -> int {
+    let c = load8(p + i)
+    if c < 0x80 {
+        return c
+    }
+    let w = __utf8_width(p, n, i)
+    if w == 1 {
+        return 0xFFFD
+    }
+    var cp = c & (0x7F >> w)
+    var j = 1
+    while j < w {
+        cp = (cp << 6) | (load8(p + i + j) & 0x3F)
+        j += 1
+    }
+    return cp
+}
+
+// Смещение первого неправильного байта в [p, p + n) или n.
+fn __utf8_bad_at(p: int, n: int) -> int {
+    let high = ~0x7F7F7F7F7F7F7F7F
+    var i = 0
+    while i < n {
+        if i + 8 <= n && (load64(p + i) & high) == 0 {
+            i += 8
+            continue
+        }
+        if load8(p + i) < 0x80 {
+            i += 1
+            continue
+        }
+        let w = __utf8_width(p, n, i)
+        if w == 1 {
+            return i
+        }
+        i += w
+    }
+    return n
+}
+
+// Число символов в [p, p + n).
+fn __utf8_go_count(p: int, n: int) -> int {
+    let high = ~0x7F7F7F7F7F7F7F7F
+    var i = 0
+    var k = 0
+    while i < n {
+        if i + 8 <= n && (load64(p + i) & high) == 0 {
+            i += 8
+            k += 8
+            continue
+        }
+        i += __utf8_width(p, n, i)
+        k += 1
+    }
+    return k
+}
+
+// Смещение начала символа k (k >= 0) или n, если символов не больше k.
+fn __utf8_go_skip(p: int, n: int, k: int) -> int {
+    let high = ~0x7F7F7F7F7F7F7F7F
+    var i = 0
+    var left = k
+    while left > 0 && i < n {
+        if left >= 8 && i + 8 <= n && (load64(p + i) & high) == 0 {
+            i += 8
+            left -= 8
+            continue
+        }
+        i += __utf8_width(p, n, i)
+        left -= 1
+    }
+    return i
+}
+
 // ---- Буфер для сборки байтов ----
 
 type Buf {
@@ -809,6 +933,25 @@ fn buf_byte(b: Buf, c: int) {
     buf_reserve(b, 1)
     store8(b.data + b.len, c)
     b.len += 1
+}
+
+// Символ cp (не суррогат, не больше 0x10FFFF) в UTF-8.
+fn buf_utf8(b: Buf, cp: int) {
+    if cp < 0x80 {
+        buf_byte(b, cp)
+    } else if cp < 0x800 {
+        buf_byte(b, 0xC0 | (cp >> 6))
+        buf_byte(b, 0x80 | (cp & 63))
+    } else if cp < 0x10000 {
+        buf_byte(b, 0xE0 | (cp >> 12))
+        buf_byte(b, 0x80 | ((cp >> 6) & 63))
+        buf_byte(b, 0x80 | (cp & 63))
+    } else {
+        buf_byte(b, 0xF0 | (cp >> 18))
+        buf_byte(b, 0x80 | ((cp >> 12) & 63))
+        buf_byte(b, 0x80 | ((cp >> 6) & 63))
+        buf_byte(b, 0x80 | (cp & 63))
+    }
 }
 
 fn buf_int(b: Buf, x: int) {

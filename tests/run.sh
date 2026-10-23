@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Тесты компилятора.
 #   tests/run/*.kh    — вывод сравнивается с .out, код выхода — с комментарием
-#                       «// exit: N» (по умолчанию 0);
+#                       «// exit: N» (по умолчанию 0); с комментариями
+#                       «// env: ИМЯ=значение ...» — по запуску на каждый;
 #   tests/errors/*.kh — не должны компилироваться; вывод компилятора должен
 #                       содержать каждую строку «// expect: ...»; ключи
 #                       компилятора — из «// flags: ...»;
@@ -40,18 +41,23 @@ for src in tests/run/*.kh; do
 		failed "$src" "не скомпилировалось:"$'\n'"$(cat "$tmp/$name.err")"
 		continue
 	fi
-	"$tmp/$name" >"$tmp/$name.out" 2>"$tmp/$name.stderr"
-	got_exit=$?
-	if ! diff -u "tests/run/$name.out" "$tmp/$name.out" >"$tmp/$name.diff"; then
-		failed "$src" "вывод отличается от ожидаемого"
-		cat "$tmp/$name.diff"
-		continue
-	fi
-	if [[ "$got_exit" != "$want_exit" ]]; then
-		failed "$src" "код выхода $got_exit, ожидался $want_exit; stderr: $(cat "$tmp/$name.stderr")"
-		continue
-	fi
-	pass=$((pass + 1))
+	mapfile -t envs < <(sed -n 's|^// env: *||p' "$src")
+	[[ ${#envs[@]} -eq 0 ]] && envs=("")
+	for e in "${envs[@]}"; do
+		# shellcheck disable=SC2086
+		env $e "$tmp/$name" >"$tmp/$name.out" 2>"$tmp/$name.stderr"
+		got_exit=$?
+		if ! diff -u "tests/run/$name.out" "$tmp/$name.out" >"$tmp/$name.diff"; then
+			failed "$src${e:+ ($e)}" "вывод отличается от ожидаемого"
+			cat "$tmp/$name.diff"
+			continue
+		fi
+		if [[ "$got_exit" != "$want_exit" ]]; then
+			failed "$src${e:+ ($e)}" "код выхода $got_exit, ожидался $want_exit; stderr: $(cat "$tmp/$name.stderr")"
+			continue
+		fi
+		pass=$((pass + 1))
+	done
 done
 
 for src in tests/errors/*.kh; do

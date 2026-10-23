@@ -1,0 +1,6 @@
+sequences: ok
+text: 53 characters in 94 bytes
+text and random bytes: ok
+buf_utf8: ok
+perm_alloc: ok
+checks: 54498090, mismatches: 0

@@ -5,7 +5,8 @@
 // путь выбирается по __simd_level (2, 1, 0), который рантайм выставляет
 // при старте по cpuid (lib/rt.kh, __simd_init).
 // Аргументы: rdi — адрес, rsi — длина, rdx — байт; результат в rax — индекс
-// первого совпадения или длина, если совпадений нет.
+// первого совпадения или длина, если совпадений нет. Примитивы UTF-8 (ниже) —
+// со своими результатами и двумя путями.
 // ============================================================================
 
 fn hex_val(c: int) -> int {
@@ -27,6 +28,19 @@ fn emit_hex(s: str) {
             continue
         }
         emit8(hex_val(s.byte(i)) * 16 + hex_val(s.byte(i + 1)))
+        i += 2
+    }
+}
+
+// То же — байты в сегмент данных.
+fn data_hex(s: str) {
+    var i = 0
+    while i + 1 < s.byte_len() {
+        if s.byte(i) == ' ' {
+            i += 1
+            continue
+        }
+        data_byte(hex_val(s.byte(i)) * 16 + hex_val(s.byte(i + 1)))
         i += 2
     }
 }
@@ -282,6 +296,266 @@ fn emit_simd_find_crlf2() {
     for h in done {
         patch_rel(h, end)
     }
+}
+
+// ---- UTF-8: проверка со счётом символов, пропуск символов, JSON со старшими байтами ----
+// Здесь два пути: AVX2 (__simd_level 2) и скалярный, в котором ASCII идёт по 8
+// байт (SWAR); отдельного SSE2 нет (docs/design/v0.13-utf8.md, §4.1), кроме
+// __simd_find_json_hi: это копия __simd_find_json со всеми тремя путями.
+// Байты — objdump -d от docs/design/v0.13-utf8.asm, вместе с переходами внутри
+// примитива (метки — в комментариях); адреса в DATA вписываются при выдаче. Код
+// проверен на C (272 млн случаев) и tests/run/utf8_simd.kh; чтобы его изменить,
+// правьте .asm, собирайте nasm и переносите байты заново. Кроме аргументов
+// затираются только rax rcx rdx r8–r11 и ymm0–ymm15 (rbp сохраняется); вызовов нет.
+
+// Константы __simd_utf8_scan в DATA (352 байта, выровнены на 32), одни на программу:
+// [0] 0x0F, [32] 0xC0, [64] [96] [128] таблицы T1 T2 T3 алгоритма Keiser–Lemire
+// «lookup», [160] 0x60, [192] 0x70, [224] 0x80, [256] маска хвоста (32 × FF и
+// 32 × 00), [320] MAXV — порог «блок кончается внутри символа».
+var utf8_tab: int
+
+fn data_fill(b: int, n: int) {
+    for i in 0..n {
+        data_byte(b)
+    }
+}
+
+fn utf8_consts() -> int {
+    if utf8_tab == 0 {
+        while (data_len & 31) != 0 {
+            data_byte(0)
+        }
+        utf8_tab = DATA_BASE + data_len
+        data_fill(0x0F, 32)
+        data_fill(0xC0, 32)
+        data_hex("02 02 02 02 02 02 02 02 80 80 80 80 21 01 15 49")
+        data_hex("02 02 02 02 02 02 02 02 80 80 80 80 21 01 15 49")
+        data_hex("E7 A3 83 83 8B CB CB CB CB CB CB CB CB DB CB CB")
+        data_hex("E7 A3 83 83 8B CB CB CB CB CB CB CB CB DB CB CB")
+        data_hex("01 01 01 01 01 01 01 01 E6 AE BA BA 01 01 01 01")
+        data_hex("01 01 01 01 01 01 01 01 E6 AE BA BA 01 01 01 01")
+        data_fill(0x60, 32)
+        data_fill(0x70, 32)
+        data_fill(0x80, 32)
+        data_fill(0xFF, 32)
+        data_fill(0, 32)
+        data_fill(0xFF, 29)
+        data_hex("EF DF BF")
+    }
+    return utf8_tab
+}
+
+// Инструкция с операндом [disp32] в DATA: байты до смещения, затем адрес.
+fn emit_abs(op: str, addr: int) {
+    emit_hex(op)
+    emit32(addr)
+}
+
+// Блок ymm0 проверки UTF-8 (148 байт): ymm6 — предыдущий блок, ymm7 копит ошибки,
+// ymm8 — «предыдущий блок кончился внутри символа», r8 += число байтов 10xxxxxx.
+// Константы — в ymm4, ymm5, ymm10–ymm15 (emit_simd_utf8_scan), t — их адрес.
+fn utf8_block(t: int) {
+    // vpmovmskb ecx, ymm0; test ecx, ecx; jnz .full
+    emit_hex("C5 FD D7 C8 85 C9 75 10")
+    // блок ASCII сразу после незаконченного символа — ошибка:
+    // vpor ymm7, ymm7, ymm8; vpxor xmm8, xmm8, xmm8; vmovdqa ymm6, ymm0; jmp .done
+    emit_hex("C4 C1 45 EB F8 C4 41 39 EF C0 C5 FD 6F F0 EB 7C")
+    // .full: байты 0x80..0xBF (-64 > b со знаком): vpcmpgtb ymm9, ymm10, ymm0;
+    // vpmovmskb ecx, ymm9; popcnt ecx, ecx; add r8, rcx
+    emit_hex("C5 2D 64 C8 C4 C1 7D D7 C9 F3 0F B8 C9 49 01 C8")
+    // ymm1 — конец прошлого блока и начало этого, ymm2 = prev1:
+    // vperm2i128 ymm1, ymm6, ymm0, 0x21; vpalignr ymm2, ymm0, ymm1, 15
+    emit_hex("C4 E3 4D 46 C8 21 C4 E3 7D 0F D1 0F")
+    // ymm3 = T1[prev1 >> 4] & T2[prev1 & 15] & T3[b >> 4] (vpsrlw, vpand, vpshufb)
+    emit_hex("C5 E5 71 D2 04 C5 E5 DB DD C4 E2 25 00 DB")
+    emit_hex("C5 ED DB D5 C4 E2 1D 00 D2 C5 E5 DB DA")
+    emit_hex("C5 ED 71 D0 04 C5 ED DB D5 C4 E2 15 00 D2 C5 E5 DB DA")
+    // после prev2 >= 0xE0 и prev3 >= 0xF0 нужен байт продолжения (бит 7):
+    // vpalignr ymm2, ymm0, ymm1, 14; vpalignr ymm1, ymm0, ymm1, 13;
+    // vpsubusb ymm2, ymm2, ymm14; vpsubusb ymm1, ymm1, ymm15
+    emit_hex("C4 E3 7D 0F D1 0E C4 E3 7D 0F C9 0D C4 C1 6D D8 D6 C4 C1 75 D8 CF")
+    // vpor ymm2, ymm2, ymm1; vpand ymm2, ymm2, ymm4; vpxor ymm2, ymm2, ymm3; vpor ymm7, ymm7, ymm2
+    emit_hex("C5 ED EB D1 C5 ED DB D4 C5 ED EF D3 C5 C5 EB FA")
+    // блок кончается внутри символа: vpsubusb ymm8, ymm0, [MAXV]; vmovdqa ymm6, ymm0
+    emit_abs("C5 7D D8 04 25", t + 320)
+    emit_hex("C5 FD 6F F0")
+    // .done
+}
+
+// __simd_utf8_scan(адрес, длина): число символов, если [p, p + n) — правильный
+// UTF-8 (таблица 3-7 Unicode: без лишне длинных форм, суррогатов и значений больше
+// U+10FFFF), иначе -1. AVX2 — проверка «lookup» по 32 байта, а число символов —
+// n минус число байтов 10xxxxxx. Последние 0–31 байт — ещё один блок: одно чтение
+// 32 байт с маской, если оно не выходит за страницу, иначе копия в обнулённый блок
+// на стеке; пустой хвост не читается вовсе (блок нулей). Нули дополнения делают
+// «символ не закончен в конце» обычной ошибкой «нет байта продолжения».
+fn emit_simd_utf8_scan() {
+    let t = utf8_consts()
+    // cmp byte [__simd_level], 2; jb .swar
+    emit_level_cmp(2)
+    emit_hex("0F 82 81 02 00 00")
+    // push rbp; mov rbp, rsp; sub rsp, 64; and rsp, -32 — блок для хвоста;
+    // xor eax, eax — смещение блока; xor r8d, r8d — байты продолжения
+    emit_hex("55 48 89 E5 48 83 EC 40 48 83 E4 E0 31 C0 45 31 C0")
+    // vpxor xmm7, xmm7, xmm7; vpxor xmm6, xmm6, xmm6; vpxor xmm8, xmm8, xmm8
+    emit_hex("C5 C1 EF FF C5 C9 EF F6 C4 41 39 EF C0")
+    // vmovdqu: ymm5 = 0x0F, ymm10 = 0xC0, ymm11–ymm13 = T1–T3, ymm14 = 0x60,
+    // ymm15 = 0x70, ymm4 = 0x80
+    emit_abs("C5 FE 6F 2C 25", t)
+    emit_abs("C5 7E 6F 14 25", t + 32)
+    emit_abs("C5 7E 6F 1C 25", t + 64)
+    emit_abs("C5 7E 6F 24 25", t + 96)
+    emit_abs("C5 7E 6F 2C 25", t + 128)
+    emit_abs("C5 7E 6F 34 25", t + 160)
+    emit_abs("C5 7E 6F 3C 25", t + 192)
+    emit_abs("C5 FE 6F 24 25", t + 224)
+    // .blk: lea rcx, [rax + 32]; cmp rcx, rsi; ja .tail; vmovdqu ymm0, [rdi + rax]
+    emit_hex("48 8D 48 20 48 39 F1 0F 87 A2 00 00 00 C5 FE 6F 04 07")
+    utf8_block(t)
+    // add rax, 32; jmp .blk
+    emit_hex("48 83 C0 20 E9 51 FF FF FF")
+    // .tail: rdx = n - rax; r9 = rdi + rax; vpxor xmm0, xmm0, xmm0; test rdx, rdx; jz .tblk
+    emit_hex("48 89 F2 48 29 C2 4C 8D 0C 07 C5 F9 EF C0 48 85 D2 0F 84 A4 00 00 00")
+    // чтение 32 байт не выходит за страницу, если (r9 & 4095) <= 4064, иначе ja .slowtail
+    emit_hex("44 89 C9 81 E1 FF 0F 00 00 81 F9 E0 0F 00 00 77 16")
+    // lea rcx, [маска + 32]; sub rcx, rdx; vmovdqu ymm0, [r9]; vpand ymm0, ymm0, [rcx]; jmp .tblk
+    emit_abs("48 8D 0C 25", t + 288)
+    emit_hex("48 29 D1 C4 C1 7E 6F 01 C5 FD DB 01 EB 7D")
+    // .slowtail: vmovdqa [rsp], ymm0 и копия хвоста двумя перекрывающимися
+    // кусками по 16, 8, 4 или 2 байта (.t8, .t4, .t2) или один байт (.t1), затем jmp .tdo
+    emit_hex("C5 FD 7F 04 24 48 83 FA 10 72 19")
+    emit_hex("C4 C1 7A 6F 09 C4 C1 7A 6F 54 11 F0 C5 FA 7F 0C 24 C5 FA 7F 54 14 F0 EB 54")
+    emit_hex("48 83 FA 08 72 13 49 8B 09 4D 8B 54 11 F8 48 89 0C 24 4C 89 54 14 F8 EB 3B")
+    emit_hex("48 83 FA 04 72 12 41 8B 09 45 8B 54 11 FC 89 0C 24 44 89 54 14 FC EB 23")
+    emit_hex("48 83 FA 02 72 16 41 0F B7 09 45 0F B7 54 11 FE 66 89 0C 24 66 44 89 54 14 FE EB 07")
+    emit_hex("41 0F B6 09 88 0C 24")
+    // .tdo: vmovdqa ymm0, [rsp]
+    emit_hex("C5 FD 6F 04 24")
+    // .tblk
+    utf8_block(t)
+    // vptest ymm7, ymm7; vzeroupper; mov rsp, rbp; pop rbp; jnz .bad;
+    // rax = n - r8; jmp .done
+    emit_hex("C4 E2 7D 17 FF C5 F8 77 48 89 EC 5D 0F 85 A5 01 00 00")
+    emit_hex("48 89 F0 4C 29 C0 E9 A1 01 00 00")
+    // .swar: строгая проверка по символу со счётом в rax, rcx — смещение:
+    // xor ecx, ecx; xor eax, eax
+    emit_hex("31 C9 31 C0")
+    // .s: cmp rcx, rsi; jae .good; 8 байт ASCII за шаг: lea r8, [rcx + 8]; cmp r8, rsi;
+    // ja .one; mov r8, [rdi + rcx]; mov r9, 0x8080808080808080; test r8, r9; jnz .one;
+    // add rcx, 8; add rax, 8; jmp .s
+    emit_hex("48 39 F1 0F 83 8B 01 00 00 4C 8D 41 08 49 39 F0 77 1D")
+    emit_hex("4C 8B 04 0F 49 B9 80 80 80 80 80 80 80 80 4D 85 C8 75 0A")
+    emit_hex("48 83 C1 08 48 83 C0 08 EB D1")
+    // .one: inc rax; edx = байт; < 0x80 — .a1, < 0xC2 — .bad, < 0xE0 — .c2,
+    // < 0xF0 — .c3, > 0xF4 — .bad
+    emit_hex("48 FF C0 0F B6 14 0F 81 FA 80 00 00 00 0F 82 4A 01 00 00")
+    emit_hex("81 FA C2 00 00 00 0F 82 48 01 00 00 81 FA E0 00 00 00 0F 82 0A 01 00 00")
+    emit_hex("81 FA F0 00 00 00 0F 82 9A 00 00 00 81 FA F4 00 00 00 0F 87 24 01 00 00")
+    // 4 байта: rcx + 3 < n; r9d = второй байт: после F0 — не меньше 0x90 (.f1),
+    // после F4 — не больше 0x8F (.f2); все три — 10xxxxxx; add rcx, 4; jmp .s
+    emit_hex("4C 8D 41 03 49 39 F0 0F 83 17 01 00 00 44 0F B6 4C 0F 01")
+    emit_hex("81 FA F0 00 00 00 75 0D 41 81 F9 90 00 00 00 0F 82 FC 00 00 00")
+    emit_hex("81 FA F4 00 00 00 75 0D 41 81 F9 8F 00 00 00 0F 87 E7 00 00 00")
+    emit_hex("41 81 E1 C0 00 00 00 41 81 F9 80 00 00 00 0F 85 D3 00 00 00")
+    emit_hex("44 0F B6 4C 0F 02 41 81 E1 C0 00 00 00 41 81 F9 80 00 00 00 0F 85 B9 00 00 00")
+    emit_hex("44 0F B6 4C 0F 03 41 81 E1 C0 00 00 00 41 81 F9 80 00 00 00 0F 85 9F 00 00 00")
+    emit_hex("48 83 C1 04 E9 00 FF FF FF")
+    // .c3: 3 байта: rcx + 2 < n; после E0 — не меньше 0xA0 (.e1), после ED — не
+    // больше 0x9F (.e2, не суррогат); оба — 10xxxxxx; add rcx, 3; jmp .s
+    emit_hex("4C 8D 41 02 49 39 F0 0F 83 89 00 00 00 44 0F B6 4C 0F 01")
+    emit_hex("81 FA E0 00 00 00 75 09 41 81 F9 A0 00 00 00 72 72")
+    emit_hex("81 FA ED 00 00 00 75 09 41 81 F9 9F 00 00 00 77 61")
+    emit_hex("41 81 E1 C0 00 00 00 41 81 F9 80 00 00 00 75 51")
+    emit_hex("44 0F B6 4C 0F 02 41 81 E1 C0 00 00 00 41 81 F9 80 00 00 00 75 3B")
+    emit_hex("48 83 C1 03 E9 9C FE FF FF")
+    // .c2: 2 байта: rcx + 1 < n; второй — 10xxxxxx; add rcx, 2; jmp .s
+    emit_hex("4C 8D 41 01 49 39 F0 73 29 44 0F B6 4C 0F 01")
+    emit_hex("41 81 E1 C0 00 00 00 41 81 F9 80 00 00 00 75 13 48 83 C1 02 E9 74 FE FF FF")
+    // .a1: inc rcx; jmp .s; .good: jmp .done; .bad: mov rax, -1; .done
+    emit_hex("48 FF C1 E9 6C FE FF FF EB 07 48 C7 C0 FF FF FF FF")
+}
+
+// __simd_utf8_skip(адрес, длина, k): смещение начала символа k (k >= 0) по
+// правилу ведущих байтов — символ начинается в байте 0 и в каждом байте, кроме
+// 10xxxxxx, — или n, если символов не больше k. На правильном UTF-8 — точное.
+fn emit_simd_utf8_skip() {
+    // xor eax, eax; test rdx, rdx; jz .r; mov eax, 1 — символ 0 начинается в
+    // байте 0, ведущие байты ищутся в [1, n)
+    emit_hex("31 C0 48 85 D2 0F 84 89 00 00 00 B8 01 00 00 00")
+    // cmp byte [__simd_level], 2; jb .s
+    emit_level_cmp(2)
+    emit_hex("72 56")
+    // ymm1 = -65: b > -65 со знаком — b не 10xxxxxx
+    emit_hex("B9 BF BF BF BF C5 F9 6E C9 C4 E2 7D 58 C9")
+    // .blk: lea rcx, [rax + 32]; cmp rcx, rsi; ja .t; vmovdqu ymm0, [rdi + rax];
+    // vpcmpgtb ymm0, ymm0, ymm1; vpmovmskb ecx, ymm0; popcnt r9d, ecx; cmp r9, rdx; jae .in;
+    // sub rdx, r9; add rax, 32; jmp .blk
+    emit_hex("48 8D 48 20 48 39 F1 77 3C C5 FE 6F 04 07")
+    emit_hex("C5 FD 64 C1 C5 FD D7 C8 F3 44 0F B8 C9 49 39 D1 73 09")
+    emit_hex("4C 29 CA 48 83 C0 20 EB D7")
+    // .in: нужный ведущий байт в этом блоке — сбросить k - 1 младших битов маски:
+    // dec rdx; jz .bit; .clr: lea r8d, [rcx - 1]; and ecx, r8d; dec rdx; jnz .clr
+    emit_hex("48 FF CA 74 0C 44 8D 41 FF 44 21 C1 48 FF CA 75 F4")
+    // .bit: bsf ecx, ecx; add rax, rcx; vzeroupper; jmp .r; .t: vzeroupper
+    emit_hex("0F BC C9 48 01 C8 C5 F8 77 EB 27 C5 F8 77")
+    // .s: по байту: cmp rax, rsi; jae .end; movzx ecx, byte [rdi + rax];
+    // and ecx, 0xC0; cmp ecx, 0x80; je .n; dec rdx; jz .r; .n: inc rax; jmp .s
+    emit_hex("48 39 F0 73 1C 0F B6 0C 07 81 E1 C0 00 00 00 81 F9 80 00 00 00 74 05")
+    emit_hex("48 FF CA 74 08 48 FF C0 EB DF")
+    // .end: mov rax, rsi; .r
+    emit_hex("48 89 F0")
+}
+
+// __simd_find_json_hi(адрес, длина): то же, что __simd_find_json, и ещё бит 62
+// результата — был ли до найденного места байт >= 0x80 (тогда строку JSON нужно
+// проверить на UTF-8). Маска старших битов копится в r9d; в блоке с находкой —
+// только до неё: lea r10, [rcx - 1]; xor r10, rcx — биты до младшей единицы
+// маски находок включительно.
+fn emit_simd_find_json_hi() {
+    // xor r9d, r9d; xor eax, eax; cmp byte [__simd_level], 1; jb .sc;
+    // cmp byte [__simd_level], 2; jb .sse
+    emit_hex("45 31 C9 31 C0")
+    emit_level_cmp(1)
+    emit_hex("0F 82 26 01 00 00")
+    emit_level_cmp(2)
+    emit_hex("72 7D")
+    // AVX2: ymm1 = '"', ymm2 = '\\', ymm3 = 0x1F
+    emit_hex("B9 22 00 00 00 C5 F9 6E C9 C4 E2 7D 78 C9")
+    emit_hex("B9 5C 00 00 00 C5 F9 6E D1 C4 E2 7D 78 D2")
+    emit_hex("B9 1F 00 00 00 C5 F9 6E D9 C4 E2 7D 78 DB")
+    // .atop: lea rcx, [rax + 32]; cmp rcx, rsi; ja .aend; ymm0 = блок;
+    // ymm5 = (min(v, 0x1F) == v) | (v == '"') | (v == '\\')
+    emit_hex("48 8D 48 20 48 39 F1 77 47 C5 FE 6F 04 07")
+    emit_hex("C5 FD DA F3 C5 CD 74 F0")
+    emit_hex("C5 FD 74 E9 C5 D5 EB EE")
+    emit_hex("C5 FD 74 F2 C5 D5 EB EE")
+    // vpmovmskb ecx, ymm5; vpmovmskb r8d, ymm0; test ecx, ecx; jnz .ahit;
+    // or r9d, r8d; add rax, 32; jmp .atop
+    emit_hex("C5 FD D7 CD C5 7D D7 C0 85 C9 75 09 45 09 C1 48 83 C0 20 EB C5")
+    // .ahit: lea r10, [rcx - 1]; xor r10, rcx; and r8d, r10d; or r9d, r8d;
+    // vzeroupper; jmp .found; .aend: vzeroupper
+    emit_hex("4C 8D 51 FF 49 31 CA 45 21 D0 45 09 C1 C5 F8 77 E9 9A 00 00 00 C5 F8 77")
+    // .sse: SSE2, те же байты в xmm1–xmm3 (movd, punpcklbw, punpcklwd, pshufd)
+    emit_hex("B9 22 00 00 00 66 0F 6E C9 66 0F 60 C9 66 0F 61 C9 66 0F 70 C9 00")
+    emit_hex("B9 5C 00 00 00 66 0F 6E D1 66 0F 60 D2 66 0F 61 D2 66 0F 70 D2 00")
+    emit_hex("B9 1F 00 00 00 66 0F 6E D9 66 0F 60 DB 66 0F 61 DB 66 0F 70 DB 00")
+    // .stop: lea rcx, [rax + 16]; cmp rcx, rsi; ja .sc; movdqu xmm0, [rdi + rax]
+    emit_hex("48 8D 48 10 48 39 F1 77 54 F3 0F 6F 04 07")
+    emit_hex("66 0F 6F F0 66 0F DA F3 66 0F 74 F0")
+    emit_hex("66 0F 6F E8 66 0F 74 E9 66 0F EB EE")
+    emit_hex("66 0F 6F F0 66 0F 74 F2 66 0F EB EE")
+    // pmovmskb ecx, xmm5; pmovmskb r8d, xmm0; test ecx, ecx; jnz .shit;
+    // or r9d, r8d; add rax, 16; jmp .stop
+    emit_hex("66 0F D7 CD 66 44 0F D7 C0 85 C9 75 09 45 09 C1 48 83 C0 10 EB B8")
+    // .shit: то же, что .ahit; .found: bsf ecx, ecx; add rax, rcx; jmp .done
+    emit_hex("4C 8D 51 FF 49 31 CA 45 21 D0 45 09 C1 0F BC C9 48 01 C8 EB 27")
+    // .sc: побайтно: cmp rax, rsi; jae .done; movzx ecx, byte [rdi + rax];
+    // '"', '\\' или < 0x20 — .done
+    emit_hex("48 39 F0 73 22 0F B6 0C 07 83 F9 22 74 19 83 F9 5C 74 14 83 F9 20 72 0F")
+    // r9d |= c >> 7: mov r10d, ecx; shr r10d, 7; or r9d, r10d; inc rax; jmp .sc
+    emit_hex("41 89 CA 41 C1 EA 07 45 09 D1 48 FF C0 EB D9")
+    // .done: test r9d, r9d; jz .ret; bts rax, 62; .ret
+    emit_hex("45 85 C9 74 05 48 0F BA E8 3E")
 }
 
 // __cpu_avx2(): есть ли AVX2 и включено ли сохранение ymm операционной системой.

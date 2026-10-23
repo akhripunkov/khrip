@@ -1244,7 +1244,7 @@ fn parse_builtin(t: Token, w: int) -> int {
         emit_call(rt_func("__json_decode"))
         return ty_opt(inner)
     }
-    let lib_only = name == "__fsqrt" || name.starts_with("__simd_") || name == "__sha256_x64" || name == "__sha512_x64" || name == "__cpu_aes" || name == "__aes_ctr" || name == "__ghash" || name == "__chacha_block" || name == "__mp_add" || name == "__mp_sub" || name == "__mont_mul" || name == "__madd" || name == "__msub" || name == "__wmul" || name == "__cpu_avx2" || name == "__cpu_sha" || name == "__spawn" || name == "__co_call" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset"
+    let lib_only = name == "__fsqrt" || name.starts_with("__simd_") || name == "__sha256_x64" || name == "__sha512_x64" || name == "__cpu_aes" || name == "__aes_ctr" || name == "__ghash" || name == "__chacha_block" || name == "__mp_add" || name == "__mp_sub" || name == "__mont_mul" || name == "__madd" || name == "__msub" || name == "__wmul" || name == "__cpu_avx2" || name == "__cpu_sha" || name == "__spawn" || name == "__co_call" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset" || name == "__data_hex"
     if lib_only && !files[t.file].is_lib {
         return -1
     }
@@ -1288,6 +1288,45 @@ fn parse_builtin(t: Token, w: int) -> int {
         } else {
             emit_simd_find_crlf2()
         }
+        return ty_int
+    }
+    if name == "__simd_utf8_scan" || name == "__simd_utf8_skip" || name == "__simd_find_json_hi" {
+        advance()
+        if name == "__simd_utf8_skip" {
+            builtin_args(3, t, name)
+            emit_pop(RDX)
+        } else {
+            builtin_args(2, t, name)
+        }
+        emit_pop(RSI)
+        emit_pop(RDI)
+        if name == "__simd_utf8_scan" {
+            emit_simd_utf8_scan()
+        } else if name == "__simd_utf8_skip" {
+            emit_simd_utf8_skip()
+        } else {
+            emit_simd_find_json_hi()
+        }
+        return ty_int
+    }
+    if name == "__data_hex" {
+        // таблица из шестнадцатеричного литерала: байты кладутся в DATA при
+        // компиляции, в программе — только адрес
+        advance()
+        let a = tok()
+        var addr = -1
+        if a.kind == T_STR {
+            addr = data_hex_table(strlits[a.val])
+            advance()
+        } else {
+            parse_expr(ty_err)
+        }
+        expect_tok(')')
+        if addr < 0 {
+            error_tok(a, "__data_hex takes a string literal of hex digit pairs", "__data_hex(\"0F C0 FF\")")
+            addr = 0
+        }
+        emit_mov_imm(RAX, addr)
         return ty_int
     }
     if name == "__cpu_sha" {

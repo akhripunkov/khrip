@@ -1,0 +1,354 @@
+// Примитивы UTF-8 рантайма (src/simd.kh) дают тот же ответ, что и простые ссылки
+// на Khrip: проверка со счётом символов (__utf8_scan), пропуск k символов
+// (__utf8_skip) и поиск для JSON со старшими байтами (__find_json_hi). Путь
+// выбирает рантайм: tests/run.sh запускает тест при каждом KHRIP_SIMD ниже, а вывод
+// один и тот же. Буферы стоят и у конца страницы, за которой — PROT_NONE.
+// env: KHRIP_SIMD=0
+// env: KHRIP_SIMD=1
+// env: KHRIP_SIMD=2
+
+fn is_cont(b: int) -> bool {
+    return (b & 0xC0) == 0x80
+}
+
+// Таблица 3-7 Unicode: число символов или -1.
+fn ref_scan(p: int, n: int) -> int {
+    var i = 0
+    var count = 0
+    while i < n {
+        let c = load8(p + i)
+        count += 1
+        if c < 0x80 {
+            i += 1
+            continue
+        }
+        var len = 0
+        var lo = 0x80
+        var hi = 0xBF
+        if c >= 0xC2 && c <= 0xDF {
+            len = 2
+        } else if c == 0xE0 {
+            len = 3
+            lo = 0xA0
+        } else if c >= 0xE1 && c <= 0xEC {
+            len = 3
+        } else if c == 0xED {
+            len = 3
+            hi = 0x9F
+        } else if c >= 0xEE && c <= 0xEF {
+            len = 3
+        } else if c == 0xF0 {
+            len = 4
+            lo = 0x90
+        } else if c >= 0xF1 && c <= 0xF3 {
+            len = 4
+        } else if c == 0xF4 {
+            len = 4
+            hi = 0x8F
+        } else {
+            return -1
+        }
+        if i + len > n {
+            return -1
+        }
+        let c1 = load8(p + i + 1)
+        if c1 < lo || c1 > hi {
+            return -1
+        }
+        for j in 2..len {
+            if !is_cont(load8(p + i + j)) {
+                return -1
+            }
+        }
+        i += len
+    }
+    return count
+}
+
+// Символ начинается в байте 0 и в каждом байте, кроме 10xxxxxx.
+fn ref_leads(p: int, n: int) -> int {
+    var c = 0
+    for i in 0..n {
+        if i == 0 || !is_cont(load8(p + i)) {
+            c += 1
+        }
+    }
+    return c
+}
+
+fn ref_skip(p: int, n: int, k: int) -> int {
+    var c = 0
+    for i in 0..n {
+        if i == 0 || !is_cont(load8(p + i)) {
+            if c == k {
+                return i
+            }
+            c += 1
+        }
+    }
+    return n
+}
+
+fn ref_json_hi(p: int, n: int) -> int {
+    var hi = 0
+    for i in 0..n {
+        let c = load8(p + i)
+        if c == '"' || c == '\\' || c < 0x20 {
+            return i | (hi << 62)
+        }
+        if c >= 0x80 {
+            hi = 1
+        }
+    }
+    return n | (hi << 62)
+}
+
+var checks: int = 0
+var bad: int = 0
+
+fn report(what: str, p: int, n: int, got: int, want: int) {
+    checks += 1
+    if got != want {
+        fail(what, p, n, got, want)
+    }
+}
+
+fn fail(what: str, p: int, n: int, got: int, want: int) {
+    bad += 1
+    if bad <= 10 {
+        var bytes = ""
+        for i in 0..n {
+            bytes += " " + load8(p + i).to_str()
+        }
+        print("mismatch {what}: n={n} got {got} want {want}:{bytes}")
+    }
+}
+
+fn check_scan(p: int, n: int) {
+    report("scan", p, n, __utf8_scan(p, n), ref_scan(p, n))
+}
+
+// Все три примитива; skip — для k = 0, 1, середины и около числа символов.
+fn check_all(p: int, n: int) {
+    check_scan(p, n)
+    let m = ref_leads(p, n)
+    for k in [0, 1, m / 2, m - 1, m, m + 1] {
+        if k >= 0 {
+            report("skip", p, n, __utf8_skip(p, n, k), ref_skip(p, n, k))
+        }
+    }
+    report("json", p, n, __find_json_hi(p, n), ref_json_hi(p, n))
+}
+
+fn hex2(b: int) -> str {
+    let d = "0123456789ABCDEF"
+    return d[b >> 4..(b >> 4) + 1] + d[b & 15..(b & 15) + 1]
+}
+
+// Короче: проверка, пропуск до последнего символа и поиск для JSON.
+fn check_one(p: int, n: int) {
+    check_scan(p, n)
+    let k = ref_leads(p, n) - 1
+    report("skip", p, n, __utf8_skip(p, n, k), ref_skip(p, n, k))
+    report("json", p, n, __find_json_hi(p, n), ref_json_hi(p, n))
+}
+
+fn fill(p: int, n: int, c: int) {
+    for i in 0..n {
+        store8(p + i, c)
+    }
+}
+
+fn copy_text(p: int, n: int, text: str) {
+    let t = __str_ptr(text)
+    let m = text.byte_len()
+    for i in 0..n {
+        store8(p + i, load8(t + i % m))
+    }
+}
+
+var seed: int = 7
+
+fn rnd(n: int) -> int {
+    seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+    return (seed >> 8) % n
+}
+
+// Байт, похожий на UTF-8: ASCII, продолжение или ведущий.
+fn rnd_byte() -> int {
+    let r = rnd(16)
+    if r < 6 {
+        return rnd(128)
+    }
+    if r < 11 {
+        return 0x80 + rnd(64)
+    }
+    return 0xC0 + rnd(64)
+}
+
+fn main() -> int {
+    // три страницы: первая и третья — PROT_NONE; end — конец средней
+    let pages = __mmap(3 * 4096)
+    syscall(10, pages, 4096, 0)
+    syscall(10, pages + 8192, 4096, 0)
+    let start = pages + 4096
+    let end = pages + 8192
+    let text = "Привет, мир! 日本語テキスト 😀🎉 ok naïve café Ελληνικά ¿qué? "
+
+    // известные случаи: п (D0 BF), одинокий BF, граница -64/-65 (C0 и BF) в
+    // разных местах блока, незаконченный символ в конце
+    for v in [[0xD0, 0xBF], [0xBF], [0xC0, 0xBF], [0xC2, 0xBF], [0xC2, 0xC0], [0xE0, 0xA0, 0xBF], [0xED, 0xA0, 0x80], [0xF4, 0x90, 0x80, 0x80], [0xD0]] {
+        var line = ""
+        for off in [0, 30, 31, 32, 63] {
+            let n = off + v.len()
+            let p = end - n
+            fill(p, off, 'a')
+            for i in 0..v.len() {
+                store8(p + off + i, v[i])
+            }
+            check_all(p, n)
+            line += " " + __utf8_scan(p, n).to_str()
+        }
+        var hex = hex2(v[0])
+        for i in 1..v.len() {
+            hex += " " + hex2(v[i])
+        }
+        print("{hex}:{line}")
+    }
+
+    // каждый байт в каждой позиции, длины 0–140, фон ASCII, конец — у края
+    // страницы; затем байты с особыми значениями в многоязычном тексте с начала
+    // страницы (и skip, и JSON)
+    fill(end - 140, 140, 'a')
+    for n in 0..141 {
+        let p = end - n
+        for at in 0..n {
+            for b in 0..256 {
+                store8(p + at, b)
+                check_scan(p, n)
+            }
+            store8(p + at, 'a')
+        }
+    }
+    for n in 0..81 {
+        for at in 0..n {
+            for b in [0x00, 0x22, 0x5C, 0x7F, 0x80, 0xBF, 0xC0, 0xC1, 0xC2, 0xDF, 0xE0, 0xED, 0xEF, 0xF0, 0xF4, 0xF5, 0xFF] {
+                store8(end - n + at, b)
+                check_all(end - n, n)
+                store8(end - n + at, 'a')
+                copy_text(start, n, text)
+                store8(start + at, b)
+                check_all(start, n)
+            }
+        }
+    }
+    print("every byte at every position: ok")
+
+    // правильный многоязычный текст с одной порчей; конец — у края страницы
+    let tn = text.byte_len()
+    for at in 0..tn {
+        for b in [0x80, 0xBF, 0xC0, 0xC1, 0xE0, 0xED, 0xF0, 0xF4, 0xF5, 0xFF, 'a', '"'] {
+            for cut in 0..4 {
+                let n = tn - cut
+                let p = end - n
+                copy_text(p, n, text)
+                store8(p + at % n, b)
+                check_all(p, n)
+            }
+        }
+    }
+    copy_text(end - tn, tn, text)
+    print("text: {__utf8_scan(end - tn, tn)} characters in {tn} bytes")
+
+    // случайные буферы у конца страницы, с начала и в середине страницы
+    for t in 0..20000 {
+        let n = rnd(200)
+        var p = start + 1000 + rnd(64)
+        let place = rnd(3)
+        if place == 0 {
+            p = end - n
+        } else if place == 1 {
+            p = start
+        }
+        if rnd(2) == 0 {
+            for i in 0..n {
+                store8(p + i, rnd_byte())
+            }
+        } else {
+            copy_text(p, n, text)
+            if n > 0 && rnd(2) == 0 {
+                store8(p + rnd(n), rnd(256))
+            }
+        }
+        check_all(p, n)
+    }
+
+    // хвост пуст и стоит ровно у конца страницы: читать нечего
+    for n in [0, 32, 64, 96, 128] {
+        let p = end - n
+        fill(p, n, 'a')
+        check_all(p, n)
+        if n > 0 {
+            store8(end - 1, 0xD0)
+            check_all(p, n)
+            store8(end - 2, 0xD0)
+            store8(end - 1, 0xBF)
+            check_all(p, n)
+        }
+    }
+
+    // все последовательности из 1–3 байт с позиций 0, 29, 30, 31 и 32 блока
+    // (фон ASCII, конец — у края страницы). Ответы ссылки для трёх байт — в
+    // таблице: число символов + 1 или 0
+    let want3 = __mmap(1 << 24)
+    let q = __alloc(8)
+    for v in 0..(1 << 24) {
+        store8(q, v >> 16)
+        store8(q + 1, (v >> 8) & 255)
+        store8(q + 2, v & 255)
+        store8(want3 + v, ref_scan(q, 3) + 1)
+    }
+    for off in [0, 29, 30, 31, 32] {
+        fill(end - off - 3, off + 3, 'a')
+        for b0 in 0..256 {
+            var p = end - off - 1
+            store8(p + off, b0)
+            check_one(p, off + 1)
+            store8(p + off, 'a')
+            for b1 in 0..256 {
+                p = end - off - 2
+                store8(p + off, b0)
+                store8(p + off + 1, b1)
+                check_one(p, off + 2)
+                store8(p + off, 'a')
+                store8(p + off + 1, 'a')
+                p = end - off - 3
+                store8(p + off, b0)
+                store8(p + off + 1, b1)
+                let row = want3 + (b0 << 16) + (b1 << 8)
+                for b2 in 0..256 {
+                    store8(p + off + 2, b2)
+                    var want = load8(row + b2) - 1
+                    if want >= 0 {
+                        want += off
+                    }
+                    let got = __utf8_scan(p, off + 3)
+                    if got != want {
+                        fail("scan3", p, off + 3, got, want)
+                    }
+                }
+                checks += 256
+                store8(p + off, 'a')
+                store8(p + off + 1, 'a')
+                store8(p + off + 2, 'a')
+            }
+        }
+    }
+    print("1-3 byte sequences: ok")
+
+    print("checks: {checks}, mismatches: {bad}")
+    if bad > 0 {
+        return 1
+    }
+    return 0
+}
