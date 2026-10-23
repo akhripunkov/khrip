@@ -1,0 +1,19 @@
+// expect: invalid pattern: (?i) is not supported at position 0
+// expect: hint: compare s.lower() with a lower-case pattern
+// expect: invalid pattern: \b is not supported at position 0
+// expect: hint: matches() always tests the whole string
+// expect: invalid pattern: \p{...} is not supported at position 5
+// expect: hint: use `\w` or list the ranges, e.g. [a-zA-Zа-яА-ЯёЁ]
+// expect: invalid pattern: lookaround is not supported at position 0
+// expect: invalid pattern: backreferences are not supported at position 3
+// expect: 5 errors
+// Регулярные выражения проверяются при компиляции: то, чего нет в грамматике
+// lib/regex.kh, — ошибка с подсказкой, а не другой смысл при первом запросе.
+fn main() {
+    let s = "Привет"
+    print(s.matches(`(?i)привет`))
+    print(s.matches(`\bПривет\b`))
+    print(s.matches(`[A-Z]\p{L}+`))
+    print(s.matches(`(?=П).*`))
+    print(s.matches(`(.)\1`))
+}

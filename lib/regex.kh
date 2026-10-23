@@ -124,7 +124,10 @@ fn __rx_peek_at(r: __Rx, d: int) -> int {
 }
 
 fn __rx_peek(r: __Rx) -> int {
-    return __rx_peek_at(r, 0)
+    if r.p >= r.cps.len() {
+        return -1
+    }
+    return r.cps[r.p]
 }
 
 // Символ шаблона для сообщения об ошибке.
@@ -162,56 +165,57 @@ fn __rx_class_add(r: __Rx, k: int, lo: int, hi: int) {
     }
 }
 
-// Пробелы White_Space вне ASCII: пары lo, hi (как __cp_is_space в text.kh).
-fn __rx_spaces() -> [int] {
-    return [0x85, 0x85, 0xA0, 0xA0, 0x1680, 0x1680, 0x2000, 0x200A, 0x2028, 0x2029, 0x202F, 0x202F, 0x205F, 0x205F, 0x3000, 0x3000]
+// Пробелы White_Space вне ASCII (как __cp_is_space в text.kh): 8 пар lo, hi —
+// u32: U+0085, U+00A0, U+1680, U+2000–200A, U+2028–2029, U+202F, U+205F, U+3000.
+const RX_NSPACES = 8
+
+fn __rx_spaces() -> int {
+    return __data_hex("85 00 00 00 85 00 00 00 A0 00 00 00 A0 00 00 00 80 16 00 00 80 16 00 00 00 20 00 00 0A 20 00 00 28 20 00 00 29 20 00 00 2F 20 00 00 2F 20 00 00 5F 20 00 00 5F 20 00 00 00 30 00 00 00 30 00 00")
 }
 
 fn __rx_is_class_esc(e: int) -> bool {
     return e == 'd' || e == 'D' || e == 'w' || e == 'W' || e == 's' || e == 'S'
 }
 
+// Маски ASCII (биты кодов 0–63 и 64–127): \d — 0–9; \w — 0–9, A–Z, _, a–z;
+// \s — \t \n \v \f \r и пробел.
+const RX_DIGIT0 = 0x03FF000000000000
+const RX_WORD0 = 0x03FF000000000000
+const RX_WORD1 = 0x07FFFFFE87FFFFFE
+const RX_SPACE0 = 0x0000000100003E00
+
+fn __rx_class_or(r: __Rx, k: int, m0: int, m1: int) {
+    r.cmask[2 * k] = r.cmask[2 * k] | m0
+    r.cmask[2 * k + 1] = r.cmask[2 * k + 1] | m1
+}
+
 // \d \D \w \W \s \S — в класс k.
 fn __rx_class_esc(r: __Rx, k: int, e: int) {
     if e == 'd' {
-        __rx_class_add(r, k, '0', '9')
+        __rx_class_or(r, k, RX_DIGIT0, 0)
     } else if e == 'D' {
-        __rx_class_add(r, k, 0, '0' - 1)
-        __rx_class_add(r, k, '9' + 1, RX_MAX_CP)
-    } else if e == 'w' || e == 'W' {
-        // ASCII: [0-9A-Z_a-z] или всё остальное; вне ASCII — по таблице
-        var c = 0
-        while c < 128 {
-            let word = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || c == '_' || (c >= 'a' && c <= 'z')
-            if word == (e == 'w') {
-                __rx_class_add(r, k, c, c)
-            }
-            c += 1
-        }
-        if e == 'w' {
-            r.cflags[k] = r.cflags[k] | RC_W
-        } else {
-            r.cflags[k] = r.cflags[k] | RC_NW
-        }
+        __rx_class_or(r, k, ~RX_DIGIT0, -1)
+        __rx_class_add(r, k, 128, RX_MAX_CP)
+    } else if e == 'w' {
+        // вне ASCII — по таблице
+        __rx_class_or(r, k, RX_WORD0, RX_WORD1)
+        r.cflags[k] = r.cflags[k] | RC_W
+    } else if e == 'W' {
+        __rx_class_or(r, k, ~RX_WORD0, ~RX_WORD1)
+        r.cflags[k] = r.cflags[k] | RC_NW
     } else {
         let sp = __rx_spaces()
         if e == 's' {
-            __rx_class_add(r, k, 9, 13)
-            __rx_class_add(r, k, ' ', ' ')
-            var i = 0
-            while i < sp.len() {
-                __rx_class_add(r, k, sp[i], sp[i + 1])
-                i += 2
+            __rx_class_or(r, k, RX_SPACE0, 0)
+            for i in 0..RX_NSPACES {
+                __rx_class_add(r, k, load32(sp + 8 * i), load32(sp + 8 * i + 4))
             }
         } else {
-            __rx_class_add(r, k, 0, 8)
-            __rx_class_add(r, k, 14, ' ' - 1)
-            var from = ' ' + 1
-            var i = 0
-            while i < sp.len() {
-                __rx_class_add(r, k, from, sp[i] - 1)
-                from = sp[i + 1] + 1
-                i += 2
+            __rx_class_or(r, k, ~RX_SPACE0, -1)
+            var from = 128
+            for i in 0..RX_NSPACES {
+                __rx_class_add(r, k, from, load32(sp + 8 * i) - 1)
+                from = load32(sp + 8 * i + 4) + 1
             }
             __rx_class_add(r, k, from, RX_MAX_CP)
         }
@@ -220,7 +224,16 @@ fn __rx_class_esc(r: __Rx, k: int, e: int) {
 
 // Класс k разобран: диапазоны — по возрастанию, слитые; отрицание.
 fn __rx_class_done(r: __Rx, k: int, neg: bool) {
-    r.pend.sort()
+    var sorted = true
+    for i in 1..r.pend.len() {
+        if r.pend[i - 1] > r.pend[i] {
+            sorted = false
+            break
+        }
+    }
+    if !sorted {
+        r.pend.sort()
+    }
     r.cfirst[k] = r.ranges.len() / 2
     var lo = -1
     var hi = -1

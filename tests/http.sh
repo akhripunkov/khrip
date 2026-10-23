@@ -201,3 +201,35 @@ elif "$KHC" -o "$tmp/fetch_store" tests/load/fetch_store.kh >"$tmp/fetch_store.e
 else
 	failed "tests/load/fetch_store.kh" "$(cat "$tmp/fetch_store.err")"
 fi
+
+# Слоты регулярных выражений (s.matches с литералом): первые запросы на 4
+# потоках ждут общей границы времени (/race) и разбирают одни и те же шаблоны
+# одновременно, публикуя программы в слоты мест вызова (__cas). Все 400 ответов
+# сверяют литералы с разбором в арене и должны совпасть.
+rx_port=$((HTTP_PORT + 5))
+if "$KHC" -o "$tmp/regex_sites" tests/load/regex_sites.kh >"$tmp/regex_sites.err" 2>&1; then
+	PORT=$rx_port THREADS=4 "$tmp/regex_sites" 2>/dev/null &
+	rx_pid=$!
+	# готовность — по соединению: запрос разобрал бы шаблоны до гонки
+	for _ in $(seq 100); do
+		(exec 3<>"/dev/tcp/127.0.0.1/$rx_port") 2>/dev/null && break
+		sleep 0.02
+	done
+	rx_url="http://127.0.0.1:$rx_port"
+	rx_pids=()
+	for i in $(seq 16); do
+		curl -s -w '\n' "$rx_url/race" $(printf "$rx_url/check %.0s" $(seq 24)) >"$tmp/regex_sites.$i" &
+		rx_pids+=($!)
+	done
+	wait "${rx_pids[@]}"
+	kill "$rx_pid"
+	wait "$rx_pid" 2>/dev/null
+	r=$(cat "$tmp"/regex_sites.[0-9]* | sort | uniq -c | sed 's/^ *//')
+	if [[ "$r" == "400 ok 139" ]]; then
+		http_ok
+	else
+		failed "http: слоты регулярных выражений на 4 потоках" "ожидалось «400 ok 139», получено «$r»"
+	fi
+else
+	failed "tests/load/regex_sites.kh" "$(cat "$tmp/regex_sites.err")"
+fi

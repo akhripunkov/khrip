@@ -1,0 +1,123 @@
+// Регулярные выражения по символам (lib/regex.kh): . и {n,m} считают символы,
+// классы [а-я] — коды Unicode, \w — буквы любых письменностей, \s — пробелы
+// Unicode, \d — только 0–9; неправильный байт — один символ U+FFFD. Литерал и
+// const в s.matches разбираются один раз на место вызова (слот в DATA), шаблон
+// из переменной — при каждом вызове: ответы обоих путей совпадают.
+
+const NAME_RE = `[А-ЯЁ][а-яё]+(-[А-ЯЁ][а-яё]+)?`
+
+fn bytes(xs: [int]) -> str {
+    let b = buf_new(xs.len() + 1)
+    for x in xs {
+        buf_byte(b, x)
+    }
+    return buf_str(b)
+}
+
+fn show(v: bool) -> str {
+    if v {
+        return "1"
+    }
+    return "0"
+}
+
+// Одно место вызова на все проверки литерала: слот заполняет первый вызов.
+fn is_name(s: str) -> bool {
+    return s.matches(NAME_RE)
+}
+
+fn main() {
+    // символы, а не байты
+    print("привет [а-я]+ " + show("привет".matches(`[а-я]+`)))
+    print("я . " + show("я".matches(`.`)) + " " + show("я".matches(`..`)))
+    print("ян .\{2} " + show("ян".matches(`.{2}`)) + " " + show("ян".matches(`.{4}`)))
+    print("Иван_1 \\w+ " + show("Иван_1".matches(`\w+`)))
+    print("я+ " + show("яяя".matches(`я+`)) + " " + show("яя".matches(`(яя)+я`)))
+    print("😀 . " + show("😀".matches(`.`)) + " [😀-🙏]+ " + show("😀😂🙏".matches(`[😀-🙏]+`)))
+    print("[^а-я] " + show("Я".matches(`[^а-я]`)) + show("я".matches(`[^а-я]`)) + show("z".matches(`[^а-я]`)))
+    print("e + U+0301: " + show("é".matches(`.`)) + " " + show(bytes([0x65, 0xCC, 0x81]).matches(`.`)) + " " + show(bytes([0x65, 0xCC, 0x81]).matches(`..`)))
+
+    // \s — White_Space: NBSP, U+2003, U+3000 — пробелы; ZWSP и BOM — нет
+    let nbsp = bytes([0xC2, 0xA0])
+    let em = bytes([0xE2, 0x80, 0x83])
+    let ideo = bytes([0xE3, 0x80, 0x80])
+    let zwsp = bytes([0xE2, 0x80, 0x8B])
+    let bom = bytes([0xEF, 0xBB, 0xBF])
+    print("\\s: " + show(nbsp.matches(`\s`)) + show(em.matches(`\s`)) + show(ideo.matches(`\s`)) + show(zwsp.matches(`\s`)) + show(bom.matches(`\s`)) + show("\t".matches(`\s`)))
+    print("\\S: " + show(nbsp.matches(`\S`)) + show(zwsp.matches(`\S`)) + " [^\\s]: " + show(nbsp.matches(`[^\s]`)) + show(zwsp.matches(`[^\s]`)))
+
+    // \d — только ASCII (как to_int): арабско-индийские цифры — не \d, но \w
+    let arabic = bytes([0xD9, 0xA1, 0xD9, 0xA2])
+    print("١٢ \\d+ " + show(arabic.matches(`\d+`)) + " \\w+ " + show(arabic.matches(`\w+`)) + " \\D+ " + show(arabic.matches(`\D+`)))
+    print("12 \\d+ " + show("12".matches(`\d+`)))
+
+    // \w по таблице Unicode: буквы, знаки (M), цифры Nd, соединители Pc
+    print("\\w: " + show("naïve".matches(`\w+`)) + show("日本語".matches(`\w+`)) + show(bytes([0x78, 0xCC, 0x81]).matches(`\w+`)) + show("a-b".matches(`\w+`)) + show("‿".matches(`\w`)))
+    print("\\W: " + show("!".matches(`\W`)) + show("я".matches(`\W`)) + show(nbsp.matches(`\W`)))
+
+    // неправильный байт — один символ U+FFFD: его берут ., \W, \S, \D, [^...]
+    let ff = bytes([0xFF])
+    let cut = bytes([0xE2, 0x82])
+    print("\\xFF: . " + show(ff.matches(`.`)) + " \\W " + show(ff.matches(`\W`)) + " \\S " + show(ff.matches(`\S`)) + " \\D " + show(ff.matches(`\D`)) + " [^a] " + show(ff.matches(`[^a]`)) + " \\w " + show(ff.matches(`\w`)) + " \\x\{FFFD} " + show(ff.matches(`\x{FFFD}`)))
+    print("E2 82: . " + show(cut.matches(`.`)) + " .\{2} " + show(cut.matches(`.{2}`)) + " a.b " + show(bytes([0x61, 0xFF, 0x62]).matches(`a.b`)))
+    print("surrogate ED A0 80: .\{3} " + show(bytes([0xED, 0xA0, 0x80]).matches(`.{3}`)))
+
+    // ^ и $ — края строки в любом месте шаблона; ленивый повтор — тот же набор
+    print("^ $: " + show("ab".matches(`^ab$`)) + show("ab".matches(`a^b`)) + show("b".matches(`(^|a)b`)) + show("a".matches(`a(b|$)`)) + show("".matches(`$^`)))
+    print("lazy: " + show("".matches(`a+?`)) + show("aa".matches(`a+?`)) + show("".matches(`a*?`)) + show("a".matches(`a??`)))
+    print("\\x: " + show("A".matches(`\x41`)) + show("я".matches(`\x{44F}`)) + show("😀".matches(`\x{1F600}`)) + show("\t".matches(`[\x00-\x1F]`)))
+
+    // const и литерал: имя по-кириллически
+    var names = ""
+    for s in ["Анна", "Анна-Мария", "анна", "Ёлка", "Anna", "Анна-", "Ян"] {
+        names += show(is_name(s))
+    }
+    print("NAME_RE " + names)
+    print("lambda " + show(["тег", "метка"].all(t => t.matches(`[а-яё]{1,20}`))) + show(["тег", "Tag"].all(t => t.matches(`[а-яё]{1,20}`))))
+
+    // литерал (программа в слоте), разбор в арене и шаблон из переменной
+    let pats = [`[а-я]+`, `.`, `.{2}`, `\w+`, `\s`, `\d+`, `[^\s]+`, `(я|ян)+`, `[\W\d]+`, `\x{FFFD}`]
+    let ins = ["привет", "я", "ян", "Иван_1", nbsp, arabic, "12", ff, cut, "яян", "!1", "", "a b", zwsp]
+    var lit = ""
+    for s in ins {
+        lit += show(s.matches(`[а-я]+`)) + show(s.matches(`.`)) + show(s.matches(`.{2}`)) + show(s.matches(`\w+`)) + show(s.matches(`\s`))
+        lit += show(s.matches(`\d+`)) + show(s.matches(`[^\s]+`)) + show(s.matches(`(я|ян)+`)) + show(s.matches(`[\W\d]+`)) + show(s.matches(`\x{FFFD}`))
+        lit += " "
+    }
+    var dyn = ""
+    var arena = ""
+    for s in ins {
+        for p in pats {
+            dyn += show(s.matches(p))
+            arena += show(__rx_exec(__rx_program(p, false), s))
+        }
+        dyn += " "
+        arena += " "
+    }
+    print("literal " + lit)
+    print("same " + show(lit == dyn) + show(lit == arena))
+
+    // слот места вызова: первый вызов кладёт туда программу, дальше она и
+    // работает (другой шаблон с тем же слотом уже не разбирается)
+    let slot = __alloc(8)
+    print("slot " + show(load64(slot) == 0) + show(__text_matches_at("ян", `.{2}`, slot)) + show(load64(slot) != 0))
+    let prog = load64(slot)
+    print("slot kept " + show(__text_matches_at("ян", `.{3}`, slot)) + show(load64(slot) == prog))
+
+    // ошибки разбора: позиция — номер символа; неправильный UTF-8 в шаблоне
+    for p in [`яя(`, `привет**`, `[я-а]`, `\p{L}`, `(?i)я`, bytes([0x61, 0xFF, 0x62]), "я" + bytes([0xD0])] {
+        let r = __rx_compile(p)
+        print("error: " + r.err + " at position {r.at}")
+    }
+
+    // длинная строка: время линейно, память состояния возвращается
+    let long = "яё".repeat(20000)
+    print("long " + show(long.matches(`[а-яё]*`)) + show(long.matches(`(я|ё)*`)) + show((long + "!").matches(`.*я`)) + show(long.matches(`(.{1000}){40}`)) + show(long.matches(`(.{1000}){39}`)))
+    var hits = 0
+    for i in 0..100000 {
+        if "ann@x.io".matches(`[^@\s]+@[^@\s]+\.[a-z]{2,}`) {
+            hits += 1
+        }
+    }
+    print("loop {hits}")
+}

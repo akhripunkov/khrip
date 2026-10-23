@@ -1,0 +1,24 @@
+// expect: regex_const.kh:13:23: error: invalid pattern: nested repetition at position 9
+// expect: hint: group the inner part, e.g. (a+)*
+// expect: regex_const.kh:14:23: error: invalid pattern: bad {n,m} at position 4
+// expect: regex_const.kh:15:23: error: invalid pattern: unclosed [ at position 2
+// expect: 3 errors
+// Шаблон-const проверяется там, где его передают в matches; позиция — номер
+// символа (кириллица — по символу, не по байтам). Шаблон из переменной
+// проверяется при вызове, а локальная переменная с именем const — не const.
+const NAME = `[а-яё]{2}++`
+
+fn check(s: str) -> bool {
+    let ok = s.matches(`[а-яё]+`)
+    let a = s.matches(NAME)
+    let b = s.matches(`Ёжик{2,1}`)
+    let d = s.matches(`ab[cd`)
+    let NAME = "("
+    let e = s.matches(NAME)
+    let f = s.matches("(" + s)
+    return ok && a && b && d && e && f
+}
+
+fn main() {
+    print(check("x"))
+}

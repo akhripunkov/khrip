@@ -1,0 +1,72 @@
+// Слоты регулярных выражений под одновременной нагрузкой (tests/http.sh, 4
+// потока): у каждого из 28 мест вызова с литералом свой слот. Первые запросы
+// (/race) ждут общей границы полсекунды и на всех потоках сразу разбирают одни
+// и те же шаблоны и публикуют программы (__cas — остаётся первая; четыре
+// больших шаблона разбираются долго, и потоки встречаются на одних слотах).
+// Каждый запрос сверяет ответы литералов с тем же шаблоном, разобранным в
+// арене запроса: при ошибке публикации ответ не «ok».
+
+fn bit(v: bool) -> str {
+    if v {
+        return "1"
+    }
+    return "0"
+}
+
+// Литералы — в том же порядке, что шаблоны в arena.
+fn lit(s: str) -> str {
+    var r = bit(s.matches(`[а-яё]+`)) + bit(s.matches(`\w+`)) + bit(s.matches(`\W+`)) + bit(s.matches(`\s+`))
+    r += bit(s.matches(`\S+`)) + bit(s.matches(`\d+`)) + bit(s.matches(`.`)) + bit(s.matches(`.{2}`))
+    r += bit(s.matches(`[^@\s]+@[^@\s]+`)) + bit(s.matches(`(я|ян)+`)) + bit(s.matches(`[А-ЯЁ][а-яё]+(-[А-ЯЁ][а-яё]+)?`)) + bit(s.matches(`[A-Za-z0-9_-]{3,32}`))
+    r += bit(s.matches(`\x{FFFD}`)) + bit(s.matches(`[\W\d]+`)) + bit(s.matches(`[^а-я]+`)) + bit(s.matches(`^.*$`))
+    r += bit(s.matches(`(a|b)*abb`)) + bit(s.matches(`😀+`)) + bit(s.matches(`[😀-🙏]+`)) + bit(s.matches(`\d{4}-\d{2}-\d{2}`))
+    r += bit(s.matches(`(?:ab|a)*b?`)) + bit(s.matches(`.*я.*`)) + bit(s.matches(`[\x00-\x7F]*`)) + bit(s.matches(`[^\x00-\x7F]+`))
+    r += bit(s.matches(`[а-яё]{0,500}`)) + bit(s.matches(`(\w|\s){0,300}`)) + bit(s.matches(`.{0,400}я?`)) + bit(s.matches(`([^@\s]{1,64}@){0,8}`))
+    return r
+}
+
+// Те же шаблоны, разобранные в арене запроса.
+fn programs() -> [int] {
+    let pats = [`[а-яё]+`, `\w+`, `\W+`, `\s+`, `\S+`, `\d+`, `.`, `.{2}`, `[^@\s]+@[^@\s]+`, `(я|ян)+`, `[А-ЯЁ][а-яё]+(-[А-ЯЁ][а-яё]+)?`, `[A-Za-z0-9_-]{3,32}`, `\x{FFFD}`, `[\W\d]+`, `[^а-я]+`, `^.*$`, `(a|b)*abb`, `😀+`, `[😀-🙏]+`, `\d{4}-\d{2}-\d{2}`, `(?:ab|a)*b?`, `.*я.*`, `[\x00-\x7F]*`, `[^\x00-\x7F]+`, `[а-яё]{0,500}`, `(\w|\s){0,300}`, `.{0,400}я?`, `([^@\s]{1,64}@){0,8}`]
+    var r: [int] = []
+    for p in pats {
+        r.push(__rx_program(p, false))
+    }
+    return r
+}
+
+fn arena(progs: [int], s: str) -> str {
+    var r = ""
+    for p in progs {
+        r += bit(__rx_exec(p, s))
+    }
+    return r
+}
+
+fn check() -> str {
+    let ins = ["привет", "Иван_1", "ян", "я", "Анна-Мария", "ann@x.io", "2024-01-15", "aabb", "😀😀", "😀🙏", "abab", "", " ", "١٢", "!1", "naïve", "12"]
+    let progs = programs()
+    var ones = 0
+    for s in ins {
+        let a = lit(s)
+        let b = arena(progs, s)
+        if a != b {
+            return "mismatch {s}: {a} {b}"
+        }
+        for i in 0..a.byte_len() {
+            if a.byte(i) == '1' {
+                ones += 1
+            }
+        }
+    }
+    return "ok {ones}"
+}
+
+route GET "/check" -> str {
+    return check()
+}
+
+route GET "/race" -> str {
+    sleep(500 - now_ms() % 500)
+    return check()
+}
