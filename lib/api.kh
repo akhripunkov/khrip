@@ -11,7 +11,9 @@
 //   структура      — [D_STRUCT, n, имя, метка, поле × n]; поле — 5 слов:
 //                    имя, «"имя":», описание, вид значения по умолчанию и оно само
 //                    (0 — нет, 1 — слово, 2 — пустой список с размером элемента,
-//                    3 — пустой словарь); метка ≥ 0 у вариантов (лежит по адресу − 8)
+//                    3 — пустой словарь, 4 — служебное поле библиотеки «__имя»:
+//                    в JSON его нет, при чтении — слово по умолчанию); метка ≥ 0
+//                    у вариантов (лежит по адресу − 8)
 //   вариант        — [D_SUM, n, имя, все без полей?, (имя, описание, значение
 //                    варианта без полей или 0) × n]
 
@@ -623,17 +625,28 @@ fn __json_enc_scalar(b: Buf, v: int, k: int) {
     }
 }
 
-fn __json_enc_struct(b: Buf, v: int, d: int) {
-    let n = load64(d + 8)
-    __json_in(v, d)
-    buf_byte(b, '\{')
-    for i in 0..n {
-        if i > 0 {
+// Поля структуры v по описанию d: «"имя":значение» через запятую (comma —
+// запятая и перед первым). Служебных полей библиотеки (вид 4) в JSON нет.
+fn __json_enc_fields(b: Buf, v: int, d: int, comma: bool) {
+    var sep = comma
+    for i in 0..load64(d + 8) {
+        let f = __field(d, i)
+        if load64(f + 24) == 4 {
+            continue
+        }
+        if sep {
             buf_byte(b, ',')
         }
-        buf_add(b, __cast(load64(__field(d, i) + 8)))
-        __json_enc(b, load64(v + i * 8), __field_desc(d, i))
+        sep = true
+        buf_add(b, __cast(load64(f + 8)))
+        __json_enc(b, load64(v + i * 8), load64(f + 16))
     }
+}
+
+fn __json_enc_struct(b: Buf, v: int, d: int) {
+    __json_in(v, d)
+    buf_byte(b, '\{')
+    __json_enc_fields(b, v, d, false)
     buf_byte(b, '}')
     __json_out(v, d)
 }
@@ -699,12 +712,7 @@ fn __json_enc_sum(b: Buf, v: int, d: int) {
     __json_in(v, vd)
     buf_add(b, "\{\"type\":")
     __json_str(b, name)
-    let n = load64(vd + 8)
-    for i in 0..n {
-        buf_byte(b, ',')
-        buf_add(b, __cast(load64(__field(vd, i) + 8)))
-        __json_enc(b, load64(v + i * 8), __field_desc(vd, i))
-    }
+    __json_enc_fields(b, v, vd, true)
     buf_byte(b, '}')
     __json_out(v, vd)
 }
@@ -1134,7 +1142,7 @@ fn __jd(j: __Json, d: int, at: str) -> int {
                 var fi = -1
                 for i in 0..n {
                     let fname: str = __cast(load64(__field(d, i)))
-                    if fname == key {
+                    if fname == key && load64(__field(d, i) + 24) != 4 {
                         fi = i
                         break
                     }
@@ -1167,7 +1175,7 @@ fn __jd(j: __Json, d: int, at: str) -> int {
                 if i < 62 && (seen & (1 << i)) == 0 {
                     let f = __field(d, i)
                     let dk = load64(f + 24)
-                    if dk == 1 {
+                    if dk == 1 || dk == 4 {
                         store64(s + i * 8, load64(f + 32))
                     } else if dk == 2 {
                         store64(s + i * 8, __list_new(4, load64(f + 32)))

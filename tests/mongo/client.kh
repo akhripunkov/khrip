@@ -295,7 +295,7 @@ fn regressions(client: Mongo, uri: str, database: str, base: str) {
     // {_id: 10, s: "\xff\xfe"}: сырые байты, проверка построителя обойдена
     let bad = __alloc(32)
     __unhex("18000000" + "105f6964000a000000" + "027300" + "03000000fffe00" + "00", bad)
-    let raw = Bson { data: __str_new(bad, 24), checked: true }
+    let raw = __bson_mark(__str_new(bad, 24))
     let insert_bad = bson_new()
     bson_str(insert_bad, "insert", c4)
     bson_array(insert_bad, "documents", [raw])

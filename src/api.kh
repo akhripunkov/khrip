@@ -636,6 +636,9 @@ fn type_desc(t: int) -> int {
             tag = si
         }
         desc_put(off, 3, tag)
+        // служебные поля библиотеки («__имя»): JSON их не пишет и не читает —
+        // признак «байты проверены» у Bson не подделать телом запроса
+        let lib_struct = st.tok >= 0 && files[toks[st.tok].file].is_lib
         var i = 0
         while i < n {
             let f = st.fields[i]
@@ -643,7 +646,12 @@ fn type_desc(t: int) -> int {
             desc_put(off, fo, const_str(f.name))
             desc_put(off, fo + 1, const_str("\"" + f.name + "\":"))
             desc_put(off, fo + 2, type_desc(f.ty))
-            if f.def >= 0 {
+            if lib_struct && f.name.starts_with("__") {
+                desc_put(off, fo + 3, 4)
+                if f.def >= 0 {
+                    desc_put(off, fo + 4, default_word(f.def, f.ty))
+                }
+            } else if f.def >= 0 {
                 let dt = toks[f.def]
                 if dt.kind == '[' {
                     desc_put(off, fo + 3, 2)

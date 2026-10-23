@@ -3,10 +3,20 @@
 // компилируются. Сети нет: адрес с учётными данными отвергается до неё.
 const COUNT_HITS = "SELECT count() FROM hits WHERE page = \{page:String}"
 
-fn run(desc: bool) -> [str] {
+fn run(desc: bool, kind: int) -> [str] {
     let c = ChConfig { url: "http://user:password@127.0.0.1:1/" }
     let order = if desc { "SELECT id FROM hits ORDER BY id DESC" } else { "SELECT id FROM hits ORDER BY id" }
     let fixed = "SELECT 1"
+    // вложенные if/match, else if и блоки со значением в конце — тоже литералы
+    let picked = match kind {
+        1 => "SELECT 1",
+        2 => if desc { "SELECT 2 DESC" } else { "SELECT 2" },
+        _ => {
+            let unused = kind + 1
+            if unused > 5 { "SELECT 3" } else { COUNT_HITS }
+        }
+    }
+    let chained = if desc { "SELECT 4" } else if kind == 2 { "SELECT 5" } else { fixed }
     var out: [str] = []
     out.push(ch_query(c, "SELECT 1").error)
     out.push(ch_query(c, COUNT_HITS).error)
@@ -14,11 +24,13 @@ fn run(desc: bool) -> [str] {
     out.push(ch_query(c, order).error)
     out.push(c.ch_query(fixed).error)
     out.push(c.ch_query_params(COUNT_HITS, {"page": ch_null()}).error)
+    out.push(ch_query(c, picked).error)
+    out.push(c.ch_query(chained).error)
     return out
 }
 
 fn main() {
-    for e in run(true) {
+    for e in run(true, 2) {
         print(e)
     }
 }

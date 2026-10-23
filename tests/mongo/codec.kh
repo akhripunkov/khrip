@@ -65,6 +65,15 @@ type CodecOid {
 type CodecArrays {
     docs: [CodecNested], tags: [str]
 }
+type CodecQuery {
+    filter: Bson
+}
+type CodecOwner {
+    owner: str?
+}
+type CodecHolder {
+    f: Bson
+}
 
 var checks: int
 var failures: int
@@ -216,6 +225,7 @@ fn main() -> int {
     verify("omitted database auth source", __mongo_url("mongodb://u:p@host").auth_source == "admin")
     verify("invalid URI escaping", __mongo_url("mongodb://u:%xy@host/test").error != "")
     regressions()
+    review()
     print("BSON/Mongo protocol: {checks} checks, {failures} failed")
     if failures != 0 {
         return 1
@@ -336,7 +346,7 @@ fn regressions() {
     let batch = bson_new()
     bson_int(batch, "id", 0)
     bson_str(batch, "ns", "db.items")
-    bson_array(batch, "firstBatch", [bson_finish(bson_new()), Bson { data: raw_hex(inner_hex), checked: true }])
+    bson_array(batch, "firstBatch", [bson_finish(bson_new()), __bson_mark(raw_hex(inner_hex))])
     let body = bson_new()
     bson_doc(body, "cursor", bson_finish(batch))
     bson_float(body, "ok", 1.0)
@@ -438,4 +448,122 @@ fn regressions() {
     let arrays = to_bson(CodecArrays { docs: [CodecNested { title: "a" }], tags: ["x"] })
     verify("bson_get_array reads documents", (bson_get_array(arrays, "docs") ?? []).len() == 1)
     verify("bson_get_array fails on scalars", bson_get_array(arrays, "tags") == none && bson_error().contains("'tags.0'"))
+}
+
+// Регрессии второго разбора исправлений PR #1.
+fn review() {
+    // Признак «проверен» не подделать: JSON его не читает и не пишет (тело
+    // запроса с "checked": true), новые байты в data и from_bson из
+    // непроверенного документа его не получают. Иначе документ с длиной в
+    // заголовке короче байтов вклеил бы поле skip рядом с filter.
+    let forged_json = "\{\"filter\": \{\"data\": \"\\u0005\\u0000\\u0000\\u0000\\u0000\\u0012skip\\u0000\\u0007\\u0000\\u0000\\u0000\\u0000\\u0000\\u0000\\u0000\", \"checked\": true, \"__checked\": 1}}"
+    let q: CodecQuery? = from_json(forged_json)
+    verify("forged JSON decodes", q != none && (q ?? CodecQuery { filter: Bson { data: "" } }).filter.data.byte_len() == 19)
+    if let query = q {
+        let find = bson_new()
+        bson_str(find, "find", "items")
+        bson_doc(find, "filter", query.filter)
+        verify("JSON cannot mark a document as checked", find.error == "BSON field 'filter' holds an invalid BSON document")
+        let nested = to_bson({ "filter": query.filter })
+        verify("to_bson checks a document from JSON", nested.error.contains("invalid BSON document"))
+        let listed = bson_new()
+        bson_array(listed, "documents", [query.filter])
+        verify("bson_array checks a document from JSON", listed.error.contains("invalid BSON document"))
+        verify("mongo_command checks a command from JSON", mongo_command(Mongo { uri: "mongodb://127.0.0.1:1/test" }, "test", query.filter).error == "invalid BSON command")
+    }
+    let shown = to_json(to_bson({ "a": 1 }))
+    verify("the mark is not in JSON", !shown.contains("checked") && !shown.contains("__none") && shown.starts_with("\{\"data\":"))
+    let swapped = to_bson({ "a": 1 })
+    swapped.data = raw_hex("0500000000" + "12736b6970000700000000000000")
+    let after = bson_new()
+    bson_doc(after, "filter", swapped)
+    verify("new bytes in data lose the mark", after.error == "BSON field 'filter' holds an invalid BSON document")
+    // {f: {s: "b\xff\xfe"}} без проверки: from_bson в поле Bson не ставит метку
+    let raw = Bson { data: raw_hex("18000000" + "036600" + "10000000" + "027300" + "04000000" + "62fffe00" + "00" + "00") }
+    let holder: CodecHolder? = from_bson(raw)
+    verify("from_bson reads a Bson field of an unchecked document", holder != none)
+    if let h = holder {
+        let laundered = bson_new()
+        bson_doc(laundered, "f", h.f)
+        verify("from_bson does not launder a document", !bson_valid(h.f) && laundered.error == "BSON field 'f' holds an invalid BSON document")
+    }
+    let good_holder: CodecHolder? = from_bson(to_bson({ "f": to_bson({ "s": "ok" }) }))
+    verify("from_bson keeps the mark of a checked document", __bson_trusted((good_holder ?? CodecHolder { f: Bson { data: "" } }).f))
+    // С2: int64 у -2^63 округляется к -2^63 — ошибка, а не паника to_int.
+    let mn = -9223372036854775807 - 1
+    for v in [mn + 1, mn + 512, mn + 513] {
+        let near = bson_new()
+        bson_int(near, "price", v)
+        let doc = bson_finish(near)
+        let as_float: CodecPrice? = from_bson(doc)
+        verify("int64 {v} is not a float", as_float == none && bson_error().contains("exactly") && bson_get_float(doc, "price") == none)
+    }
+    let exact = bson_new()
+    bson_int(exact, "price", mn + 1024)
+    let exact_doc = bson_finish(exact)
+    let exact_price: CodecPrice? = from_bson(exact_doc)
+    verify("int64 -2^63 + 1024 is a float", exact_price != none && bson_get_float(exact_doc, "price") != none)
+    // В1: Bson в корне to_bson — сам документ, а не структура {data, error}.
+    let inner = to_bson({ "title": "x" })
+    let again = to_bson(inner)
+    verify("to_bson of a Bson is the document", again.error == "" && again.data == inner.data && bson_get_str(again, "title") == "x" && !bson_has(again, "data"))
+    verify("to_bson of an invalid Bson", to_bson(Bson { data: raw_hex("0500000001") }).error == "invalid BSON document")
+    verify("to_bson of a Bson with an error", to_bson(Bson { data: "", error: "boom" }).error == "boom")
+    // В2: none в фильтре записи — ошибка: фильтр без условия совпал бы со всеми.
+    let who: str? = none
+    let by_owner = to_bson(CodecOwner { owner: who })
+    verify("to_bson remembers the none field", by_owner.data.byte_len() == 5 && by_owner.__none == "owner")
+    let offline = Mongo { uri: "mongodb://127.0.0.1:1/test" }
+    let deleted = mongo_delete(offline, "test", "notes", by_owner, true)
+    verify("mongo_delete rejects a none filter field", deleted.error.contains("filter field 'owner' is none") && !deleted.unknown_outcome)
+    let changed = mongo_update(offline, "test", "notes", by_owner, to_bson({ "$set": to_bson({ "a": 1 }) }), true)
+    verify("mongo_update rejects a none filter field", changed.error.contains("filter field 'owner' is none"))
+    let deep = to_bson({ "$and": [to_bson({ "tenant": "t" }), by_owner] })
+    verify("none path through nested documents", deep.__none == "$and.1.owner" && mongo_delete(offline, "test", "notes", deep).error.contains("'$and.1.owner'"))
+    let built = bson_new()
+    bson_doc(built, "q", by_owner)
+    verify("none path through the builder", bson_finish(built).__none == "q.owner")
+    let struct_path = to_bson({ "who": CodecOwner { owner: none } })
+    verify("none path of a nested struct", struct_path.__none == "who.owner")
+    verify("explicit empty filter is allowed", !mongo_delete(offline, "test", "notes", to_bson({ "x": 1 }), true).error.contains("is none") && !mongo_delete(offline, "test", "notes", bson_finish(bson_new()), true).error.contains("is none"))
+    let patch = to_bson({ "$set": to_bson(CodecPatch { title: "t", body: none }) })
+    verify("none in the update stays a PATCH", !mongo_update(offline, "test", "notes", to_bson({ "_id": 1 }), patch).error.contains("is none"))
+    // В8: размер массива считается точно — массив под 16 МиБ не отвергается.
+    let item = to_bson({ "s": "x".repeat(145) })
+    var docs: [Bson] = []
+    for i in 0..100000 {
+        docs.push(item)
+    }
+    let big = bson_new()
+    bson_array(big, "a", docs)
+    let big_doc = bson_finish(big)
+    let same = to_bson({ "a": docs })
+    verify("bson_array near 16 MiB", big_doc.error == "" && big_doc.data.byte_len() == 16488903 && same.data == big_doc.data)
+    var ints: [int] = []
+    for i in 0..1000000 {
+        ints.push(i)
+    }
+    let ib = bson_new()
+    bson_int_array(ib, "xs", ints)
+    let int_doc = bson_finish(ib)
+    verify("bson_int_array near 16 MiB", int_doc.error == "" && bson_valid(int_doc) && int_doc.data.byte_len() == to_bson({ "xs": ints }).data.byte_len())
+    for n in [0, 1, 9, 10, 11, 99, 100, 101, 1000] {
+        var few: [Bson] = []
+        for i in 0..n {
+            few.push(item)
+        }
+        let fb = bson_new()
+        bson_array(fb, "a", few)
+        verify("bson_array size of {n}", bson_finish(fb).data == to_bson({ "a": few }).data)
+    }
+    // С14: tlsCAFile с tls=false — противоречие, а не тихий переход на открытый текст.
+    for uri in ["tlsCAFile=/x.pem&tls=false", "tls=false&tlsCAFile=/x.pem", "ssl=false&tlsCAFile=/x.pem"] {
+        verify("contradictory TLS options: {uri}", __mongo_url("mongodb://h/db?" + uri).error.contains("tlsCAFile"))
+    }
+    let ca = __mongo_url("mongodb://h/db?tlsCAFile=/x.pem")
+    verify("tlsCAFile turns TLS on", ca.error == "" && ca.tls && ca.root == "/x.pem")
+    let both = __mongo_url("mongodb://h/db?tlsCAFile=/x.pem&tls=true")
+    verify("tlsCAFile with tls=true", both.error == "" && both.tls)
+    let missing = mongo_command(Mongo { uri: "mongodb://127.0.0.1:1/test?tlsCAFile=/nonexistent/ca.pem" }, "test", to_bson({ "ping": 1 }))
+    verify("missing CA file is named", missing.error.contains("/nonexistent/ca.pem"))
 }

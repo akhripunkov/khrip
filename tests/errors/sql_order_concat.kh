@@ -1,0 +1,9 @@
+// expect: sql_order_concat.kh:8:50: error: ORDER BY {order}: a parameter here is a constant and sorts nothing
+// expect: 1 error
+// Ветви match — набор литералов, только если match — весь инициализатор:
+// «match ... + dir» подставил бы присланное значение в текст SQL.
+type P { id: int }
+route GET "/p" (sort: str, dir: str) -> [P] {
+    let order = match sort { "name" => "name ", _ => "id " } + dir
+    return sql "SELECT id FROM products ORDER BY {order}"
+}

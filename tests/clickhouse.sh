@@ -62,6 +62,8 @@ if command -v openssl >/dev/null; then
     ch_tls_pid=$!
     wait_ready "$ch_tmp/tls.log" "$ch_tls_pid"
     SSL_CERT_FILE="$ch_tmp/pki/root.pem" "$ch_tmp/protocol" "$ch_tls_port" tls
+else
+    echo 'SKIP ClickHouse https protocol: no openssl'
 fi
 if [[ -n ${CLICKHOUSE_URL:-} ]]; then
     "$ch_tmp/client"

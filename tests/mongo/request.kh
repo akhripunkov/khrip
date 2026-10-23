@@ -4,6 +4,12 @@
 type RequestScale {
     _id: int, s: str
 }
+type RequestQuery {
+    filter: Bson
+}
+type RequestOwner {
+    owner: str?
+}
 
 store leaked: int
 
@@ -62,6 +68,23 @@ route POST "/panic" -> int {
     return 10 / zero
 }
 
+// Фильтр из тела запроса, программа добавляет limit 3. Метку «проверен» в
+// JSON не подделать: документ с длиной в заголовке короче байтов не вклеит
+// поле skip в команду find.
+route POST "/find" (body: RequestQuery) -> str {
+    let cursor = mongo_find(client(), database(), collection("leak"), body.filter, 100, 3)
+    var ids = ""
+    for d in cursor.documents {
+        ids += (bson_get_int(d, "_id") ?? -1).to_str() + ","
+    }
+    return "n={cursor.documents.len()} ids={ids} err={cursor.error}"
+}
+
+// Владелец — необязательный параметр запроса: без него фильтр стал бы пустым.
+route POST "/purge" (owner: str?) -> str {
+    return mongo_delete(client(), database(), collection("leak"), to_bson(RequestOwner { owner }), true).error
+}
+
 test "seed" {
     drop(collection("leak"))
     var docs: [Bson] = []
@@ -69,6 +92,22 @@ test "seed" {
         docs.push(to_bson(RequestScale { _id: i, s: "row {i}" }))
     }
     expect mongo_insert(client(), database(), collection("leak"), docs).error == ""
+}
+
+test "a filter from the request body cannot forge the checked mark" {
+    expect (call POST "/find" "\{\"filter\": \{\"data\": \"\\u0005\\u0000\\u0000\\u0000\\u0000\"}}").body == "n=3 ids=0,1,2, err="
+    let forged = "\\u0005\\u0000\\u0000\\u0000\\u0000\\u0012skip\\u0000\\u0007\\u0000\\u0000\\u0000\\u0000\\u0000\\u0000\\u0000"
+    for mark in ["", ", \"checked\": true", ", \"__checked\": 1"] {
+        let r = call POST "/find" "\{\"filter\": \{\"data\": \"{forged}\"{mark}}}"
+        expect r.body == "n=0 ids= err=invalid BSON command: BSON field 'filter' holds an invalid BSON document"
+    }
+}
+
+test "a none owner does not delete every document" {
+    expect (call POST "/purge").body.contains("filter field 'owner' is none")
+    let count = bson_new()
+    bson_str(count, "count", collection("leak"))
+    expect bson_get_int(mongo_command(client(), database(), bson_finish(count)).document, "n") == 10
 }
 
 test "a request ended by fail leaves a cursor" {

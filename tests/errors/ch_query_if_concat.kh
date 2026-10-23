@@ -1,0 +1,24 @@
+// expect: ch_query_if_concat.kh:16:17: error: ch_query takes the query as a string literal or const
+// expect: ch_query_if_concat.kh:17:16: error: ch_query takes the query as a string literal or const
+// expect: ch_query_if_concat.kh:18:17: error: ch_query takes the query as a string literal or const
+// expect: ch_query_if_concat.kh:19:17: error: ch_query takes the query as a string literal or const
+// expect: ch_query_if_concat.kh:20:24: error: ch_query_params takes the query as a string literal or const
+// expect: 5 errors
+// Набор литералов ветвей — только когда if/match — весь инициализатор:
+// продолжение после него (+ id, .replace) вставляет значение в текст SQL.
+fn hits(c: ChConfig, id: str, k: int) {
+    let q1 = if id.byte_len() > 0 { "SELECT count() FROM numbers(10) WHERE number = " } else { "SELECT 0 WHERE 0 = " } + id
+    let q2 = match k { 1 => "SELECT count() FROM numbers(10) WHERE number = ", _ => "x" } + id
+    let q3 = if k == 1 { "SELECT count() FROM numbers(10) WHERE number = ID" } else { "x" }.replace("ID", id)
+    // вложенный if/match в ветви — тоже только целиком
+    let q4 = if k == 2 { if k > 0 { "SELECT 1 WHERE 1 = " } else { "x" } + id } else { "y" }
+    let q5 = match k { 1 => { match k { _ => "SELECT " } + id }, _ => "z" }
+    ch_query(c, q1)
+    c.ch_query(q2)
+    ch_query(c, q3)
+    ch_query(c, q4)
+    ch_query_params(c, q5, {})
+}
+
+fn main() {
+}

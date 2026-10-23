@@ -78,12 +78,14 @@ docker network create "$network" >/dev/null
 
 # Services use the Docker host's architecture (also works on Apple Silicon).
 # Only Khrip's compiler and emitted applications need amd64 emulation.
-# С --host порты серверов открыты только на 127.0.0.1 этой машины.
+# С --host порты серверов открыты только на 127.0.0.1 этой машины. Пустой
+# массив раскрывается через ${ports[@]+...}: bash 3.2 (/bin/bash в macOS) при
+# set -u считает "${ports[@]}" без элементов неопределённой переменной.
 ports=()
 if [[ $host == 1 ]]; then
     ports=(-p 127.0.0.1::27017)
 fi
-docker run -d --name "$mongo" --network "$network" --network-alias mongo "${ports[@]}" \
+docker run -d --name "$mongo" --network "$network" --network-alias mongo ${ports[@]+"${ports[@]}"} \
     -e MONGO_INITDB_ROOT_USERNAME="$test_user" \
     -e MONGO_INITDB_ROOT_PASSWORD="$test_password" \
     "$mongo_image" >/dev/null
@@ -98,7 +100,7 @@ if [[ $nofile == unlimited || $nofile -gt 262144 ]]; then
     nofile=262144
 fi
 nofile=${CLICKHOUSE_TEST_NOFILE:-$nofile}
-docker run -d --name "$clickhouse" --network "$network" --network-alias clickhouse "${ports[@]}" \
+docker run -d --name "$clickhouse" --network "$network" --network-alias clickhouse ${ports[@]+"${ports[@]}"} \
     --ulimit "nofile=$nofile:$nofile" \
     -e CLICKHOUSE_USER="$test_user" \
     -e CLICKHOUSE_PASSWORD="$test_password" \
