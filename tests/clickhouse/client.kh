@@ -244,6 +244,7 @@ fn main() -> int {
     let hinted = ch_query(ChConfig { ...ro, server_timeout: true }, "SELECT 1 AS value")
     refused(hinted, "readonly with server_timeout", "(ChConfig server_timeout: false sends no max_execution_time)")
     successful(ch_query(c, "DROP USER kh_ro_client_test"), "drop readonly user")
+    typed_server(c)
     print("ClickHouse integration: ok")
     return 0
 }
@@ -253,4 +254,160 @@ type LongCheck { value: int, same: bool }
 fn type_check_long(body: str) {
     let rows: [LongCheck]? = ch_decode(body)
     need(rows != none && (rows ?? [])[0].value == 32768 && (rows ?? [])[0].same, "64 KiB non-ASCII parameter value")
+}
+
+// ---- Типизированный слой (lib/chdb.kh) против сервера: настройки вызова,
+// query_id и log_comment, код исключения, written_rows, DESCRIBE запроса,
+// KILL QUERY ASYNC, планы в секундах, none → DEFAULT, дедупликация ----
+
+fn d_scalar(k: int) -> int {
+    let d = __alloc(8)
+    store64(d, k)
+    return d
+}
+
+fn d_wrap(k: int, inner: int) -> int {
+    let d = __alloc(16)
+    store64(d, k)
+    store64(d + 8, inner)
+    return d
+}
+
+fn d_struct(name: str, names: [str], descs: [int]) -> int {
+    let n = names.len()
+    let d = __alloc(32 + n * 40)
+    store64(d, D_STRUCT)
+    store64(d + 8, n)
+    store64(d + 16, __cast(name))
+    store64(d + 24, -1)
+    for i in 0..n {
+        let f = d + 32 + i * 40
+        store64(f, __cast(names[i]))
+        store64(f + 8, __cast("\"" + names[i] + "\":"))
+        store64(f + 16, descs[i])
+        store64(f + 24, 0)
+        store64(f + 32, 0)
+    }
+    return d
+}
+
+type TypedHit { ts: int, user_id: int, page: str, ms: float, amount: str, note: str? }
+type TypedBack { ts: str, day: int, user_id: int, page: str, ms: float, amount: str, note: str }
+
+fn one_int(c: ChConfig, query: str, params: map[str, str]) -> int {
+    let r = __ch_run(c, query, "", params, false, false, 0, __ChCall {})
+    successful(r, query)
+    let xs: [int]? = ch_decode(r.body)
+    return (xs ?? [-1])[0]
+}
+
+fn typed_server(c: ChConfig) {
+    let table = "kh_typed_api_" + random_str(10)
+    successful(ch_query_params(c, "CREATE TABLE \{t:Identifier} (ts DateTime, day Date DEFAULT toDate(ts), user_id UInt64, page LowCardinality(String), ms Float32, amount Decimal(12, 2), note String DEFAULT 'none') ENGINE = MergeTree ORDER BY (page, ts) SETTINGS non_replicated_deduplication_window = 100", {"t": table}), "create typed table")
+    let schema = __ch_run(c, "DESCRIBE TABLE " + __ch_quote_name(table), "", {}, false, false, 0, __ChCall {})
+    successful(schema, "describe typed table")
+    let cols = __ch_describe_cols(schema.body) ?? []
+    need(cols.len() == 7 && cols[1].kind == "DEFAULT" && cols[1].expr == "toDate(ts)" && cols[3].ty == "LowCardinality(String)", "DESCRIBE columns")
+    let di = d_scalar(D_INT)
+    let ds = d_scalar(D_STR)
+    let df = d_scalar(D_FLOAT)
+    let row = d_struct("TypedHit", ["ts", "user_id", "page", "ms", "amount", "note"], [di, di, ds, df, ds, d_wrap(D_OPT, ds)])
+    var names: [str] = []
+    var heads: [str] = []
+    var plans: [__ChTWrite] = []
+    var via_input = false
+    for i in 0..6 {
+        let fname: str = __cast(load64(__field(row, i)))
+        var col = cols[0]
+        for x in cols {
+            if x.name == fname {
+                col = x
+            }
+        }
+        let t = __ch_type_of(col.ty) ?? __ChType { op: -1 }
+        let opt = load64(__field_desc(row, i)) == D_OPT && t.op != CHT_NULLABLE
+        let plan = __ch_twrite_plan(t, __field_desc(row, i), opt && col.kind == "DEFAULT", 0) else {
+            need(false, "write plan for " + fname)
+            return
+        }
+        names.push(fname)
+        if opt {
+            heads.push("Nullable(" + t.plain + ")")
+            via_input = true
+        } else {
+            heads.push(col.ty)
+        }
+        plans.push(plan)
+    }
+    let rows = [
+        TypedHit { ts: 1792782805, user_id: 7, page: "/", ms: 1.5, amount: "12.30", note: none },
+        TypedHit { ts: 1792700000, user_id: 8, page: "/a", ms: 0.25, amount: "-0.05", note: "seen" }
+    ]
+    let body = buf_new(256)
+    __ch_rb_header(body, names, heads)
+    let err = buf_new(16)
+    for r in rows {
+        let v: int = __cast(r)
+        for i in 0..6 {
+            need(__ch_twrite(body, plans[i], load64(v + i * 8), err), "typed row: " + buf_str(err))
+        }
+    }
+    let sql = __ch_tinsert_sql(table, names, heads, via_input)
+    let id = "khrip-" + random_str(16)
+    let opts = __ChCall { query_id: id, settings: {"log_comment": "app.kh:12:5", "insert_deduplication_token": "batch-1", "session_timezone": "UTC"} }
+    let ins = __ch_run(c, sql, buf_str(body), {}, true, false, 0, opts)
+    successful(ins, "typed insert through input()")
+    need(ins.written_rows == 2 && ins.query_id == id, "written_rows and query_id")
+    // повтор с тем же ключом — без новых строк (окно дедупликации таблицы)
+    successful(__ch_run(c, sql, buf_str(body), {}, true, false, 0, __ChCall { settings: {"insert_deduplication_token": "batch-1"} }), "repeated insert")
+    need(one_int(c, "SELECT count() AS value FROM \{t:Identifier}", {"t": table}) == 2, "dedup token stores the batch once")
+    let read = __ch_run(c, "SELECT toString(ts) AS ts, day, user_id, page, ms, amount, note FROM " + __ch_quote_name(table) + " ORDER BY ts", "", {}, false, false, 0, __ChCall { settings: {"session_timezone": "UTC"} })
+    successful(read, "typed read")
+    let back = __ch_tdecode(read.body, d_struct("TypedBack", ["ts", "day", "user_id", "page", "ms", "amount", "note"], [ds, di, di, ds, df, ds, ds]))
+    need(back.error == "" && back.count == 2, "typed decode: " + back.error)
+    let b0 = __lget(back.rows, 0)
+    let b1 = __lget(back.rows, 1)
+    let ts0: str = __cast(load64(b0))
+    let amount0: str = __cast(load64(b0 + 40))
+    let note0: str = __cast(load64(b0 + 48))
+    let note1: str = __cast(load64(b1 + 48))
+    need(ts0 == "2026-10-22 20:13:20" && load64(b0 + 8) == 1792627200 && load64(b0 + 16) == 8 && amount0 == "-0.05" && note0 == "seen" && note1 == "none", "values: DateTime seconds, Date in seconds, Decimal text, none -> DEFAULT")
+    // query_id и log_comment в system.query_log
+    successful(ch_query(c, "SYSTEM FLUSH LOGS"), "flush logs")
+    let logged = ch_query_params(c, "SELECT log_comment AS value FROM system.query_log WHERE query_id = \{id:String} AND type = 'QueryFinish'", {"id": id})
+    successful(logged, "query_log")
+    let comments: [str]? = ch_decode(logged.body)
+    need((comments ?? [""]).len() == 1 && (comments ?? [""])[0] == "app.kh:12:5", "log_comment recorded with the query_id")
+    // session_timezone: день одной и той же секунды
+    let tokyo = __ch_run(c, "SELECT toString(toDate(toDateTime(1792782805))) AS value", "", {}, false, false, 0, __ChCall { settings: {"session_timezone": "Asia/Tokyo"} })
+    let utc = __ch_run(c, "SELECT toString(toDate(toDateTime(1792782805))) AS value", "", {}, false, false, 0, __ChCall { settings: {"session_timezone": "UTC"} })
+    let d1: [str]? = ch_decode(tokyo.body)
+    let d2: [str]? = ch_decode(utc.body)
+    need((d1 ?? [""])[0] == "2026-10-24" && (d2 ?? [""])[0] == "2026-10-23", "session_timezone")
+    // mutations_sync: удалённое не видно сразу после ответа
+    successful(__ch_run(c, "ALTER TABLE " + __ch_quote_name(table) + " DELETE WHERE user_id = 7", "", {}, false, false, 0, __ChCall { settings: {"mutations_sync": "1"} }), "mutation")
+    need(one_int(c, "SELECT count() AS value FROM \{t:Identifier}", {"t": table}) == 1, "mutations_sync waits")
+    // код исключения
+    let missing = __ch_run(c, "SELECT * FROM kh_no_such_table_xyz", "", {}, false, false, 0, __ChCall {})
+    need(!missing.ok && missing.code == 60, "exception code 60")
+    // DESCRIBE запроса с параметрами
+    let dq = __ch_describe_query(c, "SELECT page, count() AS views, avg(ms) AS avg_ms FROM " + __ch_quote_name(table) + " WHERE ts >= \{p1:Int64} AND page IN \{p2:Array(String)} GROUP BY page ORDER BY views DESC LIMIT \{p3:Int64}", {"p1": "1", "p2": "[]", "p3": "1"}, __ChCall { raw: true }, now_ms() + 10000)
+    successful(dq, "describe query")
+    let qcols = __ch_describe_cols(dq.body) ?? []
+    need(qcols.len() == 3 && qcols[0].ty == "LowCardinality(String)" && qcols[1].ty == "UInt64" && qcols[2].ty == "Float64", "DESCRIBE TABLE (query) types")
+    // KILL QUERY ... ASYNC после срока клиента
+    let slow_id = "khrip-" + random_str(16)
+    let slow = __ch_run(ChConfig { ...c, timeout_ms: 300 }, "SELECT sleepEachRow(0.5) FROM numbers(40) SETTINGS max_block_size = 1", "", {}, false, false, 0, __ChCall { query_id: slow_id })
+    need(!slow.ok && slow.query_id == slow_id, "slow query times out")
+    __ch_kill_async(c, slow_id)
+    var running = 1
+    for attempt in 0..30 {
+        running = one_int(c, "SELECT count() AS value FROM system.processes WHERE query_id = \{id:String}", {"id": slow_id})
+        if running == 0 {
+            break
+        }
+        sleep(100)
+    }
+    need(running == 0, "KILL QUERY ASYNC stops the abandoned query")
+    successful(ch_query_params(c, "DROP TABLE \{t:Identifier}", {"t": table}), "drop typed table")
 }

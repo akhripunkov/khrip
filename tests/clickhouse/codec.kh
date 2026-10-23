@@ -154,6 +154,201 @@ fn typed_codecs() {
     require(same.error == "" && same.same, "matching types send the batch as is")
 }
 
+// ---- Типизированный слой (lib/chdb.kh): планы в секундах Khrip ----
+// Описания типов собираются вручную — те же слова, что пишет компилятор.
+
+fn d_scalar(k: int) -> int {
+    let d = __alloc(8)
+    store64(d, k)
+    return d
+}
+
+fn d_wrap(k: int, inner: int) -> int {
+    let d = __alloc(16)
+    store64(d, k)
+    store64(d + 8, inner)
+    return d
+}
+
+fn d_struct(name: str, names: [str], descs: [int]) -> int {
+    let n = names.len()
+    let d = __alloc(32 + n * 40)
+    store64(d, D_STRUCT)
+    store64(d + 8, n)
+    store64(d + 16, __cast(name))
+    store64(d + 24, -1)
+    for i in 0..n {
+        let f = d + 32 + i * 40
+        store64(f, __cast(names[i]))
+        store64(f + 8, __cast("\"" + names[i] + "\":"))
+        store64(f + 16, descs[i])
+        store64(f + 24, 0)
+        store64(f + 32, 0)
+    }
+    return d
+}
+
+// Перечисление: значения вариантов — свои слова (как адреса вариантов без полей).
+fn d_enum(name: str, labels: [str]) -> int {
+    let n = labels.len()
+    let d = __alloc(32 + n * 24)
+    store64(d, D_SUM)
+    store64(d + 8, n)
+    store64(d + 16, __cast(name))
+    store64(d + 24, 1)
+    for i in 0..n {
+        let e = d + 32 + i * 24
+        store64(e, __cast(labels[i]))
+        store64(e + 8, 0)
+        store64(e + 16, __alloc(8))
+    }
+    return d
+}
+
+fn enum_word(d: int, i: int) -> int {
+    return load64(d + 32 + i * 24 + 16)
+}
+
+fn ty(text: str) -> __ChType {
+    return __ch_type_of(text) ?? __ChType { op: -1 }
+}
+
+fn write_one(p: __ChTWrite, v: int) -> str {
+    let b = buf_new(64)
+    let err = buf_new(16)
+    if !__ch_twrite(b, p, v, err) {
+        return "error: " + buf_str(err)
+    }
+    return buf_str(b)
+}
+
+fn le_bytes(v: int, width: int) -> str {
+    let b = buf_new(width)
+    le(b, v, width)
+    return buf_str(b)
+}
+
+fn typed_layer() {
+    // ответ сервера: код ошибки и сводка
+    require(__ch_code_of("Code: 241. DB::Exception: Memory limit (total) exceeded") == 241, "exception code from the body")
+    require(__ch_code_of("no code here") == 0, "no exception code")
+    require(__ch_summary_int("\{\"read_rows\":\"1\",\"written_rows\":\"12345\",\"result_rows\":\"0\"}", "written_rows") == 12345, "summary written_rows")
+    require(__ch_summary_int("", "written_rows") == -1, "no summary")
+    // типы: Map, IP, Nothing, LowCardinality без обёртки
+    let map = ty("Map(LowCardinality(String), Array(Nullable(UInt32)))")
+    require(map.op == CHT_MAP && __ch_type_of("Map(String)") == none, "Map type")
+    let mk: __ChType = __cast(map.key)
+    require(mk.op == CHT_STR && mk.plain == "String" && mk.text == "LowCardinality(String)", "LowCardinality plain text")
+    require(ty("IPv4").op == CHT_IPV4 && ty("IPv6").op == CHT_IPV6 && ty("Nullable(Nothing)").op == CHT_NULLABLE, "IP and Nothing types")
+    // числа произвольной ширины и Decimal
+    require(__ch_wide_text(__str_ptr(le_bytes(-1, 8) + le_bytes(-1, 8)), 16, true) == "-1", "Int128 -1")
+    require(__ch_wide_text(__str_ptr(le_bytes(0, 8) + le_bytes(1, 8)), 16, false) == "18446744073709551616", "UInt128 2^64")
+    require(__ch_wide_text(__str_ptr(le_bytes(-1, 8).repeat(4)), 32, false) == "115792089237316195423570985008687907853269984665640564039457584007913129639935", "UInt256 max")
+    let wb = buf_new(16)
+    require(__ch_wide_put(wb, true, "18446744073709551617", 16) && __ch_wide_text(wb.data, 16, true) == "-18446744073709551617", "Int128 from digits")
+    require(!__ch_wide_put(buf_new(16), false, "170141183460469231731687303715884105728", 16), "Int128 overflow")
+    require(__ch_decimal_text(__str_ptr(le_bytes(-1205, 8)), 8, 2) == "-12.05" && __ch_decimal_text(__str_ptr(le_bytes(5, 4)), 4, 3) == "0.005", "Decimal text keeps the scale")
+    let half = __ch_decimal_digits("0.125", 2, 10, false)
+    let up = __ch_decimal_digits("0.135", 2, 10, false)
+    let even = __ch_decimal_digits("2.5", 0, 10, false)
+    require(half.digits == "12" && up.digits == "14" && even.digits == "2", "Decimal from float rounds half to even")
+    require(__ch_decimal_digits("12.345", 2, 10, true).error == "has more than 2 decimal places", "Decimal from str is exact")
+    require(__ch_decimal_digits("12.3400", 2, 10, true).digits == "1234", "trailing zeros are exact")
+    require(__ch_decimal_digits("123456789.5", 2, 10, true).error == "does not fit Decimal(10, 2)", "Decimal precision")
+    require(__ch_decimal_digits("1e+21", 0, 38, false).digits == "1000000000000000000000", "Decimal from 1e+21")
+    require(__ch_decimal_digits("abc", 2, 10, true).error == "is not a decimal number", "Decimal text syntax")
+    let neg = __ch_decimal_digits("-0.001", 2, 10, false)
+    require(neg.digits == "0" && !neg.negative, "negative zero after rounding")
+    // время: секунды Khrip и ISO 8601
+    require((__ch_iso_units("2026-10-23", 0) ?? 0) == 1792713600, "ISO date")
+    require((__ch_iso_units("2026-10-23T05:06:07Z", 0) ?? 0) == 1792731967, "ISO date and time")
+    require((__ch_iso_units("2026-10-23 05:06:07+03:00", 0) ?? 0) == 1792731967 - 10800, "ISO with offset")
+    require((__ch_iso_units("2026-10-23T05:06:07.120Z", 3) ?? 0) == 1792731967120, "ISO with milliseconds")
+    require(__ch_iso_units("2026-10-23T05:06:07.123Z", 0) == none && __ch_iso_units("2026-13-01", 0) == none, "ISO fraction and month")
+    require(__ch_dt64_text(-1, 3) == "1969-12-31T23:59:59.999Z" && __ch_day_text(19000) == "2022-01-08", "DateTime64 and Date text")
+    // IP
+    require(__ch_ipv4_parse("192.168.0.1") == 0xC0A80001 && __ch_ipv4_parse("1.2.3") < 0 && __ch_ipv4_parse("01.2.3.4") < 0, "IPv4 parse")
+    let v6 = buf_new(16)
+    require(__ch_ipv6_put(v6, "2001:db8::1") && __ch_ipv6_text(v6.data) == "2001:db8::1", "IPv6 compressed")
+    let v4in6 = buf_new(16)
+    require(__ch_ipv6_put(v4in6, "10.0.0.1") && __ch_ipv6_text(v4in6.data) == "::ffff:10.0.0.1", "IPv4 in IPv6")
+    require(!__ch_ipv6_put(buf_new(16), "1:::2") && !__ch_ipv6_put(buf_new(16), "1:2:3:4:5:6:7:8:9"), "bad IPv6")
+    // планы чтения: секунды, Decimal и DateTime64(p > 0) в int — отказ
+    let di = d_scalar(D_INT)
+    let ds = d_scalar(D_STR)
+    let df = d_scalar(D_FLOAT)
+    let why = buf_new(16)
+    require(__ch_tread_plan(ty("DateTime64(3)"), di, 0, why) == none && buf_str(why) == "dt64", "DateTime64(3) into int refused")
+    require(__ch_tread_plan(ty("Decimal(12, 2)"), di, 0, buf_new(16)) == none, "Decimal(12, 2) into int refused")
+    require(__ch_tread_plan(ty("Nullable(String)"), ds, 0, buf_new(16)) == none, "Nullable needs T?")
+    require(__ch_tread_plan(ty("LowCardinality(String)"), ds, 0, buf_new(16)) != none && __ch_tread_plan(ty("UInt64"), di, 0, buf_new(16)) != none, "LowCardinality and UInt64")
+    let level = d_enum("Level", ["debug", "info"])
+    require(__ch_tread_plan(ty("Enum8('debug' = 1, 'info' = 2, 'error' = 3)"), level, 0, buf_new(16)) == none, "Enum label without a Khrip variant")
+    // чтение строк: Date в секундах, DateTime64 в ISO, Enum в перечисление,
+    // Map, лишний столбец пропущен, поле без столбца — none
+    let row = d_struct("R", ["day", "at", "lvl", "attrs", "note", "amount"], [di, ds, level, d_wrap(D_MAP, 0), d_wrap(D_OPT, ds), ds])
+    store64(row + 32 + 3 * 40 + 16, __alloc(24))
+    let md = load64(row + 32 + 3 * 40 + 16)
+    store64(md, D_MAP)
+    store64(md + 8, ds)
+    store64(md + 16, di)
+    let rb = buf_new(256)
+    rb_header(rb, ["day", "skip", "AT", "lvl", "attrs", "amount"], ["Date", "Array(String)", "DateTime64(3)", "Enum8('debug' = 1, 'info' = 2)", "Map(String, UInt16)", "Decimal(9, 2)"])
+    le(rb, 19000, 2)
+    buf_byte(rb, 1)
+    __ch_string(rb, "x")
+    le(rb, 1700000000123, 8)
+    le(rb, 2, 1)
+    buf_byte(rb, 1)
+    __ch_string(rb, "k")
+    le(rb, 7, 2)
+    le(rb, -1205, 4)
+    let got = __ch_tdecode(buf_str(rb), row)
+    require(got.error == "" && got.count == 1, "typed decode: " + got.error)
+    let first = __lget(got.rows, 0)
+    let at: str = __cast(load64(first + 8))
+    let amount: str = __cast(load64(first + 40))
+    let attrs: map[str, int] = __cast(load64(first + 24))
+    require(load64(first) == 19000 * 86400 && at == "2023-11-14T22:13:20.123Z" && load64(first + 16) == enum_word(level, 1) && (attrs["k"] ?? 0) == 7 && load64(first + 32) == 0 && amount == "-12.05", "typed row values")
+    let bad = buf_new(64)
+    rb_header(bad, ["day"], ["DateTime64(3)"])
+    let mismatch = __ch_tdecode(buf_str(bad), d_struct("D", ["day"], [di]))
+    require(mismatch.header && mismatch.error == "column day is DateTime64(3), but the Khrip type is int", "header checked before values")
+    let missing = __ch_tdecode(buf_str(bad), d_struct("D", ["other"], [di]))
+    require(missing.header && missing.error == "field other has no column: the query returns day", "missing field")
+    let big = buf_new(64)
+    rb_header(big, ["n"], ["UInt64"])
+    le(big, -1, 8)
+    require(__ch_tdecode(buf_str(big), di).error == "column n: ClickHouse unsigned value does not fit Khrip int", "UInt64 overflow names the column")
+    // планы записи: секунды, диапазоны, Decimal, Enum, none → DEFAULT
+    require(__ch_twrite_plan(ty("Decimal(12, 2)"), di, false, 0) == none, "int into Decimal(12, 2) refused")
+    require(__ch_twrite_plan(ty("String"), d_wrap(D_OPT, ds), false, 0) == none, "str? into String without DEFAULT refused")
+    let dflt = __ch_twrite_plan(ty("String"), d_wrap(D_OPT, ds), true, 0) ?? __ChTWrite { op: 0 }
+    require(dflt.dst_null && write_one(dflt, 0) == raw_bytes([1]) && write_one(dflt, __cast("ab")) == raw_bytes([0, 2]) + "ab", "none becomes DEFAULT through NULL")
+    require(__ch_twrite_plan(ty("Enum8('debug' = 1)"), level, false, 0) == none, "Khrip variant missing from Enum8")
+    let day = __ch_twrite_plan(ty("Date"), di, false, 0) ?? __ChTWrite { op: 0 }
+    require(write_one(day, 19000 * 86400 + 3600) == le_bytes(19000, 2) && write_one(day, -1) == "error: -1 is out of range for Date", "int seconds into Date")
+    let ts = __ch_twrite_plan(ty("DateTime"), di, false, 0) ?? __ChTWrite { op: 0 }
+    require(write_one(ts, 4294967296) == "error: 4294967296 is out of range for DateTime", "DateTime range")
+    let ms = __ch_twrite_plan(ty("DateTime64(3, 'UTC')"), di, false, 0) ?? __ChTWrite { op: 0 }
+    require(write_one(ms, 1700000000) == le_bytes(1700000000000, 8), "int seconds into DateTime64(3)")
+    let iso = __ch_twrite_plan(ty("DateTime64(3)"), ds, false, 0) ?? __ChTWrite { op: 0 }
+    require(write_one(iso, __cast("2023-11-14T22:13:20.123Z")) == le_bytes(1700000000123, 8) && write_one(iso, __cast("yesterday")) == "error: 'yesterday' is not an ISO 8601 date and time for DateTime64(3)", "ISO into DateTime64(3)")
+    let u8 = __ch_twrite_plan(ty("UInt64"), di, false, 0) ?? __ChTWrite { op: 0 }
+    require(write_one(u8, -1) == "error: -1 is out of range for UInt64", "UInt64 range")
+    let money = __ch_twrite_plan(ty("Decimal(12, 2)"), ds, false, 0) ?? __ChTWrite { op: 0 }
+    require(write_one(money, __cast("12.34")) == le_bytes(1234, 8) && write_one(money, __cast("1.005")) == "error: '1.005' has more than 2 decimal places", "str into Decimal is exact")
+    let rounded = __ch_twrite_plan(ty("Decimal(12, 2)"), df, false, 0) ?? __ChTWrite { op: 0 }
+    let x: int = __cast(0.125)
+    require(write_one(rounded, x) == le_bytes(12, 8), "float into Decimal half to even")
+    let lvl = __ch_twrite_plan(ty("Enum8('debug' = 1, 'info' = 2, 'error' = 3)"), level, false, 0) ?? __ChTWrite { op: 0 }
+    require(write_one(lvl, enum_word(level, 1)) == le_bytes(2, 1), "Khrip enum into Enum8")
+    let label = __ch_twrite_plan(ty("LowCardinality(String)"), level, false, 0) ?? __ChTWrite { op: 0 }
+    require(write_one(label, enum_word(level, 0)) == raw_bytes([5]) + "debug", "Khrip enum into String")
+    let ip = __ch_twrite_plan(ty("IPv6"), ds, false, 0) ?? __ChTWrite { op: 0 }
+    require(write_one(ip, __cast("::1")).byte_len() == 16 && write_one(ip, __cast("nope")) == "error: 'nope' is not an IP address", "IPv6 from text")
+}
+
 fn main() -> int {
     let original = [
         ChSample { id: -9223372036854775807 - 1, name: "Привет\0\n\\", active: true, score: 2.5, maybe_score: -3.125, note: none, tags: ["a", "", "б"], numbers: [1, none, -4], flags: [true, false, true] },
@@ -188,6 +383,7 @@ fn main() -> int {
     let noncanonical: [int]? = ch_decode(raw_bytes([129,0]))
     require(noncanonical == none, "noncanonical varint")
     typed_codecs()
+    typed_layer()
     print("ClickHouse codec: ok")
     return 0
 }
