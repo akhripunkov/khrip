@@ -171,6 +171,18 @@ fn __strc() -> int {
     if __strc_mode == STRC_OFF {
         return 0
     }
+    // частый случай — запрос: блок в начале арены, номер сборки тот же
+    let b = load64(__ctx() + CTX_ARENA)
+    if b != 0 && load64(b) == __store_epoch {
+        let d = load64(__ctx() + CTX_PTR) - b
+        if d >= STRC_SIZE && d < ARENA_SIZE {
+            return b
+        }
+    }
+    return __strc_slow()
+}
+
+fn __strc_slow() -> int {
     let c = __ctx()
     var b = load64(c + CTX_ARENA)
     if b != 0 {

@@ -492,6 +492,35 @@ fn peek_simple(level: int) -> bool {
     return false
 }
 
+// Следующий токен — целая глобальная (не в store) — операнд для оператора уровня
+// level? → её адрес или 0. Ничего не потребляет. Читать её можно только в
+// момент операции (cmp rax, [адрес]): откладывать чтение, как у локальной, нельзя —
+// вызов в другом операнде может её поменять.
+fn peek_global(level: int) -> int {
+    let t = tok()
+    if t.kind != T_IDENT || tighter_follows(level, kind_at(pos + 1)) || find_local(t.text) >= 0 {
+        return 0
+    }
+    let s = sym_find(t.text)
+    if s < 0 || sym_kind(s) != SK_GLOBAL {
+        return 0
+    }
+    let g = globals[sym_idx(s)]
+    if g.ty != ty_int || global_in_store(g) {
+        return 0
+    }
+    return g.addr
+}
+
+// op rax, [адрес]: mr — код «op r, r/m».
+fn emit_alu_abs(mr: int, addr: int) {
+    emit8(0x48)
+    emit8(mr)
+    emit8(0x04)
+    emit8(0x25)
+    emit32(addr)
+}
+
 // Последняя инструкция — загрузка простого значения в rax: неизменяемой
 // локальной (параметр, let) или числа. Если левый операнд бинарной операции —
 // такая загрузка, её можно убрать, посчитать правую часть в rax, а левую взять
@@ -811,8 +840,10 @@ fn arith_rhs(op: int, level: int, at: Token) {
     want = ty_err
     if peek_simple(level) && is_int_like(op_ty) {
         advance()
-        // число op число — при компиляции (без деления: там паники)
-        if op_kind == OPK_IMM && simple_kind == OPK_IMM && op != '/' && op != '%' && fits_i32(op_val) && fits_i32(simple_val) {
+        // число op число — при компиляции (без деления: там паники). Широкие
+        // числа — только в библиотеке: в программе сумма может переполниться,
+        // а это паника при выполнении, не тихий перенос
+        if op_kind == OPK_IMM && simple_kind == OPK_IMM && op != '/' && op != '%' && ((fits_i32(op_val) && fits_i32(simple_val)) || files[at.file].is_lib) {
             let r = op_val
             if take_simple() {
                 let v = fold_int(op, op_val, r)
@@ -870,6 +901,16 @@ fn arith_rhs(op: int, level: int, at: Token) {
         }
         load_operand(RCX)
         emit_arith_rcx(op, at)
+        return
+    }
+    // глобальная: операндом из памяти
+    let ga = peek_global(level)
+    if ga != 0 && (op == '+' || op == '-' || op == '&' || op == '|' || op == '^') {
+        advance()
+        emit_alu_abs(alu_rr(op) + 2, ga)
+        if op == '+' || op == '-' {
+            emit_overflow_check(at)
+        }
         return
     }
     let deferred = take_simple_if(simple_mut && rest_pure())
@@ -1114,6 +1155,12 @@ fn emit_compare(op: int, lt: int, at: Token) -> int {
         }
         advance()
         return CC_E
+    }
+    let ga = peek_global(3)
+    if ga != 0 && lt == ty_int {
+        advance()
+        emit_alu_abs(0x3B, ga)
+        return cmp_cc(op)
     }
     // левая часть — простое значение: без стека (take_simple)
     let deferred = take_simple_if(simple_mut && rest_pure())

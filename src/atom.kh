@@ -1301,7 +1301,8 @@ fn parse_store(t: Token, name: str) -> int {
         return ty_void
     }
     var src = RAX
-    // значение — число: mov [адрес], число (без rax)
+    // значение — число: mov [адрес], число (без rax); локальная в регистре —
+    // прямо из него
     var imm = false
     var iv = 0
     if simple_kind == OPK_IMM && (name == "store8" || fits_i32(simple_val)) {
@@ -1310,6 +1311,14 @@ fn parse_store(t: Token, name: str) -> int {
         if take_simple() {
             imm = true
             iv = op_val
+        }
+        op_kind = k0
+        op_val = v0
+    } else if simple_kind == OPK_LOCAL && name != "store8" && locals[simple_val].reg >= 0 {
+        let k0 = op_kind
+        let v0 = op_val
+        if take_simple_if(true) {
+            src = locals[op_val].reg
         }
         op_kind = k0
         op_val = v0
