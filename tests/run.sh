@@ -123,6 +123,50 @@ else
 	failed "khc check --system --all-lib src/*.kh" "$(cat "$tmp/alllib.txt")"
 fi
 
+# Шаблоны регулярных выражений: проверка при компиляции (src/rx.kh) отвечает
+# на наборе tests/run/regex_grammar.kh то же, что разбор библиотеки
+# (tests/run/regex_grammar.out): шаблоны — литералами в s.matches, по 50 на
+# программу (khc сообщает не больше 100 ошибок), по одному на строку.
+sed -n '/^        \/\/ набор$/,/^        \/\/ конец набора$/p' tests/run/regex_grammar.kh |
+	sed '1d;$d' | sed 's/^ *//; s/,$//' >"$tmp/rx_pats.txt"
+rx_n=$(wc -l <"$tmp/rx_pats.txt")
+: >"$tmp/rx_check.out"
+rx_ok=1
+for ((rx_c = 0; rx_c * 50 < rx_n; rx_c++)); do
+	{
+		printf 'fn main() {\n    let s = "x"\n'
+		sed -n "$((rx_c * 50 + 1)),$((rx_c * 50 + 50))p" "$tmp/rx_pats.txt" | sed 's/^/    print(s.matches(/; s/$/))/'
+		printf '}\n'
+	} >"$tmp/rx_$rx_c.kh"
+	"$KHC" check "$tmp/rx_$rx_c.kh" >"$tmp/rx_$rx_c.txt" 2>&1
+	if grep ': error: ' "$tmp/rx_$rx_c.txt" | grep -vq ': error: invalid pattern: '; then
+		failed "регулярные выражения при компиляции" "$(cat "$tmp/rx_$rx_c.txt")"
+		rx_ok=0
+	fi
+	rx_m=$(sed -n "$((rx_c * 50 + 1)),$((rx_c * 50 + 50))p" "$tmp/rx_pats.txt" | wc -l)
+	for ((rx_j = 0; rx_j < rx_m; rx_j++)); do
+		rx_e=$(sed -n "s|^.*:$((rx_j + 3)):[0-9]*: error: invalid pattern: ||p" "$tmp/rx_$rx_c.txt")
+		echo "$((rx_c * 50 + rx_j)): ${rx_e:-ok}" >>"$tmp/rx_check.out"
+	done
+done
+if ((rx_ok)); then
+	if diff -u tests/run/regex_grammar.out "$tmp/rx_check.out" >"$tmp/rx_check.diff"; then
+		pass=$((pass + 1))
+	else
+		failed "регулярные выражения: проверка при компиляции и разбор библиотеки расходятся" "$(cat "$tmp/rx_check.diff")"
+	fi
+fi
+# Сверка с Go regexp (если есть go): tests/run/regex_go.kh и его .out — ровно
+# то, что пишет tools/regex_go.go сейчас, а правильные шаблоны набора
+# regex_grammar Go тоже принимает.
+if command -v go >/dev/null; then
+	if go run tools/regex_go.go -check >"$tmp/regex_go.txt" 2>&1; then
+		pass=$((pass + 1))
+	else
+		failed "tools/regex_go.go -check" "$(cat "$tmp/regex_go.txt")"
+	fi
+fi
+
 # __data_hex (есть только в библиотеке): литерал — пары шестнадцатеричных цифр,
 # пробелы — только между парами. Проверяется на копии библиотеки с двумя
 # функциями: правильные литералы проходят, у неправильных — по ошибке на каждый.
