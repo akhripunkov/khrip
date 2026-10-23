@@ -29,7 +29,8 @@ fn __store_unlock() {
 
 // Куча store (lib/gc.kh): ядро ссылается на неё, но без store в неё не попадает.
 fn __salloc(n: int, kind: int, mask: int) -> int {
-    return __alloc_heap(n)
+    exit(101)
+    return 0
 }
 
 fn __gc_kind_of(p: int) -> int {

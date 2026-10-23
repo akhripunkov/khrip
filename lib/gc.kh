@@ -9,12 +9,16 @@
 // после каждого запроса, который писал в store; владелец метаданных (I5) при
 // каждом выделении; дерево кучки страниц каждые 1024 операции.
 var __gc_verify: bool
+// Выделение — только общим путём (__salloc_slow): идут проверки или (шаг 6)
+// разметка; тот, кто включает разметку, ставит и этот признак.
+var __gc_slow: bool
 
 // Настройки сборщика из окружения.
 fn __gc_init() {
     if let v = env("KHRIP_GC_VERIFY") {
         __gc_verify = v == "1"
     }
+    __gc_slow = __gc_verify
 }
 
 // ---- Раскладка (§3.1, §3.2) ----
@@ -40,6 +44,13 @@ const GC_PTRB = 0x180100000000
 const GC_PAGEMAP = 0x180200000000
 const GC_SPANS = 0x180240000000
 const GC_PHEAP = 0x180300000000
+// Слово START адреса p — ((p >> 10) << 3) + GC_START_P, бит — (p >> 4) & 63;
+// слово PTRB — ((p >> 9) << 3) + GC_PTRB_P, бит — (p >> 3) & 63 (STORE_REGION
+// кратен 2^10): GC_START_P = GC_START − (STORE_REGION >> 7), GC_PTRB_P =
+// GC_PTRB − (STORE_REGION >> 6). Так быстрый путь __salloc обходится без
+// вычитания начала STORE.
+const GC_START_P = 0x17E000000000
+const GC_PTRB_P = 0x17C100000000
 // части кучки страниц: по 4 МБ на карты (2^25 страниц), 16 МБ на дерево
 const GC_PH_PART = 0x400000
 const GC_PAGE = 8192
@@ -84,7 +95,7 @@ const F_NEEDZERO = 8
 var __gc_tab: int
 // текущий спан каждого класса спана (слово на sc) или __gc_none
 var __gc_cur: int
-// пустая запись спана: в нём нет слотов
+// пустая запись спана: слотов в ней нет
 var __gc_none: int
 // кучка страниц STORE (состояние — см. __ph_init)
 var __gc_ph: int
@@ -157,11 +168,12 @@ fn __gc_classes() {
 // где могут быть ссылки (у K_PTRS — все слова объекта, хвост слота — нули).
 //
 // Быстрый путь — объект до 1 КБ, слот freeindex текущего спана класса
-// свободен, спан не требует обнуления, нет ни разметки, ни проверок; всё
-// остальное — __salloc_slow. У класса без спана текущий — пустая запись
-// __gc_none (freeindex = конец = 0), поэтому проверять 0 не нужно.
+// свободен, спан не требует обнуления, нет ни разметки, ни проверок
+// (__gc_slow); всё остальное — __salloc_slow. У класса без спана текущий —
+// пустая запись __gc_none (freeindex = конец = 0), поэтому проверять 0 не
+// нужно.
 fn __salloc(n: int, kind: int, mask: int) -> int {
-    if n > 1024 || __gc_verify || __gc_marking != 0 {
+    if n > 1024 || __gc_slow {
         return __salloc_slow(n, kind, mask)
     }
     var sc = load8(__gc_tab + ((n + 15) >> 4)) << 1
@@ -171,10 +183,9 @@ fn __salloc(n: int, kind: int, mask: int) -> int {
     let s = load64(__gc_cur + (sc << 3))
     let p = load64(s + S_FREE)
     if p < load64(s + S_FAST) {
-        let g = (p - STORE_REGION) >> 4
-        let a = GC_START + ((g >> 6) << 3)
+        let a = ((p >> 10) << 3) + GC_START_P
         let w = load64(a)
-        let b = 1 << (g & 63)
+        let b = 1 << ((p >> 4) & 63)
         if (w & b) == 0 {
             store64(a, w | b)
             let es = load64(s + S_SIZE)
@@ -189,10 +200,9 @@ fn __salloc(n: int, kind: int, mask: int) -> int {
                     }
                     m = (1 << ((n + 7) >> 3)) - 1
                 }
-                // бит PTRB слова p — 2g; объект до 64 слов задевает одно или два
-                // слова карты
-                let pa = GC_PTRB + ((g >> 5) << 3)
-                let sh = (g << 1) & 63
+                // объект до 64 слов задевает одно или два слова карты PTRB
+                let pa = ((p >> 9) << 3) + GC_PTRB_P
+                let sh = (p >> 3) & 63
                 store64(pa, load64(pa) | (m << sh))
                 if sh != 0 {
                     let hi = (m >> (64 - sh)) & ((1 << sh) - 1)
@@ -387,7 +397,9 @@ fn __gc_pagemap_set(pg: int, np: int, v: int) {
     }
 }
 
-// Подключить память STORE до end байт (кратно COMMIT) и метаданные к ней.
+// Подключить память STORE до end байт (кратно COMMIT) и метаданные к ней:
+// START, MARK, PTRB, PAGEMAP и SPANS — по паре в таблице: смещение от GCMETA
+// в гигабайтах и сдвиг (байт метаданных — байт STORE >> сдвиг).
 fn __gc_commit_to(end: int) {
     let old = __gc_committed
     let nw = (end + COMMIT - 1) & ~(COMMIT - 1)
@@ -395,11 +407,11 @@ fn __gc_commit_to(end: int) {
         __panic(PANIC_MEMORY, "region")
     }
     __gc_mprotect(STORE_REGION, old, nw)
-    __gc_mprotect(GC_START, old >> 7, nw >> 7)
-    __gc_mprotect(GC_MARK, old >> 7, nw >> 7)
-    __gc_mprotect(GC_PTRB, old >> 6, nw >> 6)
-    __gc_mprotect(GC_PAGEMAP, old >> 11, nw >> 11)
-    __gc_mprotect(GC_SPANS, old >> 7, nw >> 7)
+    let t = __data_hex("00 07 02 07 04 06 08 0B 09 07")
+    for i in 0..5 {
+        let sh = load8(t + i * 2 + 1)
+        __gc_mprotect(GCMETA + (load8(t + i * 2) << 30), old >> sh, nw >> sh)
+    }
     __gc_committed = nw
 }
 

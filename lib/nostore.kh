@@ -3,8 +3,10 @@
 // store выделение из неё не включается (__gc_ready остаётся false), поэтому
 // здесь — простые версии с тем же смыслом, и код кучи в программу не попадает.
 
+// Недостижимо: без кучи store выделение из неё не включается (__pmode_on).
 fn __salloc(n: int, kind: int, mask: int) -> int {
-    return __alloc_heap(n)
+    syscall(SYS_EXIT_GROUP, 101)
+    return 0
 }
 
 fn __gc_kind_of(p: int) -> int {
