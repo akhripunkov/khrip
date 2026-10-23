@@ -162,7 +162,7 @@ fn __float_parse(p: int, n: int) -> float? {
 }
 
 fn __str_to_float(self: str) -> float? {
-    return __float_parse(__str_ptr(self), self.len())
+    return __float_parse(__str_ptr(self), self.byte_len())
 }
 
 // ---- Печать: самая короткая запись, которая читается обратно в то же число ----
@@ -229,15 +229,15 @@ fn __f64_digits(mant: int, e2: int, k: int, p: int) -> int {
 
 // Цифры ds (первая — при 10^k) → текст, как в JavaScript.
 fn __format_dec(digits: str, k: int) -> str {
-    var n = digits.len()
-    while n > 1 && digits[n - 1] == '0' {
+    var n = digits.byte_len()
+    while n > 1 && digits.byte(n - 1) == '0' {
         n -= 1
     }
-    let ds = digits[0..n]
+    let ds = digits.byte_slice(0, n)
     if k >= 21 || k < -6 {
-        var r = ds[0..1]
+        var r = ds.byte_slice(0, 1)
         if n > 1 {
-            r = r + "." + ds[1..n]
+            r = r + "." + ds.byte_slice(1, n)
         }
         if k >= 0 {
             return r + "e+" + k.to_str()
@@ -250,7 +250,7 @@ fn __format_dec(digits: str, k: int) -> str {
     if n <= k + 1 {
         return ds + "0".repeat(k + 1 - n)
     }
-    return ds[0..k + 1] + "." + ds[k + 1..n]
+    return ds.byte_slice(0, k + 1) + "." + ds.byte_slice(k + 1, n)
 }
 
 fn __float_to_str(self: float) -> str {
@@ -313,10 +313,10 @@ fn __float_to_str(self: float) -> str {
             }
             if hit >= 0 {
                 var ds = hit.to_str()
-                while ds.len() <= d {
+                while ds.byte_len() <= d {
                     ds = "0" + ds
                 }
-                return sign + ds[..ds.len() - d] + "." + ds[ds.len() - d..]
+                return sign + ds.byte_slice(0, ds.byte_len() - d) + "." + ds.byte_slice(ds.byte_len() - d, ds.byte_len())
             }
         }
     }
@@ -347,7 +347,7 @@ fn __float_to_str(self: float) -> str {
         let ds = q.to_str()
         best = ds
         best_k = kk
-        if __dec_to_f64(__str_ptr(ds), ds.len(), kk - (p - 1)) == ab {
+        if __dec_to_f64(__str_ptr(ds), ds.byte_len(), kk - (p - 1)) == ab {
             return sign + __format_dec(ds, kk)
         }
         p += 1

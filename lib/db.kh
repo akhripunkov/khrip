@@ -397,7 +397,7 @@ fn __db_scalar_text(d: int, v: int, o: int) -> str {
             return time_iso(v)
         }
         if o == OID_DATE {
-            return time_iso(v)[..10]
+            return time_iso(v).byte_slice(0, 10)
         }
         return v.to_str()
     }
@@ -419,8 +419,8 @@ fn __db_scalar_text(d: int, v: int, o: int) -> str {
         return s
     }
     let j = __json_encode(v, d)
-    if __desc_enum(d) && !__oid_json(o) && j.len() >= 2 {
-        return j[1..j.len() - 1]
+    if __desc_enum(d) && !__oid_json(o) && j.byte_len() >= 2 {
+        return j.byte_slice(1, j.byte_len() - 1)
     }
     return j
 }
@@ -578,7 +578,7 @@ fn __db_decode(r: __PgRes, i: int, d: int, cv: int, site: int, fi: int) -> int {
     }
     if cv == CV_TIME_STR {
         let s = __pg_str(r, i)
-        if s.len() == 10 {
+        if s.byte_len() == 10 {
             return __cast(s)
         }
         return __cast(time_iso(__pg_time(r, i)))
@@ -809,43 +809,43 @@ fn __db_markers(c: int, sql: str, deadline: int) -> str {
     if !sql.contains("%%") {
         return sql
     }
-    let b = buf_new(sql.len() + 64)
+    let b = buf_new(sql.byte_len() + 64)
     var i = 0
-    let n = sql.len()
+    let n = sql.byte_len()
     while i < n {
-        if i + 3 < n && sql[i] == '%' && sql[i + 1] == '%' && (sql[i + 2] == 'T' || sql[i + 2] == 'D' || sql[i + 2] == 'A') && sql[i + 3] == ':' {
+        if i + 3 < n && sql.byte(i) == '%' && sql.byte(i + 1) == '%' && (sql.byte(i + 2) == 'T' || sql.byte(i + 2) == 'D' || sql.byte(i + 2) == 'A') && sql.byte(i + 3) == ':' {
             var j = i + 4
-            while j + 1 < n && !(sql[j] == '%' && sql[j + 1] == '%') {
+            while j + 1 < n && !(sql.byte(j) == '%' && sql.byte(j + 1) == '%') {
                 j += 1
             }
             var refend = j
             var val = ""
-            if sql[i + 2] == 'A' {
+            if sql.byte(i + 2) == 'A' {
                 // %%A:таблица.столбец:значение%%
-                while refend > i + 4 && sql[refend - 1] != ':' {
+                while refend > i + 4 && sql.byte(refend - 1) != ':' {
                     refend -= 1
                 }
-                val = sql[refend..j]
+                val = sql.byte_slice(refend, j)
                 refend -= 1
             }
             // имя таблицы может быть со схемой: столбец — после последней точки
             var dot = refend - 1
-            while dot > i + 4 && sql[dot] != '.' {
+            while dot > i + 4 && sql.byte(dot) != '.' {
                 dot -= 1
             }
-            let table = sql[i + 4..dot]
-            let col = sql[dot + 1..refend]
+            let table = sql.byte_slice(i + 4, dot)
+            let col = sql.byte_slice(dot + 1, refend)
             // тип — без модификатора: приведение к varchar(5) молча обрезало бы
             // строку, а присваивание столбцу даёт ошибку 22001 (400)
             let r = __pg_exec(c, "select format_type(a.atttypid, null), case when a.attidentity <> '' then 'nextval(' || quote_literal(pg_get_serial_sequence($1, a.attname)) || ')' else '(' || pg_get_expr(d.adbin, d.adrelid) || ')' end, t.typcategory::text from pg_attribute a join pg_type t on t.oid = a.atttypid left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum where a.attrelid = to_regclass($1) and a.attname::text in ($2::text, lower($2::text)) and a.attnum > 0 and not a.attisdropped order by a.attname::text = $2::text desc limit 1", [table, col], deadline)
-            if r.err.code.len() > 0 || r.rows == 0 {
+            if r.err.code.byte_len() > 0 || r.rows == 0 {
                 __db_mark_err = "table {table} has no column {col}"
                 return ""
             }
             let ty = __pg_str(r, 0)
-            if sql[i + 2] == 'T' {
+            if sql.byte(i + 2) == 'T' {
                 buf_add(b, ty)
-            } else if sql[i + 2] == 'D' {
+            } else if sql.byte(i + 2) == 'D' {
                 buf_add(b, __pg_text(r, 1) ?? "NULL")
             } else if __pg_str(r, 2) == "A" {
                 // список из jsonb — в массив столбца, по порядку
@@ -856,7 +856,7 @@ fn __db_markers(c: int, sql: str, deadline: int) -> str {
             i = j + 2
             continue
         }
-        buf_byte(b, sql[i])
+        buf_byte(b, sql.byte(i))
         i += 1
     }
     return buf_str(b)
@@ -867,7 +867,7 @@ fn __db_markers(c: int, sql: str, deadline: int) -> str {
 fn __db_check(c: int, site: int, notnull: map[str, bool], deadline: int) -> str {
     let marked: str = __cast(load64(site + SITE_SQL))
     let sql = __db_markers(c, marked, deadline)
-    if sql.len() == 0 {
+    if sql.byte_len() == 0 {
         return __db_mark_err + "\n    in: " + marked
     }
     store64(site + SITE_SQL, __cast(sql))
@@ -890,7 +890,7 @@ fn __db_check(c: int, site: int, notnull: map[str, bool], deadline: int) -> str 
     }
     var desc = __pg_describe_typed(c, sql, types, deadline)
     var tries = 0
-    while desc.err.code.len() > 0 && tries <= np {
+    while desc.err.code.byte_len() > 0 && tries <= np {
         tries += 1
         var changed = false
         if (desc.err.code == "42P18" || desc.err.code == "42P08") && __pg_param_no(desc.err.message) != none {
@@ -914,7 +914,7 @@ fn __db_check(c: int, site: int, notnull: map[str, bool], deadline: int) -> str 
         }
         desc = __pg_describe_typed(c, sql, types, deadline)
     }
-    if desc.err.code.len() > 0 {
+    if desc.err.code.byte_len() > 0 {
         return __db_sql_error(sql, desc.err)
     }
     // типы параметров, которые вывел сервер
@@ -935,7 +935,7 @@ fn __db_check(c: int, site: int, notnull: map[str, bool], deadline: int) -> str 
             } else {
                 why = __param_fits(d, o)
             }
-            if why.len() > 0 {
+            if why.byte_len() > 0 {
                 return "parameter ${i + 1} is sent to a {__oid_name(o)} place, but {why}\n    in: {sql}"
             }
         }
@@ -971,10 +971,10 @@ fn __db_check(c: int, site: int, notnull: map[str, bool], deadline: int) -> str 
     var whole_json = false
     if load64(dd) == D_STRUCT && desc.cols.len() == 1 && __oid_json(desc.cols[0].ty) {
         whole_json = true
-        let cname = desc.cols[0].name.lower()
+        let cname = desc.cols[0].name.ascii_lower()
         for fi in 0..load64(dd + 8) {
             let fname: str = __cast(load64(__field(dd, fi)))
-            if fname.lower() == cname {
+            if fname.ascii_lower() == cname {
                 whole_json = false
             }
         }
@@ -1013,7 +1013,7 @@ fn __db_check(c: int, site: int, notnull: map[str, bool], deadline: int) -> str 
             }
             if ci < 0 {
                 for j, col in desc.cols {
-                    if ci < 0 && col.name.lower() == fname.lower() {
+                    if ci < 0 && col.name.ascii_lower() == fname.ascii_lower() {
                         ci = j
                     }
                 }
@@ -1056,11 +1056,11 @@ fn __db_suggest(desc: __PgDesc) -> str {
 // Ошибка PostgreSQL с подсказкой и местом в тексте запроса.
 fn __db_sql_error(sql: str, e: __PgErr) -> str {
     var msg = "{e.message} [{e.code}]"
-    if e.hint.len() > 0 {
+    if e.hint.byte_len() > 0 {
         msg = msg + "\n    hint: " + e.hint
     }
     msg = msg + "\n    in: " + sql.replace("\n", " ")
-    if e.position > 0 && e.position <= sql.len() {
+    if e.position > 0 && e.position <= sql.byte_len() {
         let pad = buf_new(e.position + 8)
         for i in 0..e.position + 7 {
             buf_byte(pad, ' ')
@@ -1105,9 +1105,9 @@ fn __db_testing() -> bool {
 fn __db_start_here() {
     var c = __pg_startup(__db_testing())
     if __db_testing() {
-        let name = "khrip_test_{syscall(39)}_{random_str(6).lower()}"
+        let name = "khrip_test_{syscall(39)}_{random_str(6).ascii_lower()}"
         let e = __pg_simple(c, "create schema {name}", now_ms() + 10000)
-        if e.code.len() > 0 {
+        if e.code.byte_len() > 0 {
             eprint("khrip: cannot create the test schema: {e.message}")
             exit(1)
         }
@@ -1145,11 +1145,11 @@ fn __db_start_here() {
         let log = buf_new(64)
         let err = __pg_migrate(c, names, sqls, log)
         for line in buf_str(log).split("\n") {
-            if line.len() > 0 {
+            if line.byte_len() > 0 {
                 eprint("khrip: " + line.replace("applied ", "applied migration "))
             }
         }
-        if err.len() > 0 {
+        if err.byte_len() > 0 {
             eprint("khrip: migration failed: " + err)
             exit(1)
         }
@@ -1176,7 +1176,7 @@ fn __db_start_here() {
         for i in 0..load64(st) {
             let site = load64(st + 8 + 8 * i)
             let err = __db_check(c, site, notnull, deadline)
-            if err.len() > 0 {
+            if err.byte_len() > 0 {
                 let loc: str = __cast(load64(site + SITE_LOC))
                 eprint("{loc}: error: {err}")
                 bad += 1
@@ -1198,7 +1198,7 @@ fn __db_start_here() {
 
 // Конец khc test: удалить временную схему.
 fn __db_test_done() {
-    if __pg_url.schema.len() == 0 {
+    if __pg_url.schema.byte_len() == 0 {
         return
     }
     let schema = __pg_url.schema
@@ -1224,7 +1224,7 @@ fn __db_classify(e: __PgErr, target: str) -> __DbFail {
     let code = e.code
     // тело ответа — без значений из DETAIL (они только в журнале)
     var name = e.constraint
-    if name.len() == 0 {
+    if name.byte_len() == 0 {
         name = e.table
     }
     if code == "23505" || code == "23P01" {
@@ -1243,7 +1243,7 @@ fn __db_classify(e: __PgErr, target: str) -> __DbFail {
         if e.detail.contains("is not present") {
             return __DbFail { status: 404, msg: "not found: " + name }
         }
-        if target.len() > 0 && target.contains(" " + e.table + " ") {
+        if target.byte_len() > 0 && target.contains(" " + e.table + " ") {
             return __DbFail { status: 404, msg: "not found: " + name }
         }
         return __DbFail { status: 409, msg: "still referenced: " + name }
@@ -1273,7 +1273,7 @@ fn __db_fail(site: int, e: __PgErr) {
     let f = __db_classify(e, target)
     if f.status >= 500 {
         var extra = ""
-        if e.detail.len() > 0 {
+        if e.detail.byte_len() > 0 {
             extra = " (" + e.detail + ")"
         }
         if f.status == 500 {
@@ -1368,7 +1368,7 @@ fn __db_run(site0: int, vals: int) -> int {
             store64(cx + CTX_PGHELD, 0)
             __pg_release(c)
         }
-        if res.err.code.len() == 0 {
+        if res.err.code.byte_len() == 0 {
             break
         }
         // 55P03 — повтор, только если это наш короткий lock_timeout первой
@@ -1537,7 +1537,7 @@ fn __db_tx_commit(jb: int) {
         return
     }
     let e = __pg_tx_end(c, true, load64(c + PB_TXDL))
-    if e.code.len() > 0 {
+    if e.code.byte_len() > 0 {
         if __pg_retryable(e) || (e.code == "55P03" && load64(c + PB_TXTRY) == 0) {
             __db_tx_retry(e)
         }
@@ -1565,7 +1565,7 @@ fn __db_tx_error(e: __PgErr) {
     let f = __db_classify(e, "")
     if f.status >= 500 {
         var extra = ""
-        if e.detail.len() > 0 {
+        if e.detail.byte_len() > 0 {
             extra = " (" + e.detail + ")"
         }
         eprint("tx failed [{e.code}] {e.message}{extra}")
@@ -1614,7 +1614,7 @@ fn __db_tx_retry(e: __PgErr) {
         // ожидающие не держат одно и не ждут другое по кругу
         if load64(hk) > 0 {
             let ue = __pg_simple(c, "select pg_advisory_unlock_all()", load64(c + PB_TXDL))
-            if ue.code.len() > 0 {
+            if ue.code.byte_len() > 0 {
                 __db_tx_release(c)
                 __db_tx_error(ue)
             }
@@ -1622,7 +1622,7 @@ fn __db_tx_retry(e: __PgErr) {
         __pg_hot_leave(c)
         __pg_hold(c, ka)
         let le = __pg_simple(c, __pg_lock_sql(c), load64(c + PB_TXDL))
-        if le.code.len() > 0 {
+        if le.code.byte_len() > 0 {
             __db_tx_release(c)
             __db_tx_error(le)
         }

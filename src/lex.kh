@@ -77,6 +77,33 @@ var toks: [Token]
 var files: [SrcFile]
 var strlits: [str]
 
+// Системный код — библиотека, сгенерированный текст и программа с ключом
+// --system (исходники компилятора): строки в нём — байты. Операции, которые в
+// коде программы будут считать символы (len, s[i], срезы, for, find, lower, ...),
+// здесь — ошибки с байтовой заменой: s.byte_len(), s.byte(i), s.byte_slice(a, b).
+var system_mode: bool
+
+fn system_file(fi: int) -> bool {
+    return files[fi].is_lib || system_mode
+}
+
+fn system_code(t: Token) -> bool {
+    return system_file(t.file)
+}
+
+// Байт для сообщений: 0xD1.
+fn hex_byte(b: int) -> str {
+    let d = "0123456789ABCDEF"
+    return "0x" + d.byte_slice(b >> 4, (b >> 4) + 1) + d.byte_slice(b & 15, (b & 15) + 1)
+}
+
+// Символьная операция над str в системном коде: ошибка, которая называет замену.
+fn system_str_error(t: Token, what: str, fix: str) {
+    if system_code(t) {
+        error_tok(t, what + " in system code: write " + fix, "system code (lib/, generated code, khc --system) treats str as bytes")
+    }
+}
+
 // Текст запроса sql "...": куски между параметрами (их на один больше, чем
 // параметров) и для каждого параметра — стоит ли он внутри кавычек SQL ('%{q}%').
 type SqlLit {
@@ -108,7 +135,7 @@ fn is_ident_char(c: int) -> bool {
 }
 
 fn keyword_kind(s: str) -> int {
-    let n = s.len()
+    let n = s.byte_len()
     if n < 2 || n > 8 {
         return T_IDENT
     }
@@ -185,7 +212,7 @@ fn add_tok(kind: int, val: int, start: int, len: int) {
     toks.push(Token {
         kind: kind,
         val: val,
-        text: lx_text[start..start + len],
+        text: lx_text.byte_slice(start, start + len),
         line: lx_line,
         col: start - lx_line_start + 1,
         file: lx_file
@@ -289,7 +316,7 @@ fn is_single(c: int) -> bool {
 // Один символ литерала с экранированием; lx_p сдвигается.
 fn lex_char(end: int) -> int {
     let start = lx_p
-    let c = lx_text[lx_p]
+    let c = lx_text.byte(lx_p)
     lx_p += 1
     if c != '\\' {
         return c
@@ -298,7 +325,7 @@ fn lex_char(end: int) -> int {
         lex_error("unfinished escape sequence", start)
         return 0
     }
-    let e = lx_text[lx_p]
+    let e = lx_text.byte(lx_p)
     lx_p += 1
     if e == 'n' {
         return 10
@@ -321,10 +348,10 @@ fn lex_char(end: int) -> int {
 
 fn lex_number(end: int) -> int {
     var v = 0
-    if lx_text[lx_p] == '0' && lx_p + 1 < end && (lx_text[lx_p + 1] == 'x' || lx_text[lx_p + 1] == 'X') {
+    if lx_text.byte(lx_p) == '0' && lx_p + 1 < end && (lx_text.byte(lx_p + 1) == 'x' || lx_text.byte(lx_p + 1) == 'X') {
         lx_p += 2
         while lx_p < end {
-            let c = lx_text[lx_p]
+            let c = lx_text.byte(lx_p)
             var d = -1
             if is_digit(c) {
                 d = c - '0'
@@ -346,8 +373,8 @@ fn lex_number(end: int) -> int {
         }
         return v
     }
-    while lx_p < end && (is_digit(lx_text[lx_p]) || lx_text[lx_p] == '_') {
-        let c = lx_text[lx_p]
+    while lx_p < end && (is_digit(lx_text.byte(lx_p)) || lx_text.byte(lx_p) == '_') {
+        let c = lx_text.byte(lx_p)
         if c != '_' {
             if v > 922337203685477580 {
                 lex_error("integer literal is too large", lx_p)
@@ -364,18 +391,18 @@ fn lex_number(end: int) -> int {
 // 0..n и 3.max(4) — не дробные.
 fn float_ahead(end: int) -> bool {
     var i = lx_p
-    if lx_text[i] == '0' && i + 1 < end && (lx_text[i + 1] == 'x' || lx_text[i + 1] == 'X') {
+    if lx_text.byte(i) == '0' && i + 1 < end && (lx_text.byte(i + 1) == 'x' || lx_text.byte(i + 1) == 'X') {
         return false
     }
-    while i < end && (is_digit(lx_text[i]) || lx_text[i] == '_') {
+    while i < end && (is_digit(lx_text.byte(i)) || lx_text.byte(i) == '_') {
         i += 1
     }
-    if i + 1 < end && lx_text[i] == '.' && is_digit(lx_text[i + 1]) {
+    if i + 1 < end && lx_text.byte(i) == '.' && is_digit(lx_text.byte(i + 1)) {
         return true
     }
-    if i + 1 < end && (lx_text[i] == 'e' || lx_text[i] == 'E') {
-        let n = lx_text[i + 1]
-        return is_digit(n) || ((n == '-' || n == '+') && i + 2 < end && is_digit(lx_text[i + 2]))
+    if i + 1 < end && (lx_text.byte(i) == 'e' || lx_text.byte(i) == 'E') {
+        let n = lx_text.byte(i + 1)
+        return is_digit(n) || ((n == '-' || n == '+') && i + 2 < end && is_digit(lx_text.byte(i + 2)))
     }
     return false
 }
@@ -383,9 +410,9 @@ fn float_ahead(end: int) -> bool {
 // Дробное число → биты double (точное округление — __dec_to_f64).
 fn lex_float(end: int) -> int {
     let b = buf_new(32)
-    while lx_p < end && (is_digit(lx_text[lx_p]) || lx_text[lx_p] == '_' || lx_text[lx_p] == '.') {
-        let c = lx_text[lx_p]
-        if c == '.' && !(lx_p + 1 < end && is_digit(lx_text[lx_p + 1])) {
+    while lx_p < end && (is_digit(lx_text.byte(lx_p)) || lx_text.byte(lx_p) == '_' || lx_text.byte(lx_p) == '.') {
+        let c = lx_text.byte(lx_p)
+        if c == '.' && !(lx_p + 1 < end && is_digit(lx_text.byte(lx_p + 1))) {
             break
         }
         if c != '_' {
@@ -394,16 +421,16 @@ fn lex_float(end: int) -> int {
         lx_p += 1
     }
     var e = 0
-    if lx_p < end && (lx_text[lx_p] == 'e' || lx_text[lx_p] == 'E') {
+    if lx_p < end && (lx_text.byte(lx_p) == 'e' || lx_text.byte(lx_p) == 'E') {
         lx_p += 1
         var neg = false
-        if lx_text[lx_p] == '-' || lx_text[lx_p] == '+' {
-            neg = lx_text[lx_p] == '-'
+        if lx_text.byte(lx_p) == '-' || lx_text.byte(lx_p) == '+' {
+            neg = lx_text.byte(lx_p) == '-'
             lx_p += 1
         }
-        while lx_p < end && is_digit(lx_text[lx_p]) {
+        while lx_p < end && is_digit(lx_text.byte(lx_p)) {
             if e < 100000 {
-                e = e * 10 + (lx_text[lx_p] - '0')
+                e = e * 10 + (lx_text.byte(lx_p) - '0')
             }
             lx_p += 1
         }
@@ -425,24 +452,24 @@ fn add_strlit(s: str) -> int {
 fn interp_end(from: int, end: int) -> int {
     var depth = 0
     var i = from
-    while i < end && lx_text[i] == ' ' {
+    while i < end && lx_text.byte(i) == ' ' {
         i += 1
     }
-    if i < end && lx_text[i] == '"' {
+    if i < end && lx_text.byte(i) == '"' {
         return -1
     }
     while i < end {
-        let c = lx_text[i]
+        let c = lx_text.byte(i)
         if c == '\n' {
             return -1
         }
         if c == '"' {
             i += 1
-            while i < end && lx_text[i] != '"' {
-                if lx_text[i] == '\n' {
+            while i < end && lx_text.byte(i) != '"' {
+                if lx_text.byte(i) == '\n' {
                     return -1
                 }
-                if lx_text[i] == '\\' {
+                if lx_text.byte(i) == '\\' {
                     i += 1
                 }
                 i += 1
@@ -482,7 +509,7 @@ fn is_quantifier(from: int, to: int) -> bool {
     var commas = 0
     var i = from
     while i < to {
-        let c = lx_text[i]
+        let c = lx_text.byte(i)
         if c >= '0' && c <= '9' {
             if commas == 0 {
                 digits += 1
@@ -504,11 +531,11 @@ fn lex_string(end: int) {
     var parts = 0
     let raw = raw_string_here()
     while true {
-        if lx_p >= end || lx_text[lx_p] == '\n' {
+        if lx_p >= end || lx_text.byte(lx_p) == '\n' {
             lex_error("unterminated string; close it with \" on the same line", start)
             return
         }
-        let c = lx_text[lx_p]
+        let c = lx_text.byte(lx_p)
         if c == '"' {
             lx_p += 1
             break
@@ -520,8 +547,8 @@ fn lex_string(end: int) {
                 // восстановление: строка — до последней кавычки в строке исходника
                 var q = lx_p
                 var last = -1
-                while q < end && lx_text[q] != '\n' {
-                    if lx_text[q] == '"' {
+                while q < end && lx_text.byte(q) != '\n' {
+                    if lx_text.byte(q) == '"' {
                         last = q
                     }
                     q += 1
@@ -545,7 +572,7 @@ fn lex_string(end: int) {
                 // {3}, {3,32}, {2,}: число в фигурных скобках — текст (как в регулярных
                 // выражениях), подставлять литерал смысла нет
                 while lx_p <= close {
-                    buf_byte(b, lx_text[lx_p])
+                    buf_byte(b, lx_text.byte(lx_p))
                     lx_p += 1
                 }
                 continue
@@ -588,10 +615,10 @@ fn lex_string(end: int) {
 // После слова sql (через пробелы, на той же строке) — "..." или `...`?
 fn sql_string_next(end: int) -> bool {
     var q = lx_p
-    while q < end && lx_text[q] == ' ' {
+    while q < end && lx_text.byte(q) == ' ' {
         q += 1
     }
-    return q < end && (lx_text[q] == '"' || lx_text[q] == '`')
+    return q < end && (lx_text.byte(q) == '"' || lx_text.byte(q) == '`')
 }
 
 // sql "..." или sql `...`: обычный SQL, строка может занимать несколько строк;
@@ -601,10 +628,10 @@ fn sql_string_next(end: int) -> bool {
 fn lex_sql(start: int, end: int) {
     let tok_line = lx_line
     let tok_col = start - lx_line_start + 1
-    while lx_text[lx_p] == ' ' {
+    while lx_text.byte(lx_p) == ' ' {
         lx_p += 1
     }
-    let close_ch = lx_text[lx_p]
+    let close_ch = lx_text.byte(lx_p)
     let raw = close_ch == '`'
     let open = lx_p
     lx_p += 1
@@ -620,10 +647,10 @@ fn lex_sql(start: int, end: int) {
     toks.push(Token { kind: T_SQL, val: li, text: "sql", line: tok_line, col: tok_col, file: lx_file })
     while true {
         if lx_p >= end {
-            lex_error("unterminated sql string: close it with " + lx_text[open..open + 1], open)
+            lex_error("unterminated sql string: close it with " + lx_text.byte_slice(open, open + 1), open)
             break
         }
-        let c = lx_text[lx_p]
+        let c = lx_text.byte(lx_p)
         if c == close_ch {
             lx_p += 1
             break
@@ -649,7 +676,7 @@ fn lex_sql(start: int, end: int) {
             if close == lx_p + 1 || (close > 0 && is_quantifier(lx_p + 1, close)) || (close > 0 && st == 1 && sql_array_literal(lx_p + 1, close)) {
                 // {} и {3,5} — текст
                 while lx_p <= close {
-                    buf_byte(b, lx_text[lx_p])
+                    buf_byte(b, lx_text.byte(lx_p))
                     lx_p += 1
                 }
                 continue
@@ -678,12 +705,12 @@ fn lex_sql(start: int, end: int) {
         }
         // символ: экранирование Khrip (в `...` — только \{) или как есть
         var ch = c
-        if c == '\\' && (!raw || (lx_p + 1 < end && lx_text[lx_p + 1] == '\{')) {
+        if c == '\\' && (!raw || (lx_p + 1 < end && lx_text.byte(lx_p + 1) == '\{')) {
             ch = lex_char(end)
         } else {
             lx_p += 1
         }
-        let nx = lx_p < end && lx_text[lx_p] == '-'
+        let nx = lx_p < end && lx_text.byte(lx_p) == '-'
         // состояние SQL по символу
         if st == 0 {
             let prev = b.len
@@ -693,18 +720,18 @@ fn lex_sql(start: int, end: int) {
                 if prev > 0 && (load8(b.data + prev - 1) == 'e' || load8(b.data + prev - 1) == 'E') && (prev == 1 || !is_ident_char(load8(b.data + prev - 2))) {
                     st = 5
                 }
-            } else if ch == '$' && (prev == 0 || !is_ident_char(load8(b.data + prev - 1))) && lx_p < end && !is_digit(lx_text[lx_p]) {
+            } else if ch == '$' && (prev == 0 || !is_ident_char(load8(b.data + prev - 1))) && lx_p < end && !is_digit(lx_text.byte(lx_p)) {
                 // $тег$ ... $тег$
                 var j = lx_p
-                while j < end && is_ident_char(lx_text[j]) {
+                while j < end && is_ident_char(lx_text.byte(j)) {
                     j += 1
                 }
-                if j < end && lx_text[j] == '$' {
-                    dtag = "$" + lx_text[lx_p..j + 1]
+                if j < end && lx_text.byte(j) == '$' {
+                    dtag = "$" + lx_text.byte_slice(lx_p, j + 1)
                     st = 6
                     buf_byte(b, ch)
                     while lx_p <= j {
-                        buf_byte(b, lx_text[lx_p])
+                        buf_byte(b, lx_text.byte(lx_p))
                         lx_p += 1
                     }
                     continue
@@ -713,7 +740,7 @@ fn lex_sql(start: int, end: int) {
                 st = 2
             } else if ch == '-' && nx {
                 st = 3
-            } else if ch == '/' && lx_p < end && lx_text[lx_p] == '*' {
+            } else if ch == '/' && lx_p < end && lx_text.byte(lx_p) == '*' {
                 st = 4
             }
         } else if st == 1 {
@@ -723,17 +750,17 @@ fn lex_sql(start: int, end: int) {
         } else if st == 5 {
             if ch == '\\' && lx_p < end {
                 buf_byte(b, ch)
-                ch = lx_text[lx_p]
+                ch = lx_text.byte(lx_p)
                 lx_p += 1
             } else if ch == '\'' {
                 st = 0
             }
         } else if st == 6 {
-            if ch == '$' && lx_p + dtag.len() - 1 <= end && "$" + lx_text[lx_p..lx_p + dtag.len() - 1] == dtag {
+            if ch == '$' && lx_p + dtag.byte_len() - 1 <= end && "$" + lx_text.byte_slice(lx_p, lx_p + dtag.byte_len() - 1) == dtag {
                 buf_byte(b, ch)
                 var k = 1
-                while k < dtag.len() {
-                    buf_byte(b, lx_text[lx_p])
+                while k < dtag.byte_len() {
+                    buf_byte(b, lx_text.byte(lx_p))
                     lx_p += 1
                     k += 1
                 }
@@ -745,7 +772,7 @@ fn lex_sql(start: int, end: int) {
                 st = 0
             }
         } else if st == 4 {
-            if ch == '*' && lx_p < end && lx_text[lx_p] == '/' {
+            if ch == '*' && lx_p < end && lx_text.byte(lx_p) == '/' {
                 st = 0
             }
         }
@@ -761,7 +788,7 @@ fn sql_array_literal(from: int, to: int) -> bool {
     var depth = 0
     var i = from
     while i < to {
-        let c = lx_text[i]
+        let c = lx_text.byte(i)
         if c == '(' || c == '[' || c == '\{' {
             depth += 1
         } else if c == ')' || c == ']' || c == '}' {
@@ -770,7 +797,7 @@ fn sql_array_literal(from: int, to: int) -> bool {
             return true
         } else if c == '"' {
             i += 1
-            while i < to && lx_text[i] != '"' {
+            while i < to && lx_text.byte(i) != '"' {
                 i += 1
             }
         }
@@ -781,7 +808,7 @@ fn sql_array_literal(from: int, to: int) -> bool {
 
 fn lex_range(end: int) {
     while lx_p < end {
-        let c = lx_text[lx_p]
+        let c = lx_text.byte(lx_p)
         if c == '\n' {
             lx_p += 1
             lx_line += 1
@@ -792,18 +819,18 @@ fn lex_range(end: int) {
             lx_p += 1
             continue
         }
-        if c == '/' && lx_p + 1 < end && lx_text[lx_p + 1] == '/' {
-            while lx_p < end && lx_text[lx_p] != '\n' {
+        if c == '/' && lx_p + 1 < end && lx_text.byte(lx_p + 1) == '/' {
+            while lx_p < end && lx_text.byte(lx_p) != '\n' {
                 lx_p += 1
             }
             continue
         }
         let start = lx_p
         if is_alpha(c) {
-            while lx_p < end && is_ident_char(lx_text[lx_p]) {
+            while lx_p < end && is_ident_char(lx_text.byte(lx_p)) {
                 lx_p += 1
             }
-            let word = lx_text[start..lx_p]
+            let word = lx_text.byte_slice(start, lx_p)
             if word == "sql" && sql_string_next(end) {
                 lex_sql(start, end)
                 continue
@@ -828,9 +855,21 @@ fn lex_range(end: int) {
                 return
             }
             let v = lex_char(end)
-            if lx_p >= end || lx_text[lx_p] != '\'' {
+            if v >= 0x80 && system_file(lx_file) {
+                // в системном коде символ — один байт ASCII
+                var bytes = ""
+                var q = start + 1
+                while q < end && q < start + 5 && lx_text.byte(q) >= 0x80 {
+                    bytes += " " + hex_byte(lx_text.byte(q))
+                    q += 1
+                }
+                lex_error("non-ASCII character literal in system code: write its UTF-8 bytes as numbers:" + bytes, start)
+                while lx_p < end && lx_text.byte(lx_p) != '\'' && lx_text.byte(lx_p) != '\n' {
+                    lx_p += 1
+                }
+            } else if lx_p >= end || lx_text.byte(lx_p) != '\'' {
                 lex_error("character literal must contain exactly one character; use \"...\" for strings", start)
-                while lx_p < end && lx_text[lx_p] != '\'' && lx_text[lx_p] != '\n' {
+                while lx_p < end && lx_text.byte(lx_p) != '\'' && lx_text.byte(lx_p) != '\n' {
                     lx_p += 1
                 }
             }
@@ -847,8 +886,8 @@ fn lex_range(end: int) {
             let line0 = lx_line
             let col0 = start - lx_line_start + 1
             var q = lx_p + 1
-            while q < end && lx_text[q] != '`' {
-                if lx_text[q] == '\n' {
+            while q < end && lx_text.byte(q) != '`' {
+                if lx_text.byte(q) == '\n' {
                     lx_line += 1
                     lx_line_start = q + 1
                 }
@@ -859,13 +898,13 @@ fn lex_range(end: int) {
                 lx_p = end
                 return
             }
-            let raw = lx_text[lx_p + 1..q]
+            let raw = lx_text.byte_slice(lx_p + 1, q)
             lx_p = q + 1
             toks.push(Token { kind: T_STR, val: add_strlit(raw), text: "`...`", line: line0, col: col0, file: lx_file })
             continue
         }
         if lx_p + 2 < end {
-            let k3 = three_char_kind(c, lx_text[lx_p + 1], lx_text[lx_p + 2])
+            let k3 = three_char_kind(c, lx_text.byte(lx_p + 1), lx_text.byte(lx_p + 2))
             if k3 != 0 {
                 lx_p += 3
                 add_tok(k3, 0, start, 3)
@@ -873,7 +912,7 @@ fn lex_range(end: int) {
             }
         }
         if lx_p + 1 < end {
-            let k = two_char_kind(c, lx_text[lx_p + 1])
+            let k = two_char_kind(c, lx_text.byte(lx_p + 1))
             if k != 0 {
                 lx_p += 2
                 add_tok(k, 0, start, 2)
@@ -887,7 +926,7 @@ fn lex_range(end: int) {
             }
             continue
         }
-        lex_error("unexpected character '" + lx_text[start..start + 1] + "'", start)
+        lex_error("unexpected character '" + lx_text.byte_slice(start, start + 1) + "'", start)
         lx_p += 1
     }
 }
@@ -898,5 +937,5 @@ fn lex_file(fi: int) {
     lx_p = 0
     lx_line = 1
     lx_line_start = 0
-    lex_range(lx_text.len())
+    lex_range(lx_text.byte_len())
 }

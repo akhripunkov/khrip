@@ -212,7 +212,7 @@ fn __hex_digit(x: int) -> int {
 // Строка JSON в кавычках. Безопасные участки копируются целиком.
 fn __json_str(b: Buf, s: str) {
     let p = __str_ptr(s)
-    let n = s.len()
+    let n = s.byte_len()
     buf_reserve(b, n + 2)
     buf_byte(b, '"')
     var start = 0
@@ -371,7 +371,7 @@ fn __json_enc_sum(b: Buf, v: int, d: int) {
 
 // Строка в кавычках JSON.
 fn __json_quote(s: str) -> str {
-    let b = buf_new(s.len() + 8)
+    let b = buf_new(s.byte_len() + 8)
     __json_str(b, s)
     return __str_new(b.data, b.len)
 }
@@ -420,10 +420,10 @@ fn __jd_found(j: __Json) -> str {
 }
 
 fn __jd_fail(j: __Json, at: str, msg: str) {
-    if j.err.len() > 0 {
+    if j.err.byte_len() > 0 {
         return
     }
-    if at.len() > 0 {
+    if at.byte_len() > 0 {
         j.err = at + ": " + msg
     } else {
         j.err = msg
@@ -435,7 +435,7 @@ fn __jd_expect(j: __Json, at: str, what: str) {
 }
 
 fn __jd_word(j: __Json, w: str) -> bool {
-    let n = w.len()
+    let n = w.byte_len()
     if j.p + n <= j.end && __memeq(j.p, __str_ptr(w), n) {
         j.p += n
         return true
@@ -623,7 +623,7 @@ fn __jd_skip(j: __Json, at: str) {
             j.p += 1
             return
         }
-        while j.err.len() == 0 {
+        while j.err.byte_len() == 0 {
             if c == '\{' {
                 __jd_str(j, at)
                 if __jd_peek(j) != ':' {
@@ -665,7 +665,7 @@ fn __jd_skip(j: __Json, at: str) {
 }
 
 fn __jd_join(at: str, name: str) -> str {
-    if at.len() == 0 {
+    if at.byte_len() == 0 {
         return name
     }
     return at + "." + name
@@ -722,7 +722,7 @@ fn __jd(j: __Json, d: int, at: str) -> int {
             j.p += 1
             return __cast(xs)
         }
-        while j.err.len() == 0 {
+        while j.err.byte_len() == 0 {
             xs.push(__jd(j, ed, at + "[" + xs.len().to_str() + "]"))
             let e = __jd_peek(j)
             if e == ']' {
@@ -755,7 +755,7 @@ fn __jd(j: __Json, d: int, at: str) -> int {
             j.p += 1
             return m
         }
-        while j.err.len() == 0 {
+        while j.err.byte_len() == 0 {
             let key = __jd_str(j, at)
             if __jd_peek(j) != ':' {
                 __jd_expect(j, at, "':'")
@@ -801,7 +801,7 @@ fn __jd(j: __Json, d: int, at: str) -> int {
         if __jd_peek(j) == '}' {
             j.p += 1
         } else {
-            while j.err.len() == 0 {
+            while j.err.byte_len() == 0 {
                 let key = __jd_str(j, at)
                 if __jd_peek(j) != ':' {
                     __jd_expect(j, at, "':'")
@@ -839,7 +839,7 @@ fn __jd(j: __Json, d: int, at: str) -> int {
                 j.p += 1
             }
         }
-        if j.err.len() == 0 {
+        if j.err.byte_len() == 0 {
             for i in 0..n {
                 if i < 62 && (seen & (1 << i)) == 0 {
                     let f = __field(d, i)
@@ -904,7 +904,7 @@ fn __jd_type_tag(j: __Json, at: str) -> str {
     j.p += 1
     var r = ""
     var found = false
-    while j.err.len() == 0 && __jd_peek(j) != '}' {
+    while j.err.byte_len() == 0 && __jd_peek(j) != '}' {
         let key = __jd_str(j, at)
         if __jd_peek(j) != ':' {
             __jd_expect(j, at, "':'")
@@ -921,7 +921,7 @@ fn __jd_type_tag(j: __Json, at: str) -> str {
             j.p += 1
         }
     }
-    if !found && j.err.len() == 0 {
+    if !found && j.err.byte_len() == 0 {
         __jd_fail(j, at, "missing field 'type'")
     }
     j.p = save
@@ -940,7 +940,7 @@ fn __jd_sum(j: __Json, d: int, at: str) -> int {
         }
         name = __jd_type_tag(j, at)
     }
-    if j.err.len() > 0 {
+    if j.err.byte_len() > 0 {
         return 0
     }
     for i in 0..n {
@@ -964,12 +964,12 @@ fn __jd_sum(j: __Json, d: int, at: str) -> int {
 // Значение типа T? из текста JSON: none, если текст не подходит (текст ошибки —
 // в __json_error()). Для int и bool результат — ячейка.
 fn __json_decode(s: str, d: int) -> int {
-    let j = __Json { p: __str_ptr(s), end: __str_ptr(s) + s.len(), err: "" }
+    let j = __Json { p: __str_ptr(s), end: __str_ptr(s) + s.byte_len(), err: "" }
     let v = __jd(j, d, "")
-    if j.err.len() == 0 && __jd_peek(j) != -1 {
+    if j.err.byte_len() == 0 && __jd_peek(j) != -1 {
         __jd_fail(j, "", "unexpected " + __jd_found(j) + " after the value")
     }
-    if j.err.len() > 0 {
+    if j.err.byte_len() > 0 {
         if load64(__ctx() + CTX_WORKER) != 0 {
             let w = __w()
             w.json_err = j.err
@@ -1104,12 +1104,12 @@ fn __reply_json_error() {
 
 fn __path_segs(p: str) -> [str] {
     var segs: [str] = []
-    let n = p.len()
+    let n = p.byte_len()
     var start = 1
     var i = 1
     while i <= n {
-        if i == n || p[i] == '/' {
-            segs.push(p[start..i])
+        if i == n || p.byte(i) == '/' {
+            segs.push(p.byte_slice(start, i))
             start = i + 1
         }
         i += 1
@@ -1119,8 +1119,9 @@ fn __path_segs(p: str) -> [str] {
 
 // Текст для строки запроса: всё, кроме букв, цифр и - _ . ~, — как %XX.
 fn url_encode(s: str) -> str {
-    let b = buf_new(s.len() + 8)
-    for c in s {
+    let b = buf_new(s.byte_len() + 8)
+    for i in 0..s.byte_len() {
+        let c = s.byte(i)
         if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~' {
             buf_byte(b, c)
         } else {
@@ -1133,10 +1134,10 @@ fn url_encode(s: str) -> str {
 }
 
 fn __url_decode(s: str) -> str {
-    let n = s.len()
+    let n = s.byte_len()
     var plain = true
     for i in 0..n {
-        let c = s[i]
+        let c = s.byte(i)
         if c == '%' || c == '+' {
             plain = false
             break
@@ -1148,11 +1149,11 @@ fn __url_decode(s: str) -> str {
     let b = buf_new(n)
     var i = 0
     while i < n {
-        let c = s[i]
+        let c = s.byte(i)
         if c == '+' {
             buf_byte(b, ' ')
-        } else if c == '%' && i + 2 < n && __hex_val(s[i + 1]) >= 0 && __hex_val(s[i + 2]) >= 0 {
-            buf_byte(b, __hex_val(s[i + 1]) * 16 + __hex_val(s[i + 2]))
+        } else if c == '%' && i + 2 < n && __hex_val(s.byte(i + 1)) >= 0 && __hex_val(s.byte(i + 2)) >= 0 {
+            buf_byte(b, __hex_val(s.byte(i + 1)) * 16 + __hex_val(s.byte(i + 2)))
             i += 2
         } else {
             buf_byte(b, c)
@@ -1164,18 +1165,18 @@ fn __url_decode(s: str) -> str {
 
 // Значение параметра name из строки запроса «a=1&b=2» или none.
 fn __query(q: str, name: str) -> str? {
-    let n = q.len()
+    let n = q.byte_len()
     var start = 0
     var i = 0
     while i <= n {
-        if i == n || q[i] == '&' {
-            let part = q[start..i]
-            let eq = part.find("=") ?? part.len()
-            if __url_decode(part[..eq]) == name {
-                if eq >= part.len() {
+        if i == n || q.byte(i) == '&' {
+            let part = q.byte_slice(start, i)
+            let eq = part.byte_find("=") ?? part.byte_len()
+            if __url_decode(part.byte_slice(0, eq)) == name {
+                if eq >= part.byte_len() {
                     return ""
                 }
-                return __url_decode(part[eq + 1..])
+                return __url_decode(part.byte_slice(eq + 1, part.byte_len()))
             }
             start = i + 1
         }
@@ -1233,11 +1234,11 @@ fn header(name: str) -> str? {
         return none
     }
     let r: __Req = __cast(w.cur)
-    let want = name.lower()
+    let want = name.ascii_lower()
     for line in r.headers.split("\r\n") {
-        let c = line.find(":") ?? 0
-        if c > 0 && line[..c].trim().lower() == want {
-            return line[c + 1..].trim()
+        let c = line.byte_find(":") ?? 0
+        if c > 0 && line.byte_slice(0, c).ascii_trim().ascii_lower() == want {
+            return line.byte_slice(c + 1, line.byte_len()).ascii_trim()
         }
     }
     return none
@@ -1290,7 +1291,7 @@ fn __serve_one(w: __Worker, req: __Req) {
         __pmode_reset()
         let msg: str = __cast(load64(c + CTX_PANIC))
         if w.failed > 0 {
-            if msg.len() == 0 {
+            if msg.byte_len() == 0 {
                 __reply_status(w.failed)
             } else {
                 __reply_text(w.failed, msg)
@@ -1397,9 +1398,9 @@ fn __expect_eq(l: str, r: str, want_eq: bool, at: str, text: str) {
 fn __header_map(text: str) -> map[str, str] {
     var m: map[str, str] = {}
     for line in text.split("\r\n") {
-        let c = line.find(":") ?? 0
+        let c = line.byte_find(":") ?? 0
         if c > 0 {
-            m[line[..c].trim().lower()] = line[c + 1..].trim()
+            m[line.byte_slice(0, c).ascii_trim().ascii_lower()] = line.byte_slice(c + 1, line.byte_len()).ascii_trim()
         }
     }
     return m
@@ -1416,9 +1417,9 @@ fn __call(method: str, target: str, body: int, d: int, headers: int) -> Response
     }
     var path = target
     var query = ""
-    if let q = target.find("?") {
-        path = target[..q]
-        query = target[q + 1..]
+    if let q = target.byte_find("?") {
+        path = target.byte_slice(0, q)
+        query = target.byte_slice(q + 1, target.byte_len())
     }
     var text = ""
     if d != 0 {

@@ -1,0 +1,9 @@
+// flags: --system
+// expect: non-ASCII character literal in system code: write its UTF-8 bytes as numbers: 0xD1 0x8F
+// expect: 1 error
+// В системном коде символьный литерал — один байт ASCII.
+fn main() {
+    let c = 'я'
+    let d = 'z'
+    print((c + d).to_str())
+}

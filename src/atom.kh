@@ -123,11 +123,11 @@ fn unknown_name_hint(name: str) -> str {
         return "in sql, \{" + name + "} is a value from Khrip; for the PostgreSQL literal '\{" + name + "}' write '\\\{" + name + "}'"
     }
     let h = name_hint(name)
-    if h.len() > 0 {
+    if h.byte_len() > 0 {
         return h
     }
     let s = similar_name(name)
-    if s.len() > 0 {
+    if s.byte_len() > 0 {
         return "did you mean '" + s + "'?"
     }
     return ""
@@ -538,7 +538,7 @@ fn parse_struct_lit(si: int, at: Token) -> int {
                 emit_load(RCX, RSP, 0)
                 emit_store(RCX, j * 8, RAX)
             } else {
-                if missing.len() > 0 {
+                if missing.byte_len() > 0 {
                     missing += ", "
                 }
                 missing += fields[j].name + ": " + ty_name(fields[j].ty)
@@ -546,7 +546,7 @@ fn parse_struct_lit(si: int, at: Token) -> int {
         }
         j += 1
     }
-    if missing.len() > 0 {
+    if missing.byte_len() > 0 {
         error_tok(at, "missing fields in " + structs[si].name + ": " + missing, "set every field, or copy them with ...other")
     }
     emit_pop(RAX)
@@ -713,7 +713,7 @@ fn tx_arg_check(t: Token, fi: int, shift: int) {
     let roots = call_arg_roots(open)
     for a in 0..roots.len() {
         let p = a + shift
-        if p < pm.len() && pm[p] && roots[a].len() > 0 && tx_is_outer(roots[a]) {
+        if p < pm.len() && pm[p] && roots[a].byte_len() > 0 && tx_is_outer(roots[a]) {
             error_tok(t, t.text + "() changes its argument " + roots[a] + ", which comes from outside tx, and the block may run again after a conflict", "pass a copy, or call it after the block")
         }
     }
@@ -776,7 +776,7 @@ fn field_load(t: int, nt: Token) -> int {
                 hint = "did you mean '" + f.name + "'?"
             }
         }
-        if hint.len() == 0 {
+        if hint.byte_len() == 0 {
             if func_find(nt.text) >= 0 {
                 hint = "to call the function, write ." + nt.text + "()"
             }
@@ -839,23 +839,19 @@ fn parse_index(t: int) -> int {
         emit_mov_rr(RCX, RAX)
         emit_pop(RAX)
     }
+    if k == K_STR {
+        system_str_error(at, "str index s[i]", "s.byte(i)")
+    }
     expect_tok(']')
     no_struct = saved
     emit_bounds_check(at)
     emit_load(RAX, RAX, 0)
     if k == K_STR {
-        // movzx eax, byte [rax + rcx]
-        emit8(0x0F)
-        emit8(0xB6)
-        emit8(0x04)
-        emit8(0x08)
+        emit_movzx_index()
         return ty_int
     }
     if k == K_LIST && ty_elem(t) == ty_bool {
-        emit8(0x0F)
-        emit8(0xB6)
-        emit8(0x04)
-        emit8(0x08)
+        emit_movzx_index()
         return ty_bool
     }
     // mov rax, [rax + rcx*8]
@@ -871,6 +867,9 @@ fn parse_index(t: int) -> int {
 
 // Получатель в стеке, начало среза в rax; текущий токен — после «..».
 fn finish_slice(t: int, at: Token, saved: bool) -> int {
+    if tkind(t) == K_STR {
+        system_str_error(at, "str slice", "s.byte_slice(a, b)")
+    }
     emit_push(RAX)
     if kind() == ']' {
         // до конца: длина получателя
@@ -943,7 +942,7 @@ fn compile_args(ps: [Param], first: int, tt: int, kt: int, vt: int, name: str, a
         var sig = ""
         var j = first
         while j < ps.len() {
-            if sig.len() > 0 {
+            if sig.byte_len() > 0 {
                 sig += ", "
             }
             sig += ps[j].name + ": " + ty_name(ps[j].ty)
@@ -1541,6 +1540,9 @@ fn parse_builtin(t: Token, w: int) -> int {
         let t1 = parse_expr(ty_err)
         expect_tok(')')
         let k = tkind(t1)
+        if k == K_STR {
+            system_str_error(t, "len(str)", "s.byte_len()")
+        }
         if k == K_STR || k == K_LIST || k == K_MAP {
             emit_load(RAX, RAX, 8)
             return ty_int
@@ -1588,9 +1590,9 @@ fn parse_call(t: Token, w: int) -> int {
     advance()
     if fi < 0 {
         var hint = name_hint(name)
-        if hint.len() == 0 {
+        if hint.byte_len() == 0 {
             let s = similar_name(name)
-            if s.len() > 0 {
+            if s.byte_len() > 0 {
                 hint = "did you mean '" + s + "'?"
             }
         }
@@ -1650,6 +1652,40 @@ fn method_prefix(k: int) -> str {
     return ""
 }
 
+// Функция метода str. find, lower, upper и trim — пока те же байтовые функции,
+// что byte_find, ascii_lower, ascii_upper и ascii_trim; в системном коде эти
+// имена — ошибки (system_str_method).
+fn str_method_fn(name: str) -> str {
+    if name == "find" || name == "find_from" {
+        return "__str_byte_" + name
+    }
+    if name == "lower" || name == "upper" || name == "trim" {
+        return "__str_ascii_" + name
+    }
+    return "__str_" + name
+}
+
+// Методы str, которые в системном коде запрещены: у них будет символьный смысл.
+// Текущий токен — '('.
+fn system_str_method(nt: Token) {
+    let name = nt.text
+    if name == "len" {
+        system_str_error(nt, "str .len()", "s.byte_len()")
+    } else if name == "find" || name == "find_from" {
+        system_str_error(nt, "str ." + name + "()", "s.byte_" + name + "(...)")
+    } else if name == "lower" || name == "upper" || name == "trim" {
+        system_str_error(nt, "str ." + name + "()", "s.ascii_" + name + "()")
+    } else if name == "matches" {
+        system_str_error(nt, "regex .matches()", "a byte loop with s.byte(i)")
+    } else if (name == "split" || name == "replace") && kind_at(pos + 1) == T_STR && strlits[toks[pos + 1].val] == "" && (kind_at(pos + 2) == ',' || kind_at(pos + 2) == ')') {
+        if name == "split" {
+            system_str_error(nt, "split(\"\")", "a byte loop with s.byte(i)")
+        } else {
+            system_str_error(nt, "replace(\"\", ...)", "a Buf filled byte by byte")
+        }
+    }
+}
+
 fn skip_call_args() {
     let close = matching_close(pos)
     pos = close
@@ -1677,6 +1713,9 @@ fn parse_method(rt: int, nt: Token) -> int {
         skip_call_args()
         return ty_err
     }
+    if k == K_STR && system_code(nt) {
+        system_str_method(nt)
+    }
     if k == K_FLOAT && name == "to_int" && kind_at(pos + 1) == ')' {
         advance()
         advance()
@@ -1691,12 +1730,23 @@ fn parse_method(rt: int, nt: Token) -> int {
         last_was_call = false
         return ty_float
     }
-    if name == "len" && (k == K_STR || k == K_LIST || k == K_MAP) && kind_at(pos + 1) == ')' {
+    if ((name == "len" && (k == K_STR || k == K_LIST || k == K_MAP)) || (name == "byte_len" && k == K_STR)) && kind_at(pos + 1) == ')' {
         advance()
         advance()
         emit_load(RAX, RAX, 8)
         last_was_call = false
         return ty_int
+    }
+    if k == K_STR && name == "byte" && kind_at(pos + 2) == ')' {
+        // s.byte(i) с простым индексом: индекс сразу в rcx
+        pos += 1
+        if peek_simple(1) && is_int_like(op_ty) {
+            load_operand(RCX)
+            pos += 2
+            emit_byte_at(nt)
+            return ty_int
+        }
+        pos -= 1
     }
     if k == K_MAP {
         return parse_map_method(rt, nt)
@@ -1713,7 +1763,9 @@ fn parse_method(rt: int, nt: Token) -> int {
     }
     var fi = -1
     let prefix = method_prefix(k)
-    if prefix.len() > 0 {
+    if k == K_STR {
+        fi = func_find(str_method_fn(name))
+    } else if prefix.byte_len() > 0 {
         fi = func_find(prefix + name)
         if k == K_LIST && name == "sum" && tt == ty_float {
             fi = func_find("__list_sum_float")
@@ -1739,7 +1791,7 @@ fn parse_method(rt: int, nt: Token) -> int {
     }
     if fi < 0 {
         var hint = method_hint(name)
-        if hint.len() == 0 {
+        if hint.byte_len() == 0 {
             let uf = func_find(name)
             if uf >= 0 && funcs[uf].params.len() > 0 {
                 hint = "'" + name + "' takes " + ty_name(funcs[uf].params[0].ty) + " as its first parameter"
@@ -1765,9 +1817,30 @@ fn parse_method(rt: int, nt: Token) -> int {
         emit_call(rt_func("__barrier"))
         emit_store(RSP, 0, RAX)
     }
+    if k == K_STR && name == "byte" {
+        emit_pop(RCX)
+        emit_pop(RAX)
+        emit_byte_at(nt)
+        return ty_int
+    }
+    if k == K_STR && name == "byte_slice" {
+        // как срез s[a..b]: прямой вызов, без встраивания
+        emit_args_to_regs(n)
+        emit_call(rt_func("__str_slice"))
+        last_was_call = true
+        return ty_str
+    }
     emit_call_args(fi, n)
     last_was_call = true
     return subst(f.ret, tt, ty_err, ty_err)
+}
+
+// s.byte(i): получатель в rax, индекс в rcx; байт с проверкой границ.
+fn emit_byte_at(at: Token) {
+    emit_bounds_check(at)
+    emit_load(RAX, RAX, 0)
+    emit_movzx_index()
+    last_was_call = false
 }
 
 // contains/sort/index_of для [int] и [str] — разные функции библиотеки.

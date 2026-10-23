@@ -24,9 +24,9 @@ fn smap_new() -> StrMap {
 fn str_hash(s: str) -> int {
     var h = 5381
     var i = 0
-    let n = s.len()
+    let n = s.byte_len()
     while i < n {
-        h = (h * 33 + s[i]) & 0xFFFFFFF
+        h = (h * 33 + s.byte(i)) & 0xFFFFFFF
         i += 1
     }
     return h
@@ -97,8 +97,8 @@ fn min_int(a: int, b: int) -> int {
 
 // Расстояние редактирования — для подсказок «может быть, вы имели в виду».
 fn edit_distance(a: str, b: str) -> int {
-    let n = a.len()
-    let m = b.len()
+    let n = a.byte_len()
+    let m = b.byte_len()
     if n > 40 || m > 40 {
         return 99
     }
@@ -115,7 +115,7 @@ fn edit_distance(a: str, b: str) -> int {
         j = 1
         while j <= m {
             var cost = 1
-            if a[i - 1] == b[j - 1] {
+            if a.byte(i - 1) == b.byte(j - 1) {
                 cost = 0
             }
             cur.push(min_int(min_int(prev[j] + 1, cur[j - 1] + 1), prev[j - 1] + cost))

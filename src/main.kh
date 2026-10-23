@@ -5,7 +5,10 @@
 //   khc run <файл.kh>...            собрать и сразу запустить
 //   khc test <файл.kh>...           собрать и запустить блоки test
 //   khc check <файл.kh>...          только проверить
-//   ключи: --json (ошибки в JSON), --test (собрать запуск тестов в -o)
+//   ключи: --json (ошибки в JSON), --test (собрать запуск тестов в -o),
+//          --system (программа — системный код: строки только через байтовый
+//          API; так собираются исходники компилятора), --all-lib (проверить
+//          все функции подключённой библиотеки, а не только вызванные)
 //
 // Стандартная библиотека (lib/*.kh) подключается сама: каталог lib ищется
 // рядом с исполняемым файлом компилятора (../lib) или в $KHRIP_LIB.
@@ -104,8 +107,8 @@ fn run_image(img: str, name: str) -> int {
         return 1
     }
     var off = 0
-    while off < img.len() {
-        let w = syscall(1, fd, __str_ptr(img) + off, img.len() - off)
+    while off < img.byte_len() {
+        let w = syscall(1, fd, __str_ptr(img) + off, img.byte_len() - off)
         if w <= 0 {
             eprint("khc: cannot write the program image")
             return 1
@@ -173,8 +176,10 @@ fn usage() -> int {
     eprint("       khc run <file.kh>...     build and run")
     eprint("       khc test <file.kh>...    build and run the test blocks")
     eprint("       khc check <file.kh>...   only check")
-    eprint("options: --json  report errors as JSON")
-    eprint("         --test  build a runner for test blocks")
+    eprint("options: --json     report errors as JSON")
+    eprint("         --test     build a runner for test blocks")
+    eprint("         --system   system code: str only through the byte API")
+    eprint("         --all-lib  check every library function, not only the called ones")
     return 2
 }
 
@@ -187,6 +192,7 @@ fn main() -> int {
     var run = false
     var sizes = false
     var locks = false
+    var all_lib = false
     var i = 1
     while i < argv.len() {
         let a = argv[i]
@@ -210,6 +216,10 @@ fn main() -> int {
             sizes = true
         } else if a == "--locks" {
             locks = true
+        } else if a == "--system" {
+            system_mode = true
+        } else if a == "--all-lib" {
+            all_lib = true
         } else if a == "--version" {
             print("khc " + version())
             return 0
@@ -218,7 +228,7 @@ fn main() -> int {
         }
         i += 1
     }
-    if inputs.len() == 0 || (out.len() == 0 && !check_only && !run) {
+    if inputs.len() == 0 || (out.byte_len() == 0 && !check_only && !run) {
         return usage()
     }
     types_init()
@@ -283,10 +293,10 @@ fn main() -> int {
     emit8(0x0F)
     emit8(0x0B)
     // Функции программы компилируются все (ради ошибок), функции библиотеки —
-    // только вызванные: очередь work пополняет emit_call.
+    // только вызванные: очередь work пополняет emit_call. С --all-lib — все.
     var f = 0
     while f < funcs.len() {
-        if funcs[f].body >= 0 && !funcs[f].is_lib && !funcs[f].used {
+        if funcs[f].body >= 0 && (!funcs[f].is_lib || all_lib) && !funcs[f].used {
             funcs[f].used = true
             compile_fn(f)
         }

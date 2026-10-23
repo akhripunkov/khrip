@@ -1,0 +1,32 @@
+// flags: --system
+// expect: str .len() in system code: write s.byte_len()
+// expect: len(str) in system code: write s.byte_len()
+// expect: str index s[i] in system code: write s.byte(i)
+// expect: str slice in system code: write s.byte_slice(a, b)
+// expect: for over a str in system code: write for i in 0..s.byte_len() { s.byte(i) }
+// expect: treats str as bytes
+// expect: 7 errors
+// Системный код (--system, lib/, сгенерированный текст): строки — байты.
+fn main() {
+    let s = "abc"
+    var n = s.len()
+    n += len(s)
+    n += s[0]
+    let t = s[1..]
+    let u = s[..2]
+    let v = s[0..1]
+    for c in s {
+        n += c
+    }
+    // списки — как обычно
+    let xs = [1, 2, 3]
+    n += xs.len() + len(xs) + xs[0]
+    let ys = xs[1..]
+    for x in ys {
+        n += x
+    }
+    // байтовый API
+    n += s.byte_len() + s.byte(0) + s.byte(n - n) + (s.byte_find("b") ?? 0) + s.byte_find_from("c", 1)
+    let w = s.byte_slice(0, 2) + s.ascii_lower() + s.ascii_upper() + s.ascii_trim()
+    print(n.to_str() + t + u + v + w)
+}

@@ -251,7 +251,7 @@ fn parse_type() -> int {
                 t = ty_map(k, v)
             }
         } else if (name == "T" || name == "K" || name == "V") && generic_ok() {
-            t = ty_make(K_GEN, name[0], 0)
+            t = ty_make(K_GEN, name.byte(0), 0)
         } else {
             let s = struct_find(name)
             let u = sum_find(name)

@@ -122,12 +122,12 @@ fn prescan_api(k: int) {
 }
 
 fn path_name_ok(s: str) -> bool {
-    if s.len() == 0 || !is_alpha(s[0]) {
+    if s.byte_len() == 0 || !is_alpha(s.byte(0)) {
         return false
     }
     var i = 0
-    while i < s.len() {
-        if !is_ident_char(s[i]) {
+    while i < s.byte_len() {
+        if !is_ident_char(s.byte(i)) {
             return false
         }
         i += 1
@@ -138,17 +138,17 @@ fn path_name_ok(s: str) -> bool {
 // Сегменты пути "/users/{id}" → ["users", "{id}"].
 fn route_segments(path: str, at: Token) -> [str] {
     var segs: [str] = []
-    if path.len() == 0 || path[0] != '/' {
+    if path.byte_len() == 0 || path.byte(0) != '/' {
         error_tok(at, "a route path must start with /", "e.g. \"/users/\{id}\"")
         return segs
     }
     var start = 1
     var i = 1
-    while i <= path.len() {
-        if i == path.len() || path[i] == '/' {
-            let seg = path[start..i]
+    while i <= path.byte_len() {
+        if i == path.byte_len() || path.byte(i) == '/' {
+            let seg = path.byte_slice(start, i)
             if seg.starts_with("\{") {
-                if !seg.ends_with("}") || !path_name_ok(seg[1..seg.len() - 1]) {
+                if !seg.ends_with("}") || !path_name_ok(seg.byte_slice(1, seg.byte_len() - 1)) {
                     error_tok(at, "bad path parameter '" + seg + "'", "path parameters look like \{id}")
                 }
             } else if seg.contains("\{") || seg.contains("}") || seg.contains(" ") || seg.contains("?") {
@@ -209,8 +209,8 @@ fn prescan_route() {
         advance()
     } else {
         var hint = "e.g. route GET \"/users\" -> [User] \{ ... }"
-        if mt.kind == T_IDENT && is_http_method(mt.text.upper()) {
-            hint = "write the method in upper case: " + mt.text.upper()
+        if mt.kind == T_IDENT && is_http_method(mt.text.ascii_upper()) {
+            hint = "write the method in upper case: " + mt.text.ascii_upper()
             advance()
         }
         error_tok(mt, "expected an HTTP method (GET, POST, PUT, PATCH, DELETE), found " + tok_show(mt), hint)
@@ -277,7 +277,7 @@ fn prescan_route() {
     }
     for seg in segs {
         if seg.starts_with("\{") && seg.ends_with("}") {
-            let name = seg[1..seg.len() - 1]
+            let name = seg.byte_slice(1, seg.byte_len() - 1)
             var found = false
             for p in ps {
                 if p.name == name {
@@ -489,7 +489,7 @@ fn store_raw_type(t: int, seen: [int]) -> str {
             }
             for f in st.fields {
                 let r = store_raw_type(f.ty, seen)
-                if r.len() > 0 {
+                if r.byte_len() > 0 {
                     return r
                 }
             }
@@ -504,7 +504,7 @@ fn check_api() {
         if g.is_store && !files[toks[g.tok].file].is_lib {
             var seen: [int] = []
             let bad = store_raw_type(g.ty, seen)
-            if bad.len() > 0 {
+            if bad.byte_len() > 0 {
                 error_tok(toks[g.tok], "store '" + g.name + "' holds " + bad + ", which is a byte buffer of the library, not a value", "store the text instead: buf_str(b) gives a str")
             }
         }
@@ -703,7 +703,7 @@ fn default_word(i: int, ty: int) -> int {
 fn variants_text(r: Route) -> str {
     var s = ""
     for v in r.variants {
-        if s.len() > 0 {
+        if s.byte_len() > 0 {
             s += " | "
         }
         if v.ty < 0 {
@@ -982,9 +982,9 @@ fn in_test() -> bool {
 }
 
 fn expect_text(at: Token) -> str {
-    var line = source_line(at.file, at.line).trim()
+    var line = source_line(at.file, at.line).ascii_trim()
     if line.starts_with("expect ") {
-        line = line[7..line.len()].trim()
+        line = line.byte_slice(7, line.byte_len()).ascii_trim()
     }
     return line
 }
@@ -1192,8 +1192,8 @@ fn parse_fetch(at: Token) -> int {
 fn src_lit(s: str) -> str {
     var r = "\""
     var i = 0
-    while i < s.len() {
-        let c = s[i]
+    while i < s.byte_len() {
+        let c = s.byte(i)
         if c == '"' || c == '\\' || c == '\{' {
             r += "\\"
         }
@@ -1257,14 +1257,14 @@ fn gen_param(b: Buf, r: Route, i: int) {
     }
     if !optional {
         buf_add(b, "            let " + v + "_s = " + q + " else \{\n                __missing(" + lit + ")\n                return\n            }\n")
-        if conv.len() == 0 {
+        if conv.byte_len() == 0 {
             buf_add(b, "            let " + v + " = " + v + "_s\n")
         } else {
             buf_add(b, "            let " + v + " = " + conv + "(" + v + "_s, " + lit + ") else \{\n                return\n            }\n")
         }
         return
     }
-    if conv.len() == 0 {
+    if conv.byte_len() == 0 {
         buf_add(b, "            let " + v + " = " + q + "\n")
         return
     }
@@ -1328,7 +1328,7 @@ fn gen_route_call(b: Buf, r: Route, ri: int) {
     }
     var args = ""
     for p in ps {
-        if args.len() > 0 {
+        if args.byte_len() > 0 {
             args += ", "
         }
         args += "p_" + p.name

@@ -21,12 +21,12 @@ fn hex_val(c: int) -> int {
 // Байты машинного кода из строки «C5 FD 74 C1».
 fn emit_hex(s: str) {
     var i = 0
-    while i + 1 < s.len() {
-        if s[i] == ' ' {
+    while i + 1 < s.byte_len() {
+        if s.byte(i) == ' ' {
             i += 1
             continue
         }
-        emit8(hex_val(s[i]) * 16 + hex_val(s[i + 1]))
+        emit8(hex_val(s.byte(i)) * 16 + hex_val(s.byte(i + 1)))
         i += 2
     }
 }

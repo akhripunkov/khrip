@@ -239,7 +239,7 @@ fn __out_raw(c: __Conn, p: int, n: int) {
 }
 
 fn __out_str(c: __Conn, s: str) {
-    __out_raw(c, __str_ptr(s), s.len())
+    __out_raw(c, __str_ptr(s), s.byte_len())
 }
 
 fn __out_int(c: __Conn, x: int) {
@@ -321,7 +321,7 @@ fn __lower(c: int) -> int {
 
 // Сравнение без учёта регистра с образцом в нижнем регистре.
 fn __ieq(p: int, n: int, s: str) -> bool {
-    if n != s.len() {
+    if n != s.byte_len() {
         return false
     }
     let q = __str_ptr(s)
@@ -975,7 +975,7 @@ fn __data_path() -> str {
 }
 
 fn __timers_wanted() -> bool {
-    return __every_count() > 0 || __data_path().len() > 0
+    return __every_count() > 0 || __data_path().byte_len() > 0
 }
 
 fn __signal_set() -> int {
@@ -992,7 +992,7 @@ fn __block_signals() {
 
 fn __load_store() {
     let path = __data_path()
-    if path.len() == 0 {
+    if path.byte_len() == 0 {
         return
     }
     let text = read_file(path) else {
@@ -1050,7 +1050,7 @@ fn __timer_loop() {
     }
     let set = __signal_set()
     let ts = __alloc(16)
-    let saving = __data_path().len() > 0
+    let saving = __data_path().byte_len() > 0
     while true {
         var wait = 3600000
         if saving {

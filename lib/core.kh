@@ -464,11 +464,26 @@ fn __str_concat(a: str, b: str) -> str {
     return __str_new(p, an + bn)
 }
 
+// ---- Байтовый API ----
+// Длина, байт, срез и поиск в байтах; смена регистра и обрезка пробелов — только
+// ASCII. Системный код (компилятор и библиотека) работает со строками только так:
+// s.byte_len() и s.byte(i) khc встраивает, s.byte_slice(a, b) вызывает __str_slice
+// напрямую; загрузчик (boot) находит эти функции по имени.
+
+fn __str_byte_len(self: str) -> int {
+    return __str_len(self)
+}
+
 fn __str_byte(self: str, i: int) -> int {
     if i < 0 || i >= __str_len(self) {
         __panic(PANIC_INDEX, "str")
     }
     return load8(__str_ptr(self) + i)
+}
+
+// Байты [from, to) без копирования; символ UTF-8 может разрезаться.
+fn __str_byte_slice(self: str, from: int, to: int) -> str {
+    return __str_slice(self, from, to)
 }
 
 // Границы среза прижимаются к [0, len], как в Python и JS: xs[a..a + n] не
@@ -491,7 +506,8 @@ fn __str_slice(self: str, from: int, to: int) -> str {
     return __str_new(__str_ptr(self) + a, b - a)
 }
 
-fn __str_find_from(self: str, sub: str, from: int) -> int {
+// Первое вхождение sub с байта from: индекс байта или -1.
+fn __str_byte_find_from(self: str, sub: str, from: int) -> int {
     let n = __str_len(self)
     let m = __str_len(sub)
     let p = __str_ptr(self)
@@ -515,8 +531,8 @@ fn __str_find_from(self: str, sub: str, from: int) -> int {
     return -1
 }
 
-fn __str_find(self: str, sub: str) -> int? {
-    let i = __str_find_from(self, sub, 0)
+fn __str_byte_find(self: str, sub: str) -> int? {
+    let i = __str_byte_find_from(self, sub, 0)
     if i < 0 {
         return none
     }
@@ -524,7 +540,7 @@ fn __str_find(self: str, sub: str) -> int? {
 }
 
 fn __str_contains(self: str, sub: str) -> bool {
-    return __str_find_from(self, sub, 0) >= 0
+    return __str_byte_find_from(self, sub, 0) >= 0
 }
 
 fn __str_starts_with(self: str, prefix: str) -> bool {
@@ -542,7 +558,8 @@ fn __is_space(c: int) -> bool {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r'
 }
 
-fn __str_trim(self: str) -> str {
+// Без пробелов ASCII (SP HT CR LF) по краям.
+fn __str_ascii_trim(self: str) -> str {
     let p = __str_ptr(self)
     var a = 0
     var b = __str_len(self)
@@ -588,11 +605,11 @@ fn __str_case(self: str, lo: int, below: int, past: int) -> str {
     return __str_new(p, n)
 }
 
-fn __str_lower(self: str) -> str {
+fn __str_ascii_lower(self: str) -> str {
     return __str_case(self, 'A', 0x3F3F3F3F, 0x25252525)
 }
 
-fn __str_upper(self: str) -> str {
+fn __str_ascii_upper(self: str) -> str {
     return __str_case(self, 'a', 0x1F1F1F1F, 0x05050505)
 }
 
@@ -605,7 +622,7 @@ fn __str_split(self: str, sep: str) -> [str] {
         return parts
     }
     while true {
-        let i = __str_find_from(self, sep, start)
+        let i = __str_byte_find_from(self, sep, start)
         if i < 0 {
             break
         }
@@ -624,7 +641,7 @@ fn __str_replace(self: str, old: str, new: str) -> str {
     let b = buf_new(__str_len(self) + 16)
     var start = 0
     while true {
-        let i = __str_find_from(self, old, start)
+        let i = __str_byte_find_from(self, old, start)
         if i < 0 {
             break
         }
@@ -1626,7 +1643,7 @@ fn __int_to_f64_bits(v: int) -> int {
         sign = 1 << 63
     }
     let s = __int_to_str(v)
-    return sign | __dec_to_f64(__str_ptr(s), s.len(), 0)
+    return sign | __dec_to_f64(__str_ptr(s), s.byte_len(), 0)
 }
 
 // x == v, где x — int? или bool? (ячейка или 0).

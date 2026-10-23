@@ -31,7 +31,8 @@ fn __sha_kt() -> int {
     let t = __mmap(4096)
     var n = 0
     var v = 0
-    for c in hex {
+    for i in 0..hex.byte_len() {
+        let c = hex.byte(i)
         if c == ' ' {
             store32(t + n * 4, v)
             n += 1
@@ -120,8 +121,8 @@ fn __hex_bytes(p: int, n: int) -> str {
     let b = buf_new(n * 2)
     for i in 0..n {
         let v = load8(p + i)
-        buf_byte(b, digits[v >> 4])
-        buf_byte(b, digits[v & 15])
+        buf_byte(b, digits.byte(v >> 4))
+        buf_byte(b, digits.byte(v & 15))
     }
     return __str_new(b.data, b.len)
 }
@@ -129,7 +130,7 @@ fn __hex_bytes(p: int, n: int) -> str {
 // SHA-256 текста — 64 шестнадцатеричные цифры.
 fn sha256(text: str) -> str {
     let out = __alloc(32)
-    __sha256(__str_ptr(text), text.len(), out)
+    __sha256(__str_ptr(text), text.byte_len(), out)
     return __hex_bytes(out, 32)
 }
 
@@ -187,8 +188,8 @@ fn __pbkdf2(pw: str, salt: int, slen: int, iter: int, out: int) {
     let k = __sha_kt()
     let w = __alloc(512)
     let st = __alloc(32)
-    let ist = __hmac_state(__str_ptr(pw), pw.len(), 0x36, k, w)
-    let ost = __hmac_state(__str_ptr(pw), pw.len(), 0x5c, k, w)
+    let ist = __hmac_state(__str_ptr(pw), pw.byte_len(), 0x36, k, w)
+    let ost = __hmac_state(__str_ptr(pw), pw.byte_len(), 0x5c, k, w)
     let msg = __alloc(64)
     __memcpy(msg, salt, slen)
     store32(msg + slen, 0x01000000)
@@ -227,9 +228,9 @@ fn __pbkdf2_unlocked(pw: str, salt: int, slen: int, iter: int, out: int) {
 }
 
 fn __unhex(s: str, out: int) -> int {
-    let n = s.len() / 2
+    let n = s.byte_len() / 2
     for i in 0..n {
-        store8(out + i, __hex_val(s[2 * i]) * 16 + __hex_val(s[2 * i + 1]))
+        store8(out + i, __hex_val(s.byte(2 * i)) * 16 + __hex_val(s.byte(2 * i + 1)))
     }
     return n
 }
@@ -245,7 +246,7 @@ fn hash_password(password: str) -> str {
 
 fn check_password(password: str, stored: str) -> bool {
     let parts = stored.split("$")
-    if parts.len() != 4 || parts[0] != "pbkdf2_sha256" || parts[2].len() > 64 {
+    if parts.len() != 4 || parts[0] != "pbkdf2_sha256" || parts[2].byte_len() > 64 {
         return false
     }
     let iter = parts[1].to_int() ?? 0
@@ -257,13 +258,13 @@ fn check_password(password: str, stored: str) -> bool {
     let dk = __alloc(32)
     __pbkdf2_unlocked(password, salt, slen, iter, dk)
     let got = __hex_bytes(dk, 32)
-    if got.len() != parts[3].len() {
+    if got.byte_len() != parts[3].byte_len() {
         return false
     }
     // без раннего выхода: время сравнения не зависит от места расхождения
     var diff = 0
-    for i in 0..got.len() {
-        diff = diff | (got[i] ^ parts[3][i])
+    for i in 0..got.byte_len() {
+        diff = diff | (got.byte(i) ^ parts[3].byte(i))
     }
     return diff == 0
 }
@@ -275,12 +276,12 @@ fn check_password(password: str, stored: str) -> bool {
 fn __hex_words64(hex: str, p: int) {
     var n = 0
     var i = 0
-    while i + 16 <= hex.len() {
+    while i + 16 <= hex.byte_len() {
         var hi = 0
         var lo = 0
         for j in 0..8 {
-            hi = hi * 16 + __hex_val(hex[i + j])
-            lo = lo * 16 + __hex_val(hex[i + 8 + j])
+            hi = hi * 16 + __hex_val(hex.byte(i + j))
+            lo = lo * 16 + __hex_val(hex.byte(i + 8 + j))
         }
         store32(p + n * 8, lo)
         store32(p + n * 8 + 4, hi)
@@ -469,12 +470,12 @@ fn __hkdf_expand(size: int, prk: int, info: int, ilen: int, out: int, len: int) 
 // HKDF-Expand-Label из TLS 1.3 (RFC 8446, 7.1): метка «tls13 label».
 fn __hkdf_label(size: int, secret: int, label: str, ctx: int, clen: int, out: int, len: int) {
     let full = "tls13 " + label
-    let info = __alloc(4 + full.len() + clen)
+    let info = __alloc(4 + full.byte_len() + clen)
     store8(info, len >> 8)
     store8(info + 1, len & 255)
-    store8(info + 2, full.len())
-    __memcpy(info + 3, __str_ptr(full), full.len())
-    store8(info + 3 + full.len(), clen)
-    __memcpy(info + 4 + full.len(), ctx, clen)
-    __hkdf_expand(size, secret, info, 4 + full.len() + clen, out, len)
+    store8(info + 2, full.byte_len())
+    __memcpy(info + 3, __str_ptr(full), full.byte_len())
+    store8(info + 3 + full.byte_len(), clen)
+    __memcpy(info + 4 + full.byte_len(), ctx, clen)
+    __hkdf_expand(size, secret, info, 4 + full.byte_len() + clen, out, len)
 }

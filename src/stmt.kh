@@ -1446,6 +1446,9 @@ fn for_range(n1: Token, inclusive: bool, saved_ns: bool) {
 // for x in список / строка (байты); for i, x in ...
 fn for_list(n1: Token, n2: Token, two: bool, t: int) {
     let is_str = tkind(t) == K_STR
+    if is_str {
+        system_str_error(n1, "for over a str", "for i in 0..s.byte_len() \{ s.byte(i) }")
+    }
     let lst = hidden_local(t)
     emit_store_local(lst)
     var idx = -1
@@ -1478,10 +1481,7 @@ fn for_list(n1: Token, n2: Token, two: bool, t: int) {
         emit_load(RCX, RBP, il.off)
     }
     if is_str || et == ty_bool {
-        emit8(0x0F)
-        emit8(0xB6)
-        emit8(0x04)
-        emit8(0x08)
+        emit_movzx_index()
     } else {
         emit8(0x48)
         emit8(0x8B)

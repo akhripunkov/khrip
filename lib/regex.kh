@@ -56,10 +56,10 @@ fn __rx_fail(r: __Rx, msg: str) -> int {
 }
 
 fn __rx_peek(r: __Rx) -> int {
-    if r.p >= r.pat.len() {
+    if r.p >= r.pat.byte_len() {
         return -1
     }
-    return r.pat[r.p]
+    return r.pat.byte(r.p)
 }
 
 // Новый пустой класс: номер.
@@ -155,7 +155,7 @@ fn __rx_class(r: __Rx) -> int {
             lo = __rx_plain_escape(e)
         }
         var hi = lo
-        if __rx_peek(r) == '-' && r.p + 1 < r.pat.len() && r.pat[r.p + 1] != ']' {
+        if __rx_peek(r) == '-' && r.p + 1 < r.pat.byte_len() && r.pat.byte(r.p + 1) != ']' {
             r.p += 1
             hi = __rx_peek(r)
             r.p += 1
@@ -182,7 +182,7 @@ fn __rx_atom(r: __Rx) -> int {
     let c = __rx_peek(r)
     if c == '(' {
         r.p += 1
-        if __rx_peek(r) == '?' && r.p + 1 < r.pat.len() && r.pat[r.p + 1] == ':' {
+        if __rx_peek(r) == '?' && r.p + 1 < r.pat.byte_len() && r.pat.byte(r.p + 1) == ':' {
             r.p += 2
         }
         let n = __rx_alt(r)
@@ -351,14 +351,14 @@ fn __rx_compile(pattern: str) -> __Rx {
     var pat = pattern
     // ^ и $ по краям ничего не меняют: совпадение всегда целиком
     if pat.starts_with("^") {
-        pat = pat[1..]
+        pat = pat.byte_slice(1, pat.byte_len())
     }
     if pat.ends_with("$") && !pat.ends_with("\\$") {
-        pat = pat[..pat.len() - 1]
+        pat = pat.byte_slice(0, pat.byte_len() - 1)
     }
     let r = __Rx { pat, p: 0, err: "", kind: [], a: [], b: [], c: [], classes: [], nclasses: 0, op: [], x: [], y: [] }
     let root = __rx_alt(r)
-    if r.p < pat.len() && r.err == "" {
+    if r.p < pat.byte_len() && r.err == "" {
         __rx_fail(r, "unexpected )")
     }
     if r.op.len() > 100000 {
@@ -393,8 +393,8 @@ fn __rx_run(r: __Rx, s: str) -> bool {
     var next: [int] = []
     var gen = 1
     __rx_add(r, cur, mark, gen, 0)
-    for i in 0..s.len() {
-        let c = s[i]
+    for i in 0..s.byte_len() {
+        let c = s.byte(i)
         gen += 1
         next.clear()
         for pc in cur {

@@ -40,7 +40,7 @@ fn int_in(xs: [int], v: int) -> bool {
 fn variant_names(s: int) -> str {
     var r = ""
     for v in sums[s].variants {
-        if r.len() > 0 {
+        if r.byte_len() > 0 {
             r += ", "
         }
         r += structs[v].name
@@ -425,13 +425,13 @@ fn parse_match(as_value: bool, w: int) -> int {
             var missing = ""
             for v in sums[sum].variants {
                 if !int_in(covered, v) {
-                    if missing.len() > 0 {
+                    if missing.byte_len() > 0 {
                         missing += ", "
                     }
                     missing += structs[v].name
                 }
             }
-            if missing.len() > 0 {
+            if missing.byte_len() > 0 {
                 error_tok(at, "match does not handle " + missing, "add an arm for each, or _ => ...")
             } else {
                 complete = true

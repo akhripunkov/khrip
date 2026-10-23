@@ -51,42 +51,42 @@ var sq_built: bool
 fn sq_lex(s: str) -> [SqTok] {
     var out: [SqTok] = []
     var i = 0
-    let n = s.len()
+    let n = s.byte_len()
     while i < n {
-        let c = s[i]
+        let c = s.byte(i)
         if c == ' ' || c == '\n' || c == '\t' || c == '\r' {
             i += 1
             continue
         }
-        if c == '-' && i + 1 < n && s[i + 1] == '-' {
-            while i < n && s[i] != '\n' {
+        if c == '-' && i + 1 < n && s.byte(i + 1) == '-' {
+            while i < n && s.byte(i) != '\n' {
                 i += 1
             }
             continue
         }
-        if c == '/' && i + 1 < n && s[i + 1] == '*' {
+        if c == '/' && i + 1 < n && s.byte(i + 1) == '*' {
             i += 2
-            while i + 1 < n && !(s[i] == '*' && s[i + 1] == '/') {
+            while i + 1 < n && !(s.byte(i) == '*' && s.byte(i + 1) == '/') {
                 i += 1
             }
             i += 2
             continue
         }
         let start = i
-        if c == '\'' || ((c == 'e' || c == 'E') && i + 1 < n && s[i + 1] == '\'') {
+        if c == '\'' || ((c == 'e' || c == 'E') && i + 1 < n && s.byte(i + 1) == '\'') {
             if c != '\'' {
                 i += 1
             }
             i += 1
             while i < n {
-                if s[i] == '\'' {
-                    if i + 1 < n && s[i + 1] == '\'' {
+                if s.byte(i) == '\'' {
+                    if i + 1 < n && s.byte(i + 1) == '\'' {
                         i += 2
                         continue
                     }
                     break
                 }
-                if s[i] == '\\' && c != '\'' {
+                if s.byte(i) == '\\' && c != '\'' {
                     i += 1
                 }
                 i += 1
@@ -95,27 +95,27 @@ fn sq_lex(s: str) -> [SqTok] {
             out.push(SqTok { kind: SQ_STR, text: "", at: start })
             continue
         }
-        if c == '$' && i + 1 < n && is_digit(s[i + 1]) {
+        if c == '$' && i + 1 < n && is_digit(s.byte(i + 1)) {
             i += 1
-            while i < n && is_digit(s[i]) {
+            while i < n && is_digit(s.byte(i)) {
                 i += 1
             }
-            out.push(SqTok { kind: SQ_PARAM, text: s[start..i], at: start })
+            out.push(SqTok { kind: SQ_PARAM, text: s.byte_slice(start, i), at: start })
             continue
         }
         if c == '$' {
             // $$...$$ или $tag$...$tag$
             var j = i + 1
-            while j < n && is_ident_char(s[j]) {
+            while j < n && is_ident_char(s.byte(j)) {
                 j += 1
             }
-            if j < n && s[j] == '$' {
-                let tag = s[i..j + 1]
+            if j < n && s.byte(j) == '$' {
+                let tag = s.byte_slice(i, j + 1)
                 var k = j + 1
-                while k + tag.len() <= n && s[k..k + tag.len()] != tag {
+                while k + tag.byte_len() <= n && s.byte_slice(k, k + tag.byte_len()) != tag {
                     k += 1
                 }
-                i = k + tag.len()
+                i = k + tag.byte_len()
                 out.push(SqTok { kind: SQ_STR, text: "", at: start })
                 continue
             }
@@ -123,8 +123,8 @@ fn sq_lex(s: str) -> [SqTok] {
         if c == '"' {
             i += 1
             let b = buf_new(16)
-            while i < n && s[i] != '"' {
-                buf_byte(b, s[i])
+            while i < n && s.byte(i) != '"' {
+                buf_byte(b, s.byte(i))
                 i += 1
             }
             i += 1
@@ -133,34 +133,34 @@ fn sq_lex(s: str) -> [SqTok] {
         }
         if is_alpha(c) {
             let b = buf_new(16)
-            while i < n && (is_ident_char(s[i]) || s[i] == '$') {
-                buf_byte(b, sql_lower(s[i]))
+            while i < n && (is_ident_char(s.byte(i)) || s.byte(i) == '$') {
+                buf_byte(b, sql_lower(s.byte(i)))
                 i += 1
             }
             out.push(SqTok { kind: SQ_WORD, text: buf_str(b), at: start })
             continue
         }
-        if is_digit(c) || (c == '.' && i + 1 < n && is_digit(s[i + 1])) {
-            while i < n && (is_ident_char(s[i]) || s[i] == '.') {
+        if is_digit(c) || (c == '.' && i + 1 < n && is_digit(s.byte(i + 1))) {
+            while i < n && (is_ident_char(s.byte(i)) || s.byte(i) == '.') {
                 i += 1
             }
-            out.push(SqTok { kind: SQ_NUM, text: s[start..i], at: start })
+            out.push(SqTok { kind: SQ_NUM, text: s.byte_slice(start, i), at: start })
             continue
         }
         // знаки: ::, двухсимвольные операторы, остальное по одному
         if i + 1 < n {
-            let two = s[i..i + 2]
+            let two = s.byte_slice(i, i + 2)
             if two == "::" || two == "<=" || two == ">=" || two == "<>" || two == "!=" || two == "||" || two == "->" || two == "=>" {
                 i += 2
-                if two == "->" && i < n && s[i] == '>' {
+                if two == "->" && i < n && s.byte(i) == '>' {
                     i += 1
                 }
-                out.push(SqTok { kind: SQ_PUNCT, text: s[start..i], at: start })
+                out.push(SqTok { kind: SQ_PUNCT, text: s.byte_slice(start, i), at: start })
                 continue
             }
         }
         i += 1
-        out.push(SqTok { kind: SQ_PUNCT, text: s[start..i], at: start })
+        out.push(SqTok { kind: SQ_PUNCT, text: s.byte_slice(start, i), at: start })
     }
     return out
 }
@@ -330,7 +330,7 @@ fn sq_create_table(t: [SqTok], i: int) {
     }
     k = sq_table_name(t, k)
     let name = sq_last_name
-    if name.len() == 0 {
+    if name.byte_len() == 0 {
         sq_uncertain = true
         return
     }
@@ -681,7 +681,7 @@ fn sq_similar(name: str, names: [str]) -> str {
     var bd = 3
     for n in names {
         let d = edit_distance(name, n)
-        if d < bd && d <= (name.len() + 2) / 3 {
+        if d < bd && d <= (name.byte_len() + 2) / 3 {
             bd = d
             best = n
         }
@@ -716,7 +716,7 @@ fn sq_report(at: Token, lit: SqlLit, word: str, msg: str, hint: str) {
             var line = lit.lines[si]
             var col = lit.cols[si]
             for k in 0..p {
-                if seg[k] == '\n' {
+                if seg.byte(k) == '\n' {
                     line += 1
                     col = 1
                 } else {
@@ -733,14 +733,14 @@ fn sq_report(at: Token, lit: SqlLit, word: str, msg: str, hint: str) {
 }
 
 fn sq_word_pos(seg: str, word: str) -> int {
-    let n = seg.len()
-    let w = word.len()
+    let n = seg.byte_len()
+    let w = word.byte_len()
     var i = 0
     while i + w <= n {
-        var ok = (i == 0 || !is_ident_char(seg[i - 1])) && (i + w == n || !is_ident_char(seg[i + w]))
+        var ok = (i == 0 || !is_ident_char(seg.byte(i - 1))) && (i + w == n || !is_ident_char(seg.byte(i + w)))
         if ok {
             for k in 0..w {
-                if sql_lower(seg[i + k]) != word[k] {
+                if sql_lower(seg.byte(i + k)) != word.byte(k) {
                     ok = false
                     break
                 }
@@ -948,7 +948,7 @@ fn sq_fits(field_ty: int, col_ty: str) -> str {
     var base = col_ty
     var arr = false
     if col_ty.ends_with("[]") {
-        base = col_ty[0..col_ty.len() - 2]
+        base = col_ty.byte_slice(0, col_ty.byte_len() - 2)
         arr = true
     }
     let ints = base == "integer" || base == "bigint" || base == "smallint"
@@ -995,7 +995,7 @@ fn sq_fits(field_ty: int, col_ty: str) -> str {
 
 fn sq_kh_for(col_ty: str) -> str {
     if col_ty.ends_with("[]") {
-        return "[" + sq_kh_for(col_ty[0..col_ty.len() - 2]) + "]"
+        return "[" + sq_kh_for(col_ty.byte_slice(0, col_ty.byte_len() - 2)) + "]"
     }
     if col_ty == "integer" || col_ty == "bigint" || col_ty == "smallint" {
         return "int"
@@ -1043,7 +1043,7 @@ fn sq_check(at: Token, lit: SqlLit, cur: str, shape: int, inner: int, ps: [SqlPa
             if !nm.contains(".") && !nm.starts_with("pg_") && !sq_has(sc.defined, nm) && sq_table(nm) < 0 && (t[k].kind == SQ_QUOTED || !sq_keyword(w)) {
                 let s = sq_similar(nm, all_names)
                 var hint = "tables: " + all_names.join(", ")
-                if s.len() > 0 {
+                if s.byte_len() > 0 {
                     hint = "did you mean " + s + "? " + hint
                 }
                 sq_report(at, lit, nm, "no table " + nm + " in the migrations", hint)
@@ -1075,7 +1075,7 @@ fn sq_check(at: Token, lit: SqlLit, cur: str, shape: int, inner: int, ps: [SqlPa
                         let names = sq_table_cols(ti)
                         let s = sq_similar(cn, names)
                         var hint = sq_tables[ti].name + " has " + names.join(", ")
-                        if s.len() > 0 {
+                        if s.byte_len() > 0 {
                             hint = "did you mean " + s + "? " + hint
                         }
                         sq_report(at, lit, cn, sq_tables[ti].name + " has no column " + cn, hint)
@@ -1102,7 +1102,7 @@ fn sq_check(at: Token, lit: SqlLit, cur: str, shape: int, inner: int, ps: [SqlPa
                     }
                     let s = sq_similar(w, names)
                     var hint = where + ": " + names.join(", ")
-                    if s.len() > 0 {
+                    if s.byte_len() > 0 {
                         hint = "did you mean " + s + "? " + hint
                     }
                     sq_report(at, lit, w, "no column " + w + " in " + where, hint)
@@ -1159,9 +1159,9 @@ fn sq_check(at: Token, lit: SqlLit, cur: str, shape: int, inner: int, ps: [SqlPa
             error_tok(at, ty_name(inner) + " takes one column, but the query returns " + outs.len().to_str() + ": " + names.join(", "), "select one column, or use a type with these fields")
             return
         }
-        if outs.len() == 1 && outs[0].ty.len() > 0 {
+        if outs.len() == 1 && outs[0].ty.byte_len() > 0 {
             let why = sq_fits(inner, outs[0].ty)
-            if why.len() > 0 {
+            if why.byte_len() > 0 {
                 error_tok(at, "column " + outs[0].name + " is " + outs[0].ty + ", but " + ty_name(inner) + " is expected", "make it " + sq_kh_for(outs[0].ty) + " (or cast in SQL)")
             }
         }
@@ -1188,9 +1188,9 @@ fn sq_check(at: Token, lit: SqlLit, cur: str, shape: int, inner: int, ps: [SqlPa
                 continue
             }
             let o = outs[oi]
-            if o.ty.len() > 0 {
+            if o.ty.byte_len() > 0 {
                 let why = sq_fits(f.ty, o.ty)
-                if why.len() > 0 {
+                if why.byte_len() > 0 {
                     error_tok(at, st.name + "." + f.name + " is " + ty_name(f.ty) + ", but column " + o.name + " is " + o.ty, "make the field " + sq_kh_for(o.ty) + " (or cast in SQL)")
                     return
                 }
@@ -1216,13 +1216,13 @@ fn sq_col_type(t: [SqTok], i: int, sc: SqScope) -> str {
         name = t[i + 2].text
         al = t[i].text
     }
-    if name.len() == 0 || sq_left_joined(t) {
+    if name.byte_len() == 0 || sq_left_joined(t) {
         return ""
     }
     var ty = ""
     var found = 0
     for x in 0..sc.tables.len() {
-        if al.len() == 0 || sc.aliases[x] == al {
+        if al.byte_len() == 0 || sc.aliases[x] == al {
             let ci = sq_find_col(sc.tables[x], name)
             if ci >= 0 {
                 ty = sq_tables[sc.tables[x]].cols[ci].ty
@@ -1286,7 +1286,7 @@ fn sq_check_params(at: Token, t: [SqTok], sc: SqScope, ps: [SqlParam]) -> bool {
         if t[i].kind != SQ_PARAM {
             continue
         }
-        let no = (t[i].text[1..t[i].text.len()].to_int() ?? 0) - 1
+        let no = (t[i].text.byte_slice(1, t[i].text.byte_len()).to_int() ?? 0) - 1
         if no < 0 || no >= ps.len() || (ps[no].kind != PK_VAL && ps[no].kind != PK_FIELD) {
             continue
         }
@@ -1300,9 +1300,9 @@ fn sq_check_params(at: Token, t: [SqTok], sc: SqScope, ps: [SqlParam]) -> bool {
         } else if i + 2 < t.len() && (sq_is(t, i + 1, "=") || sq_is(t, i + 1, "<>") || sq_is(t, i + 1, "<") || sq_is(t, i + 1, ">") || sq_is(t, i + 1, "<=") || sq_is(t, i + 1, ">=")) && !sq_is(t, i + 3, "(") && !sq_is(t, i + 3, "::") {
             col = sq_col_type(t, i + 2, sc)
         }
-        if col.len() > 0 && !(i >= 3 && sq_is(t, i - 3, "::")) {
+        if col.byte_len() > 0 && !(i >= 3 && sq_is(t, i - 3, "::")) {
             let why = sq_param_fits(ps[no].ty, col)
-            if why.len() > 0 {
+            if why.byte_len() > 0 {
                 error_tok(at, "a value is compared with or written to a " + col + " column, but " + why, "")
                 return true
             }
@@ -1327,11 +1327,11 @@ fn sq_check_params(at: Token, t: [SqTok], sc: SqScope, ps: [SqlParam]) -> bool {
                 var p = j + 2
                 while p < t.len() && !sq_is(t, p, ")") {
                     if t[p].kind == SQ_PARAM && (sq_is(t, p + 1, ",") || sq_is(t, p + 1, ")")) && pos < cols.len() {
-                        let no = (t[p].text[1..t[p].text.len()].to_int() ?? 0) - 1
+                        let no = (t[p].text.byte_slice(1, t[p].text.byte_len()).to_int() ?? 0) - 1
                         let ci = sq_find_col(ti, cols[pos])
                         if no >= 0 && no < ps.len() && ci >= 0 && (ps[no].kind == PK_VAL || ps[no].kind == PK_FIELD) {
                             let why = sq_param_fits(ps[no].ty, sq_tables[ti].cols[ci].ty)
-                            if why.len() > 0 {
+                            if why.byte_len() > 0 {
                                 error_tok(at, "INSERT INTO " + sq_tables[ti].name + ": " + cols[pos] + " is " + sq_tables[ti].cols[ci].ty + ", but " + why, "")
                                 return true
                             }
@@ -1515,7 +1515,7 @@ fn sq_outputs(t: [SqTok], sc: SqScope) -> [SqOut] {
             col_name = it[2].text
             col_al = it[0].text
         }
-        if col_name.len() > 0 {
+        if col_name.byte_len() > 0 {
             let x = sq_owner(sc, col_al, col_name)
             if x >= 0 {
                 let ti = sc.tables[x]
@@ -1532,11 +1532,11 @@ fn sq_outputs(t: [SqTok], sc: SqScope) -> [SqOut] {
                     }
                 }
             }
-            if name.len() == 0 {
+            if name.byte_len() == 0 {
                 name = col_name
             }
         }
-        if name.len() == 0 {
+        if name.byte_len() == 0 {
             // выражение без AS: имя даёт PostgreSQL (count, coalesce, ?column?)
             name = "?"
         }
@@ -1588,12 +1588,12 @@ fn sq_owner(sc: SqScope, al: str, col: str) -> int {
     var ti_found = -1
     for x in 0..sc.tables.len() {
         let ti = sc.tables[x]
-        if (al.len() == 0 || sc.aliases[x] == al) && sq_find_col(ti, col) >= 0 {
+        if (al.byte_len() == 0 || sc.aliases[x] == al) && sq_find_col(ti, col) >= 0 {
             if found < 0 {
                 found = x
                 ti_found = ti
-            } else if ti != ti_found || al.len() > 0 {
-                if al.len() == 0 {
+            } else if ti != ti_found || al.byte_len() > 0 {
+                if al.byte_len() == 0 {
                     return -2
                 }
             }

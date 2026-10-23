@@ -39,25 +39,25 @@ fn __parse_url(url: str) -> __Url? {
     var rest = ""
     var https = false
     if url.starts_with("http://") {
-        rest = url[7..]
+        rest = url.byte_slice(7, url.byte_len())
     } else if url.starts_with("https://") {
-        rest = url[8..]
+        rest = url.byte_slice(8, url.byte_len())
         https = true
     } else {
         return none
     }
-    var cut = rest.len()
-    for i in 0..rest.len() {
-        if rest[i] == '/' || rest[i] == '?' {
+    var cut = rest.byte_len()
+    for i in 0..rest.byte_len() {
+        if rest.byte(i) == '/' || rest.byte(i) == '?' {
             cut = i
             break
         }
     }
-    let hostport = rest[..cut]
-    var target = rest[cut..]
-    if target.len() == 0 {
+    let hostport = rest.byte_slice(0, cut)
+    var target = rest.byte_slice(cut, rest.byte_len())
+    if target.byte_len() == 0 {
         target = "/"
-    } else if target[0] == '?' {
+    } else if target.byte(0) == '?' {
         target = "/" + target
     }
     var host = hostport
@@ -65,11 +65,11 @@ fn __parse_url(url: str) -> __Url? {
     if https {
         port = 443
     }
-    if let c = hostport.find(":") {
-        host = hostport[..c]
-        port = hostport[c + 1..].to_int() ?? -1
+    if let c = hostport.byte_find(":") {
+        host = hostport.byte_slice(0, c)
+        port = hostport.byte_slice(c + 1, hostport.byte_len()).to_int() ?? -1
     }
-    if host.len() == 0 || port <= 0 || port > 65535 {
+    if host.byte_len() == 0 || port <= 0 || port > 65535 {
         return none
     }
     return __Url { https, host, port, target }
@@ -88,7 +88,7 @@ fn __ip_parse(s: str) -> int? {
         let v = p.to_int() else {
             return none
         }
-        if v < 0 || v > 255 || p.len() == 0 {
+        if v < 0 || v > 255 || p.byte_len() == 0 {
             return none
         }
         ip = ip * 256 + v
@@ -101,8 +101,8 @@ fn __hosts_lookup(host: str) -> int? {
         return none
     }
     for line in text.split("\n") {
-        let l = (line.split("#"))[0].replace("\t", " ").trim()
-        let words = l.split(" ").filter(w => w.len() > 0)
+        let l = (line.split("#"))[0].replace("\t", " ").ascii_trim()
+        let words = l.split(" ").filter(w => w.byte_len() > 0)
         if words.len() < 2 {
             continue
         }
@@ -119,9 +119,9 @@ fn __nameservers() -> [int] {
     var r: [int] = []
     if let text = read_file("/etc/resolv.conf") {
         for line in text.split("\n") {
-            let l = line.trim()
+            let l = line.ascii_trim()
             if l.starts_with("nameserver ") {
-                if let ip = __ip_parse(l[11..].trim()) {
+                if let ip = __ip_parse(l.byte_slice(11, l.byte_len()).ascii_trim()) {
                     r.push(ip)
                 }
             }
@@ -165,10 +165,10 @@ fn __dns_query(host: str, deadline: int) -> int? {
         buf_byte(q, b)
     }
     for label in host.split(".") {
-        if label.len() == 0 || label.len() > 63 {
+        if label.byte_len() == 0 || label.byte_len() > 63 {
             return none
         }
-        buf_byte(q, label.len())
+        buf_byte(q, label.byte_len())
         buf_add(q, label)
     }
     for b in [0, 0, 1, 0, 1] {
@@ -254,8 +254,8 @@ fn __no_proxy(host: str) -> bool {
     }
     let list = env("NO_PROXY") ?? env("no_proxy") ?? ""
     for item in list.split(",") {
-        let d = item.trim()
-        if d.len() > 0 && (host == d || host.ends_with("." + d.trim_start_dot())) {
+        let d = item.ascii_trim()
+        if d.byte_len() > 0 && (host == d || host.ends_with("." + d.trim_start_dot())) {
             return true
         }
     }
@@ -264,7 +264,7 @@ fn __no_proxy(host: str) -> bool {
 
 fn __str_trim_start_dot(self: str) -> str {
     if self.starts_with(".") {
-        return self[1..]
+        return self.byte_slice(1, self.byte_len())
     }
     return self
 }
@@ -277,35 +277,35 @@ fn __fetch_fail(msg: str) -> Response {
 
 // Тело ответа по частям: «размер\r\nданные\r\n» ... «0\r\n\r\n».
 fn __unchunk(s: str) -> str {
-    let b = buf_new(s.len())
+    let b = buf_new(s.byte_len())
     var i = 0
-    while i < s.len() {
+    while i < s.byte_len() {
         var size = 0
-        while i < s.len() && __hex_val(s[i]) >= 0 {
-            size = size * 16 + __hex_val(s[i])
+        while i < s.byte_len() && __hex_val(s.byte(i)) >= 0 {
+            size = size * 16 + __hex_val(s.byte(i))
             i += 1
         }
-        let eol = s.find_from("\r\n", i)
+        let eol = s.byte_find_from("\r\n", i)
         if eol < 0 || size == 0 {
             break
         }
         i = eol + 2
-        if i + size > s.len() {
-            buf_add(b, s[i..])
+        if i + size > s.byte_len() {
+            buf_add(b, s.byte_slice(i, s.byte_len()))
             break
         }
-        buf_add(b, s[i..i + size])
+        buf_add(b, s.byte_slice(i, i + size))
         i += size + 2
     }
     return __str_new(b.data, b.len)
 }
 
 fn __parse_response(raw: str) -> Response {
-    let hend = raw.find("\r\n\r\n") else {
+    let hend = raw.byte_find("\r\n\r\n") else {
         return __fetch_fail("incomplete HTTP response")
     }
-    let head = raw[..hend]
-    var body = raw[hend + 4..]
+    let head = raw.byte_slice(0, hend)
+    var body = raw.byte_slice(hend + 4, raw.byte_len())
     let lines = head.split("\r\n")
     let first = lines[0].split(" ")
     if first.len() < 2 || !first[0].starts_with("HTTP/") {
@@ -313,20 +313,20 @@ fn __parse_response(raw: str) -> Response {
     }
     let status = first[1].to_int() ?? 0
     // ответ прокси на CONNECT и «100 Continue» — перед настоящим ответом
-    if (status == 100 || (status == 200 && head.lower().contains("connection established"))) && body.starts_with("HTTP/") {
+    if (status == 100 || (status == 200 && head.ascii_lower().contains("connection established"))) && body.starts_with("HTTP/") {
         return __parse_response(body)
     }
     var chunked = false
     var length = -1
     var hs: map[str, str] = {}
     for line in lines[1..lines.len()] {
-        let c = line.find(":") ?? line.len()
-        let name = line[..c].trim().lower()
-        let value = line[c + 1..].trim()
-        if c < line.len() {
+        let c = line.byte_find(":") ?? line.byte_len()
+        let name = line.byte_slice(0, c).ascii_trim().ascii_lower()
+        let value = line.byte_slice(c + 1, line.byte_len()).ascii_trim()
+        if c < line.byte_len() {
             hs[name] = value
         }
-        if name == "transfer-encoding" && value.lower().contains("chunked") {
+        if name == "transfer-encoding" && value.ascii_lower().contains("chunked") {
             chunked = true
         } else if name == "content-length" {
             length = value.to_int() ?? -1
@@ -334,8 +334,8 @@ fn __parse_response(raw: str) -> Response {
     }
     if chunked {
         body = __unchunk(body)
-    } else if length >= 0 && length < body.len() {
-        body = body[..length]
+    } else if length >= 0 && length < body.byte_len() {
+        body = body.byte_slice(0, length)
     }
     return Response { status, body, headers: hs }
 }
@@ -360,8 +360,8 @@ fn __pool() -> int {
 fn __pool_tag(host: str, port: int) -> int {
     let key = host + ":" + port.to_str()
     var h = 0x3bd39e10cb0ef593
-    for c in key {
-        h = __wmul(h ^ c, 0x100000001b3)
+    for i in 0..key.byte_len() {
+        h = __wmul(h ^ key.byte(i), 0x100000001b3)
     }
     return h | 1
 }
@@ -512,7 +512,7 @@ fn __link_read(tag: int, h: int, b: Buf, deadline: int) -> int {
 // Туннель через прокси: CONNECT имя:порт и ответ 200.
 fn __proxy_connect(fd: int, host: str, port: int, auth: str, deadline: int) -> bool {
     let req = "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n{auth}\r\n"
-    if !__fd_write_all(fd, __str_ptr(req), req.len(), deadline) {
+    if !__fd_write_all(fd, __str_ptr(req), req.byte_len(), deadline) {
         return false
     }
     // ответ читается по байту: после заголовков прокси ничего не шлёт, пока
@@ -539,26 +539,26 @@ fn __proxy_connect(fd: int, host: str, port: int, auth: str, deadline: int) -> b
 
 fn __b64_encode(s: str) -> str {
     let abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-    let b = buf_new(s.len() * 4 / 3 + 4)
+    let b = buf_new(s.byte_len() * 4 / 3 + 4)
     var i = 0
-    while i < s.len() {
-        let n = (s.len() - i).min(3)
-        var v = s[i] << 16
+    while i < s.byte_len() {
+        let n = (s.byte_len() - i).min(3)
+        var v = s.byte(i) << 16
         if n > 1 {
-            v = v | (s[i + 1] << 8)
+            v = v | (s.byte(i + 1) << 8)
         }
         if n > 2 {
-            v = v | s[i + 2]
+            v = v | s.byte(i + 2)
         }
-        buf_byte(b, abc[(v >> 18) & 63])
-        buf_byte(b, abc[(v >> 12) & 63])
+        buf_byte(b, abc.byte((v >> 18) & 63))
+        buf_byte(b, abc.byte((v >> 12) & 63))
         if n > 1 {
-            buf_byte(b, abc[(v >> 6) & 63])
+            buf_byte(b, abc.byte((v >> 6) & 63))
         } else {
             buf_byte(b, '=')
         }
         if n > 2 {
-            buf_byte(b, abc[v & 63])
+            buf_byte(b, abc.byte(v & 63))
         } else {
             buf_byte(b, '=')
         }
@@ -576,25 +576,25 @@ type __Proxy {
 fn __proxy_for(var_names: [str], host: str) -> __Proxy? {
     var value = ""
     for v in var_names {
-        if value.len() == 0 {
+        if value.byte_len() == 0 {
             value = env(v) ?? ""
         }
     }
-    if value.len() == 0 || __no_proxy(host) {
+    if value.byte_len() == 0 || __no_proxy(host) {
         return none
     }
     var auth = ""
     var rest = value
     var scheme = "http://"
     if rest.starts_with("http://") {
-        rest = rest[7..]
+        rest = rest.byte_slice(7, rest.byte_len())
     } else if rest.starts_with("https://") {
         // прокси по TLS не поддерживается
         return none
     }
-    if let at = rest.find("@") {
-        auth = "Proxy-Authorization: Basic " + __b64_encode(rest[..at]) + "\r\n"
-        rest = rest[at + 1..]
+    if let at = rest.byte_find("@") {
+        auth = "Proxy-Authorization: Basic " + __b64_encode(rest.byte_slice(0, at)) + "\r\n"
+        rest = rest.byte_slice(at + 1, rest.byte_len())
     }
     let u = __parse_url(scheme + rest) else {
         return none
@@ -775,7 +775,7 @@ fn __http_exchange(url: __Url, request: str, method: str) -> Response {
                 return __fetch_fail(buf_str(err))
             }
         }
-        let sent = __link_write(tag, c, __str_ptr(request), request.len(), deadline)
+        let sent = __link_write(tag, c, __str_ptr(request), request.byte_len(), deadline)
         var failed = !sent
         b.len = 0
         end = -1
@@ -813,7 +813,7 @@ fn __http_exchange(url: __Url, request: str, method: str) -> Response {
     }
     let r = __parse_response(__str_new(b.data, b.len))
     // ответ целиком и сервер не просит закрыть — соединение снова в запас
-    if end >= 0 && end == b.len && r.status > 0 && __memeq(b.data, __str_ptr("HTTP/1.1"), 8) && (r.headers["connection"] ?? "").lower() != "close" && (tag == 0 || __tls_idle_ok(c)) {
+    if end >= 0 && end == b.len && r.status > 0 && __memeq(b.data, __str_ptr("HTTP/1.1"), 8) && (r.headers["connection"] ?? "").ascii_lower() != "close" && (tag == 0 || __tls_idle_ok(c)) {
         __pool_put(ip, port, tag, c)
     } else {
         __link_close(tag, c)
@@ -845,7 +845,7 @@ fn __fetch(method: str, url: str, body: int, d: int, headers: int) -> Response {
     }
     var r = __fetch_fail("bad URL: " + url)
     if let u = __parse_url(url) {
-        let req = buf_new(256 + text.len())
+        let req = buf_new(256 + text.byte_len())
         var target = u.target
         // через прокси http цель запроса — адрес целиком (https идёт туннелем)
         if !u.https && __proxy_for(["HTTP_PROXY", "http_proxy"], u.host) != none {
@@ -863,7 +863,7 @@ fn __fetch(method: str, url: str, body: int, d: int, headers: int) -> Response {
             if !hs.has("Content-Type") {
                 buf_add(req, "Content-Type: " + ctype + "\r\n")
             }
-            buf_add(req, "Content-Length: " + text.len().to_str() + "\r\n")
+            buf_add(req, "Content-Length: " + text.byte_len().to_str() + "\r\n")
         }
         buf_add(req, "\r\n")
         buf_add(req, text)

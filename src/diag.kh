@@ -54,25 +54,25 @@ fn source_line(file: int, line: int) -> str {
     let text = files[file].text
     var i = 0
     var cur = 1
-    let n = text.len()
+    let n = text.byte_len()
     while i < n && cur < line {
-        if text[i] == '\n' {
+        if text.byte(i) == '\n' {
             cur += 1
         }
         i += 1
     }
     var j = i
-    while j < n && text[j] != '\n' {
+    while j < n && text.byte(j) != '\n' {
         j += 1
     }
-    return text[i..j]
+    return text.byte_slice(i, j)
 }
 
 fn json_escape(s: str) -> str {
-    let b = buf_new(s.len() + 8)
+    let b = buf_new(s.byte_len() + 8)
     var i = 0
-    while i < s.len() {
-        let c = s[i]
+    while i < s.byte_len() {
+        let c = s.byte(i)
         if c == '"' || c == '\\' {
             buf_byte(b, '\\')
             buf_byte(b, c)
@@ -115,8 +115,8 @@ fn print_diags() {
         let mark = buf_new(d.col + 8)
         buf_add(mark, "    ")
         var c = 1
-        while c < d.col && c <= line.len() {
-            if line[c - 1] == '\t' {
+        while c < d.col && c <= line.byte_len() {
+            if line.byte(c - 1) == '\t' {
                 buf_byte(mark, '\t')
             } else {
                 buf_byte(mark, ' ')
@@ -125,7 +125,7 @@ fn print_diags() {
         }
         buf_byte(mark, '^')
         eprint(buf_str(mark))
-        if d.hint.len() > 0 {
+        if d.hint.byte_len() > 0 {
             eprint("    hint: " + d.hint)
         }
         i += 1

@@ -179,6 +179,14 @@ fn emit_store(base: int, disp: int, src: int) {
     emit_mem(0x89, src, base, disp)
 }
 
+// movzx eax, byte [rax + rcx]: байт строки или bool списка по индексу.
+fn emit_movzx_index() {
+    emit8(0x0F)
+    emit8(0xB6)
+    emit8(0x04)
+    emit8(0x08)
+}
+
 fn emit_mov_imm(dst: int, v: int) {
     if v >= 0 && v <= 0x7FFFFFFF {
         if dst >= 8 {
@@ -338,9 +346,9 @@ fn data_u64(v: int) {
 fn data_str(s: str) -> int {
     let off = data_len
     var i = 0
-    let n = s.len()
+    let n = s.byte_len()
     while i < n {
-        data_byte(s[i])
+        data_byte(s.byte(i))
         i += 1
     }
     data_byte(0)

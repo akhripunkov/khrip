@@ -295,11 +295,11 @@ fn file_table() -> int {
         while i < files.len() {
             var name = files[i].path
             if files[i].is_lib && name != "<generated>" {
-                var j = name.len()
-                while j > 0 && name[j - 1] != '/' {
+                var j = name.byte_len()
+                while j > 0 && name.byte(j - 1) != '/' {
                     j -= 1
                 }
-                name = "lib/" + name[j..name.len()]
+                name = "lib/" + name.byte_slice(j, name.byte_len())
             }
             store64(data + off + i * 8, data_str(name))
             i += 1

@@ -92,7 +92,7 @@ fn now_ms() -> int {
 
 fn __pad(v: int, width: int) -> str {
     var r = v.to_str()
-    while r.len() < width {
+    while r.byte_len() < width {
         r = "0" + r
     }
     return r
@@ -163,12 +163,12 @@ fn __days_in_month(y: int, m: int) -> int {
 
 // n цифр с позиции i или -1.
 fn __digits(s: str, i: int, n: int) -> int {
-    if i + n > s.len() {
+    if i + n > s.byte_len() {
         return -1
     }
     var v = 0
     for k in i..i + n {
-        let c = s[k]
+        let c = s.byte(k)
         if c < '0' || c > '9' {
             return -1
         }
@@ -182,7 +182,7 @@ fn __parse_ymd(s: str) -> int? {
     let y = __digits(s, 0, 4)
     let m = __digits(s, 5, 2)
     let d = __digits(s, 8, 2)
-    if s.len() < 10 || s[4] != '-' || s[7] != '-' || y < 0 || m < 1 || m > 12 || d < 1 || d > __days_in_month(y, m) {
+    if s.byte_len() < 10 || s.byte(4) != '-' || s.byte(7) != '-' || y < 0 || m < 1 || m > 12 || d < 1 || d > __days_in_month(y, m) {
         return none
     }
     return __days_from_civil(y, m, d)
@@ -190,7 +190,7 @@ fn __parse_ymd(s: str) -> int? {
 
 // Дата «2026-10-19» → секунды с 1970 (полночь UTC), неверная дата — none.
 fn parse_date(s: str) -> int? {
-    if s.len() != 10 {
+    if s.byte_len() != 10 {
         return none
     }
     let days = __parse_ymd(s) else {
@@ -208,14 +208,14 @@ fn parse_time(s: str) -> int? {
     let h = __digits(s, 11, 2)
     let mi = __digits(s, 14, 2)
     let sec = __digits(s, 17, 2)
-    if s.len() < 20 || (s[10] != 'T' && s[10] != 't' && s[10] != ' ') || s[13] != ':' || s[16] != ':' || h < 0 || h > 23 || mi < 0 || mi > 59 || sec < 0 || sec > 59 {
+    if s.byte_len() < 20 || (s.byte(10) != 'T' && s.byte(10) != 't' && s.byte(10) != ' ') || s.byte(13) != ':' || s.byte(16) != ':' || h < 0 || h > 23 || mi < 0 || mi > 59 || sec < 0 || sec > 59 {
         return none
     }
     var i = 19
-    if s[i] == '.' {
+    if s.byte(i) == '.' {
         i += 1
         let from = i
-        while i < s.len() && s[i] >= '0' && s[i] <= '9' {
+        while i < s.byte_len() && s.byte(i) >= '0' && s.byte(i) <= '9' {
             i += 1
         }
         if i == from {
@@ -223,16 +223,16 @@ fn parse_time(s: str) -> int? {
         }
     }
     var offset = 0
-    if i == s.len() - 1 && (s[i] == 'Z' || s[i] == 'z') {
+    if i == s.byte_len() - 1 && (s.byte(i) == 'Z' || s.byte(i) == 'z') {
         offset = 0
-    } else if i == s.len() - 6 && (s[i] == '+' || s[i] == '-') && s[i + 3] == ':' {
+    } else if i == s.byte_len() - 6 && (s.byte(i) == '+' || s.byte(i) == '-') && s.byte(i + 3) == ':' {
         let oh = __digits(s, i + 1, 2)
         let om = __digits(s, i + 4, 2)
         if oh < 0 || oh > 23 || om < 0 || om > 59 {
             return none
         }
         offset = oh * 3600 + om * 60
-        if s[i] == '-' {
+        if s.byte(i) == '-' {
             offset = -offset
         }
     } else {
@@ -268,7 +268,7 @@ fn random_str(n: int) -> str {
         i += 1
         // без перекоса: 248 = 4 × 62
         if v < 248 {
-            buf_byte(b, abc[v % 62])
+            buf_byte(b, abc.byte(v % 62))
         }
     }
     return __str_new(b.data, b.len)

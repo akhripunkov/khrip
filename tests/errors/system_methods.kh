@@ -1,0 +1,26 @@
+// flags: --system
+// expect: str .find() in system code: write s.byte_find(...)
+// expect: str .find_from() in system code: write s.byte_find_from(...)
+// expect: str .lower() in system code: write s.ascii_lower()
+// expect: str .upper() in system code: write s.ascii_upper()
+// expect: str .trim() in system code: write s.ascii_trim()
+// expect: regex .matches() in system code
+// expect: split("") in system code
+// expect: replace("", ...) in system code
+// expect: 8 errors
+// Методы, которые в коде программы будут работать с символами, в системном коде
+// запрещены; split и replace с непустым разделителем — байтовые.
+fn main() {
+    let s = "a,b"
+    let i = s.find(",") ?? 0
+    let j = s.find_from(",", 0)
+    let a = s.lower()
+    let b = s.upper()
+    let c = s.trim()
+    let m = s.matches("a.b")
+    let p = s.split("")
+    let r = s.replace("", "-")
+    let q = s.split(",")
+    let w = s.replace(",", ";")
+    print(a + b + c + r + w + (i + j + p.len() + q.len()).to_str() + m.to_str())
+}

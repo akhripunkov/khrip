@@ -43,11 +43,11 @@ fn __tlv(p: int, end: int) -> __Tlv? {
 
 // Содержимое элемента — равно ли байтам hex.
 fn __der_is(t: __Tlv, hex: str) -> bool {
-    if t.len * 2 != hex.len() {
+    if t.len * 2 != hex.byte_len() {
         return false
     }
     for i in 0..t.len {
-        if load8(t.at + i) != __hex_val(hex[2 * i]) * 16 + __hex_val(hex[2 * i + 1]) {
+        if load8(t.at + i) != __hex_val(hex.byte(2 * i)) * 16 + __hex_val(hex.byte(2 * i + 1)) {
             return false
         }
     }
@@ -59,8 +59,8 @@ fn __der_time(t: __Tlv) -> int? {
     let s = __str_new(t.at, t.len)
     var y = 0
     var rest = ""
-    if t.tag == 0x17 && s.len() == 13 {
-        y = s[..2].to_int() ?? -1
+    if t.tag == 0x17 && s.byte_len() == 13 {
+        y = s.byte_slice(0, 2).to_int() ?? -1
         if y < 0 {
             return none
         }
@@ -69,21 +69,21 @@ fn __der_time(t: __Tlv) -> int? {
         } else {
             y += 1900
         }
-        rest = s[2..]
-    } else if t.tag == 0x18 && s.len() == 15 {
-        y = s[..4].to_int() ?? -1
-        rest = s[4..]
+        rest = s.byte_slice(2, s.byte_len())
+    } else if t.tag == 0x18 && s.byte_len() == 15 {
+        y = s.byte_slice(0, 4).to_int() ?? -1
+        rest = s.byte_slice(4, s.byte_len())
     } else {
         return none
     }
     if !rest.ends_with("Z") {
         return none
     }
-    let mo = rest[0..2].to_int() ?? 0
-    let d = rest[2..4].to_int() ?? 0
-    let h = rest[4..6].to_int() ?? -1
-    let mi = rest[6..8].to_int() ?? -1
-    let sec = rest[8..10].to_int() ?? -1
+    let mo = rest.byte_slice(0, 2).to_int() ?? 0
+    let d = rest.byte_slice(2, 4).to_int() ?? 0
+    let h = rest.byte_slice(4, 6).to_int() ?? -1
+    let mi = rest.byte_slice(6, 8).to_int() ?? -1
+    let sec = rest.byte_slice(8, 10).to_int() ?? -1
     if y < 0 || mo < 1 || mo > 12 || d < 1 || d > 31 || h < 0 || h > 23 || mi < 0 || mi > 59 || sec < 0 || sec > 60 {
         return none
     }
@@ -253,7 +253,7 @@ fn __cert_extensions(c: __Cert, exts: __Tlv) {
                 }
                 q = gn.end
                 if gn.tag == 0x82 {
-                    c.dns.push(__str_copy(gn.at, gn.len).lower())
+                    c.dns.push(__str_copy(gn.at, gn.len).ascii_lower())
                 } else if gn.tag == 0x87 {
                     c.ips.push(__str_copy(gn.at, gn.len))
                 }
@@ -315,7 +315,7 @@ fn __cert_extensions(c: __Cert, exts: __Tlv) {
                         continue
                     }
                     if gn.tag == 0x82 {
-                        let name = __str_copy(gn.at, gn.len).lower()
+                        let name = __str_copy(gn.at, gn.len).ascii_lower()
                         if sub.tag == 0xA0 {
                             c.permitted.push(name)
                         } else {
@@ -485,27 +485,27 @@ fn __pem_certs(text: str) -> [__Cert] {
     let end = "-----END CERTIFICATE-----"
     var at = 0
     while true {
-        let a = text.find_from(begin, at)
+        let a = text.byte_find_from(begin, at)
         if a < 0 {
             break
         }
-        let e = text.find_from(end, a)
+        let e = text.byte_find_from(end, a)
         if e < 0 {
             break
         }
         let b = buf_new(2048)
-        __b64_decode(__str_ptr(text) + a + begin.len(), e - a - begin.len(), b)
+        __b64_decode(__str_ptr(text) + a + begin.byte_len(), e - a - begin.byte_len(), b)
         if let c = __cert_parse(b.data, b.len) {
             r.push(c)
         }
-        at = e + end.len()
+        at = e + end.byte_len()
     }
     return r
 }
 
 fn __ca_file() -> str? {
     let own = env("SSL_CERT_FILE") ?? ""
-    if own.len() > 0 {
+    if own.byte_len() > 0 {
         return own
     }
     for f in ["/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/ca-bundle.pem", "/etc/pki/tls/cacert.pem", "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", "/etc/ssl/cert.pem"] {
@@ -555,7 +555,7 @@ var __rootfile_name: int
 var __rootfile_certs: int
 
 fn __roots_from(path: str) -> [__Cert] {
-    if path.len() == 0 {
+    if path.byte_len() == 0 {
         return __roots()
     }
     __store_rw_init()
@@ -601,8 +601,8 @@ fn __dns_match(pattern: str, host: str) -> bool {
         return true
     }
     if pattern.starts_with("*.") {
-        let dot = host.find(".") ?? -1
-        return dot > 0 && host[dot..] == pattern[1..]
+        let dot = host.byte_find(".") ?? -1
+        return dot > 0 && host.byte_slice(dot, host.byte_len()) == pattern.byte_slice(1, pattern.byte_len())
     }
     return false
 }
@@ -611,7 +611,7 @@ fn __dns_match(pattern: str, host: str) -> bool {
 fn __dns_within(host: str, tree: str) -> bool {
     var t = tree
     if t.starts_with(".") {
-        t = t[1..]
+        t = t.byte_slice(1, t.byte_len())
     }
     return host == t || host.ends_with("." + t)
 }
@@ -671,7 +671,7 @@ fn __verify_chain_with(chain: [__Cert], host: str, now: int, roots: [__Cert]) ->
     if leaf.unknown_critical || !leaf.server_auth {
         return "the server certificate is not for TLS servers"
     }
-    if host.len() > 0 && !__host_ok(leaf, host) {
+    if host.byte_len() > 0 && !__host_ok(leaf, host) {
         return "the certificate is for another name, not {host}"
     }
     if !__cert_time_ok(leaf, now) {
@@ -711,7 +711,7 @@ fn __verify_chain_with(chain: [__Cert], host: str, now: int, roots: [__Cert]) ->
 
 // nameConstraints промежуточных сертификатов для имени сервера.
 fn __check_constraints(path: [__Cert], host: str) -> str? {
-    if host.len() == 0 || __host_ip(host) != none {
+    if host.byte_len() == 0 || __host_ip(host) != none {
         return none
     }
     for c in path {
@@ -748,7 +748,7 @@ fn __vcache() -> int {
 fn __vcache_key(leaf: __Cert, host: str, out: int) {
     let h = __hash_new(32)
     __hash_update(h, leaf.der, leaf.len)
-    __hash_update(h, __str_ptr(host), host.len())
+    __hash_update(h, __str_ptr(host), host.byte_len())
     __hash_final(h, out)
 }
 

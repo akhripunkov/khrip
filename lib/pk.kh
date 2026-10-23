@@ -212,7 +212,7 @@ fn __rsa_pkcs1_verify(nb: int, nlen: int, eb: int, elen: int, hash: int, hlen: i
         return false
     }
     let info = __rsa_digest_info(hlen)
-    let tlen = info.len() / 2 + hlen
+    let tlen = info.byte_len() / 2 + hlen
     if slen < tlen + 11 {
         return false
     }
@@ -223,8 +223,8 @@ fn __rsa_pkcs1_verify(nb: int, nlen: int, eb: int, elen: int, hash: int, hlen: i
         store8(want + i, 0xFF)
     }
     store8(want + slen - tlen - 1, 0)
-    for i in 0..info.len() / 2 {
-        store8(want + slen - tlen + i, __hex_val(info[2 * i]) * 16 + __hex_val(info[2 * i + 1]))
+    for i in 0..info.byte_len() / 2 {
+        store8(want + slen - tlen + i, __hex_val(info.byte(2 * i)) * 16 + __hex_val(info.byte(2 * i + 1)))
     }
     __memcpy(want + slen - hlen, hash, hlen)
     return __memeq(em, want, slen)
@@ -342,10 +342,10 @@ type __Pt {
 }
 
 fn __mp_hex(hex: str, n: int) -> int {
-    let len = hex.len() / 2
+    let len = hex.byte_len() / 2
     let b = __alloc(len)
     for i in 0..len {
-        store8(b + i, __hex_val(hex[2 * i]) * 16 + __hex_val(hex[2 * i + 1]))
+        store8(b + i, __hex_val(hex.byte(2 * i)) * 16 + __hex_val(hex.byte(2 * i + 1)))
     }
     return __mp_from_be(b, len, n)
 }

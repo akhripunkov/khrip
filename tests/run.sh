@@ -8,6 +8,8 @@
 #   tests/api/*.kh    — блоки test (khc test); вывод сравнивается с .out;
 #   tests/locks/*.kh  — какие маршруты берут store на чтение (khc check --locks);
 #   tests/sqlcheck/   — правильный SQL: khc check без базы не находит ошибок;
+#   khc check --all-lib — вся библиотека (и не вызванные функции) и исходники
+#                       компилятора (--system) проходят проверки системного кода;
 #   docs/tutorial/    — примеры учебника выполняются, их тесты проходят;
 #   tests/http.sh     — HTTP-сервер на Khrip отвечает правильно;
 #   tests/coro.sh     — запросы, которые ждут (sleep, fetch), не держат поток;
@@ -95,6 +97,20 @@ for src in docs/tutorial/*.kh docs/tutorial/answers/*.kh; do
 		failed "$src" "$(cat "$tmp/tutorial.out")"
 	fi
 done
+
+# Системный код: строки в нём — байты (s.byte_len(), s.byte(i), s.byte_slice).
+# --all-lib проверяет все функции библиотеки, а не только вызванные программой:
+# с API (crud.kh) и без него — вместе с исходниками компилятора в режиме --system.
+if "$KHC" check --all-lib tests/api/crud.kh >"$tmp/alllib.txt" 2>&1; then
+	pass=$((pass + 1))
+else
+	failed "khc check --all-lib tests/api/crud.kh" "$(cat "$tmp/alllib.txt")"
+fi
+if "$KHC" check --system --all-lib src/*.kh >"$tmp/alllib.txt" 2>&1; then
+	pass=$((pass + 1))
+else
+	failed "khc check --system --all-lib src/*.kh" "$(cat "$tmp/alllib.txt")"
+fi
 
 # Правильный SQL: проверка без базы не должна найти в нём ни одной ошибки.
 for src in tests/sqlcheck/*.kh; do
