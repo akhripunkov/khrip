@@ -1,0 +1,39 @@
+// expect: ident_ascii.kh:27:9: error: identifiers use ASCII letters, digits and _; found 'и' (U+0438)
+// expect: hint: write the name in ASCII; other characters can go in strings and comments
+// expect: ident_ascii.kh:28:12: error: identifiers use ASCII letters, digits and _; found 'é' (U+00E9)
+// expect: ident_ascii.kh:29:9: error: identifiers use ASCII letters, digits and _; found '名' (U+540D)
+// expect: ident_ascii.kh:30:11: error: unexpected character '“' (U+201C)
+// expect: hint: use the ASCII " instead
+// expect: ident_ascii.kh:31:15: error: unexpected character '×' (U+00D7)
+// expect: hint: use the ASCII * instead
+// expect: ident_ascii.kh:32:10: error: unexpected character '≤' (U+2264)
+// expect: hint: use the ASCII <= instead
+// expect: ident_ascii.kh:33:15: error: unexpected character '→' (U+2192)
+// expect: hint: use the ASCII -> instead
+// expect: ident_ascii.kh:34:12: error: unexpected character ' ' (U+00A0)
+// expect: hint: use a plain space instead
+// expect: ident_ascii.kh:35:10: error: unexpected invisible character U+200B
+// expect: hint: delete it
+// expect: ident_ascii.kh:36:10: error: unexpected character '（' (U+FF08)
+// expect: hint: use the ASCII ( instead
+// expect: ident_ascii.kh:37:13: error: unexpected character '😀' (U+1F600)
+// expect: hint: characters outside ASCII can go in strings and comments
+// expect: ident_ascii.kh:38:14: error: unexpected control character U+0001
+// expect: 12 errors
+// Символ вне ASCII в коде — в сообщении целиком и с кодом: буква — имя не на
+// ASCII; у кавычек, знаков и пробелов, похожих на ASCII, — замена; невидимый
+// символ — только код. Управляющий символ — код и «delete it».
+fn main() {
+    let имя = 1
+    let café = 2
+    let 名前 = 3
+    print(“hi”)
+    let a = 3 × 4
+    if a ≤ 5 { }
+    let f = 1 → 2
+    let b = 1
+    let c​ = 1
+    print（1）
+    let e = 😀
+    let g = 1
+}

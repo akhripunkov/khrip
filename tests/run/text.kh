@@ -13,6 +13,12 @@ fn show(xs: [str]) -> str {
     return "[" + xs.join("|") + "]"
 }
 
+// не встроенный метод str: s.slice(a, b) вызывает эту функцию (байтовый
+// __str_slice библиотеки — не метод в программе)
+fn slice(s: str, a: int, b: int) -> str {
+    return s[a..b] + "!"
+}
+
 fn main() {
     let words = ["hello", "привет", "日本語", "a😀b", "e\u{301}clair", ""]
     for w in words {
@@ -106,6 +112,7 @@ fn main() {
     }
     print(to_json(raw))
     print(bad[1..].byte_len())
+    print("Привет".slice(1, 3))
 
     // за концом строки — паника
     let short = "ой"

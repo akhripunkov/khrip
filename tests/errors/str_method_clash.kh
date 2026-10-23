@@ -1,0 +1,48 @@
+// expect: str_method_clash.kh:16:4: error: fn trim clashes with the built-in str method trim
+// expect: hint: rename it: s.trim() calls the built-in, never a function that takes str first
+// expect: str_method_clash.kh:20:4: error: fn find clashes with the built-in str method find
+// expect: hint: rename it: s.find(...) calls the built-in, never a function that takes str first
+// expect: str_method_clash.kh:24:4: error: fn byte_len clashes with the built-in str method byte_len
+// expect: str_method_clash.kh:28:4: error: fn lower clashes with the built-in str method lower
+// expect: str_method_clash.kh:47:15: error: str has no method 'case'
+// expect: 5 errors
+// Функция программы — метод своего первого параметра, но у str встроенные
+// методы главнее: s.trim() вызывает встроенный trim, даже если в программе есть
+// fn trim(s: str). Такое объявление — ошибка (и с str? первым параметром).
+// Функции с тем же именем и другим первым параметром — как раньше. Внутренние
+// функции библиотеки (__str_case, байтовый __str_slice) в программе не методы
+// str: s.slice(...) вызывает функцию программы, s.case(...) — ошибка.
+
+fn trim(s: str) -> str {
+    return "T"
+}
+
+fn find(name: str, from: int) -> int {
+    return from
+}
+
+fn byte_len(s: str) -> int {
+    return 1000
+}
+
+fn lower(s: str?) -> str {
+    return "l"
+}
+
+fn upper(xs: [int]) -> int {
+    return xs.len()
+}
+
+fn split(n: int, parts: int) -> int {
+    return n / parts
+}
+
+fn slice(s: str, a: int, b: int) -> str {
+    return s[a..b]
+}
+
+fn main() {
+    print([1, 2].upper() + split(6, 2))
+    print("привет".slice(1, 3))
+    print("x".case(1, 2, 3))
+}

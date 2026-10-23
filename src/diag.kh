@@ -1,7 +1,8 @@
 // ============================================================================
 // Ошибки компиляции. Компилятор не останавливается на первой ошибке: собирает
 // все (по одной на оператор), печатает с исходной строкой, кареткой и
-// подсказкой, как исправить. С ключом --json — тот же список в JSON.
+// подсказкой, как исправить. Столбец — номер символа в строке, а не байта. С
+// ключом --json — тот же список в JSON.
 // ============================================================================
 
 type Diag {
@@ -68,10 +69,177 @@ fn source_line(file: int, line: int) -> str {
     return text.byte_slice(i, j)
 }
 
-fn json_escape(s: str) -> str {
-    let b = buf_new(s.byte_len() + 8)
+// ---- Столбцы: символы, а не байты ----
+// Лексер и проверки хранят столбец в байтах от начала строки (с 1). Человеку и
+// агенту нужен номер символа: в «let s = "мир"; let x: int = "a"» строка "a" —
+// в столбце 33, а не 36. Перевод — при выводе, по тексту строки: символы — по
+// правилу Go, как у s.len() в программе. Байт внутри символа относится к этому
+// символу.
+
+// Смещение начала символа, в котором байт col - 1 строки line (за концом строки
+// — как есть).
+fn col_byte(line: str, col: int) -> int {
+    let n = line.byte_len()
+    let p = col - 1
+    if p <= 0 || p >= n {
+        if p < 0 {
+            return 0
+        }
+        return p
+    }
+    var q = p
+    while q > 0 && p - q < 3 && (line.byte(q) & 0xC0) == 0x80 {
+        q -= 1
+    }
+    if q < p && (line.byte(q) & 0xC0) != 0x80 && q + __utf8_width(__str_ptr(line), n, q) > p {
+        return q
+    }
+    return p
+}
+
+// Номер символа (с 1) для байтового столбца col строки line.
+fn char_col(line: str, col: int) -> int {
+    let p = col_byte(line, col)
+    let n = line.byte_len()
+    if p > n {
+        return __utf8_go_count(__str_ptr(line), n) + (p - n) + 1
+    }
+    return __utf8_go_count(__str_ptr(line), p) + 1
+}
+
+// Столбец места в исходнике для сообщений (file:line:col): номер символа.
+fn src_col(file: int, line: int, col: int) -> int {
+    return char_col(source_line(file, line), col)
+}
+
+// ---- Указатель ^ под строкой ----
+// Указатель стоит под первым байтом места ошибки, если в терминале каждый
+// символ строки занимает столько клеток, сколько у wcwidth: табуляция
+// повторяется табуляцией, широкий символ (East_Asian_Width W и F: иероглифы,
+// кана, хангыль, полноширинные формы, эмодзи) — два пробела, комбинируемый знак
+// и символ нулевой ширины — ничего, остальные — один пробел. Эмодзи из
+// нескольких кодов (👍🏽, ZWJ-последовательности) терминалы рисуют по-разному:
+// по этому правилу у них ширина — сумма ширин кодов.
+
+// Широкие символы: диапазоны East_Asian_Width W и F из EastAsianWidth.txt
+// Unicode 17.0.0 (соседние слиты), парами «первый, последний».
+var wide_cps: [int]
+
+// Диапазоны в записи «1100-115F 23F0» (одно число — один код) → wide_cps.
+fn wide_add(s: str) {
     var i = 0
-    while i < s.byte_len() {
+    let n = s.byte_len()
+    while i < n {
+        var a = 0
+        while i < n && hex_digit(s.byte(i)) >= 0 {
+            a = a * 16 + hex_digit(s.byte(i))
+            i += 1
+        }
+        var b = a
+        if i < n && s.byte(i) == '-' {
+            i += 1
+            b = 0
+            while i < n && hex_digit(s.byte(i)) >= 0 {
+                b = b * 16 + hex_digit(s.byte(i))
+                i += 1
+            }
+        }
+        wide_cps.push(a)
+        wide_cps.push(b)
+        i += 1
+    }
+}
+
+fn wide_init() {
+    wide_add("1100-115F 231A-231B 2329-232A 23E9-23EC 23F0 23F3 25FD-25FE 2614-2615")
+    wide_add("2630-2637 2648-2653 267F 268A-268F 2693 26A1 26AA-26AB 26BD-26BE")
+    wide_add("26C4-26C5 26CE 26D4 26EA 26F2-26F3 26F5 26FA 26FD 2705 270A-270B 2728")
+    wide_add("274C 274E 2753-2755 2757 2795-2797 27B0 27BF 2B1B-2B1C 2B50 2B55")
+    wide_add("2E80-2E99 2E9B-2EF3 2F00-2FD5 2FF0-303E 3041-3096 3099-30FF 3105-312F")
+    wide_add("3131-318E 3190-31E5 31EF-321E 3220-3247 3250-A48C A490-A4C6 A960-A97C")
+    wide_add("AC00-D7A3 F900-FAFF FE10-FE19 FE30-FE52 FE54-FE66 FE68-FE6B FF01-FF60")
+    wide_add("FFE0-FFE6 16FE0-16FE4 16FF0-16FF6 17000-18CD5 18CFF-18D1E 18D80-18DF2")
+    wide_add("1AFF0-1AFF3 1AFF5-1AFFB 1AFFD-1AFFE 1B000-1B122 1B132 1B150-1B152 1B155")
+    wide_add("1B164-1B167 1B170-1B2FB 1D300-1D356 1D360-1D376 1F004 1F0CF 1F18E")
+    wide_add("1F191-1F19A 1F200-1F202 1F210-1F23B 1F240-1F248 1F250-1F251 1F260-1F265")
+    wide_add("1F300-1F320 1F32D-1F335 1F337-1F37C 1F37E-1F393 1F3A0-1F3CA 1F3CF-1F3D3")
+    wide_add("1F3E0-1F3F0 1F3F4 1F3F8-1F43E 1F440 1F442-1F4FC 1F4FF-1F53D 1F54B-1F54E")
+    wide_add("1F550-1F567 1F57A 1F595-1F596 1F5A4 1F5FB-1F64F 1F680-1F6C5 1F6CC")
+    wide_add("1F6D0-1F6D2 1F6D5-1F6D8 1F6DC-1F6DF 1F6EB-1F6EC 1F6F4-1F6FC 1F7E0-1F7EB")
+    wide_add("1F7F0 1F90C-1F93A 1F93C-1F945 1F947-1F9FF 1FA70-1FA7C 1FA80-1FA8A")
+    wide_add("1FA8E-1FAC6 1FAC8 1FACD-1FADC 1FADF-1FAEA 1FAEF-1FAF8 20000-2FFFD")
+    wide_add("30000-3FFFD")
+}
+
+// Сколько клеток терминала занимает символ cp: 0, 1 или 2.
+fn char_cells(cp: int) -> int {
+    if cp < 0x300 {
+        return 1
+    }
+    if combining_mark(cp) || (cp >= 0x200B && cp <= 0x200F) || (cp >= 0x2060 && cp <= 0x2064) || cp == 0xFEFF || (cp >= 0xFE00 && cp <= 0xFE0F) || (cp >= 0xE0100 && cp <= 0xE01EF) {
+        return 0
+    }
+    if cp < 0x1100 {
+        return 1
+    }
+    if wide_cps.len() == 0 {
+        wide_init()
+    }
+    // последний диапазон с началом <= cp
+    var lo = 0
+    var hi = wide_cps.len() / 2
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2
+        if wide_cps[2 * mid] <= cp {
+            lo = mid
+        } else {
+            hi = mid
+        }
+    }
+    if wide_cps[2 * lo] <= cp && cp <= wide_cps[2 * lo + 1] {
+        return 2
+    }
+    return 1
+}
+
+// Строка указателя: отступ под символами line до байта p, затем ^.
+fn caret_line(line: str, p: int) -> str {
+    let n = line.byte_len()
+    let s = __str_ptr(line)
+    let mark = buf_new(p + 8)
+    buf_add(mark, "    ")
+    var i = 0
+    while i < p && i < n {
+        let c = line.byte(i)
+        if c == '\t' {
+            buf_byte(mark, '\t')
+            i += 1
+            continue
+        }
+        var k = 1
+        if c >= 0x80 {
+            k = char_cells(__utf8_decode(s, n, i))
+        }
+        while k > 0 {
+            buf_byte(mark, ' ')
+            k -= 1
+        }
+        i += __utf8_width(s, n, i)
+    }
+    buf_byte(mark, '^')
+    return buf_str(mark)
+}
+
+// Строка для JSON: кавычка и \ экранируются, управляющие символы — \n, \t или
+// \u00XX, правильный UTF-8 копируется как есть, каждый неправильный байт —
+// � (правило Go, как у to_json). Так вывод --json — правильный JSON, какие
+// бы байты ни были в исходнике, путях и сообщениях.
+fn json_escape(s: str) -> str {
+    let n = s.byte_len()
+    let p = __str_ptr(s)
+    let b = buf_new(n + 8)
+    var i = 0
+    while i < n {
         let c = s.byte(i)
         if c == '"' || c == '\\' {
             buf_byte(b, '\\')
@@ -80,7 +248,17 @@ fn json_escape(s: str) -> str {
             buf_add(b, "\\n")
         } else if c == '\t' {
             buf_add(b, "\\t")
-        } else if c >= 32 {
+        } else if c < 32 {
+            buf_add(b, "\\u" + hex_text(c, 4))
+        } else if c >= 0x80 {
+            let w = __utf8_width(p, n, i)
+            if w == 1 {
+                buf_add(b, "\\ufffd")
+            } else {
+                buf_add_raw(b, p + i, w)
+                i += w - 1
+            }
+        } else {
             buf_byte(b, c)
         }
         i += 1
@@ -98,7 +276,8 @@ fn print_diags() {
             if i > 0 {
                 buf_add(b, ",\n ")
             }
-            buf_add(b, "\{\"file\":\"" + json_escape(files[d.file].path) + "\",\"line\":" + d.line.to_str() + ",\"col\":" + d.col.to_str())
+            let col = src_col(d.file, d.line, d.col)
+            buf_add(b, "\{\"file\":\"" + json_escape(files[d.file].path) + "\",\"line\":" + d.line.to_str() + ",\"col\":" + col.to_str())
             buf_add(b, ",\"message\":\"" + json_escape(d.msg) + "\",\"hint\":\"" + json_escape(d.hint) + "\"}")
             i += 1
         }
@@ -109,22 +288,10 @@ fn print_diags() {
     var i = 0
     while i < diags.len() {
         let d = diags[i]
-        eprint(files[d.file].path + ":" + d.line.to_str() + ":" + d.col.to_str() + ": error: " + d.msg)
         let line = source_line(d.file, d.line)
+        eprint(files[d.file].path + ":" + d.line.to_str() + ":" + char_col(line, d.col).to_str() + ": error: " + d.msg)
         eprint("    " + line)
-        let mark = buf_new(d.col + 8)
-        buf_add(mark, "    ")
-        var c = 1
-        while c < d.col && c <= line.byte_len() {
-            if line.byte(c - 1) == '\t' {
-                buf_byte(mark, '\t')
-            } else {
-                buf_byte(mark, ' ')
-            }
-            c += 1
-        }
-        buf_byte(mark, '^')
-        eprint(buf_str(mark))
+        eprint(caret_line(line, col_byte(line, d.col)))
         if d.hint.byte_len() > 0 {
             eprint("    hint: " + d.hint)
         }
@@ -277,7 +444,7 @@ fn method_hint(name: str, bytes: bool) -> str {
     if name == "delete" || name == "erase" || name == "Remove" {
         return "use .remove(key) for maps, .remove_at(i) for lists"
     }
-    if name == "substring" || name == "substr" || name == "Substring" {
+    if name == "substring" || name == "substr" || name == "Substring" || name == "slice" {
         if bytes {
             return "use s.byte_slice(from, to)"
         }
