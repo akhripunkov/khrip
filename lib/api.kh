@@ -8,10 +8,12 @@
 //   [T]            — [D_LIST, T]
 //   map[K, V]      — [D_MAP, K, V]
 //   T?             — [D_OPT, T]
-//   структура      — [D_STRUCT, n, имя, метка, поле × n]; поле — 5 слов:
-//                    имя, «"имя":», описание, вид значения по умолчанию и оно само
-//                    (0 — нет, 1 — слово, 2 — пустой список с размером элемента,
-//                    3 — пустой словарь); метка ≥ 0 у вариантов (лежит по адресу − 8)
+//   структура      — [D_STRUCT, n, имя, метка, поле × n, маска ссылок]; поле —
+//                    5 слов: имя, «"имя":», описание, вид значения по умолчанию и
+//                    оно само (0 — нет, 1 — слово, 2 — пустой список с размером
+//                    элемента, 3 — пустой словарь); метка ≥ 0 у вариантов (лежит
+//                    по адресу − 8); маска: бит i — поле i ссылка, бит 63 — полей
+//                    больше 63 (для кучи store, __struct_alloc)
 //   вариант        — [D_SUM, n, имя, все без полей?, (имя, описание, значение
 //                    варианта без полей или 0) × n]
 
@@ -97,10 +99,34 @@ fn __struct_alloc(d: int) -> int {
         n = 1
     }
     let tag = load64(d + 24)
+    if load64(__ctx() + CTX_PSAVE_PTR) != 0 {
+        return __struct_salloc(d, n, tag)
+    }
     if tag < 0 {
         return __alloc(n * 8)
     }
     let p = __alloc(n * 8 + 8)
+    store64(p, tag)
+    return p + 8
+}
+
+// То же в куче store: ссылки объекта — поля по маске описания (у варианта —
+// со сдвигом на слово метки); полей больше 63 — каждое слово ссылка.
+fn __struct_salloc(d: int, n: int, tag: int) -> int {
+    var mask = load64(d + 32 + load64(d + 8) * 40)
+    var kind = K_MASK
+    if mask < 0 {
+        kind = K_PTRS
+    } else if tag >= 0 {
+        mask = mask << 1
+    }
+    if mask == 0 {
+        kind = K_NOSCAN
+    }
+    if tag < 0 {
+        return __salloc(n * 8, kind, mask)
+    }
+    let p = __salloc(n * 8 + 8, kind, mask)
     store64(p, tag)
     return p + 8
 }
@@ -147,7 +173,7 @@ fn __persist(v: int, d: int) -> int {
 }
 
 fn __persist_copy(v: int, d: int) -> int {
-    if __store_ptr == 0 {
+    if !__gc_ready {
         // store ещё нет (глобальные до __store_init, main программы с test):
         // всё живёт в обычной памяти, копировать некуда
         return v
@@ -270,13 +296,13 @@ fn __dc_copy(st: int, v: int, d: int) -> int {
         return v
     }
     if k == D_STR {
-        let s = __str_copy(load64(v), load64(v + 8))
+        let s = __str_copy_store(load64(v), load64(v + 8))
         return __cast(s)
     }
     if k == D_OPT {
         let inner = load64(d + 8)
         if __is_scalar(inner) {
-            let b = __alloc(8)
+            let b = __alloc_k(8, K_NOSCAN, 0)
             store64(b, load64(v))
             return b
         }
@@ -290,7 +316,7 @@ fn __dc_copy(st: int, v: int, d: int) -> int {
         let ed = load64(d + 8)
         let n = load64(v + 8)
         let es = load64(v + 24)
-        let h = __list_new(n, es)
+        let h = __list_new_k(n, es, !__is_scalar(ed))
         __dc_put(st, v, h)
         let data = load64(h)
         __memcpy(data, load64(v), n * es)
@@ -333,7 +359,7 @@ fn __dc_copy(st: int, v: int, d: int) -> int {
 fn __dc_map(st: int, v: int, d: int) -> int {
     let kd = load64(d + 8)
     let vd = load64(d + 16)
-    let m = __map_new_cap(load64(v + 48), load64(v + 8))
+    let m = __map_new_k(load64(v + 48), !__is_scalar(vd), load64(v + 8))
     __dc_put(st, v, m)
     let keys = load64(load64(m))
     let vals = load64(load64(m + 16))
@@ -1635,6 +1661,7 @@ fn __serve_one(w: __Worker, req: __Req) {
     store64(c + CTX_CATCH, prev)
     store64(c + CTX_JNULLS, 0)
     __db_end()
+    __gc_verify_release()
     __store_unlock()
     store64(c + CTX_STORE_MODE, 0)
     w.cur = 0
@@ -1679,6 +1706,7 @@ fn __test_end(name: str) {
     }
     store64(c + CTX_CATCH, 0)
     __db_end()
+    __gc_verify_release()
     __store_unlock()
     if __test_bad {
         __tests_failed += 1

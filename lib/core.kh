@@ -47,7 +47,9 @@ const CTX_SAVE_END = 32
 // арена потока: начало и конец подключённой части (0 — арены нет)
 const CTX_ARENA = 40
 const CTX_ARENA_END = 48
-// арена, пока выделение идёт из постоянной памяти store (0 — не идёт)
+// арена (или обычная память), пока выделение идёт из кучи store (0 — не идёт;
+// CTX_PTR и CTX_END в это время — нули, и каждое __alloc уходит в __alloc_slow,
+// а оттуда — в __salloc, lib/gc.kh)
 const CTX_PSAVE_PTR = 56
 const CTX_PSAVE_END = 64
 // поток держит блокировку store
@@ -124,6 +126,13 @@ const STORE_REGION = 0x100000000000
 const STORE_SIZE = 0x4000000000
 const COMMIT = 4194304
 
+// Виды объектов кучи store (lib/gc.kh, __salloc): K_NOSCAN — в объекте нет
+// ссылок (строка, ячейка int?, [int]); K_PTRS — каждое слово может быть
+// ссылкой; K_MASK — ссылки — слова, отмеченные битами маски (бит i — слово i).
+const K_NOSCAN = 0
+const K_PTRS = 1
+const K_MASK = 2
+
 // ---- Паники ----
 
 const PANIC_INDEX = 1
@@ -175,33 +184,31 @@ fn __alloc_trim(p: int, old: int, new: int) {
 }
 
 fn __alloc_slow(c: int, size: int) -> int {
+    if load64(c + CTX_PSAVE_PTR) != 0 {
+        // идёт выделение из store (__pmode_on): объект — в куче store; вид
+        // неизвестен, поэтому каждое его слово — возможная ссылка
+        return __salloc(size, K_PTRS, 0)
+    }
     let p = load64(c + CTX_PTR)
-    let arena = __in_arena(p)
-    if arena || (p >> 40) == (STORE_REGION >> 40) {
-        // арена или постоянная память: зарезервированная область подключается кусками
-        var limit = STORE_REGION + STORE_SIZE
-        if arena {
-            limit = load64(c + CTX_ARENA) + __arena_size(load64(c + CTX_ARENA))
-            if load64(c + CTX_MEMPANIC) == 0 {
-                limit -= ARENA_RESERVE
-            }
+    if __in_arena(p) {
+        // арена: зарезервированная область подключается кусками
+        var limit = load64(c + CTX_ARENA) + __arena_size(load64(c + CTX_ARENA))
+        if load64(c + CTX_MEMPANIC) == 0 {
+            limit -= ARENA_RESERVE
         }
         let end = load64(c + CTX_END)
         var new_end = (p + size + COMMIT - 1) & ~(COMMIT - 1)
         if new_end > limit {
-            if arena && load64(c + CTX_MEMPANIC) == 0 {
+            if load64(c + CTX_MEMPANIC) == 0 {
                 // запрос исчерпал свою память: паника (500), а запас — на неё
                 store64(c + CTX_MEMPANIC, 1)
                 __panic(PANIC_MEMORY, "region")
             }
-            if arena {
-                // исчерпан и запас: без выделений сообщить и выйти (иначе паника
-                // выделяет память, снова паникует — и так до переполнения стека)
-                let fixed = "panic: out of memory: the request used all of its 1 GB arena\n"
-                syscall(1, 2, __str_ptr(fixed), __str_len(fixed))
-                syscall(231, 101)
-            }
-            __panic(PANIC_MEMORY, "region")
+            // исчерпан и запас: без выделений сообщить и выйти (иначе паника
+            // выделяет память, снова паникует — и так до переполнения стека)
+            let fixed = "panic: out of memory: the request used all of its 1 GB arena\n"
+            syscall(1, 2, __str_ptr(fixed), __str_len(fixed))
+            syscall(231, 101)
         }
         if new_end > end && syscall(10, end, new_end - end, 3) < 0 {
             __panic(PANIC_MEMORY, "mprotect")
@@ -248,17 +255,33 @@ fn __in_store(p: int) -> bool {
 // состояние сервера) — в обычной памяти потока: в store её не найти от корней
 // store, и блокировка store ей не нужна.
 fn __alloc_for(h: int, n: int) -> int {
+    return __alloc_for_k(h, n, K_PTRS, 0)
+}
+
+// То же с видом объекта для кучи store (kind, mask — как у __salloc).
+fn __alloc_for_k(h: int, n: int, kind: int, mask: int) -> int {
     let c = __ctx()
-    if __in_arena(load64(c + CTX_PTR)) && !__in_arena(h) {
-        if !__in_store(h) {
-            return __alloc_heap(n)
-        }
-        let on = __pmode_on()
-        let p = __alloc(n)
-        if on {
-            __pmode_off()
-        }
+    if load64(c + CTX_PSAVE_PTR) != 0 {
+        // выделение уже идёт из store
+        return __salloc(n, kind, mask)
+    }
+    if __in_store(h) {
+        __pmode_on()
+        let p = __salloc(n, kind, mask)
+        __pmode_off()
         return p
+    }
+    if __in_arena(load64(c + CTX_PTR)) && !__in_arena(h) {
+        return __alloc_heap(n)
+    }
+    return __alloc(n)
+}
+
+// Память вида kind: из кучи store, если выделение идёт из store, иначе — как
+// __alloc.
+fn __alloc_k(n: int, kind: int, mask: int) -> int {
+    if load64(__ctx() + CTX_PSAVE_PTR) != 0 {
+        return __salloc(n, kind, mask)
     }
     return __alloc(n)
 }
@@ -271,7 +294,7 @@ fn __alloc_heap(n: int) -> int {
     let size = (n + 15) & ~15
     let c = __ctx()
     var at = c + CTX_PTR
-    if __in_store(load64(at)) {
+    if load64(c + CTX_PSAVE_PTR) != 0 {
         at = c + CTX_PSAVE_PTR
     }
     if __in_arena(load64(at)) {
@@ -292,29 +315,27 @@ fn __alloc_heap(n: int) -> int {
     return q
 }
 
-// ---- Постоянная память store: одна область на процесс ----
+// ---- Постоянная память store: куча store (lib/gc.kh) ----
 
-var __store_ptr: int
-var __store_end: int
+// Куча store готова (__store_init в lib/gc.kh): до этого (глобальные до
+// загрузки, fn main программы с тестами) и в программах без store значения
+// живут в обычной памяти, и копировать их некуда.
+var __gc_ready: bool
+// Идёт разметка сборщика (шаг 6 docs/design/v0.13-store-gc.md): новые объекты
+// store сразу помечены. Пока сборщика нет — всегда 0.
+var __gc_marking: int
 // Номер сборки мусора store: сборщик увеличивает его под исключительной
 // блокировкой, и кэши строк (lib/text.kh) с другим номером очищаются — их
 // ключи могли указывать на освобождённую память.
 var __store_epoch: int
 
-fn __store_init() {
-    if __store_ptr == 0 {
-        if !__reserve(STORE_REGION, STORE_SIZE) {
-            __panic(PANIC_MEMORY, "store region")
-        }
-        __store_ptr = STORE_REGION
-        __store_end = STORE_REGION
-    }
-}
-
-// Переключить выделение на постоянную память. → false, если уже переключено.
+// Переключить выделение на кучу store. → false, если уже переключено или
+// кучи нет. Признак переключения — сохранённый курсор CTX_PSAVE_PTR, а
+// CTX_PTR = CTX_END = 0: быстрый путь __alloc не проходит, и __alloc_slow
+// отдаёт объект из кучи store.
 fn __pmode_on() -> bool {
     let c = __ctx()
-    if load64(c + CTX_PSAVE_PTR) != 0 || __store_ptr == 0 {
+    if load64(c + CTX_PSAVE_PTR) != 0 || !__gc_ready {
         return false
     }
     __store_lock()
@@ -323,20 +344,36 @@ fn __pmode_on() -> bool {
         // лучше ответ 500, чем гонка с другими читателями
         __panic_msg("internal: a read-only route changes store")
     }
+    if load64(c + CTX_PTR) == 0 {
+        // поток ещё ничего не выделял: курсор — признак, ему нельзя быть нулём
+        __alloc(16)
+    }
     store64(c + CTX_PSAVE_PTR, load64(c + CTX_PTR))
     store64(c + CTX_PSAVE_END, load64(c + CTX_END))
-    store64(c + CTX_PTR, __store_ptr)
-    store64(c + CTX_END, __store_end)
+    store64(c + CTX_PTR, 0)
+    store64(c + CTX_END, 0)
     return true
 }
 
 fn __pmode_off() {
     let c = __ctx()
-    __store_ptr = load64(c + CTX_PTR)
-    __store_end = load64(c + CTX_END)
     store64(c + CTX_PTR, load64(c + CTX_PSAVE_PTR))
     store64(c + CTX_END, load64(c + CTX_PSAVE_END))
     store64(c + CTX_PSAVE_PTR, 0)
+}
+
+// Изменение контейнера h (список, словарь): у контейнера в store — только под
+// исключительной блокировкой. Иначе маршрут, который компилятор счёл
+// читающим (src/rw.kh), менял бы store одновременно с другими читателями и
+// (шаг 6) с разметкой сборщика: лучше ответ 500, чем гонка.
+fn __store_mut(h: int) {
+    if (h >> 40) == (STORE_REGION >> 40) && load64(__ctx() + CTX_STORE_HELD) != 1 {
+        __store_mut_slow()
+    }
+}
+
+fn __store_mut_slow() {
+    __panic_msg("internal: store changed without the exclusive store lock")
 }
 
 // Блокировка store (__store_lock, __store_unlock) — в lib/rt.kh: ей нужны
@@ -522,6 +559,18 @@ fn __str_copy(ptr: int, len: int) -> str {
     let p = __alloc(len + 1)
     __memcpy(p, ptr, len)
     return __str_new(p, len)
+}
+
+// Копия байтов в новую строку одним объектом: [заголовок {ptr, len}][байты][0],
+// ptr = адрес объекта + 16. Так строки копируются в store (__deep_copy): один
+// объект кучи store без ссылок вместо двух, а срез такой строки (ptr внутри
+// объекта) указывает в тот же объект.
+fn __str_copy_store(ptr: int, len: int) -> str {
+    let h = __alloc_k(len + 17, K_NOSCAN, 0)
+    store64(h, h + 16)
+    store64(h + 8, len)
+    __memcpy(h + 16, ptr, len)
+    return __cast(h)
 }
 
 fn __str_ptr(s: str) -> int {
@@ -1122,6 +1171,24 @@ fn __list_new(cap: int, esize: int) -> int {
     return h
 }
 
+// То же с видами объектов для кучи store: в заголовке ссылка — только data
+// (слово 0); в data ссылки — элементы, если elem_ref.
+fn __list_new_k(cap: int, esize: int, elem_ref: bool) -> int {
+    var c = cap
+    if c < 4 {
+        c = 4
+    }
+    var kind = K_NOSCAN
+    if elem_ref {
+        kind = K_PTRS
+    }
+    let h = __alloc_k(32, K_MASK, 1)
+    store64(h, __alloc_k(c * esize, kind, 0))
+    store64(h + 16, c)
+    store64(h + 24, esize)
+    return h
+}
+
 fn __lget(h: int, i: int) -> int {
     if load64(h + 24) == 1 {
         return load8(load64(h) + i)
@@ -1143,7 +1210,12 @@ fn __list_grow(h: int, need: int) {
         cap *= 2
     }
     let es = load64(h + 24)
-    let data = __alloc_for(h, cap * es)
+    // новый массив списка в store — того же вида, что старый ([int] — без ссылок)
+    var kind = K_PTRS
+    if __in_store(h) {
+        kind = __gc_kind_of(load64(h))
+    }
+    let data = __alloc_for_k(h, cap * es, kind, 0)
     __memcpy(data, load64(h), load64(h + 8) * es)
     store64(h, data)
     store64(h + 16, cap)
@@ -1151,6 +1223,7 @@ fn __list_grow(h: int, need: int) {
 
 fn __list_push(self: [T], v: T) {
     let h: int = __cast(self)
+    __store_mut(h)
     let len = load64(h + 8)
     if len == load64(h + 16) {
         __list_grow(h, len + 1)
@@ -1161,6 +1234,7 @@ fn __list_push(self: [T], v: T) {
 
 fn __list_pop(self: [T]) -> T {
     let h: int = __cast(self)
+    __store_mut(h)
     let len = load64(h + 8)
     if len == 0 {
         __panic(PANIC_EMPTY, "pop")
@@ -1184,12 +1258,14 @@ fn __list_last(self: [T]) -> T {
 
 fn __list_clear(self: [T]) {
     let h: int = __cast(self)
+    __store_mut(h)
     __list_vacate(h, 0)
     store64(h + 8, 0)
 }
 
 fn __list_truncate(self: [T], n: int) {
     let h: int = __cast(self)
+    __store_mut(h)
     if n >= 0 && n < load64(h + 8) {
         __list_vacate(h, n)
         store64(h + 8, n)
@@ -1207,6 +1283,7 @@ fn __list_vacate(h: int, from: int) {
 
 fn __list_insert(self: [T], i: int, v: T) {
     let h: int = __cast(self)
+    __store_mut(h)
     let len = load64(h + 8)
     if i < 0 || i > len {
         __panic(PANIC_INDEX, "insert")
@@ -1225,6 +1302,7 @@ fn __list_insert(self: [T], i: int, v: T) {
 
 fn __list_remove_at(self: [T], i: int) -> T {
     let h: int = __cast(self)
+    __store_mut(h)
     let len = load64(h + 8)
     if i < 0 || i >= len {
         __panic(PANIC_INDEX, "remove_at")
@@ -1245,6 +1323,7 @@ fn __list_remove_at(self: [T], i: int) -> T {
 // Разворачивает список на месте и возвращает его же (для цепочек).
 fn __list_reverse(self: [T]) -> [T] {
     let h: int = __cast(self)
+    __store_mut(h)
     var a = 0
     var b = load64(h + 8) - 1
     while a < b {
@@ -1568,6 +1647,7 @@ fn __sort_words(data: int, n: int, by_str: bool) {
 // слияние снизу вверх по массиву номеров. Возвращает тот же список.
 fn __sort_by(self: [T], keys: [int], by_str: bool) -> [T] {
     let h: int = __cast(self)
+    __store_mut(h)
     let kh: int = __cast(keys)
     let n = load64(h + 8)
     let kd = load64(kh)
@@ -1938,12 +2018,14 @@ fn __opt_eq_str(a: int, b: int) -> bool {
 
 fn __list_sort_int(self: [int]) -> [int] {
     let h: int = __cast(self)
+    __store_mut(h)
     __sort_words(load64(h), load64(h + 8), false)
     return self
 }
 
 fn __list_sort_str(self: [str]) -> [str] {
     let h: int = __cast(self)
+    __store_mut(h)
     __sort_words(load64(h), load64(h + 8), true)
     return self
 }
@@ -1961,6 +2043,24 @@ fn __map_new(str_keys: int) -> int {
     store64(m + 24, __list_new(8, 8))
     store64(m + 32, __alloc(16 * 8))
     store64(m + 40, 15)
+    store64(m + 48, str_keys)
+    return m
+}
+
+// Пустой словарь на n записей с видами объектов для кучи store: в заголовке
+// ссылки — keys, vals, alive и slots (слова 0, 2, 3, 4); в массивах ссылки —
+// строковые ключи и значения, если vals_ref; alive и slots — числа.
+fn __map_new_k(str_keys: int, vals_ref: bool, n: int) -> int {
+    var size = 16
+    while size < n * 4 {
+        size *= 2
+    }
+    let m = __alloc_k(64, K_MASK, 0x1D)
+    store64(m, __list_new_k(n, 8, str_keys != 0))
+    store64(m + 16, __list_new_k(n, 8, vals_ref))
+    store64(m + 24, __list_new_k(n, 8, false))
+    store64(m + 32, __alloc_k(size * 8, K_NOSCAN, 0))
+    store64(m + 40, size - 1)
     store64(m + 48, str_keys)
     return m
 }
@@ -2079,7 +2179,7 @@ fn __map_rehash(m: int) {
     while size < w * 4 {
         size *= 2
     }
-    store64(m + 32, __alloc_for(m, size * 8))
+    store64(m + 32, __alloc_for_k(m, size * 8, K_NOSCAN, 0))
     store64(m + 40, size - 1)
     var i = 0
     while i < w {
@@ -2089,6 +2189,7 @@ fn __map_rehash(m: int) {
 }
 
 fn __map_set(m: int, k: int, v: int) {
+    __store_mut(m)
     let idx = __map_find(m, k)
     if idx >= 0 {
         store64(load64(load64(m + 16)) + idx * 8, v)
@@ -2149,6 +2250,7 @@ fn __map_has(m: int, k: int) -> bool {
 
 // Удаляет ключ → значение или 0, если ключа не было.
 fn __map_remove_word(m: int, k: int, found: int) -> int {
+    __store_mut(m)
     store64(found, 0)
     let idx = __map_find(m, k)
     if idx < 0 {
@@ -2211,6 +2313,7 @@ fn __map_values(m: int, esize: int) -> int {
 }
 
 fn __map_clear(m: int) {
+    __store_mut(m)
     if __in_store(m) {
         let n = load64(load64(m) + 8)
         __memset(load64(load64(m)), 0, n * 8)
@@ -2223,7 +2326,7 @@ fn __map_clear(m: int) {
     store64(m + 8, 0)
     store64(m + 56, 0)
     // словарь в store: новая таблица — тоже в постоянной памяти, не в арене
-    store64(m + 32, __alloc_for(m, 16 * 8))
+    store64(m + 32, __alloc_for_k(m, 16 * 8, K_NOSCAN, 0))
     store64(m + 40, 15)
 }
 

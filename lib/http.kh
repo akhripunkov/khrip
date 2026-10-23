@@ -1056,6 +1056,7 @@ fn __run_task(w: __Worker, i: int) {
     }
     store64(c + CTX_CATCH, 0)
     __db_end()
+    __gc_verify_release()
     __store_unlock()
     __arena_end()
 }

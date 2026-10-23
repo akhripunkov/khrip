@@ -1271,7 +1271,7 @@ fn parse_builtin(t: Token, w: int) -> int {
         emit_call(rt_func("__json_decode"))
         return ty_opt(inner)
     }
-    let lib_only = name == "__fsqrt" || name.starts_with("__simd_") || name == "__sha256_x64" || name == "__sha512_x64" || name == "__cpu_aes" || name == "__aes_ctr" || name == "__ghash" || name == "__chacha_block" || name == "__mp_add" || name == "__mp_sub" || name == "__mont_mul" || name == "__madd" || name == "__msub" || name == "__wmul" || name == "__cpu_avx2" || name == "__cpu_sha" || name == "__spawn" || name == "__co_call" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset" || name == "__data_end" || name == "__data_hex" || name == "__gc_roots"
+    let lib_only = name == "__fsqrt" || name.starts_with("__simd_") || name == "__sha256_x64" || name == "__sha512_x64" || name == "__cpu_aes" || name == "__aes_ctr" || name == "__ghash" || name == "__chacha_block" || name == "__mp_add" || name == "__mp_sub" || name == "__mont_mul" || name == "__madd" || name == "__msub" || name == "__wmul" || name == "__cpu_avx2" || name == "__cpu_sha" || name == "__spawn" || name == "__co_call" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset" || name == "__data_end" || name == "__data_hex" || name == "__gc_roots" || name == "__ctz" || name == "__clz"
     if lib_only && !files[t.file].is_lib {
         return -1
     }
@@ -1557,6 +1557,20 @@ fn parse_builtin(t: Token, w: int) -> int {
         emit8(0x0A)
         emit_setcc(CC_E)
         return ty_bool
+    }
+    if name == "__ctz" || name == "__clz" {
+        // число нулевых битов справа (__ctz) или слева (__clz); у нуля — 64
+        advance()
+        builtin_args(1, t, name)
+        emit_pop(RAX)
+        if name == "__ctz" {
+            // mov ecx, 64; bsf rax, rax; cmovz rax, rcx
+            emit_hex("B9 40 00 00 00 48 0F BC C0 48 0F 44 C1")
+        } else {
+            // mov ecx, 127; bsr rax, rax; cmovz rax, rcx; xor rax, 63
+            emit_hex("B9 7F 00 00 00 48 0F BD C0 48 0F 44 C1 48 83 F0 3F")
+        }
+        return ty_int
     }
     if name == "__xchg" || name == "__xadd" {
         advance()
