@@ -302,7 +302,7 @@ route GET "/stats/pages" (from: int, to: int, limit: int = 10) -> [PageStat] {
 | `CLICKHOUSE_URL` | required when a `table`, `ch` or `migration ch` uses the default connection | `http(s)://user:password@host:8123/database`; no path means `default` |
 | `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD` | from the URL | override the URL's credentials, so secrets can be kept apart |
 | `CLICKHOUSE_TIMEOUT` | `DATABASE_TIMEOUT`, 10000 ms | budget of one operation: admission, connect, exchange. The server gets `max_execution_time` = what is left (not for readonly=1 users) |
-| `CLICKHOUSE_MAX_RESULT` | 64 MiB | bytes of one result |
+| `CLICKHOUSE_MAX_RESULT` | 64 MiB | bytes of one result; a bigger one is a 500 (never retried), and the log line says to add `LIMIT` or aggregate |
 | `CLICKHOUSE_INFLIGHT` | 32 | operations in flight per worker, FIFO admission |
 | `DATABASE_MIGRATE` | `apply` | shared with PostgreSQL: `apply` runs migrations at start, `check` only verifies; `./app migrate` applies and exits |
 | `KHRIP_TEST_CLICKHOUSE_URL` (+ `_USER`, `_PASSWORD`) | `CLICKHOUSE_URL` | used by `khc test` |
@@ -342,29 +342,38 @@ become SQL text:
 | `str`, enum | `String` | an enum is sent as its label |
 | `[T]` | `Array(T)` | `x IN ({xs})` and `x IN {xs}` become `IN {pN:Array(T)}`; an empty list matches nothing |
 | `map[K, V]` | `Map(K, V)` | |
-| `T?` | `Nullable(T)` | only behind `({x} IS NULL OR col = {x})`; a bare comparison is a compile error |
+| `T?` | `Nullable(T)` | only behind `({x} IS NULL OR col = {x})` (or `isNull({x})`), or inside `coalesce`/`ifNull`; a bare comparison, a `LIKE` pattern, a `BETWEEN` bound, `IN ({x})` or a function argument in `WHERE`/`HAVING`/`ON` is a compile error: NULL there silently matches nothing |
 | `[T]?`, struct | — | compile errors: arrays are never NULL; rows go through `t.insert` |
 
 `'...{x}...'` becomes `concat('...', {pN:String}, '...')`; after `LIKE`/`ILIKE`
-the value's `\`, `%` and `_` match literally. `ORDER BY {o}` takes a local made
+and in `like`, `ilike`, `notLike`, `notILike` the value's `\`, `%` and `_`
+match literally. A `str` value is always a string: only a Khrip `none` becomes
+NULL. A value longer than 128 KiB as a parameter (after LIKE escaping) is a 400
+`bad value: {x} is too long (N bytes as a ClickHouse parameter, at most 131072)`. `ORDER BY {o}` takes a local made
 of string literals (`let o = match q { "new" => "ts DESC", _ => "page" }`): each
 literal is a separate checked query.
 
 Results follow `sql`: `[R]` all rows, `R?` one row or none, `R` one row (none
 answers 404 and the route must list `| 404`), a scalar type for one column.
 Columns match fields by name (exactly, then ignoring case); extra columns are
-ignored; a field without a column needs `?` or a default. Statements without
-rows (`INSERT INTO t SELECT ...`, `ALTER TABLE t UPDATE/DELETE ...`,
-`DELETE FROM`, `TRUNCATE`, `OPTIMIZE`, `SYSTEM`) give nothing, `int` (written
-rows) or `DbResult`. `ALTER ... UPDATE/DELETE` runs with `mutations_sync = 1`,
-so the next read sees the change. `KILL QUERY ...` gives rows or `int`.
+ignored; a field without a column needs `?` or a default. `INSERT INTO t
+SELECT ...` gives nothing, `int` (written rows) or `DbResult`; start checks
+that the SELECT's column names go in the order of the target columns, because
+ClickHouse matches them by position. Other statements without rows
+(`ALTER TABLE t UPDATE/DELETE ...`, `DELETE FROM`, `TRUNCATE`, `OPTIMIZE`,
+`SYSTEM`) give nothing or `DbResult`: ClickHouse does not count their rows, so
+`let n: int = ch "ALTER ..."` is a compile error and `DbResult.count` is 0.
+`ALTER ... UPDATE/DELETE` runs with `mutations_sync = 1`, so the next read
+sees the change. `KILL QUERY ...` gives rows or `int`.
 
 Compile errors, with fixes in their hints: DDL (it belongs in `migration ch N`),
 `INSERT ... VALUES` and `INSERT INTO t {rows}` (`t.insert`), `FORMAT`, `SET`,
 `{x}` in `SETTINGS`, `wait_for_async_insert = 0`, `?` and `$1`, `{x:Int64}`
 (write `{x}`), several statements, `LIMIT` without `ORDER BY`, `DELETE`
 without `WHERE`, a row query without a type, `ch` inside `tx` (also through a
-function) and in a global's initial value.
+function) and in a global's initial value. `FORMAT`, `SETTINGS`, `VALUES` and
+`LIMIT` count as clauses only where a clause stands (`FORMAT JSON` at the end,
+`SETTINGS name =`, `LIMIT 10`), so columns with those names are fine.
 
 ### Reads (§4.8)
 
@@ -403,9 +412,9 @@ that start builds from `DESCRIBE TABLE`, so column order never matters:
 | Khrip field | Columns |
 |---|---|
 | `int` | `Int*`, `UInt*` (range-checked), `Date`/`Date32` (seconds, floored to the day), `DateTime` (0 … 2^32−1), `DateTime64(p)` (seconds × 10^p), `Decimal(P, 0)`, `Bool` (0/1) |
-| `float` | `Float32`, `Float64`, `Decimal(P, S)` (rounded half to even) |
+| `float` | `Float32`, `Float64`, `Decimal(P, S)` (rounded half to even); NaN and ±Inf are a 400 |
 | `bool` | `Bool`, `UInt8` |
-| `str` | `String`, `LowCardinality(String)`, `FixedString(N)`, `Enum8/16` (a label), `UUID`, `IPv4`/`IPv6`, `Date`/`DateTime`/`DateTime64` (ISO 8601), `Decimal` (exact text; more places is 400) |
+| `str` | `String`, `LowCardinality(String)`, `FixedString(N)`, `Enum8/16` (a label), `UUID`, `IPv4`/`IPv6`, `Date`/`DateTime`/`DateTime64` (ISO 8601), `Decimal` (exact text; more places is 400), `Int128/256`, `UInt128/256` (decimal text in the column's range) |
 | enum | `Enum8/16` (every variant must be a label), `String` |
 | `[T]`, `map[str, V]` | `Array(T)`, `Map(String, V)` |
 | `T?` | `Nullable(T)`; a non-Nullable column **with a DEFAULT** gets its default for none |
@@ -418,7 +427,9 @@ Start refuses (with the declaration or insert location):
 - a column that the inserted type lacks and that has no `DEFAULT`,
   `MATERIALIZED`, `ALIAS` or `EPHEMERAL` and is not Nullable — rows would
   silently get `0`, `''` or 1970-01-01 (S12);
-- `T?` into a non-Nullable column without `DEFAULT` (S13);
+- `T?` into a non-Nullable column without `DEFAULT` (S13), and `[T]?` or
+  `map[K, V]?` into an `Array` or `Map` column even with a `DEFAULT` (arrays
+  and maps are never NULL, and ClickHouse takes no NULL for them);
 - `int` into `Decimal(P, S>0)` — money in cents would be stored ×100 (S14);
 - a field for a `MATERIALIZED`/`ALIAS` column, a field without a column, a
   type mismatch, a Khrip enum variant missing from an `Enum8/16` (S24).
@@ -433,12 +444,26 @@ Without the window a repeated insert is stored twice — and with the window,
 two inserts of identical rows without a token are also stored once (ClickHouse
 deduplicates by the data hash).
 
+When the table is changed after start (an `ALTER` outside the program's
+migrations) and an insert fails on its columns, the insert asks `DESCRIBE TABLE`
+again, rebuilds its plan and retries once; the log says
+`table events changed after start: the insert plan was rebuilt`. If the rows no
+longer fit the table (a field lost its column), the insert is a 500 and the
+log names the start error.
+
 ### Migrations
 
 `migration ch N` (or `migration NAME N`) runs once, in order, at start or with
 `./app migrate`. It is recorded in `khrip_migrations` (MergeTree) in that
-database with the sha256 of its text; an edited migration that already ran
-stops the start. Statements are split by `;` outside strings and comments and
+database with the sha256 of its text, as `N` for the default connection and
+`NAME/N` for a named one, so two connections may share a database. An edited
+migration that already ran stops the start, and so does a number lower than
+the highest applied one (`migration ch 2 is older than the applied migration
+ch 3: renumber it to 4`). Starts that run at the same time take turns: the
+first one creates `khrip_migrations_lock` (a Memory table) and drops it when
+done; the others wait for it (up to 60 s) and then see the migrations applied.
+A start killed while migrating leaves the table behind: the next start waits
+60 s and then stops with a message that names it (drop it by hand). Statements are split by `;` outside strings and comments and
 sent one per request; a failure names the statement:
 `khrip: ClickHouse migration ch 2 failed at statement 2 of 3: ...`. ClickHouse
 DDL is not transactional: prefer one statement per migration, or `IF NOT EXISTS`.
@@ -447,7 +472,9 @@ DDL is not transactional: prefer one statement per migration, or `IF NOT EXISTS`
 
 For each connection: `SELECT version(), getSetting('readonly'),
 serverTimezone()` (network errors are retried for up to 60 s). A readonly
-user and a program that writes through the connection stop the start (S20).
+user and a program that writes through the connection stop the start (S20);
+migrations count as writes only when they are to be applied, so a reader with
+`DATABASE_MIGRATE=check` and all migrations applied starts.
 Then migrations, then `DESCRIBE TABLE` of every table, then every `ch` site:
 SELECTs with `DESCRIBE TABLE (query)` and sample parameter values (int `1`,
 str `''`, none `\N`, ...; value errors are retried with other strings), other
@@ -477,7 +504,8 @@ mismatch is a 500, never wrong data.
 | `R` expected and no row | 404 | `not found` |
 | not sent; a read whose reply was lost; the client deadline; codes 159, 160, 201–203, 209, 210, 241, 242, 252, 285, 394, 425, 439, 999, 516; HTTP 5xx without a code | 503 + `Retry-After: 1` | `database unavailable, try again` |
 | an insert or statement sent and its reply lost; 319 | 500 | `write outcome unknown` |
-| anything else (unknown table, type mismatch at run time, UInt64 overflow, result over the cap) | 500 | `internal error` |
+| a parameter value over 128 KiB, an `Insert.dedup` key over 4 KiB | 400 | `bad value: {x} is too long (...)`, `bad value: Insert.dedup is too long (...)` |
+| anything else (unknown table, type mismatch at run time, UInt64 overflow, a result over `CLICKHOUSE_MAX_RESULT`) | 500 | `internal error` |
 
 5xx failures print one line with the site, the exception code and name, the
 message and the query id. Every call has `query_id = khrip-<16 hex>` and
@@ -491,7 +519,9 @@ cancelled (cancelling is not a rollback).
 (inserts and statements without rows; a read into `DbResult` is a compile
 error). `r` must be checked — `r.ok`, `r.status`, `r.code`, `r.error` or
 `r.unknown_outcome`; reading only `r.count` is a compile error, because a
-failure also has `count` 0.
+failure also has `count` 0. The same holds for a function that returns
+`DbResult`: `let r = flush(rows)` must be checked, and `flush(rows);` as a
+statement is a compile error (the failures it holds would be dropped).
 
 ```khrip
 every 10 s {
@@ -521,7 +551,8 @@ data should be selected as `base64Encode(col)` before it goes to JSON.
 
 `khc test` creates `khrip_test_<pid>_<rand>` on `KHRIP_TEST_CLICKHOUSE_URL`
 (else `CLICKHOUSE_URL`) for every connection, runs the migrations and all start
-checks there, and drops it at the end (`DROP DATABASE ... SYNC`). Test code may
+checks there, and drops it at the end (`DROP DATABASE ... SYNC`) — also when a
+migration or a start check fails. Test code may
 call `ch` and `t.insert` directly; a failure fails the test. Without a server:
 `khrip: tests use ClickHouse: set KHRIP_TEST_CLICKHOUSE_URL=http://user:password@host:8123/test (khc test works in its own temporary database and drops it)`.
 

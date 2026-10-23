@@ -21,3 +21,21 @@ route POST "/seen" -> 204 {
     visits.insert([Visit { ts: seen, page: "/" }])
     return 204
 }
+
+// Локальная переменная с именем таблицы — не таблица: events.push меняет store
+// через неё, маршрут пишет.
+store queue: [int]
+
+route POST "/queue" -> 204 {
+    let visits = queue
+    visits.push(1)
+    return 204
+}
+
+fn add_to(visits: [int]) -> int {
+    return visits.len()
+}
+
+route GET "/queue" -> int {
+    return add_to(queue)
+}

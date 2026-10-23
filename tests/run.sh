@@ -12,6 +12,8 @@
 #   tests/api/*.kh    — блоки test (khc test); вывод сравнивается с .out;
 #   tests/locks/*.kh  — какие маршруты берут store на чтение (khc check --locks);
 #   tests/sqlcheck/   — правильный SQL: khc check без базы не находит ошибок;
+#   tests/chcheck/    — то же для ch "..." и таблиц ClickHouse (PostgreSQL их
+#                       не подтверждает, поэтому отдельно от tests/sqlcheck);
 #   khc check --all-lib — вся библиотека (и не вызванные функции) и исходники
 #                       компилятора (--system) проходят проверки системного кода;
 #   docs/tutorial/    — примеры учебника выполняются, их тесты проходят;
@@ -169,7 +171,7 @@ else
 fi
 
 # Правильный SQL: проверка без базы не должна найти в нём ни одной ошибки.
-for src in tests/sqlcheck/*.kh; do
+for src in tests/sqlcheck/*.kh tests/chcheck/*.kh; do
 	if "$KHC" check "$src" >"$tmp/sqlcheck.txt" 2>&1; then
 		pass=$((pass + 1))
 	else

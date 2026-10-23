@@ -1,6 +1,6 @@
 // expect: this ch statement returns no rows: it gives the number of written rows (int) or a DbResult
 type Row { n: int }
 fn main() {
-    let rows: [Row] = ch "ALTER TABLE events DELETE WHERE ts < 5"
+    let rows: [Row] = ch "INSERT INTO archive SELECT * FROM events"
     print(rows.len())
 }

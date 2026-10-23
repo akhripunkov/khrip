@@ -1,0 +1,12 @@
+// expect: ch names database archive: one connection is one database (khc test replaces it)
+// expect: ch names database backup: one connection is one database (khc test replaces it)
+// expect: ch names database staging: one connection is one database (khc test replaces it)
+// expect: ch names database old: one connection is one database (khc test replaces it)
+fn main() {
+    ch "TRUNCATE archive.events"
+    ch "TRUNCATE TABLE IF EXISTS old.events"
+    let e: int = ch "EXISTS backup.events"
+    let names: [str] = ch "SHOW TABLES FROM staging"
+    let sys: [str] = ch "SHOW TABLES FROM system"
+    print(e + names.len() + sys.len())
+}

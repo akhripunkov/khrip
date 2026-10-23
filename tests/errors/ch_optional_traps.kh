@@ -1,0 +1,25 @@
+// expect: {q} may be none, and a comparison with NULL is never true: rows would silently not match
+// expect: {lo} may be none, and a comparison with NULL is never true: rows would silently not match
+// expect: {hi} may be none, and a comparison with NULL is never true: rows would silently not match
+// expect: {prefix} may be none, and a comparison with NULL is never true: rows would silently not match
+// expect: {one} may be none, and a comparison with NULL is never true: rows would silently not match
+// expect: {dir} may be none, and a comparison with NULL is never true: rows would silently not match
+// expect: {pat} may be none, and a comparison with NULL is never true: rows would silently not match
+type Row { n: int }
+fn main() {
+    let q: str? = env("Q")
+    let lo: int? = none
+    let hi: int? = none
+    let prefix: str? = env("PREFIX")
+    let one: str? = env("ONE")
+    let dir: str? = env("DIR")
+    let pat: str? = env("PAT")
+    let a: [Row] = ch "SELECT count() AS n FROM clicks WHERE url LIKE '%{q}%'"
+    let b: [Row] = ch "SELECT count() AS n FROM clicks WHERE ts BETWEEN {lo} AND 100"
+    let b2: [Row] = ch "SELECT count() AS n FROM clicks WHERE ts BETWEEN 1 AND {hi}"
+    let c: [Row] = ch "SELECT count() AS n FROM clicks WHERE startsWith(url, lower({prefix}))"
+    let d: [Row] = ch "SELECT count() AS n FROM clicks WHERE url IN ({one}, '/b')"
+    let e: [Row] = ch "SELECT count() AS n FROM clicks WHERE url = '/{dir}/index'"
+    let f: [Row] = ch "SELECT count() AS n FROM clicks WHERE like(url, concat('%', {pat}, '%'))"
+    print(a.len() + b.len() + b2.len() + c.len() + d.len() + e.len() + f.len())
+}

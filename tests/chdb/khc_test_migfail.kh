@@ -1,0 +1,8 @@
+// khc test, где падает миграция: временная база всё равно удаляется.
+migration ch 1 `CREATE TABLE t1 (id UInt64) ENGINE = MergeTree ORDER BY id;
+CREATE TABLE t1 (id UInt64) ENGINE = MergeTree ORDER BY id`
+
+test "never runs" {
+    let n: int = ch "SELECT count() FROM t1"
+    expect n == 0
+}

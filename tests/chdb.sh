@@ -86,7 +86,7 @@ grep -qF "khrip: CLICKHOUSE_URL is not set (8 ch queries): http://user:password@
 python3 tests/chdb/proxy.py "$proxy_port" "${host_port%:*}" "${host_port##*:}" >"$chdb_tmp/proxy.log" 2>&1 &
 pids+=($!)
 wait_port "$proxy_port" 2>/dev/null || true
-PORT=$port THREADS=2 CLICKHOUSE_URL="http://127.0.0.1:$proxy_port/$db" CLICKHOUSE_TIMEOUT=1000 "$chdb_tmp/api" >"$chdb_tmp/api.log" 2>&1 &
+PORT=$port THREADS=2 CLICKHOUSE_URL="http://127.0.0.1:$proxy_port/$db" CLICKHOUSE_TIMEOUT=1000 CLICKHOUSE_MAX_RESULT=1000000 "$chdb_tmp/api" >"$chdb_tmp/api.log" 2>&1 &
 pids+=($!)
 wait_port "$port"
 status() {
@@ -100,6 +100,22 @@ grep -q '^bad value: ' "$chdb_tmp/body" || fail "/parse body: $(cat "$chdb_tmp/b
 ! grep -q 'version' "$chdb_tmp/body" || fail "/parse body has the server version: $(cat "$chdb_tmp/body")"
 [[ $(status "/huge") == 500 ]] || fail "/huge: $(cat "$chdb_tmp/body")"
 [[ $(cat "$chdb_tmp/body") == "internal error" ]] || fail "/huge body: $(cat "$chdb_tmp/body")"
+# строка с меткой ch_null() остаётся строкой (не NULL)
+[[ $(status "/sentinel?s=%FFkhrip%3ANULL") == 200 ]] || fail "/sentinel: $(cat "$chdb_tmp/body")"
+[[ $(cat "$chdb_tmp/body") == '{"len":11,"quoted":11,"isnull":false,"n":0}' ]] || fail "a str parameter became NULL: $(cat "$chdb_tmp/body")"
+# ответ больше CLICKHOUSE_MAX_RESULT: 500, без Retry-After, без повтора
+[[ $(status "/big?n=10") == 200 ]] || fail "/big small: $(cat "$chdb_tmp/body")"
+[[ $(status "/big?n=1000000") == 500 ]] || fail "/big over the cap: $(cat "$chdb_tmp/body")"
+! grep -qi '^Retry-After' "$chdb_tmp/headers" || fail "/big over the cap has Retry-After"
+grep -q 'add LIMIT or aggregate' "$chdb_tmp/api.log" || fail "no LIMIT hint for a large result: $(cat "$chdb_tmp/api.log")"
+q default "SYSTEM FLUSH LOGS" >/dev/null
+big_runs=$(q default "SELECT count() FROM system.query_log WHERE current_database = '$db' AND type = 'QueryStart' AND log_comment LIKE 'tests/chdb/api.kh:%' AND startsWith(query, 'SELECT number FROM numbers(')")
+# 1 — /big?n=10, 1 — /big?n=1000000 (без повтора)
+[[ $big_runs == 2 ]] || fail "a result over the cap ran $big_runs queries (want 2: no retry)"
+# значение параметра: до 128 КиБ — запрос, больше — 400
+[[ $(status "/ids?n=8000") == 200 ]] || fail "/ids 8000 values: $(cat "$chdb_tmp/body")"
+[[ $(status "/ids?n=20000") == 400 ]] || fail "/ids 20000 values: $(cat "$chdb_tmp/body")"
+[[ $(cat "$chdb_tmp/body") == "bad value: {ids} is too long ("*" bytes as a ClickHouse parameter, at most 131072)" ]] || fail "/ids body: $(cat "$chdb_tmp/body")"
 [[ $(status "/slow") == 503 ]] || fail "/slow: $(cat "$chdb_tmp/body")"
 grep -qi '^Retry-After: 1' "$chdb_tmp/headers" || fail "/slow without Retry-After"
 # срок клиента вышел — KILL QUERY: на сервере запроса больше нет
@@ -133,7 +149,7 @@ done
 expect_output tables env CLICKHOUSE_URL="$s2_url" "$chdb_tmp/tables"
 # проверки при запуске: все ошибки сразу, затем выход 1
 fresh "$step2"
-for t in "s12 (id UInt64, ts DateTime)" "s13 (id UInt64, note String)" "s14 (id UInt64, amount Decimal(12, 2))" "s21 (id UInt64)" "s24 (id UInt64, level Enum8('Debug' = 1, 'Info' = 2, 'Error' = 3))" "mat (id UInt64, twice UInt64 MATERIALIZED id * 2)"; do
+for t in "s12 (id UInt64, ts DateTime)" "s13 (id UInt64, note String)" "s14 (id UInt64, amount Decimal(12, 2))" "s21 (id UInt64)" "s24 (id UInt64, level Enum8('Debug' = 1, 'Info' = 2, 'Error' = 3))" "mat (id UInt64, twice UInt64 MATERIALIZED id * 2)" "s13a (id UInt64, tags Array(String) DEFAULT [])"; do
     q "$step2" "CREATE TABLE $t ENGINE = MergeTree ORDER BY id" || fail "create $t"
 done
 if CLICKHOUSE_URL="$s2_url" "$chdb_tmp/startup" >"$chdb_tmp/startup.out" 2>"$chdb_tmp/startup.err"; then
@@ -142,30 +158,36 @@ fi
 while IFS= read -r want; do
     grep -qF -- "$want" "$chdb_tmp/startup.err" || fail "startup: expected «$want», got:"$'\n'"$(cat "$chdb_tmp/startup.err")"
 done <<X
-tests/chdb/startup.kh:17:7: error: table s12: column ts (DateTime) is not a field of S12Row and has no DEFAULT: rows would get 1970-01-01 00:00:00
+tests/chdb/startup.kh:18:7: error: table s12: column ts (DateTime) is not a field of S12Row and has no DEFAULT: rows would get 1970-01-01 00:00:00
     hint: add ts to S12Row, or DEFAULT now() to the column
-tests/chdb/startup.kh:18:7: error: table s13: S13Row.note is str? but column note is String without DEFAULT: none would be written as ''
+tests/chdb/startup.kh:19:7: error: table s13: S13Row.note is str? but column note is String without DEFAULT: none would be written as ''
     hint: make the column Nullable(String) or give it a DEFAULT, or make the field str
-tests/chdb/startup.kh:19:7: error: table s14: S14Row.amount is int, but column amount is Decimal(12, 2): an int would be read as whole units
+tests/chdb/startup.kh:20:7: error: table s14: S14Row.amount is int, but column amount is Decimal(12, 2): an int would be read as whole units
     hint: keep cents in an Int64 column, or send a str ("12.34") or a float
-tests/chdb/startup.kh:20:7: error: table s21: insert dedup needs a Replicated table or SETTINGS non_replicated_deduplication_window = N: without it a repeated insert is stored twice
-tests/chdb/startup.kh:21:7: error: table s24: enum Level has Trace, but column level is Enum8('Debug' = 1, 'Info' = 2, 'Error' = 3)
-tests/chdb/startup.kh:22:7: error: table mat: column twice is MATERIALIZED, so MatRow.twice cannot be inserted
-tests/chdb/startup.kh:23:7: error: table nope does not exist in $step2
-tests/chdb/startup.kh:27:22: error: column views is UInt64, but Views.views is str
-tests/chdb/startup.kh:28:24: error: PageRow.avg_ms has no column: the query returns page
+tests/chdb/startup.kh:21:7: error: table s21: insert dedup needs a Replicated table or SETTINGS non_replicated_deduplication_window = N: without it a repeated insert is stored twice
+tests/chdb/startup.kh:22:7: error: table s24: enum Level has Trace, but column level is Enum8('Debug' = 1, 'Info' = 2, 'Error' = 3)
+tests/chdb/startup.kh:23:7: error: table mat: column twice is MATERIALIZED, so MatRow.twice cannot be inserted
+tests/chdb/startup.kh:24:7: error: table nope does not exist in $step2
+tests/chdb/startup.kh:25:7: error: table s13a: S13aRow.tags is [str]? but column tags is Array(String): ClickHouse arrays and maps are never NULL, so none cannot be written
+    hint: make the field [str] and use an empty value for none
+tests/chdb/startup.kh:29:22: error: column views is UInt64, but Views.views is str
+tests/chdb/startup.kh:30:24: error: PageRow.avg_ms has no column: the query returns page
     hint: select it (or rename with AS avg_ms), or give the field a default
-tests/chdb/startup.kh:29:21: error: column ts is DateTime64(3), but Ts64.ts is int
+tests/chdb/startup.kh:31:21: error: column ts is DateTime64(3), but Ts64.ts is int
     hint: make it str, or select toUnixTimestamp(ts) AS ts (seconds) or toUnixTimestamp64Milli(ts) AS ts_ms
-tests/chdb/startup.kh:31:18: error: Illegal types of arguments (Date, Int64) of function greaterOrEquals
+tests/chdb/startup.kh:33:18: error: Illegal types of arguments (Date, Int64) of function greaterOrEquals
     hint: compare a Date column with toDate({from})
-tests/chdb/startup.kh:33:18: warning: not checked at start: the query fails with sample parameter values (Unknown element '' for enum); it is checked on its first run
-tests/chdb/startup.kh:34:18: error: Unknown table expression identifier 'missing_table'
-tests/chdb/startup.kh:35:22: error: column n can be NULL, but Maybe.n is int and has no none
-tests/chdb/startup.kh:36:5: error: table gone does not exist in $step2
-tests/chdb/startup.kh:37:5: error: Unknown expression or function identifier \`idd\`
-tests/chdb/startup.kh:38:18: error: Unknown expression identifier \`nope\`
-khrip: 16 ClickHouse declaration(s) or ch statement(s) do not match the server
+tests/chdb/startup.kh:35:18: warning: not checked at start: the query fails with sample parameter values (Unknown element '' for enum); it is checked on its first run
+tests/chdb/startup.kh:36:18: error: Unknown table expression identifier 'missing_table'
+tests/chdb/startup.kh:37:22: error: column n can be NULL, but Maybe.n is int and has no none
+tests/chdb/startup.kh:38:5: error: table gone does not exist in $step2
+tests/chdb/startup.kh:39:5: error: Unknown expression or function identifier \`idd\`
+tests/chdb/startup.kh:40:18: error: Unknown expression identifier \`nope\`
+tests/chdb/startup.kh:41:19: error: INSERT ... SELECT puts the column ts into s12.id: ClickHouse matches the columns by position, not by name
+    hint: select them in the order id, ts, or list them: INSERT INTO s12 (ts, id) SELECT ...
+tests/chdb/startup.kh:44:21: error: column xs can be NULL, but Tags.xs is [int] and has no none
+    hint: make it [int?]
+khrip: 19 ClickHouse declaration(s) or ch statement(s) do not match the server
 X
 # миграции: S22, проверка без применения, ./app migrate, изменённая миграция
 fresh "$step2"
@@ -195,6 +217,33 @@ if CLICKHOUSE_URL="$s2_url" "$chdb_tmp/mig_edited" >/dev/null 2>"$chdb_tmp/mig.e
     fail "an edited migration let the program start"
 fi
 grep -qF "khrip: ClickHouse migration ch 1 was changed after it was applied" "$chdb_tmp/mig.err" || fail "edited migration: $(cat "$chdb_tmp/mig.err")"
+# номер меньше применённого — отказ, как у PostgreSQL
+fresh "$step2"
+for name in mig_order1 mig_order2 mig_seed mig_two; do
+    "$KHC" -o "$chdb_tmp/$name" "tests/chdb/$name.kh"
+done
+CLICKHOUSE_URL="$s2_url" "$chdb_tmp/mig_order1" >/dev/null 2>"$chdb_tmp/mig.err" || fail "migrations 1 and 3: $(cat "$chdb_tmp/mig.err")"
+if CLICKHOUSE_URL="$s2_url" "$chdb_tmp/mig_order2" >/dev/null 2>"$chdb_tmp/mig.err"; then
+    fail "migration 2 after the applied 3 was applied"
+fi
+grep -qF "khrip: ClickHouse migration ch 2 is older than the applied migration ch 3: renumber it to 4" "$chdb_tmp/mig.err" || fail "out-of-order migration: $(cat "$chdb_tmp/mig.err")"
+# одновременные запуски: миграция с данными применяется один раз (замок базы)
+fresh "$step2"
+mig_pids=()
+for k in 1 2 3 4; do
+    CLICKHOUSE_URL="$s2_url" "$chdb_tmp/mig_seed" migrate >"$chdb_tmp/seed$k.out" 2>&1 &
+    mig_pids+=($!)
+done
+for pid in "${mig_pids[@]}"; do
+    wait "$pid" || fail "concurrent ./app migrate: $(cat "$chdb_tmp"/seed*.out)"
+done
+[[ $(q "$step2" "SELECT count() FROM seed") == 3 ]] || fail "concurrent starts applied the seed migration $(q "$step2" "SELECT count() FROM seed") / 3 rows"
+[[ $(q "$step2" "SELECT count() FROM khrip_migrations") == 1 ]] || fail "khrip_migrations after concurrent starts"
+[[ $(q "$step2" "EXISTS TABLE khrip_migrations_lock") == 0 ]] || fail "the migration lock was not released"
+# два соединения к одной базе — у каждого своя migration 1
+fresh "$step2"
+METRICS_CLICKHOUSE_URL="${base%%://*}://$ch_user:$ch_pass@$host_port/$step2" CLICKHOUSE_URL="$s2_url" "$chdb_tmp/mig_two" >/dev/null 2>"$chdb_tmp/mig.err" || fail "two connections to one database: $(cat "$chdb_tmp/mig.err")"
+[[ $(q "$step2" "SELECT arrayStringConcat(groupArray(name), ',') FROM (SELECT name FROM khrip_migrations ORDER BY name)") == "1,metrics/1" ]] || fail "migration records of two connections: $(q "$step2" "SELECT name FROM khrip_migrations")"
 # пользователь с readonly=1: чтение без настроек проходит, запись — S20
 fresh "$step2"
 ro_user="kh_ro_chdb_$$"
@@ -209,8 +258,11 @@ if env -u CLICKHOUSE_USER -u CLICKHOUSE_PASSWORD CLICKHOUSE_URL="$ro_url" "$chdb
     q default "DROP USER $ro_user" >/dev/null
     fail "a writer started with a readonly user"
 fi
-q default "DROP USER $ro_user" >/dev/null
 grep -qF "khrip: ClickHouse user $ro_user is read-only, but the program writes (tests/chdb/readonly_writer.kh:6:5)" "$chdb_tmp/ro.err" || fail "S20: $(cat "$chdb_tmp/ro.err")"
+# readonly и DATABASE_MIGRATE=check с применёнными миграциями — программа только читает
+CLICKHOUSE_URL="$s2_url" "$chdb_tmp/mig_seed" migrate >/dev/null 2>&1 || fail "seed for the readonly check"
+[[ $(env -u CLICKHOUSE_USER -u CLICKHOUSE_PASSWORD DATABASE_MIGRATE=check CLICKHOUSE_URL="$ro_url" "$chdb_tmp/mig_seed" 2>"$chdb_tmp/ro.err") == 3 ]] || fail "readonly reader with migrations in check mode: $(cat "$chdb_tmp/ro.err")"
+q default "DROP USER $ro_user" >/dev/null
 # именованное соединение: таблицы in ИМЯ, migration ИМЯ N, ch ИМЯ; none — отказ
 fresh "$step2"
 "$KHC" -o "$chdb_tmp/named" tests/chdb/named.kh
@@ -225,6 +277,14 @@ KHRIP_TEST_CLICKHOUSE_URL="$base/default" KHRIP_TEST_CLICKHOUSE_USER="$ch_user" 
 diff -u tests/chdb/khc_test.out "$chdb_tmp/khc_test.out" || fail "khc test output differs"
 after=$(q default "SELECT count() FROM system.databases WHERE startsWith(name, 'khrip_test_')")
 [[ $after == "$before" ]] || fail "khc test left its temporary database ($before before, $after after)"
+# проверки при запуске или миграция не прошли — временная база всё равно удалена
+for bad in khc_test_bad khc_test_migfail; do
+    if KHRIP_TEST_CLICKHOUSE_URL="$base/default" KHRIP_TEST_CLICKHOUSE_USER="$ch_user" KHRIP_TEST_CLICKHOUSE_PASSWORD="$ch_pass" "$KHC" test "tests/chdb/$bad.kh" >"$chdb_tmp/$bad.out" 2>&1; then
+        fail "$bad: khc test passed"
+    fi
+    after=$(q default "SELECT count() FROM system.databases WHERE startsWith(name, 'khrip_test_')")
+    [[ $after == "$before" ]] || fail "$bad: khc test left its temporary database ($before before, $after after): $(cat "$chdb_tmp/$bad.out")"
+done
 # P3 и clicks на настоящей схеме (migration ch 1): вставки и отчёты по HTTP
 fresh "$step2"
 PORT=$port THREADS=2 CLICKHOUSE_URL="$s2_url" "$chdb_tmp/p3" >"$chdb_tmp/p3.log" 2>&1 &
@@ -254,4 +314,22 @@ wait_port "$port"
 [[ $(status "/daily?from=0&to=9999999999") == 200 ]] || fail "clicks daily: $(cat "$chdb_tmp/body")"
 grep -q '"hits":3' "$chdb_tmp/body" || fail "clicks daily body: $(cat "$chdb_tmp/body")"
 [[ $(post /clicks '[{"user_id":5,"url":"/","country":"DE","ms":-10}]') == 400 ]] || fail "clicks negative ms: $(cat "$chdb_tmp/body")"
+kill "${pids[-1]}"
+wait "${pids[-1]}" 2>/dev/null || true
+# таблицу изменили после запуска: план вставки — заново, один повтор
+fresh "$step2"
+"$KHC" -o "$chdb_tmp/replan" tests/chdb/replan.kh
+PORT=$port THREADS=2 CLICKHOUSE_URL="$s2_url" "$chdb_tmp/replan" >"$chdb_tmp/replan.log" 2>&1 &
+pids+=($!)
+wait_port "$port"
+[[ $(post /p '{"id":1,"v":5}') == 201 ]] || fail "replan first insert: $(cat "$chdb_tmp/body")"
+q "$step2" "ALTER TABLE pr MODIFY COLUMN v UInt8" || fail "alter pr"
+[[ $(post /p '{"id":2,"v":7}') == 201 ]] || fail "insert after ALTER MODIFY COLUMN: $(cat "$chdb_tmp/body") $(cat "$chdb_tmp/replan.log")"
+grep -qF "tests/chdb/replan.kh:11:5: table pr changed after start: the insert plan was rebuilt" "$chdb_tmp/replan.log" || fail "replan log: $(cat "$chdb_tmp/replan.log")"
+[[ $(post /p '{"id":3,"v":300}') == 400 ]] || fail "the rebuilt plan lets 300 into UInt8: $(cat "$chdb_tmp/body")"
+[[ $(cat "$chdb_tmp/body") == "bad value: pr.v: 300 is out of range for UInt8" ]] || fail "replan 400 body: $(cat "$chdb_tmp/body")"
+[[ $(status /p) == 200 && $(cat "$chdb_tmp/body") == 12 ]] || fail "rows after replan: $(cat "$chdb_tmp/body")"
+q "$step2" "ALTER TABLE pr DROP COLUMN s" || fail "drop pr.s"
+[[ $(post /p '{"id":4,"v":1}') == 500 ]] || fail "insert into a table without the field's column: $(cat "$chdb_tmp/body")"
+grep -qF "tests/chdb/replan.kh:11:5: error: table pr: P.s has no column" "$chdb_tmp/replan.log" || fail "replan error log: $(cat "$chdb_tmp/replan.log")"
 echo "typed ClickHouse (ch queries, statuses, tables, migrations, startup checks, khc test): ok"

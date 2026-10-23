@@ -72,9 +72,13 @@ fn __dh_line(h: __DbHttp, max: int) -> str {
     return ""
 }
 
+// Ответ больше предела клиента: запрос выполнен, ответ отброшен. Это ошибка
+// программы (выбрать меньше строк), а не потерянный ответ: не повторять.
+const DH_TOO_LARGE = "database HTTP response exceeds max_response_bytes"
+
 fn __dh_take(h: __DbHttp, out: Buf, n: int, max: int) -> bool {
     if n < 0 || n > max - out.len {
-        h.error = "database HTTP response exceeds max_response_bytes"
+        h.error = DH_TOO_LARGE
         return false
     }
     var left = n
@@ -238,12 +242,15 @@ fn __dh_response(h: __DbHttp, max: int) -> Response {
             if chunks > 65536 || metadata > 1048576 {
                 return __fetch_fail("database HTTP chunk count or metadata exceeds limit")
             }
-            let size = __dh_chunk_size(line, max - out.len)
+            let size = __dh_chunk_size(line, 2147483647)
             if h.error.byte_len() > 0 {
                 return __fetch_fail(h.error)
             }
             if size < 0 {
-                return __fetch_fail("invalid or oversized database HTTP chunk")
+                return __fetch_fail("invalid database HTTP chunk size")
+            }
+            if size > max - out.len {
+                return __fetch_fail(DH_TOO_LARGE)
             }
             if size == 0 {
                 var trailers: map[str, str] = {}
@@ -269,9 +276,12 @@ fn __dh_response(h: __DbHttp, max: int) -> Response {
             }
         }
     } else if hs.has("content-length") {
-        let n = __dh_decimal(hs["content-length"] ?? "", max)
+        let n = __dh_decimal(hs["content-length"] ?? "", 9223372036854775807)
         if n < 0 {
-            return __fetch_fail("invalid content-length or response exceeds max_response_bytes")
+            return __fetch_fail("invalid database HTTP content-length")
+        }
+        if n > max {
+            return __fetch_fail(DH_TOO_LARGE)
         }
         if !__dh_take(h, out, n, max) {
             return __fetch_fail(h.error)
@@ -377,7 +387,7 @@ fn __dh_exchange(url: __Url, head: str, rest: str, budget: bool, query: str, pay
     if __link_write(tag, c, __str_ptr(lead), lead.byte_len(), deadline) && __link_write(tag, c, __str_ptr(query), query.byte_len(), deadline) && __link_write(tag, c, __str_ptr(payload), payload.byte_len(), deadline) {
         r = __dh_response(h, max)
     }
-    if r.status == 0 {
+    if r.status == 0 && r.body != DH_TOO_LARGE {
         r.headers["x-khrip-unknown-outcome"] = "1"
     }
     if r.status > 0 && !(r.headers["connection"] ?? "").ascii_lower().contains("close") && (tag == 0 || __tls_idle_ok(c)) {

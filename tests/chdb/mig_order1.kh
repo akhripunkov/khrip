@@ -1,0 +1,6 @@
+// Применены миграции 1 и 3; tests/chdb.sh затем запускает mig_order2.kh.
+migration ch 1 `CREATE TABLE a (id UInt64) ENGINE = MergeTree ORDER BY id`
+migration ch 3 `CREATE TABLE c (id UInt64) ENGINE = MergeTree ORDER BY id`
+fn main() {
+    print("ok")
+}

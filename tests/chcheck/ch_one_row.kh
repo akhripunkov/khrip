@@ -1,0 +1,21 @@
+// Агрегат без GROUP BY отдаёт ровно одну строку и в ClickHouse: uniq, countIf,
+// quantile, WITH ... SELECT count() — маршруту с одним типом 404 не нужен.
+type Stats { users: int, errors: int }
+type N { n: int }
+type P { p95: float }
+
+route GET "/stats" -> Stats {
+    return ch "SELECT uniq(user_id) AS users, countIf(status >= 500) AS errors FROM clicks"
+}
+
+route GET "/since" (from: int) -> N {
+    return ch "WITH {from} AS start SELECT count() AS n FROM clicks WHERE ts >= start"
+}
+
+route GET "/p95" -> P {
+    return ch "SELECT quantileExact(0.95)(ms) AS p95 FROM clicks"
+}
+
+route GET "/states" -> N {
+    return ch "SELECT uniqExact(user_id) AS n FROM clicks WHERE ts > 0"
+}

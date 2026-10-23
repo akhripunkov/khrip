@@ -84,6 +84,48 @@ fn ch_table_sym(name: str) -> int {
     return sym_idx(s)
 }
 
+// toks[i] — вызов вставки таблицы ClickHouse: ИМЯ.insert(, где ИМЯ — таблица,
+// а не параметр или локальная функции fi с тем же именем.
+fn ch_table_call_at(fi: int, i: int) -> bool {
+    let t = toks[i]
+    if t.kind != T_IDENT || kind_at(i + 1) != '.' || kind_at(i + 2) != T_IDENT || toks[i + 2].text != "insert" || kind_at(i + 3) != '(' {
+        return false
+    }
+    if i > 0 && toks[i - 1].kind == '.' {
+        return false
+    }
+    if ch_table_sym(t.text) < 0 {
+        return false
+    }
+    return !name_local_in(fi, i, t.text)
+}
+
+// Имя — параметр функции fi или локальная, объявленная в её теле до лексемы i
+// (let, var, for, if let, лямбда x =>).
+fn name_local_in(fi: int, i: int, name: str) -> bool {
+    let f = funcs[fi]
+    for p in f.params {
+        if p.name == name {
+            return true
+        }
+    }
+    if f.body < 0 {
+        return false
+    }
+    var j = f.body
+    while j < i {
+        let t = toks[j]
+        if t.kind == T_IDENT && t.text == name {
+            let pk = toks[j - 1].kind
+            if pk == T_LET || pk == T_VAR || pk == T_FOR || kind_at(j + 1) == T_FATARROW || (pk == ',' && toks[j - 2].kind == T_IDENT && toks[j - 3].kind == T_FOR) {
+                return true
+            }
+        }
+        j += 1
+    }
+    return false
+}
+
 // Тип результата DbResult (явная форма записи, lib/chdb.kh).
 fn is_db_result(t: int) -> bool {
     return tkind(t) == K_STRUCT && structs[types[t].a].name == "DbResult" && files[toks[structs[types[t].a].tok].file].is_lib

@@ -27,3 +27,28 @@ route GET "/slow" -> N {
     let n: int = ch "SELECT sum(sleepEachRow(0.2)) AS n FROM numbers(50) SETTINGS max_block_size = 1"
     return N { n }
 }
+
+// Строка из данных никогда не становится NULL (метка ch_null() — только у
+// низкоуровневого ch_query_params): длина 11, не NULL, ни одного совпадения.
+type Echo { len: int, quoted: int, isnull: bool, n: int }
+
+route GET "/sentinel" (s: str) -> Echo {
+    let o: str? = s
+    return ch "SELECT any(length({s})) AS len, any(length('{s}')) AS quoted, any({o} IS NULL) AS isnull, countIf({o} IS NULL OR toString(number) = {o}) AS n FROM numbers(10)"
+}
+
+// Ответ больше CLICKHOUSE_MAX_RESULT: 500 без Retry-After, запрос — один раз.
+route GET "/big" (n: int) -> N {
+    let xs: [int] = ch "SELECT number FROM numbers({n}) ORDER BY number"
+    return N { n: xs.len() }
+}
+
+// Значение параметра больше 128 КиБ — 400, меньше — запрос.
+route GET "/ids" (n: int) -> N {
+    var ids: [int] = []
+    for i in 0..n {
+        ids.push(i * 1000000007)
+    }
+    let c: int = ch "SELECT count() FROM numbers(10) WHERE number IN {ids}"
+    return N { n: c }
+}

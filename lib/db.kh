@@ -1116,7 +1116,7 @@ fn __db_start_here() {
         let pc = __pg_connect(__pg_url, now_ms() + 10000)
         if pc.c == 0 {
             eprint("khrip: cannot connect to the database: {pc.err}")
-            exit(1)
+            __db_exit(1)
         }
         c = pc.c
     }
@@ -1138,7 +1138,7 @@ fn __db_start_here() {
     let mode = env("DATABASE_MIGRATE") ?? "apply"
     if mode != "apply" && mode != "check" && mode != "1" && mode != "0" {
         eprint("khrip: DATABASE_MIGRATE must be apply or check, not {mode}")
-        exit(1)
+        __db_exit(1)
     }
     let migrate = mode == "apply" || mode == "1" || (args().len() > 1 && args()[1] == "migrate")
     if names.len() > 0 && migrate {
@@ -1151,7 +1151,7 @@ fn __db_start_here() {
         }
         if err.byte_len() > 0 {
             eprint("khrip: migration failed: " + err)
-            exit(1)
+            __db_exit(1)
         }
     } else if names.len() > 0 {
         // DATABASE_MIGRATE=check: схему меняет отдельный шаг (./app migrate)
@@ -1163,7 +1163,7 @@ fn __db_start_here() {
         for nm in names {
             if !applied.contains(nm) {
                 eprint("khrip: migration {nm} is not applied (DATABASE_MIGRATE={mode}): run ./app migrate")
-                exit(1)
+                __db_exit(1)
             }
         }
     }
@@ -1185,9 +1185,18 @@ fn __db_start_here() {
     }
     if bad > 0 {
         eprint("khrip: {bad} sql statement(s) do not match the database")
-        exit(1)
+        __db_exit(1)
     }
     __pg_free(c)
+}
+
+// Выход при запуске с ошибкой: в khc test сначала удалить временные схему и
+// базы (__db_done — PostgreSQL и ClickHouse), иначе они остались бы на сервере.
+fn __db_exit(code: int) {
+    if __db_testing() {
+        __db_done()
+    }
+    exit(code)
 }
 
 // ./app migrate — шаг выкладки: миграции и проверки всех баз (PostgreSQL,

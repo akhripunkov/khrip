@@ -245,8 +245,35 @@ fn typed_layer() {
     require(__ch_wide_text(__str_ptr(le_bytes(0, 8) + le_bytes(1, 8)), 16, false) == "18446744073709551616", "UInt128 2^64")
     require(__ch_wide_text(__str_ptr(le_bytes(-1, 8).repeat(4)), 32, false) == "115792089237316195423570985008687907853269984665640564039457584007913129639935", "UInt256 max")
     let wb = buf_new(16)
-    require(__ch_wide_put(wb, true, "18446744073709551617", 16) && __ch_wide_text(wb.data, 16, true) == "-18446744073709551617", "Int128 from digits")
-    require(!__ch_wide_put(buf_new(16), false, "170141183460469231731687303715884105728", 16), "Int128 overflow")
+    require(__ch_wide_put(wb, true, "18446744073709551617", 16, true) && __ch_wide_text(wb.data, 16, true) == "-18446744073709551617", "Int128 from digits")
+    require(!__ch_wide_put(buf_new(16), false, "170141183460469231731687303715884105728", 16, true), "Int128 overflow")
+    // Int128/Int256/UInt128/UInt256 из текста: знак и границы столбца
+    let ds0 = d_scalar(D_STR)
+    let u128 = __ch_twrite_plan(ty("UInt128"), ds0, false, 0) ?? __ChTWrite { op: 0 }
+    let i128 = __ch_twrite_plan(ty("Int128"), ds0, false, 0) ?? __ChTWrite { op: 0 }
+    let u256 = __ch_twrite_plan(ty("UInt256"), ds0, false, 0) ?? __ChTWrite { op: 0 }
+    let i256 = __ch_twrite_plan(ty("Int256"), ds0, false, 0) ?? __ChTWrite { op: 0 }
+    require(write_one(u128, __cast("-1")) == "error: '-1' is out of range for UInt128", "UInt128 refuses -1")
+    // NaN и бесконечность — не числа столбца
+    let dfl = d_scalar(D_FLOAT)
+    let f64 = __ch_twrite_plan(ty("Float64"), dfl, false, 0) ?? __ChTWrite { op: 0 }
+    let f32 = __ch_twrite_plan(ty("Float32"), dfl, false, 0) ?? __ChTWrite { op: 0 }
+    let dec = __ch_twrite_plan(ty("Decimal(12, 2)"), dfl, false, 0) ?? __ChTWrite { op: 0 }
+    let inf = 1.0 / 0.0
+    let nan = inf - inf
+    require(write_one(f64, bits(1.5)) == le_bytes(bits(1.5), 8), "Float64 1.5")
+    require(write_one(f64, bits(nan)).starts_with("error: ") && write_one(f64, bits(nan)).ends_with(" is not a finite number"), "Float64 refuses NaN")
+    require(write_one(f64, bits(inf)).ends_with(" is not a finite number"), "Float64 refuses Inf")
+    require(write_one(f32, bits(0.0 - inf)).ends_with(" is not a finite number"), "Float32 refuses -Inf")
+    require(write_one(dec, bits(inf)).ends_with(" is not a finite number"), "Decimal refuses Inf")
+    require(write_one(u128, __cast("340282366920938463463374607431768211455")) == raw_bytes([255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255]), "UInt128 max")
+    require(write_one(u128, __cast("340282366920938463463374607431768211456")) == "error: '340282366920938463463374607431768211456' is out of range for UInt128", "UInt128 max + 1")
+    require(write_one(i128, __cast("-170141183460469231731687303715884105728")) == le_bytes(0, 8) + le_bytes(-9223372036854775807 - 1, 8), "Int128 min")
+    require(write_one(i128, __cast("170141183460469231731687303715884105728")) == "error: '170141183460469231731687303715884105728' is out of range for Int128", "Int128 max + 1")
+    require(write_one(i128, __cast("-0")) == le_bytes(0, 8) + le_bytes(0, 8), "Int128 -0")
+    require(write_one(u256, __cast("115792089237316195423570985008687907853269984665640564039457584007913129639935")) == raw_bytes([255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255]), "UInt256 max")
+    require(write_one(i256, __cast("-57896044618658097711785492504343953926634992332820282019728792003956564819968")) == le_bytes(0, 8).repeat(3) + le_bytes(-9223372036854775807 - 1, 8), "Int256 min")
+    require(write_one(u256, __cast("1.5")) == "error: '1.5' has more than 0 decimal places", "UInt256 fraction")
     require(__ch_decimal_text(__str_ptr(le_bytes(-1205, 8)), 8, 2) == "-12.05" && __ch_decimal_text(__str_ptr(le_bytes(5, 4)), 4, 3) == "0.005", "Decimal text keeps the scale")
     let half = __ch_decimal_digits("0.125", 2, 10, false)
     let up = __ch_decimal_digits("0.135", 2, 10, false)

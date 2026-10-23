@@ -1,4 +1,5 @@
 // expect: this query answers 404 when no row matches, but route GET "/pages/{page}" does not list 404
+// expect: hint: add | 404 to the route, or answer yourself: let row: T = ch ... else { return 401 }
 type Stat { page: str, views: int }
 route GET "/pages/{page}" (page: str) -> Stat {
     return ch "SELECT page, count() AS views FROM events WHERE page = {page} GROUP BY page"

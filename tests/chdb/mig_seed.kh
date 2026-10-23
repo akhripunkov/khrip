@@ -1,0 +1,6 @@
+// Миграция с данными: четыре одновременных ./app migrate применяют её один раз.
+migration ch 1 `CREATE TABLE IF NOT EXISTS seed (id UInt64) ENGINE = MergeTree ORDER BY id; INSERT INTO seed SELECT number FROM numbers(3)`
+fn main() {
+    let n: int = ch "SELECT count() FROM seed"
+    print(n)
+}

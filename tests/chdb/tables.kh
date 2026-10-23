@@ -53,9 +53,10 @@ fn main() {
     print("queue " + queued.to_str())
     let empty: [Job] = []
     print("empty " + queue.insert(empty).to_str())
-    let m: DbResult = ch "ALTER TABLE queue DELETE WHERE id = 1"
+    // комментарий в конце запроса проверке при запуске не мешает
+    let m: DbResult = ch "ALTER TABLE queue DELETE WHERE id = 1 -- cleanup"
     print("mutation " + m.ok.to_str())
-    let left: int = ch "SELECT count() FROM queue"
+    let left: int = ch "SELECT count() FROM queue # what is left"
     print("queue " + left.to_str())
     let copied: int = ch "INSERT INTO queue SELECT id + 10, body FROM queue"
     print("copied " + copied.to_str())

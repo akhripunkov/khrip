@@ -1,0 +1,17 @@
+// Таблицу изменили после запуска (ALTER вне миграций): вставка, упавшая на
+// заголовке, строит план заново по DESCRIBE и повторяется один раз.
+migration ch 1 `CREATE TABLE pr (id UInt64, v UInt64, s String) ENGINE = MergeTree ORDER BY id`
+
+type P { id: int, v: int, s: str }
+type In { id: int, v: int }
+
+table pr: P
+
+route POST "/p" (b: In) -> 201 {
+    pr.insert(P { id: b.id, v: b.v, s: "x" })
+    return 201
+}
+
+route GET "/p" -> int {
+    return ch "SELECT sum(v) FROM pr"
+}

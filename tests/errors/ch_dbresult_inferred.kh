@@ -1,0 +1,10 @@
+// expect: r is never checked, so the failures it holds are ignored
+type Event { ts: int, page: str }
+table events: Event
+fn flush(rows: [Event]) -> DbResult {
+    return events.insert(rows)
+}
+fn main() {
+    let r = flush([Event { ts: 1, page: "/" }])
+    print(r.count)
+}

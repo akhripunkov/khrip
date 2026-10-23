@@ -1,0 +1,14 @@
+// khc test, где проверка при запуске не проходит: временная база всё равно
+// удаляется (tests/chdb.sh сверяет число баз khrip_test_*).
+migration ch 1 `CREATE TABLE t1 (id UInt64) ENGINE = MergeTree ORDER BY id`
+
+type T { id: int }
+type Bad { id: int, nope: int }
+
+table t1: T
+table t2: Bad at "t1"
+
+test "never runs" {
+    t1.insert(T { id: 1 })
+    expect true
+}

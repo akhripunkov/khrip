@@ -13,6 +13,7 @@ type PageRow { page: str, avg_ms: float }
 type Ts64 { ts: int }
 type N { n: int }
 type Maybe { n: int }
+type S13aRow { id: int, tags: [str]? }
 
 table s12: S12Row
 table s13: S13Row
@@ -21,6 +22,7 @@ table s21: S21Row
 table s24: S24Row
 table mat: MatRow
 table nope: Missing
+table s13a: S13aRow
 
 fn main() {
     s21.insert([S21Row { id: 1 }], Insert { dedup: "k" })
@@ -36,5 +38,11 @@ fn main() {
     ch "ALTER TABLE gone DELETE WHERE id = 1"
     ch "ALTER TABLE s12 DELETE WHERE idd < {from}"
     let w: int = ch "INSERT INTO s12 SELECT nope, now() FROM numbers(1)"
-    print(a.len() + b.len() + c.len() + d.len() + e.len() + f.len() + g.len() + w)
+    let w2: int = ch "INSERT INTO s12 SELECT ts, id FROM s12"
+    let ex: int = ch "EXISTS TABLE not_yet_created"
+    let w3: int = ch "INSERT INTO TABLE s12 SELECT id, ts FROM s12"
+    let h: [Tags] = ch "SELECT [toNullable(id)] AS xs FROM s12"
+    print(a.len() + b.len() + c.len() + d.len() + e.len() + f.len() + g.len() + w + w2 + ex + w3 + h.len())
 }
+
+type Tags { xs: [int] }

@@ -62,6 +62,11 @@ fn main() {
     let pct = "%"
     let like_pct: int = ch "SELECT count() FROM clicks WHERE url ILIKE '%{pct}'"
     print(like.to_str() + " " + like_under.to_str() + " " + like_pct.to_str())
+    // и в функциях like, notLike: «_» значения — буква
+    let fn_like: int = ch "SELECT like('/px1', '%{under}%') AS v"
+    let fn_not: int = ch "SELECT notLike('/px1', '%{under}%') AS v"
+    let fn_not_i: int = ch "SELECT notILike('/PX1', '%{under}%') AS v"
+    print(fn_like.to_str() + " " + fn_not.to_str() + " " + fn_not_i.to_str())
     // IN со списком и пустым списком
     let urls = ["/p1", "/p3", "/nope"]
     let none_urls: [str] = []

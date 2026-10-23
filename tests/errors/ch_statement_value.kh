@@ -1,0 +1,5 @@
+// expect: this expression has no value
+fn main() {
+    let gone = ch "TRUNCATE TABLE events"
+    print(gone)
+}

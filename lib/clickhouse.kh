@@ -83,10 +83,17 @@ fn __ch_is_null(s: str) -> bool {
 
 // Значения параметров ClickHouse разбирает в формате escaped (как TabSeparated):
 // \N — NULL, обратная косая черта и управляющие символы экранируются.
+// Метка ch_null() — только у низкоуровневого ch_query_params: типизированный
+// слой (lib/chdb.kh) берёт __ch_escaped, и никакая строка данных не становится NULL.
 fn __ch_param(s: str) -> str {
     if __ch_is_null(s) {
         return "\\N"
     }
+    return __ch_escaped(s)
+}
+
+// Строка в формате escaped — всегда строка, никогда не NULL.
+fn __ch_escaped(s: str) -> str {
     let b = buf_new(s.byte_len() + 16)
     for i in 0..s.byte_len() {
         let c = s.byte(i)
@@ -232,8 +239,8 @@ fn __ch_run(c: ChConfig, query: str, payload: str, params: map[str, str], insert
         }
         var values: [str] = []
         for k, v in params {
-            if !__ch_identifier(k) || v.byte_len() > 65536 {
-                return ChResult { error: "invalid ClickHouse parameter name or value over 65536 bytes: " + k }
+            if !__ch_identifier(k) || v.byte_len() > CH_PARAM_MAX {
+                return ChResult { error: "invalid ClickHouse parameter name or value over 131072 bytes: " + k }
             }
             if opts.raw {
                 values.push(v)
@@ -296,6 +303,10 @@ fn __ch_run(c: ChConfig, query: str, payload: str, params: map[str, str], insert
 }
 
 // Код исключения из текста ошибки ClickHouse: «Code: 241. DB::Exception: ...».
+// Наибольшее значение параметра: поле multipart, сервер принимает до 128 КиБ
+// (http_max_field_value_size).
+const CH_PARAM_MAX = 131072
+
 fn __ch_code_of(body: str) -> int {
     let at = body.byte_find("Code: ") ?? -1
     if at < 0 || at > 64 {
@@ -2411,7 +2422,8 @@ fn __ch_describe_cols(body: str) -> [__ChCol]? {
 // DESCRIBE TABLE (запрос) с параметрами: типы столбцов результата без
 // выполнения запроса.
 fn __ch_describe_query(c: ChConfig, query: str, params: map[str, str], opts: __ChCall, deadline: int) -> ChResult {
-    return __ch_run(c, "DESCRIBE TABLE (" + query + ")", "", params, false, false, deadline, opts)
+    // скобка — с новой строки: комментарий -- или # в конце запроса её не съест
+    return __ch_run(c, "DESCRIBE TABLE (" + query + "\n)", "", params, false, false, deadline, opts)
 }
 
 // Отмена запроса после срока клиента: KILL QUERY ... ASYNC по другому
@@ -2482,7 +2494,9 @@ fn __ch_wide_text(p: int, width: int, signed: bool) -> str {
 
 // Цифры (без знака и ведущих нулей) → width байт дополнительного кода в b;
 // false — не помещается.
-fn __ch_wide_put(b: Buf, negative: bool, digits: str, width: int) -> bool {
+// signed: Int128/Int256 и Decimal — от −2^(8w−1) до 2^(8w−1)−1; иначе
+// (UInt128/UInt256) — от 0 до 2^(8w)−1.
+fn __ch_wide_put(b: Buf, negative: bool, digits: str, width: int, signed: bool) -> bool {
     let n = width / 4
     let words = __alloc(n * 8)
     for i in 0..n {
@@ -2499,11 +2513,28 @@ fn __ch_wide_put(b: Buf, negative: bool, digits: str, width: int) -> bool {
             return false
         }
     }
-    // знаковый диапазон: старший бит модуля свободен (кроме -2^(8w-1))
-    if (load64(words + (n - 1) * 8) & 0x80000000) != 0 {
+    var zero = true
+    for i in 0..n {
+        if load64(words + i * 8) != 0 {
+            zero = false
+        }
+    }
+    if !signed && negative && !zero {
         return false
     }
-    if negative {
+    if signed && (load64(words + (n - 1) * 8) & 0x80000000) != 0 {
+        // модуль ≥ 2^(8w−1): можно только −2^(8w−1) ровно
+        var exact = negative && load64(words + (n - 1) * 8) == 0x80000000
+        for i in 0..n - 1 {
+            if load64(words + i * 8) != 0 {
+                exact = false
+            }
+        }
+        if !exact {
+            return false
+        }
+    }
+    if negative && !zero {
         var carry = 1
         for i in 0..n {
             let w = ((~load64(words + i * 8)) & 0xFFFFFFFF) + carry
@@ -3722,6 +3753,9 @@ type __ChTWrite {
     words: [int] = []
     // тип столбца (для сообщений)
     target: str = ""
+    // Int128/256, UInt128/256 из текста: знак столбца
+    signed: bool = true
+    wide: bool = false
 }
 
 // План записи значения типа d в столбец ty; none_default — d это T?, столбец
@@ -3895,11 +3929,12 @@ fn __ch_twrite_base(t: __ChType, d: int, depth: int) -> __ChTWrite? {
             return __ChTWrite { op: CHW_DEC_STR, width: t.width, scale: t.scale, precision: t.precision, target: text }
         }
         if op == CHT_INT && t.width > 8 {
+            // цифр у наибольшего значения: UInt128 — 39, UInt256 — 78
             var digits = 39
             if t.width == 32 {
-                digits = 77
+                digits = 78
             }
-            return __ChTWrite { op: CHW_DEC_STR, width: t.width, precision: digits, target: text }
+            return __ChTWrite { op: CHW_DEC_STR, width: t.width, precision: digits, target: text, signed: t.signed, wide: true }
         }
         return none
     }
@@ -3932,6 +3967,11 @@ fn __ch_twrite_base(t: __ChType, d: int, depth: int) -> __ChTWrite? {
         return none
     }
     return none
+}
+
+// Биты float — конечное число (у NaN и ±Inf показатель из одних единиц).
+fn __ch_finite(bits: int) -> bool {
+    return ((bits >> 52) & 2047) != 2047
 }
 
 fn __ch_tbad(err: Buf, what: str) -> bool {
@@ -3980,6 +4020,11 @@ fn __ch_twrite(b: Buf, p: __ChTWrite, v0: int, err: Buf) -> bool {
         __ch_varint(b, s.byte_len())
         buf_add(b, s)
         return true
+    }
+    if (op == CHW_F64 || op == CHW_F32 || op == CHW_DEC_F) && !__ch_finite(v) {
+        // NaN и бесконечность в столбец не пишутся (§4.7)
+        let x: float = __cast(v)
+        return __ch_tbad(err, x.to_str() + " is not a finite number")
     }
     if op == CHW_F64 {
         buf_reserve(b, 8)
@@ -4064,7 +4109,10 @@ fn __ch_twrite(b: Buf, p: __ChTWrite, v0: int, err: Buf) -> bool {
             __ch_put_int(b, signed, p.width)
             return true
         }
-        if !__ch_wide_put(b, dec.negative, dec.digits, p.width) {
+        if !__ch_wide_put(b, dec.negative, dec.digits, p.width, p.signed) {
+            if p.wide {
+                return __ch_tbad(err, "'" + text + "' is out of range for " + p.target)
+            }
             return __ch_tbad(err, "'" + text + "' does not fit " + p.target)
         }
         return true
