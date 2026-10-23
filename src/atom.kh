@@ -160,8 +160,9 @@ fn parse_ident(w: int) -> int {
     if li >= 0 {
         let at = code_len
         emit_load_local(li)
-        if !locals[li].mutable && !is_narrowed(li) {
+        if !is_narrowed(li) {
             note_simple(OPK_LOCAL, li, at)
+            simple_mut = locals[li].mutable
         }
         let nk = kind()
         let keeps_opt = nk == T_QQ || ((nk == T_EQ || nk == T_NE) && kind_at(pos + 1) == T_NONE)
@@ -924,7 +925,7 @@ var arg_val: [int]
 
 // Значение аргумента в rax: в стек или (defer и оно простое) — запись без кода.
 fn push_arg(defer: bool) {
-    if defer && take_simple() {
+    if defer && take_simple_if(simple_mut && rest_pure()) {
         arg_kind.push(op_kind)
         arg_val.push(op_val)
         return
@@ -1128,7 +1129,7 @@ fn inline_call(fi: int, n: int, deferred: bool) {
     // return в самом конце тела — переход на следующую инструкцию
     if inline_rets.len() > base && inline_rets[inline_rets.len() - 1] == code_len - 4 && code_len - 5 >= barrier {
         inline_rets.pop()
-        code_len -= 5
+        code_rollback(code_len - 5)
     }
     let end = here()
     while inline_rets.len() > base {
@@ -1241,7 +1242,7 @@ fn parse_store(t: Token, name: str) -> int {
         got += 1
         if got == 1 {
             disp = take_addimm()
-            deferred = take_simple()
+            deferred = take_simple_if(simple_mut && rest_pure())
             lk = op_kind
             lv = op_val
             if deferred && lk == OPK_LOCAL && locals[lv].reg >= 0 {
@@ -1293,17 +1294,18 @@ fn parse_builtin(t: Token, w: int) -> int {
         // адрес x + число: число — смещением; x — неизменяемая локальная в
         // регистре: прямо [регистр + смещение]
         let disp = take_addimm()
-        var base = RAX
-        if simple_kind == OPK_LOCAL && locals[simple_val].reg >= 0 && take_simple() {
-            base = locals[op_val].reg
+        let index = take_addreg()
+        var base = take_regload()
+        if base < 0 {
+            base = RAX
         }
         if name == "load8" {
-            emit_mem_sized(0x0FB6, RAX, base, disp, false)
+            emit_mem_index(0x0FB6, RAX, base, index, disp, false)
         } else if name == "load32" {
             // mov eax, [...] (старшие 32 бита — нули)
-            emit_mem_sized(0x8B, RAX, base, disp, false)
+            emit_mem_index(0x8B, RAX, base, index, disp, false)
         } else {
-            emit_mem_sized(0x8B, RAX, base, disp, true)
+            emit_mem_index(0x8B, RAX, base, index, disp, true)
         }
         return ty_int
     }

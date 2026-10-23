@@ -265,9 +265,30 @@ fn take_addimm() -> int {
     if addimm_end != code_len || addimm_at < barrier || !fits_i32(addimm_val) {
         return 0
     }
-    code_len = addimm_at
-    addimm_end = -1
+    code_rollback(addimm_at)
     return addimm_val
+}
+
+// Код с позиции p убран: записи о последних инструкциях (simple, stored,
+// regload, addreg, addimm), которые кончаются дальше p, больше ничего не
+// описывают — иначе новая инструкция той же длины совпала бы с такой записью.
+fn code_rollback(p: int) {
+    code_len = p
+    if simple_end > p {
+        simple_end = -1
+    }
+    if stored_end > p {
+        stored_end = -1
+    }
+    if regload_end > p {
+        regload_end = -1
+    }
+    if addreg_end > p {
+        addreg_end = -1
+    }
+    if addimm_end > p {
+        addimm_end = -1
+    }
 }
 
 // op reg, [base + disp] или [base + disp], reg: op — один байт или два
@@ -285,6 +306,38 @@ fn emit_mem_sized(op: int, reg: int, base: int, disp: int, w: bool) {
     }
     emit8(op & 255)
     emit_modrm_mem(reg, base, disp)
+}
+
+// То же с индексом: op reg, [base + index + disp] (index = -1 — без индекса).
+fn emit_mem_index(op: int, reg: int, base: int, index: int, disp: int, w: bool) {
+    if index < 0 {
+        emit_mem_sized(op, reg, base, disp, w)
+        return
+    }
+    var rex = 0x40 | ((reg >> 3) << 2) | ((index >> 3) << 1) | (base >> 3)
+    if w {
+        rex = rex | 8
+    }
+    if rex != 0x40 {
+        emit8(rex)
+    }
+    if op > 255 {
+        emit8(op >> 8)
+    }
+    emit8(op & 255)
+    var md = 0x80
+    if disp == 0 && (base & 7) != 5 {
+        md = 0
+    } else if disp >= -128 && disp <= 127 {
+        md = 0x40
+    }
+    emit8(md | ((reg & 7) << 3) | 4)
+    emit8(((index & 7) << 3) | (base & 7))
+    if md == 0x40 {
+        emit8(disp & 255)
+    } else if md == 0x80 {
+        emit32(disp)
+    }
 }
 
 fn emit_alu_imm_raw(ext: int, dst: int, v: int) {
@@ -313,7 +366,7 @@ fn emit_push(r: int) {
 // pop сразу после push rax превращается в mov.
 fn emit_pop(r: int) {
     if last_push >= 0 && last_push == code_len - 1 && last_push >= barrier {
-        code_len -= 1
+        code_rollback(code_len - 1)
         last_push = -1
         emit_mov_rr(r, RAX)
         return

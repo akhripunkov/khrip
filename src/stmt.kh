@@ -416,6 +416,13 @@ fn parse_let() {
     if alias {
         tx_aliases.push(name.text)
     }
+    // let y = x, где x — неизменяемая локальная, а y регистра не получил: y — та
+    // же ячейка (или регистр), без копии; обе не меняются
+    if !mutable && locals[li].reg < 0 && simple_kind == OPK_LOCAL && take_simple() {
+        locals[li].reg = locals[op_val].reg
+        locals[li].off = locals[op_val].off
+        return
+    }
     emit_store_local(li)
 }
 
@@ -951,10 +958,18 @@ fn cond_or(fl: [int]) {
             }
         }
         advance()
-        tl.push(emit_jmp())
-        let h = here()
-        for x in local_fl {
-            patch_rel(x, h)
+        let last = code_len - 4
+        if local_fl.len() == 1 && local_fl[0] == last && last - 2 >= barrier && load8(code + last - 2) == 0x0F {
+            // единственный переход «ложь» — последняя инструкция: обратить его
+            // в переход «истина» на тело
+            store8(code + last - 1, load8(code + last - 1) ^ 1)
+            tl.push(last)
+        } else {
+            tl.push(emit_jmp())
+            let h = here()
+            for x in local_fl {
+                patch_rel(x, h)
+            }
         }
         local_fl = []
         start = pos
@@ -1022,7 +1037,46 @@ fn try_reg_compare() -> int {
     return cmp_cc(op)
 }
 
+// Скобка с условием: ( ... ), за которой — &&, ||, ) или { (конец операнда
+// условия). → позиция парной ) или -1.
+fn cond_paren() -> int {
+    if kind() != '(' {
+        return -1
+    }
+    var depth = 0
+    var j = pos
+    while j < toks.len() {
+        let k = toks[j].kind
+        if k == '(' || k == '[' || k == '\{' {
+            depth += 1
+        } else if k == ')' || k == ']' || k == '}' {
+            depth -= 1
+            if depth == 0 {
+                let nk = kind_at(j + 1)
+                if k == ')' && (nk == T_ANDAND || nk == T_OROR || nk == ')' || nk == '\{') {
+                    return j
+                }
+                return -1
+            }
+        } else if k == T_EOF {
+            return -1
+        }
+        j += 1
+    }
+    return -1
+}
+
 fn cond_cmp(fl: [int]) {
+    if cond_paren() >= 0 {
+        // (a || b) && c: внутри — тоже переходы
+        advance()
+        let saved = no_struct
+        no_struct = false
+        cond_or(fl)
+        no_struct = saved
+        expect_tok(')')
+        return
+    }
     let rc = try_reg_compare()
     if rc >= 0 {
         fl.push(emit_jcc(rc ^ 1))
@@ -1730,6 +1784,9 @@ fn begin_fn(fi: int) -> int {
     panic_sites.clear()
     simple_end = -1
     addimm_end = -1
+    stored_end = -1
+    regload_end = -1
+    addreg_end = -1
     fn_ret_ty = funcs[fi].ret
     panic_mode = false
     inline_depth = 0
@@ -1765,7 +1822,7 @@ fn end_fn(frame_at: int, diverged: bool) {
     let sled = frame_at + 4
     if diverged && ret_holes.len() > 0 && ret_holes[ret_holes.len() - 1] == code_len - 4 && code_len - 5 >= barrier {
         ret_holes.pop()
-        code_len -= 5
+        code_rollback(code_len - 5)
     } else if !diverged {
         emit_mov_imm(RAX, 0)
     }
