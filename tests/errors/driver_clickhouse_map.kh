@@ -1,0 +1,5 @@
+// expect: ch_encode needs a supported value type
+fn main() {
+    let values: [map[str, int]] = [{"a": 1}]
+    ch_encode(values)
+}

@@ -1,0 +1,108 @@
+// Типизированные бинарные кодеки драйверов. Сеть остаётся в библиотеке;
+// компилятор передаёт ей то же описание типа, которое использует JSON.
+
+fn driver_io(name: str) -> bool {
+    return name == "mongo_command" || name == "mongo_insert" || name == "mongo_update" || name == "mongo_delete" || name == "mongo_cursor" || name == "mongo_find" || name == "mongo_next" || name == "mongo_close" || name == "ch_query" || name == "ch_query_params" || name == "ch_insert" || name == "ch_cancel"
+}
+
+fn driver_ch_type(t: int, row: bool, depth: int) -> bool {
+    if depth > 32 {
+        return false
+    }
+    let k = tkind(t)
+    if k == K_INT || k == K_FLOAT || k == K_BOOL || k == K_STR {
+        return true
+    }
+    if k == K_OPT {
+        // Nullable(Array(T)) is invalid; Array(Nullable(T)) is supported.
+        return tkind(types[t].a) != K_LIST && driver_ch_type(types[t].a, false, depth + 1)
+    }
+    if k == K_LIST {
+        return driver_ch_type(types[t].a, false, depth + 1)
+    }
+    if k == K_STRUCT && row {
+        let s = structs[types[t].a]
+        if s.fields.len() == 0 {
+            return false
+        }
+        for f in s.fields {
+            if !driver_ch_type(f.ty, false, depth + 1) {
+                return false
+            }
+        }
+        return true
+    }
+    return false
+}
+
+fn parse_database_builtin(t: Token, w: int) -> int {
+    let name = t.text
+    let bson = name == "to_bson" || name == "from_bson"
+    let encode = name == "to_bson" || name == "ch_encode"
+    if !bson && name != "ch_encode" && name != "ch_decode" {
+        return -1
+    }
+    advance()
+    let a = tok()
+    let saved = no_struct
+    no_struct = false
+    var target = ty_err
+    if !encode {
+        target = ty_str
+        if bson {
+            target = ty_struct(struct_find("Bson"))
+        }
+    }
+    let value_ty = parse_expr(target)
+    no_struct = saved
+    expect_tok(')')
+    var shape = value_ty
+    if !encode {
+        coerce(value_ty, target, a)
+        shape = ty_inner(w)
+    }
+    let d = type_desc(shape)
+    var ok = d != 0
+    if bson {
+        ok = ok && (tkind(shape) == K_STRUCT || (tkind(shape) == K_MAP && types[shape].a == ty_str))
+    } else {
+        ok = ok && tkind(shape) == K_LIST
+        if ok {
+            ok = driver_ch_type(types[shape].a, true, 0)
+        }
+    }
+    if !ok {
+        var hint = "use a struct or map[str, T] document"
+        if !bson {
+            hint = "use a list of rows with int, float, bool, str, optional or array fields"
+        }
+        if !encode && w == ty_err {
+            hint = "declare the optional result type: let rows: [Row]? = ch_decode(body)"
+            if bson {
+                hint = "declare the optional result type: let doc: Document? = from_bson(body)"
+            }
+        }
+        var required = "result type"
+        if encode {
+            required = "value type"
+        }
+        error_tok(t, name + " needs a supported " + required, hint)
+        return ty_err
+    }
+    emit_mov_rr(RDI, RAX)
+    emit_mov_imm(RSI, d)
+    if bson {
+        if encode {
+            emit_call(rt_func("__bson_encode"))
+            return ty_struct(struct_find("Bson"))
+        }
+        emit_call(rt_func("__bson_decode"))
+    } else {
+        if encode {
+            emit_call(rt_func("__ch_encode"))
+            return ty_str
+        }
+        emit_call(rt_func("__ch_decode"))
+    }
+    return ty_opt(shape)
+}

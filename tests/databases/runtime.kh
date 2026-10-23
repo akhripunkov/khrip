@@ -1,0 +1,157 @@
+// Real shared-server test: both drivers, store, coroutine switches, arena reset,
+// and deliberate failure after resource checkout. Fault injection below uses
+// internal library APIs so cleanup can be exercised without exhausting memory.
+type RuntimeDocument { _id: int, value: str }
+type RuntimeRow { id: int, value: str }
+type RuntimeCount { total: int }
+type RuntimeCounts { requests: int, mongo: int, clickhouse: int }
+type RuntimeResources { mongo_active: int, mongo_held: int, clickhouse_active: int, clickhouse_held: int, tls_pending: int }
+type RuntimeTlsCleanup { block: bool, input: bool, plain: bool, pending: int }
+
+store runtime_requests: int
+
+fn runtime_mongo() -> Mongo {
+    return Mongo { uri: env("MONGODB_URI") ?? "mongodb://mongo/khrip_test?directConnection=true" }
+}
+
+fn runtime_ch() -> ChConfig {
+    return ChConfig {
+        url: env("CLICKHOUSE_URL") ?? "http://clickhouse:8123/",
+        database: "khrip_test",
+        user: env("CLICKHOUSE_USER") ?? "khrip",
+        password: env("CLICKHOUSE_PASSWORD") ?? "khrip_database_test_password"
+    }
+}
+
+fn runtime_name() -> str { return env("KHRIP_RUNTIME_NAME") ?? "kh_runtime" }
+
+fn runtime_check_mongo(r: MongoResult) {
+    if r.error != "" { fail(500, "MongoDB: " + r.error) }
+}
+
+fn runtime_check_ch(r: ChResult) {
+    if !r.ok { fail(500, "ClickHouse: " + r.error) }
+}
+
+route GET "/ready" -> str { return "ready" }
+
+route POST "/init" -> 204 {
+    runtime_check_ch(ch_query(runtime_ch(), "CREATE TABLE " + runtime_name() + " (id Int64, value String) ENGINE=Memory"))
+    return 204
+}
+
+route POST "/work/{id}" (id: int) -> RuntimeRow {
+    runtime_requests += 1
+    let value = "value-{id}-Привет"
+    let client = runtime_mongo()
+    runtime_check_mongo(mongo_insert(client, "khrip_test", runtime_name(), [to_bson(RuntimeDocument { _id: id, value })]))
+    let row = RuntimeRow { id, value }
+    let config = runtime_ch()
+    runtime_check_ch(ch_insert(config, runtime_name(), ch_encode([row])))
+
+    let filter = bson_new()
+    bson_int(filter, "_id", id)
+    let cursor = mongo_find(client, "khrip_test", runtime_name(), bson_finish(filter), 1, 1)
+    if cursor.error != "" || cursor.documents.len() != 1 { fail(500, "MongoDB read after write failed: " + cursor.error) }
+    let actual: RuntimeDocument? = from_bson(cursor.documents[0])
+    if actual == none { fail(500, "BSON decode failed: " + bson_error()) }
+    if (actual ?? RuntimeDocument { _id: -1, value: "" }).value != value { fail(500, "BSON data changed across request") }
+    runtime_check_mongo(mongo_close(cursor))
+
+    let selected = ch_query_params(config, "SELECT id,value FROM " + runtime_name() + " WHERE id=\{id:Int64}", {"id": id.to_str()})
+    runtime_check_ch(selected)
+    let decoded: [RuntimeRow]? = ch_decode(selected.body)
+    let rows = decoded ?? []
+    if rows.len() != 1 { fail(500, "RowBinary row count mismatch: " + ch_error()) }
+    if rows[0].id != id || rows[0].value != value { fail(500, "RowBinary data changed across request") }
+    return row
+}
+
+route GET "/counts" -> RuntimeCounts {
+    let command = bson_new()
+    bson_str(command, "count", runtime_name())
+    let m = mongo_command(runtime_mongo(), "khrip_test", bson_finish(command))
+    runtime_check_mongo(m)
+    let c = ch_query(runtime_ch(), "SELECT count() AS total FROM " + runtime_name())
+    runtime_check_ch(c)
+    let counts: [RuntimeCount]? = ch_decode(c.body)
+    let rows = counts ?? []
+    if rows.len() != 1 { fail(500, "count result cannot be decoded") }
+    return RuntimeCounts { requests: runtime_requests, mongo: bson_get_int(m.document, "n") ?? -1, clickhouse: rows[0].total }
+}
+
+route GET "/resources" -> RuntimeResources {
+    return RuntimeResources {
+        mongo_active: load64(__mongo_pool()),
+        mongo_held: load64(__ctx() + CTX_MONGOHELD),
+        clickhouse_active: load64(__ctx() + CTX_CHACTIVE),
+        clickhouse_held: load64(__ctx() + CTX_CHHELD),
+        tls_pending: load64(__ctx() + CTX_TLS_PENDING)
+    }
+}
+
+fn runtime_pending_tls(fd: int) -> int {
+    let block = __mmap(TLS_BLOCK)
+    store64(__ctx() + CTX_TLS_PENDING, block)
+    store64(block + TB_FD, fd)
+    __tb_save(block, TB_IN, buf_mm(16384))
+    __tb_save(block, TB_PLAIN, buf_mm(16384))
+    return block
+}
+
+fn runtime_unmapped(p: int, length: int, vector: int) -> bool {
+    for i in 0..length / 4096 {
+        // Linux x86-64 mincore: -ENOMEM means this page has no mapping.
+        if syscall(27, p + i * 4096, 4096, vector) != -12 { return false }
+    }
+    return true
+}
+
+route POST "/tls-cleanup" -> RuntimeTlsCleanup {
+    let vector = __alloc(8)
+    let block = runtime_pending_tls(-1)
+    let input = load64(block + TB_IN)
+    let plain = load64(block + TB_PLAIN)
+    __tls_pending_cleanup()
+    // No mmap calls occur between cleanup and these checks: a released address
+    // cannot have been reused by a subsequent allocation in this request.
+    return RuntimeTlsCleanup {
+        block: runtime_unmapped(block, TLS_BLOCK, vector),
+        input: runtime_unmapped(input, 16384, vector),
+        plain: runtime_unmapped(plain, 16384, vector),
+        pending: load64(__ctx() + CTX_TLS_PENDING)
+    }
+}
+
+route POST "/fault/{mode}" (mode: int) -> int | 409 str {
+    let client = runtime_mongo()
+    let deadline = now_ms() + 10000
+    // Checkout uses a live pooled Mongo connection when available. Cleanup must
+    // decrement the pool's active count even if this request never returns it.
+    let mongo = __mongo_take(client.uri, deadline)
+    if mongo == 0 { fail(500, "fault injection could not acquire Mongo resource") }
+    let config = runtime_ch()
+    let u = __parse_url(config.url) else { fail(500, "invalid test URL") }
+    if u.https { fail(500, "fault injector requires local HTTP ClickHouse") }
+    let ip = __resolve(u.host, deadline) else { fail(500, "test host did not resolve") }
+    let fd = __connect(ip, u.port, deadline)
+    if fd < 0 { fail(500, "fault injection could not connect") }
+    let guard = __DbHttp { c: fd, tag: 0, deadline, input: buf_new(128) }
+    store64(__ctx() + CTX_CHHELD, __cast(guard))
+    // An unfinished TLS handshake has not yet returned its block to the driver.
+    // It needs separate cleanup after the driver closes the underlying socket.
+    runtime_pending_tls(fd)
+    // Several requests hold different resources while their coroutines switch.
+    sleep(2)
+    if mode == 0 { fail(409, "injected failure") }
+    let values = [1]
+    return values[mode]
+}
+
+route DELETE "/cleanup" -> 204 {
+    let command = bson_new()
+    bson_str(command, "drop", runtime_name())
+    runtime_check_mongo(mongo_command(runtime_mongo(), "khrip_test", bson_finish(command)))
+    runtime_check_ch(ch_query(runtime_ch(), "DROP TABLE IF EXISTS " + runtime_name()))
+    return 204
+}

@@ -1,0 +1,383 @@
+// Bounded HTTP/1.1 exchange for database clients. Reuses fetch's nonblocking
+// TCP/TLS and idle pool, but validates framing and never retries a request.
+// Response bytes are bounded before allocation; a truncated body is an error.
+
+// Worker-shared admission counter; outside the coroutine-saved context range.
+const CTX_CHACTIVE = 296
+
+type __DbHttp {
+    c: int
+    tag: int
+    deadline: int
+    input: Buf
+    pos: int = 0
+    error: str = ""
+    lease: bool = false
+}
+
+fn __dh_acquire(h: __DbHttp, max_inflight: int) -> bool {
+    let ctx = __ctx()
+    while load64(ctx + CTX_CHACTIVE) >= max_inflight {
+        if now_ms() >= h.deadline { return false }
+        sleep(1)
+    }
+    if now_ms() >= h.deadline { return false }
+    // No coroutine switch occurs between increment and setting the lease bit.
+    store64(ctx + CTX_CHACTIVE, load64(ctx + CTX_CHACTIVE) + 1)
+    h.lease = true
+    return true
+}
+
+fn __dh_release(h: __DbHttp) {
+    if h.lease {
+        h.lease = false
+        let ctx = __ctx()
+        store64(ctx + CTX_CHACTIVE, (load64(ctx + CTX_CHACTIVE) - 1).max(0))
+    }
+}
+
+fn __dh_fill(h: __DbHttp) -> bool {
+    if h.pos < h.input.len {
+        return true
+    }
+    h.input.len = 0
+    h.pos = 0
+    if now_ms() >= h.deadline {
+        h.error = "database HTTP deadline exceeded"
+        return false
+    }
+    let n = __link_read(h.tag, h.c, h.input, h.deadline)
+    if n <= 0 {
+        h.error = "database HTTP response truncated or connection timed out"
+        return false
+    }
+    return true
+}
+
+// Lines cannot grow without limit (status, headers, chunk sizes and trailers).
+fn __dh_line(h: __DbHttp, max: int) -> str {
+    let b = buf_new(128)
+    while b.len <= max + 1 {
+        if !__dh_fill(h) {
+            return ""
+        }
+        let c = load8(h.input.data + h.pos)
+        h.pos += 1
+        if c == '\n' {
+            if b.len == 0 || b.len - 1 > max || load8(b.data + b.len - 1) != '\r' {
+                h.error = "database HTTP line is not terminated by CRLF"
+                return ""
+            }
+            return __str_new(b.data, b.len - 1)
+        }
+        buf_byte(b, c)
+    }
+    h.error = "database HTTP header exceeds limit"
+    return ""
+}
+
+fn __dh_take(h: __DbHttp, out: Buf, n: int, max: int) -> bool {
+    if n < 0 || n > max - out.len {
+        h.error = "database HTTP response exceeds max_response_bytes"
+        return false
+    }
+    var left = n
+    while left > 0 {
+        if !__dh_fill(h) {
+            return false
+        }
+        let count = left.min(h.input.len - h.pos)
+        buf_add_raw(out, h.input.data + h.pos, count)
+        h.pos += count
+        left -= count
+    }
+    return true
+}
+
+fn __dh_decimal(s: str, max: int) -> int {
+    if s.byte_len() == 0 {
+        return -1
+    }
+    var n = 0
+    for i in 0..s.byte_len() {
+        let c = s.byte(i)
+        if c < '0' || c > '9' || n > max / 10 || (n == max / 10 && c - '0' > max % 10) {
+            return -1
+        }
+        n = n * 10 + c - '0'
+    }
+    return n
+}
+
+fn __dh_chunk_size(s: str, max: int) -> int {
+    var n = 0
+    var i = 0
+    while i < s.byte_len() && s.byte(i) != ';' {
+        let d = __hex_val(s.byte(i))
+        if d < 0 || n > max / 16 || (n == max / 16 && d > max % 16) {
+            return -1
+        }
+        n = n * 16 + d
+        i += 1
+    }
+    if i == 0 {
+        return -1
+    }
+    return n
+}
+
+fn __dh_token(s: str) -> bool {
+    if s.byte_len() == 0 {
+        return false
+    }
+    for i in 0..s.byte_len() {
+        let c = s.byte(i)
+        if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+            return false
+        }
+    }
+    return true
+}
+
+fn __dh_headers(h: __DbHttp, hs: map[str, str]) -> bool {
+    var bytes = 0
+    var count = 0
+    while count < 128 {
+        let line = __dh_line(h, 8192)
+        bytes += line.byte_len() + 2
+        if h.error.byte_len() > 0 {
+            return false
+        }
+        if bytes > 32768 {
+            h.error = "database HTTP headers exceed limit"
+            return false
+        }
+        if line.byte_len() == 0 {
+            return true
+        }
+        let colon = line.byte_find(":") ?? -1
+        if colon <= 0 {
+            h.error = "malformed database HTTP header"
+            return false
+        }
+        let name = line.byte_slice(0, colon).ascii_lower()
+        let value = line.byte_slice(colon + 1, line.byte_len()).ascii_trim()
+        if !__dh_token(name) {
+            h.error = "invalid database HTTP header name"
+            return false
+        }
+        for i in 0..value.byte_len() {
+            let c = value.byte(i)
+            if (c < 32 && c != 9) || c == 127 {
+                h.error = "invalid database HTTP header value"
+                return false
+            }
+        }
+        if hs.has(name) && (name == "content-length" || name == "transfer-encoding") {
+            h.error = "duplicate database HTTP framing header"
+            return false
+        }
+        hs[name] = value
+        count += 1
+    }
+    h.error = "too many database HTTP headers"
+    return false
+}
+
+fn __dh_response(h: __DbHttp, max: int) -> Response {
+    var status = 0
+    var version = ""
+    var hs: map[str, str] = {}
+    var interim = 0
+    while true {
+        let line = __dh_line(h, 8192)
+        if h.error.byte_len() > 0 {
+            return __fetch_fail(h.error)
+        }
+        if line.byte_len() < 12 || (line.byte_slice(0, 9) != "HTTP/1.1 " && line.byte_slice(0, 9) != "HTTP/1.0 ") {
+            return __fetch_fail("invalid database HTTP status line")
+        }
+        version = line.byte_slice(0, 8)
+        status = __dh_decimal(line.byte_slice(9, 12), 599)
+        if status < 100 || (line.byte_len() > 12 && line.byte(12) != ' ') {
+            return __fetch_fail("invalid database HTTP status code")
+        }
+        hs = {}
+        if !__dh_headers(h, hs) {
+            return __fetch_fail(h.error)
+        }
+        if status >= 200 {
+            break
+        }
+        interim += 1
+        if status == 101 || interim > 4 || hs.has("content-length") || hs.has("transfer-encoding") {
+            return __fetch_fail("unsupported database HTTP interim response")
+        }
+    }
+    if version != "HTTP/1.1" {
+        hs["connection"] = "close"
+    }
+    let encoding = (hs["content-encoding"] ?? "identity").ascii_lower()
+    if encoding != "identity" {
+        return __fetch_fail("unsupported database HTTP content encoding")
+    }
+    let out = buf_new(4096)
+    if hs.has("content-length") && hs.has("transfer-encoding") {
+        return __fetch_fail("ambiguous database HTTP response framing")
+    }
+    if status == 204 || status == 304 {
+        if hs.has("transfer-encoding") || (hs["content-length"] ?? "0") != "0" {
+            return __fetch_fail("unexpected database HTTP body")
+        }
+    } else if hs.has("transfer-encoding") {
+        if (hs["transfer-encoding"] ?? "").ascii_lower() != "chunked" {
+            return __fetch_fail("unsupported database HTTP transfer encoding")
+        }
+        var chunks = 0
+        var metadata = 0
+        while true {
+            let line = __dh_line(h, 1024)
+            chunks += 1
+            metadata += line.byte_len() + 4
+            if chunks > 65536 || metadata > 1048576 {
+                return __fetch_fail("database HTTP chunk count or metadata exceeds limit")
+            }
+            let size = __dh_chunk_size(line, max - out.len)
+            if h.error.byte_len() > 0 {
+                return __fetch_fail(h.error)
+            }
+            if size < 0 {
+                return __fetch_fail("invalid or oversized database HTTP chunk")
+            }
+            if size == 0 {
+                var trailers: map[str, str] = {}
+                if !__dh_headers(h, trailers) {
+                    return __fetch_fail(h.error)
+                }
+                if trailers.has("content-length") || trailers.has("transfer-encoding") {
+                    return __fetch_fail("invalid database HTTP framing trailer")
+                }
+                for k, v in trailers {
+                    if k == "x-clickhouse-exception-code" || k == "x-clickhouse-query-id" {
+                        hs[k] = v
+                    }
+                }
+                break
+            }
+            if !__dh_take(h, out, size, max) {
+                return __fetch_fail(h.error)
+            }
+            let end = __dh_line(h, 0)
+            if h.error.byte_len() > 0 || end.byte_len() != 0 {
+                return __fetch_fail("invalid database HTTP chunk terminator")
+            }
+        }
+    } else if hs.has("content-length") {
+        let n = __dh_decimal(hs["content-length"] ?? "", max)
+        if n < 0 {
+            return __fetch_fail("invalid content-length or response exceeds max_response_bytes")
+        }
+        if !__dh_take(h, out, n, max) {
+            return __fetch_fail(h.error)
+        }
+    } else {
+        // EOF framing is valid, but the connection cannot be pooled afterwards.
+        hs["connection"] = "close"
+        while true {
+            if h.pos < h.input.len {
+                if !__dh_take(h, out, h.input.len - h.pos, max) {
+                    return __fetch_fail(h.error)
+                }
+            }
+            h.input.len = 0
+            h.pos = 0
+            let n = __link_read(h.tag, h.c, h.input, h.deadline)
+            if n == 0 {
+                break
+            }
+            if n < 0 || now_ms() >= h.deadline {
+                return __fetch_fail("database HTTP deadline exceeded or connection error")
+            }
+        }
+    }
+    if h.pos != h.input.len {
+        return __fetch_fail("unexpected bytes after database HTTP response")
+    }
+    return Response { status, body: __str_new(out.data, out.len), headers: hs }
+}
+
+fn __dh_exchange(url: __Url, head: str, query: str, payload: str, deadline: int, max: int, max_inflight: int) -> Response {
+    if load64(__ctx() + CTX_CHHELD) != 0 {
+        return __fetch_fail("nested ClickHouse operation")
+    }
+    var tag = 0
+    if url.https {
+        tag = __pool_tag(url.host, url.port)
+    }
+    let h = __DbHttp { c: -1, tag, deadline, input: buf_new(16384) }
+    store64(__ctx() + CTX_CHHELD, __cast(h))
+    if !__dh_acquire(h, max_inflight) {
+        __ch_request_cleanup()
+        return __fetch_fail("ClickHouse admission deadline exceeded")
+    }
+    let ip = __resolve(url.host, deadline) else {
+        __ch_request_cleanup()
+        return __fetch_fail("cannot resolve database host")
+    }
+    var c = __pool_take(ip, url.port, tag, url.host, url.port)
+    h.c = c
+    if c < 0 {
+        c = __connect(ip, url.port, deadline)
+        h.c = c
+        h.tag = 0
+        if c < 0 {
+            __ch_request_cleanup()
+            return __fetch_fail("cannot connect to ClickHouse")
+        }
+        if tag != 0 {
+            let tls = __tls_connect(c, url.host, url.port, deadline)
+            if tls.blk == 0 {
+                __ch_request_cleanup()
+                return __fetch_fail(tls.err)
+            }
+            c = tls.blk
+            h.c = c
+            h.tag = tag
+        }
+    }
+    var r = __fetch_fail("database HTTP connection failed while sending; write outcome may be unknown")
+    if __link_write(tag, c, __str_ptr(head), head.byte_len(), deadline) && __link_write(tag, c, __str_ptr(query), query.byte_len(), deadline) && __link_write(tag, c, __str_ptr(payload), payload.byte_len(), deadline) {
+        r = __dh_response(h, max)
+    }
+    if r.status == 0 {
+        r.headers["x-khrip-unknown-outcome"] = "1"
+    }
+    if r.status > 0 && !(r.headers["connection"] ?? "").ascii_lower().contains("close") && (tag == 0 || __tls_idle_ok(c)) {
+        __pool_put(ip, url.port, tag, c)
+    } else {
+        __link_close(tag, c)
+    }
+    h.c = -1
+    __dh_release(h)
+    store64(__ctx() + CTX_CHHELD, 0)
+    return r
+}
+
+// Called before request arena reset, including panic and fail paths. Avoid
+// allocations and graceful TLS close: the operation may be halfway through I/O.
+fn __ch_request_cleanup() {
+    let ctx = __ctx()
+    let p = load64(ctx + CTX_CHHELD)
+    store64(ctx + CTX_CHHELD, 0)
+    if p == 0 { return }
+    let h: __DbHttp = __cast(p)
+    __dh_release(h)
+    if h.c < 0 { return }
+    if h.tag == 0 {
+        syscall(SYS_CLOSE, h.c)
+    } else {
+        syscall(SYS_CLOSE, load64(h.c + TB_FD))
+        __tls_free(h.c)
+    }
+    h.c = -1
+}

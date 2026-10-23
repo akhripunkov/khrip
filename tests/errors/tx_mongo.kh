@@ -1,0 +1,11 @@
+// expect: mongo_command inside tx runs again on every retry and holds a database connection
+// expect: call it before or after the tx block
+route POST "/write" -> 204 {
+    let client = Mongo { uri: "mongodb://localhost/test" }
+    let command = bson_finish(bson_new())
+    tx {
+        sql "DELETE FROM events"
+        mongo_command(client, "test", command)
+    }
+    return 204
+}

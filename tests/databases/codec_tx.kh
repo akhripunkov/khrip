@@ -1,0 +1,12 @@
+// Pure binary serialization is permitted inside a retrying PostgreSQL block.
+type Event { id: int, name: str }
+route POST "/write" -> 204 {
+    tx {
+        let id: int = sql "SELECT 1"
+        let event = Event { id, name: "event" }
+        let bson = to_bson(event)
+        let decoded: Event? = from_bson(bson)
+        let rows = ch_encode([event])
+    }
+    return 204
+}

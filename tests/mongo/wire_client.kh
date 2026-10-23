@@ -1,0 +1,43 @@
+fn probe(client: Mongo, mode: str) -> MongoResult {
+    let command = bson_new()
+    bson_str(command, "probe", mode)
+    return mongo_command(client, "test", bson_finish(command))
+}
+
+fn main() -> int {
+    let client = Mongo { uri: args()[1], timeout_ms: 300, max_message_bytes: 4096 }
+    var failed = 0
+    for mode in ["fragmented", "checksum", "optional_flag"] {
+        let r = probe(client, mode)
+        if r.error != "" {
+            print("FAIL " + mode + ": " + r.error)
+            failed += 1
+        }
+    }
+    for mode in ["truncated", "oversized", "wrong_id", "timeout", "disconnect", "bad_bson", "bad_checksum", "required_flag"] {
+        let r = probe(client, mode)
+        if r.error == "" || !r.unknown_outcome {
+            print("FAIL " + mode + ": expected unknown outcome")
+            failed += 1
+        }
+        if load64(__ctx() + CTX_MONGOHELD) != 0 || load64(load64(__ctx() + CTX_MONGOPOOL)) != 0 {
+            print("FAIL " + mode + ": connection still checked out")
+            failed += 1
+        }
+        let recovery = probe(client, "recover")
+        if recovery.error != "" {
+            print("FAIL " + mode + " recovery: " + recovery.error)
+            failed += 1
+        }
+    }
+    // Failed authentication/handshake means the application command was not sent.
+    let handshake = Mongo { uri: args()[2], timeout_ms: 300 }
+    let h = probe(handshake, "never_sent")
+    if h.error == "" || h.unknown_outcome {
+        print("FAIL failed handshake outcome")
+        failed += 1
+    }
+    print("MongoDB wire faults: {failed} failed")
+    if failed != 0 { return 1 }
+    return 0
+}

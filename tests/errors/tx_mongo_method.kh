@@ -1,0 +1,10 @@
+// expect: mongo_command inside tx: the block may run again after a conflict
+route POST "/write" -> 204 {
+    let client = Mongo { uri: "mongodb://localhost/test" }
+    let command = bson_finish(bson_new())
+    tx {
+        sql "DELETE FROM events"
+        client.mongo_command("test", command)
+    }
+    return 204
+}

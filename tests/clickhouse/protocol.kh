@@ -1,0 +1,43 @@
+fn main() -> int {
+    let scheme = if args().len() > 2 { "https" } else { "http" }
+    let base = scheme + "://127.0.0.1:" + args()[1]
+    for path in ["valid", "chunked", "interim"] {
+        for n in 0..2 {
+            let r = ch_query(ChConfig { url: base + "/" + path }, "SELECT 1")
+            if !r.ok || r.body != "ok" {
+                eprint("FAIL HTTP " + path + ": " + r.error)
+                return 1
+            }
+        }
+    }
+    let large = ch_query(ChConfig { url: base + "/large-close", timeout_ms: 60000 }, "SELECT 1")
+    if !large.ok || large.body.byte_len() != 1048576 || !large.body.starts_with("zzzz") || !large.body.ends_with("zzzz") {
+        eprint("FAIL HTTP large response followed by close: " + large.error)
+        return 1
+    }
+    // Exercise the metadata cap rather than CPU speed under x86 emulation/TLS.
+    let fragments = ch_query(ChConfig { url: base + "/too-many-chunks", timeout_ms: 60000 }, "SELECT 1")
+    if fragments.ok || !fragments.error.contains("chunk count") || !fragments.unknown_outcome {
+        eprint("FAIL HTTP excessive chunk metadata: " + fragments.error)
+        return 1
+    }
+    for path in ["truncated", "truncated-chunk", "bad-chunk", "duplicate", "ambiguous", "overflow", "late-error", "unsupported-compression", "slow"] {
+        let r = ch_query(ChConfig { url: base + "/" + path, timeout_ms: 150 }, "SELECT 1")
+        if r.ok || r.error.byte_len() == 0 || (path != "late-error" && !r.unknown_outcome) {
+            eprint("FAIL HTTP accepted " + path)
+            return 1
+        }
+    }
+    let invalid = ch_query(ChConfig { url: "http://user:password@example.com/" }, "INSERT INTO x VALUES(1)")
+    if invalid.ok || invalid.unknown_outcome {
+        eprint("FAIL invalid config has a known outcome")
+        return 1
+    }
+    let after = ch_query(ChConfig { url: base + "/valid" }, "SELECT 1")
+    if !after.ok || after.body != "ok" {
+        eprint("FAIL HTTP pool poisoned after malformed replies")
+        return 1
+    }
+    print("ClickHouse " + scheme + " protocol: ok")
+    return 0
+}

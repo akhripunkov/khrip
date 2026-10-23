@@ -1,0 +1,884 @@
+// BSON 1.1 codec. Documents preserve order and BSON types; no JSON round trip.
+// Public builders never interpolate input as query syntax. Limits apply before
+// dereferencing untrusted lengths. See https://bsonspec.org/spec.html.
+
+const BSON_MAX_BYTES = 16777216
+const BSON_MAX_DEPTH = 64
+
+type Bson {
+    data: str, error: str = ""
+}
+type BsonBuilder {
+    buffer: Buf, error: str = "", keys: map[str, bool] = {}
+}
+type BsonObjectId {
+    hex: str
+}
+type BsonDate {
+    milliseconds: int
+}
+type BsonBinary {
+    data: str, subtype: int = 0
+}
+// Exact IEEE decimal128 bytes, little endian. Decimal arithmetic is not implied.
+type BsonDecimal128 {
+    bytes: str
+}
+type BsonTimestamp {
+    increment: int, seconds: int
+}
+type BsonField {
+    name: str, kind: int, data: str
+}
+type __BsonRead {
+    error: str = ""
+}
+
+fn __bson_u32(b: Buf, n: int) {
+    buf_reserve(b, 4)
+    store32(b.data + b.len, n)
+    b.len += 4
+}
+
+fn __bson_u64(b: Buf, n: int) {
+    buf_reserve(b, 8)
+    store64(b.data + b.len, n)
+    b.len += 8
+}
+
+fn __bson_zero(p: int, end: int) -> int {
+    var i = p
+    while i < end {
+        if load8(i) == 0 {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+// BSON strings and field names are UTF-8; arbitrary bytes belong in Binary.
+// Reject overlong encodings, lone continuations, surrogates and > U+10FFFF.
+fn __bson_utf8(p: int, n: int) -> bool {
+    var i = 0
+    while i < n {
+        let lead = load8(p + i)
+        if lead < 128 {
+            i += 1
+            continue
+        }
+        var size = 0
+        if lead >= 194 && lead <= 223 {
+            size = 2
+        } else if lead >= 224 && lead <= 239 {
+            size = 3
+        } else if lead >= 240 && lead <= 244 {
+            size = 4
+        } else {
+            return false
+        }
+        if size > n - i {
+            return false
+        }
+        let second = load8(p + i + 1)
+        if second < 128 || second > 191 {
+            return false
+        }
+        if (lead == 224 && second < 160) || (lead == 237 && second >= 160) || (lead == 240 && second < 144) || (lead == 244 && second >= 144) {
+            return false
+        }
+        for j in 2..size {
+            let c = load8(p + i + j)
+            if c < 128 || c > 191 {
+                return false
+            }
+        }
+        i += size
+    }
+    return true
+}
+
+// Returns the byte after one value, or -1. All nested documents validated.
+fn __bson_value_end(kind: int, p: int, end: int, depth: int) -> int {
+    var n = 0
+    if kind == 1 || kind == 9 || kind == 17 || kind == 18 {
+        n = 8
+    } else if kind == 16 {
+        n = 4
+    } else if kind == 7 {
+        n = 12
+    } else if kind == 19 {
+        n = 16
+    } else if kind == 6 || kind == 10 || kind == 127 || kind == 255 {
+        return p
+    } else if kind == 8 {
+        if p >= end || load8(p) > 1 {
+            return -1
+        }
+        return p + 1
+    } else if kind == 2 || kind == 13 || kind == 14 {
+        if end - p < 4 {
+            return -1
+        }
+        n = load32(p)
+        if n < 1 || n > end - p - 4 || load8(p + 4 + n - 1) != 0 {
+            return -1
+        }
+        if !__bson_utf8(p + 4, n - 1) {
+            return -1
+        }
+        return p + 4 + n
+    } else if kind == 3 || kind == 4 {
+        if end - p < 5 {
+            return -1
+        }
+        n = load32(p)
+        if n < 5 || n > end - p || !__bson_valid_doc(p, n, depth + 1, kind == 4) {
+            return -1
+        }
+        return p + n
+    } else if kind == 5 {
+        if end - p < 5 {
+            return -1
+        }
+        n = load32(p)
+        if n > end - p - 5 {
+            return -1
+        }
+        if load8(p + 4) == 2 {
+            if n < 4 || load32(p + 5) != n - 4 {
+                return -1
+            }
+        }
+        return p + 5 + n
+    } else if kind == 11 {
+        let z = __bson_zero(p, end)
+        if z < 0 {
+            return -1
+        }
+        let z2 = __bson_zero(z + 1, end)
+        if z2 < 0 {
+            return -1
+        }
+        if !__bson_utf8(p, z - p) || !__bson_utf8(z + 1, z2 - z - 1) {
+            return -1
+        }
+        return z2 + 1
+    } else if kind == 12 {
+        let z = __bson_value_end(2, p, end, depth)
+        if z < 0 || end - z < 12 {
+            return -1
+        }
+        return z + 12
+    } else if kind == 15 {
+        if end - p < 4 {
+            return -1
+        }
+        n = load32(p)
+        if n < 14 || n > end - p {
+            return -1
+        }
+        let code_end = __bson_value_end(2, p + 4, p + n, depth)
+        if code_end < 0 {
+            return -1
+        }
+        let scope_end = __bson_value_end(3, code_end, p + n, depth)
+        if scope_end != p + n {
+            return -1
+        }
+        return scope_end
+    } else {
+        return -1
+    }
+    if n > end - p {
+        return -1
+    }
+    return p + n
+}
+
+fn __bson_valid_doc(p: int, n: int, depth: int, array: bool) -> bool {
+    if depth > BSON_MAX_DEPTH || n < 5 || n > BSON_MAX_BYTES {
+        return false
+    }
+    if load32(p) != n || load8(p + n - 1) != 0 {
+        return false
+    }
+    let end = p + n - 1
+    var at = p + 4
+    var index = 0
+    while at < end {
+        let kind = load8(at)
+        let z = __bson_zero(at + 1, end)
+        if z < 0 {
+            return false
+        }
+        if !__bson_utf8(at + 1, z - at - 1) {
+            return false
+        }
+        if array && __str_new(at + 1, z - at - 1) != index.to_str() {
+            return false
+        }
+        at = __bson_value_end(kind, z + 1, end, depth)
+        if at < 0 {
+            return false
+        }
+        index += 1
+    }
+    return at == end
+}
+
+fn bson_valid(doc: Bson) -> bool {
+    return doc.error == "" && __bson_valid_doc(__str_ptr(doc.data), doc.data.byte_len(), 0, false)
+}
+
+fn bson_parse(data: str) -> Bson {
+    let doc = Bson {
+        data
+    }
+    if !bson_valid(doc) {
+        return Bson {
+            data: "", error: "invalid BSON document"
+        }
+    }
+    return doc
+}
+
+fn bson_new() -> BsonBuilder {
+    let b = BsonBuilder {
+        buffer: buf_new(128)
+    }
+    __bson_u32(b.buffer, 0)
+    return b
+}
+
+fn __bson_key(b: BsonBuilder, key: str, kind: int, size: int) -> bool {
+    if b.error != "" {
+        return false
+    }
+    if key.contains("\0") {
+        b.error = "BSON field name contains NUL"
+        return false
+    }
+    if !__bson_utf8(__str_ptr(key), key.byte_len()) {
+        b.error = "BSON field name is not UTF-8"
+        return false
+    }
+    if b.keys.has(key) {
+        b.error = "duplicate BSON field: " + key
+        return false
+    }
+    if size < 0 || size > BSON_MAX_BYTES || key.byte_len() > BSON_MAX_BYTES - size - 2 || b.buffer.len > BSON_MAX_BYTES - size - key.byte_len() - 3 {
+        b.error = "BSON document exceeds 16 MiB"
+        return false
+    }
+    b.keys[key] = true
+    buf_byte(b.buffer, kind)
+    buf_add(b.buffer, key)
+    buf_byte(b.buffer, 0)
+    return true
+}
+
+fn bson_int(b: BsonBuilder, key: str, value: int) {
+    if __bson_key(b, key, 18, 8) {
+        __bson_u64(b.buffer, value)
+    }
+}
+
+fn bson_int32(b: BsonBuilder, key: str, value: int) {
+    if value < -2147483648 || value > 2147483647 {
+        b.error = "BSON int32 out of range"
+        return
+    }
+    if __bson_key(b, key, 16, 4) {
+        __bson_u32(b.buffer, value)
+    }
+}
+
+fn bson_float(b: BsonBuilder, key: str, value: float) {
+    if __bson_key(b, key, 1, 8) {
+        __bson_u64(b.buffer, __cast(value))
+    }
+}
+
+fn bson_str(b: BsonBuilder, key: str, value: str) {
+    if !__bson_utf8(__str_ptr(value), value.byte_len()) {
+        b.error = "BSON string is not UTF-8; use BsonBinary for bytes"
+        return
+    }
+    if __bson_key(b, key, 2, value.byte_len() + 5) {
+        __bson_u32(b.buffer, value.byte_len() + 1)
+        buf_add(b.buffer, value)
+        buf_byte(b.buffer, 0)
+    }
+}
+
+fn bson_bool(b: BsonBuilder, key: str, value: bool) {
+    if __bson_key(b, key, 8, 1) {
+        if value {
+            buf_byte(b.buffer, 1)
+        } else {
+            buf_byte(b.buffer, 0)
+        }
+    }
+}
+
+fn bson_null(b: BsonBuilder, key: str) {
+    __bson_key(b, key, 10, 0)
+}
+
+fn __bson_doc(b: BsonBuilder, key: str, value: Bson, kind: int) {
+    if !bson_valid(value) {
+        b.error = "invalid nested BSON document"
+        return
+    }
+    if __bson_key(b, key, kind, value.data.byte_len()) {
+        buf_add(b.buffer, value.data)
+    }
+}
+
+fn bson_doc(b: BsonBuilder, key: str, value: Bson) {
+    __bson_doc(b, key, value, 3)
+}
+
+fn bson_array(b: BsonBuilder, key: str, values: [Bson]) {
+    let a = bson_new()
+    for i in 0..values.len() {
+        bson_doc(a, i.to_str(), values[i])
+    }
+    __bson_doc(b, key, bson_finish(a), 4)
+}
+
+fn bson_int_array(b: BsonBuilder, key: str, values: [int]) {
+    let a = bson_new()
+    for i in 0..values.len() {
+        bson_int(a, i.to_str(), values[i])
+    }
+    __bson_doc(b, key, bson_finish(a), 4)
+}
+
+fn bson_binary(b: BsonBuilder, key: str, value: str, subtype: int = 0) {
+    if subtype < 0 || subtype > 255 || subtype == 2 {
+        b.error = "invalid or legacy BSON binary subtype"
+        return
+    }
+    if __bson_key(b, key, 5, value.byte_len() + 5) {
+        __bson_u32(b.buffer, value.byte_len())
+        buf_byte(b.buffer, subtype)
+        buf_add(b.buffer, value)
+    }
+}
+
+fn bson_object_id(b: BsonBuilder, key: str, hex: str) {
+    let raw = __alloc(12)
+    if hex.byte_len() != 24 {
+        b.error = "ObjectId needs 24 hexadecimal digits"
+        return
+    }
+    for i in 0..24 {
+        if __hex_val(hex.byte(i)) < 0 {
+            b.error = "ObjectId needs 24 hexadecimal digits"
+            return
+        }
+    }
+    __unhex(hex, raw)
+    if __bson_key(b, key, 7, 12) {
+        buf_add_raw(b.buffer, raw, 12)
+    }
+}
+
+fn bson_date(b: BsonBuilder, key: str, milliseconds: int) {
+    if __bson_key(b, key, 9, 8) {
+        __bson_u64(b.buffer, milliseconds)
+    }
+}
+
+fn bson_decimal128(b: BsonBuilder, key: str, bytes: str) {
+    if bytes.byte_len() != 16 {
+        b.error = "decimal128 needs exactly 16 bytes"
+        return
+    }
+    if __bson_key(b, key, 19, 16) {
+        buf_add(b.buffer, bytes)
+    }
+}
+
+fn bson_timestamp(b: BsonBuilder, key: str, increment: int, seconds: int) {
+    if increment < 0 || increment > 4294967295 || seconds < 0 || seconds > 4294967295 {
+        b.error = "timestamp parts must fit uint32"
+        return
+    }
+    if __bson_key(b, key, 17, 8) {
+        __bson_u32(b.buffer, increment)
+        __bson_u32(b.buffer, seconds)
+    }
+}
+
+fn bson_finish(b: BsonBuilder) -> Bson {
+    if b.error != "" {
+        return Bson {
+            data: "", error: b.error
+        }
+    }
+    // Snapshot: finishing twice or appending later does not mutate the document.
+    let data = __alloc(b.buffer.len + 1)
+    __memcpy(data, b.buffer.data, b.buffer.len)
+    store32(data, b.buffer.len + 1)
+    store8(data + b.buffer.len, 0)
+    return bson_parse(__str_new(data, b.buffer.len + 1))
+}
+
+fn __bson_fields(doc: Bson) -> [BsonField] {
+    var fields: [BsonField] = []
+    let base = __str_ptr(doc.data)
+    let end = base + doc.data.byte_len() - 1
+    var at = base + 4
+    while at < end {
+        let kind = load8(at)
+        let z = __bson_zero(at + 1, end)
+        let next = __bson_value_end(kind, z + 1, end, 0)
+        fields.push(BsonField {
+            name: __str_new(at + 1, z - at - 1), kind, data: __str_new(z + 1, next - z - 1)
+        })
+        at = next
+    }
+    return fields
+}
+
+fn bson_fields(doc: Bson) -> [BsonField] {
+    if !bson_valid(doc) {
+        return []
+    }
+    return __bson_fields(doc)
+}
+
+fn bson_get(doc: Bson, key: str) -> BsonField? {
+    if !bson_valid(doc) {
+        return none
+    }
+    for field in __bson_fields(doc) {
+        if field.name == key {
+            return field
+        }
+    }
+    return none
+}
+
+fn bson_has(doc: Bson, key: str) -> bool {
+    return bson_get(doc, key) != none
+}
+
+fn bson_is_null(doc: Bson, key: str) -> bool {
+    let field = bson_get(doc, key) else {
+        return false
+    }
+    return field.kind == 10
+}
+
+fn bson_get_int(doc: Bson, key: str) -> int? {
+    let f = bson_get(doc, key) else {
+        return none
+    }
+    if f.kind == 18 {
+        return load64(__str_ptr(f.data))
+    }
+    if f.kind == 16 {
+        let v = load32(__str_ptr(f.data))
+        if v > 2147483647 {
+            return v - 4294967296
+        }
+        return v
+    }
+    return none
+}
+
+fn bson_get_str(doc: Bson, key: str) -> str? {
+    let f = bson_get(doc, key) else {
+        return none
+    }
+    if f.kind != 2 {
+        return none
+    }
+    return f.data.byte_slice(4, f.data.byte_len() - 1)
+}
+
+fn bson_get_bool(doc: Bson, key: str) -> bool? {
+    let f = bson_get(doc, key) else {
+        return none
+    }
+    if f.kind != 8 {
+        return none
+    }
+    return f.data.byte(0) == 1
+}
+
+fn bson_get_doc(doc: Bson, key: str) -> Bson? {
+    let f = bson_get(doc, key) else {
+        return none
+    }
+    if f.kind != 3 {
+        return none
+    }
+    return Bson {
+        data: f.data
+    }
+}
+
+fn bson_get_array(doc: Bson, key: str) -> [Bson] {
+    let f = bson_get(doc, key) else {
+        return []
+    }
+    if f.kind != 4 {
+        return []
+    }
+    var out: [Bson] = []
+    for e in __bson_fields(Bson {
+        data: f.data
+    }) {
+        if e.kind != 3 {
+            return []
+        }
+        out.push(Bson {
+            data: e.data
+        })
+    }
+    return out
+}
+
+fn bson_get_binary(doc: Bson, key: str) -> BsonBinary? {
+    let f = bson_get(doc, key) else {
+        return none
+    }
+    if f.kind != 5 {
+        return none
+    }
+    let subtype = f.data.byte(4)
+    var start = 5
+    if subtype == 2 {
+        start = 9
+    }
+    return BsonBinary {
+        data: f.data.byte_slice(start, f.data.byte_len()), subtype
+    }
+}
+
+fn __bson_struct_name(d: int) -> str {
+    if load64(d) != D_STRUCT {
+        return ""
+    }
+    return __cast(load64(d + 16))
+}
+
+fn __bson_encode_value(b: BsonBuilder, key: str, v: int, d: int, depth: int) {
+    if depth > BSON_MAX_DEPTH {
+        b.error = "BSON nesting exceeds 64"
+        return
+    }
+    let kind = load64(d)
+    if kind == D_OPT {
+        if v == 0 {
+            bson_null(b, key)
+            return
+        }
+        let inner = load64(d + 8)
+        var value = v
+        if __is_scalar(inner) {
+            value = load64(v)
+        }
+        __bson_encode_value(b, key, value, inner, depth)
+    } else if kind == D_INT {
+        bson_int(b, key, v)
+    } else if kind == D_BOOL {
+        bson_bool(b, key, v != 0)
+    } else if kind == D_FLOAT {
+        bson_float(b, key, __cast(v))
+    } else if kind == D_STR {
+        bson_str(b, key, __cast(v))
+    } else if kind == D_STRUCT && __bson_struct_name(d) == "BsonObjectId" {
+        bson_object_id(b, key, __cast(load64(v)))
+    } else if kind == D_STRUCT && __bson_struct_name(d) == "BsonDate" {
+        bson_date(b, key, load64(v))
+    } else if kind == D_STRUCT && __bson_struct_name(d) == "BsonBinary" {
+        bson_binary(b, key, __cast(load64(v)), load64(v + 8))
+    } else if kind == D_STRUCT && __bson_struct_name(d) == "BsonDecimal128" {
+        bson_decimal128(b, key, __cast(load64(v)))
+    } else if kind == D_STRUCT && __bson_struct_name(d) == "BsonTimestamp" {
+        bson_timestamp(b, key, load64(v), load64(v + 8))
+    } else if kind == D_STRUCT || kind == D_MAP {
+        __bson_doc(b, key, __bson_encode_doc(v, d, depth + 1), 3)
+    } else if kind == D_LIST {
+        let a = bson_new()
+        let ed = load64(d + 8)
+        let n = load64(v + 8)
+        let data = load64(v)
+        for i in 0..n {
+            var value = 0
+            if load64(ed) == D_BOOL {
+                value = load8(data + i)
+            } else {
+                value = load64(data + i * 8)
+            }
+            __bson_encode_value(a, i.to_str(), value, ed, depth + 1)
+        }
+        __bson_doc(b, key, bson_finish(a), 4)
+    } else if kind == D_SUM {
+        let e = __variant_entry(d, v)
+        if e == 0 {
+            b.error = "invalid variant"
+            return
+        }
+        let name: str = __cast(load64(e))
+        if load64(d + 24) != 0 {
+            bson_str(b, key, name)
+        } else {
+            let a = bson_new()
+            bson_str(a, "type", name)
+            __bson_encode_struct(a, v, load64(e + 8), depth + 1)
+            __bson_doc(b, key, bson_finish(a), 3)
+        }
+    } else {
+        b.error = "unsupported BSON value type"
+    }
+}
+
+fn __bson_encode_struct(b: BsonBuilder, v: int, d: int, depth: int) {
+    for i in 0..load64(d + 8) {
+        let f = __field(d, i)
+        let key: str = __cast(load64(f))
+        __bson_encode_value(b, key, load64(v + i * 8), load64(f + 16), depth)
+    }
+}
+
+fn __bson_encode_doc(v: int, d: int, depth: int) -> Bson {
+    if depth > BSON_MAX_DEPTH {
+        return Bson {
+            data: "", error: "BSON nesting exceeds 64"
+        }
+    }
+    let b = bson_new()
+    if load64(d) == D_STRUCT {
+        __bson_encode_struct(b, v, d, depth)
+    } else if load64(d) == D_MAP && load64(load64(d + 8)) == D_STR {
+        let keys: [str] = __cast(__map_keys(v))
+        for key in keys {
+            __bson_encode_value(b, key, __map_get_or0(v, __cast(key)), load64(d + 16), depth)
+        }
+    } else {
+        b.error = "BSON root must be a struct or map[str, T]"
+    }
+    return bson_finish(b)
+}
+
+fn __bson_encode(v: int, d: int) -> Bson {
+    return __bson_encode_doc(v, d, 0)
+}
+
+fn __bson_decode_value(r: __BsonRead, f: BsonField, d: int, depth: int) -> int {
+    if r.error != "" {
+        return 0
+    }
+    if depth > BSON_MAX_DEPTH {
+        r.error = "BSON nesting exceeds 64"
+        return 0
+    }
+    let kind = load64(d)
+    let p = __str_ptr(f.data)
+    if kind == D_OPT {
+        if f.kind == 10 {
+            return 0
+        }
+        let inner = load64(d + 8)
+        let value = __bson_decode_value(r, f, inner, depth)
+        if __is_scalar(inner) {
+            let cell = __alloc(8)
+            store64(cell, value)
+            return cell
+        }
+        return value
+    }
+    if kind == D_INT && f.kind == 18 {
+        return load64(p)
+    }
+    if kind == D_INT && f.kind == 16 {
+        let value = load32(p)
+        if value > 2147483647 {
+            return value - 4294967296
+        }
+        return value
+    }
+    if kind == D_BOOL && f.kind == 8 {
+        return load8(p)
+    }
+    if kind == D_FLOAT && f.kind == 1 {
+        return load64(p)
+    }
+    if kind == D_STR && f.kind == 2 {
+        return __cast(f.data.byte_slice(4, f.data.byte_len() - 1))
+    }
+    let name = __bson_struct_name(d)
+    if name == "BsonObjectId" && f.kind == 7 {
+        return __cast(BsonObjectId {
+            hex: __hex_bytes(p, 12)
+        })
+    }
+    if name == "BsonDate" && f.kind == 9 {
+        return __cast(BsonDate {
+            milliseconds: load64(p)
+        })
+    }
+    if name == "BsonBinary" && f.kind == 5 {
+        let subtype = load8(p + 4)
+        var skip = 5
+        if subtype == 2 {
+            skip = 9
+        }
+        return __cast(BsonBinary {
+            data: f.data.byte_slice(skip, f.data.byte_len()), subtype
+        })
+    }
+    if name == "BsonDecimal128" && f.kind == 19 {
+        return __cast(BsonDecimal128 {
+            bytes: f.data
+        })
+    }
+    if name == "BsonTimestamp" && f.kind == 17 {
+        return __cast(BsonTimestamp {
+            increment: load32(p), seconds: load32(p + 4)
+        })
+    }
+    if kind == D_LIST && f.kind == 4 {
+        let ed = load64(d + 8)
+        var size = 8
+        if load64(ed) == D_BOOL {
+            size = 1
+        }
+        let xs: [int] = __cast(__list_new(4, size))
+        for e in __bson_fields(Bson {
+            data: f.data
+        }) {
+            xs.push(__bson_decode_value(r, e, ed, depth + 1))
+        }
+        return __cast(xs)
+    }
+    if kind == D_STRUCT && f.kind == 3 {
+        return __bson_decode_struct(r, Bson {
+            data: f.data
+        }, d, depth + 1)
+    }
+    if kind == D_MAP && f.kind == 3 && load64(load64(d + 8)) == D_STR {
+        let m = __map_new(1)
+        let seen: map[str, bool] = {}
+        for e in __bson_fields(Bson {
+            data: f.data
+        }) {
+            if seen.has(e.name) {
+                r.error = "duplicate BSON field: " + e.name
+                return 0
+            }
+            seen[e.name] = true
+            __map_set(m, __cast(e.name), __bson_decode_value(r, e, load64(d + 16), depth + 1))
+            if r.error != "" {
+                return 0
+            }
+        }
+        return m
+    }
+    if kind == D_SUM {
+        var tag = ""
+        if load64(d + 24) != 0 && f.kind == 2 {
+            tag = f.data.byte_slice(4, f.data.byte_len() - 1)
+        } else if f.kind == 3 {
+            tag = bson_get_str(Bson {
+                data: f.data
+            }, "type") ?? ""
+        }
+        for i in 0..load64(d + 8) {
+            let e = d + 32 + i * 24
+            let ename: str = __cast(load64(e))
+            if ename == tag {
+                if load64(e + 16) != 0 {
+                    return load64(e + 16)
+                }
+                return __bson_decode_struct(r, Bson {
+                    data: f.data
+                }, load64(e + 8), depth + 1)
+            }
+        }
+    }
+    r.error = "BSON field '" + f.name + "' has an incompatible type"
+    return 0
+}
+
+fn __bson_decode_struct(r: __BsonRead, doc: Bson, d: int, depth: int) -> int {
+    let n = load64(d + 8)
+    let out = __struct_alloc(d)
+    let seen = __alloc(n + 1)
+    let keys: map[str, bool] = {}
+    for e in __bson_fields(doc) {
+        if keys.has(e.name) {
+            r.error = "duplicate BSON field: " + e.name
+            return 0
+        }
+        keys[e.name] = true
+        for i in 0..n {
+            let f = __field(d, i)
+            let key: str = __cast(load64(f))
+            if key == e.name {
+                store64(out + i * 8, __bson_decode_value(r, e, load64(f + 16), depth))
+                if r.error != "" {
+                    return 0
+                }
+                store8(seen + i, 1)
+                if e.kind == 10 && load64(load64(f + 16)) == D_OPT && i < 62 {
+                    __json_null_mark(out, i)
+                }
+                break
+            }
+        }
+    }
+    for i in 0..n {
+        if load8(seen + i) != 0 {
+            continue
+        }
+        let f = __field(d, i)
+        let dk = load64(f + 24)
+        if dk == 1 {
+            store64(out + i * 8, load64(f + 32))
+        } else if dk == 2 {
+            store64(out + i * 8, __list_new(4, load64(f + 32)))
+        } else if dk == 3 {
+            store64(out + i * 8, __map_new(load64(f + 32)))
+        } else if load64(load64(f + 16)) != D_OPT {
+            let name: str = __cast(load64(f))
+            r.error = "missing BSON field: " + name
+        }
+    }
+    return out
+}
+
+// Error stored in existing request-local JSON diagnostic slot, not shared global
+// state between coroutines. bson_error() and json_error() describe last decode.
+fn __bson_decode(doc: Bson, d: int) -> int {
+    let r = __BsonRead {}
+    var result = 0
+    if !bson_valid(doc) {
+        r.error = "invalid BSON document"
+    } else {
+        result = __bson_decode_value(r, BsonField {
+            name: "", kind: 3, data: doc.data
+        }, d, 0)
+    }
+    if load64(__ctx() + CTX_WORKER) != 0 {
+        let worker = __w()
+        worker.json_err = r.error
+    } else {
+        __json_last_err = r.error
+    }
+    if r.error != "" {
+        return 0
+    }
+    return result
+}
+
+fn bson_error() -> str {
+    return json_error()
+}

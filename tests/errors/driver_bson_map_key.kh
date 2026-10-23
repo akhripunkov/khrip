@@ -1,0 +1,5 @@
+// expect: to_bson needs a supported value type
+fn main() {
+    let values: map[int, str] = {1: "a"}
+    to_bson(values)
+}

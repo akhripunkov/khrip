@@ -1,0 +1,638 @@
+// ClickHouse HTTP(S) client and RowBinary codec. No external libraries.
+// SQL values use ClickHouse {name:Type} parameters, never string substitution.
+// Results are materialized with an explicit byte limit. Batch INSERT writes the
+// encoded body directly, without concatenating it with SQL or HTTP headers.
+
+type ChConfig {
+    url: str
+    database: str = "default"
+    user: str = "default"
+    password: str = ""
+    timeout_ms: int = 10000
+    max_request_bytes: int = 16777216
+    max_response_bytes: int = 16777216
+    // Admission threshold against all active ClickHouse operations on this
+    // worker. Use the same limit across configs for one fixed per-worker cap.
+    max_inflight: int = 32
+    // Server-side batching is opt-in. Always wait for the flush acknowledgement.
+    async_insert: bool = false
+}
+
+type ChResult {
+    ok: bool = false
+    status: int = 0
+    body: str = ""
+    error: str = ""
+    query_id: str = ""
+    // The server may have applied a write whose response was lost. Never retry
+    // solely because ok is false; use idempotency/deduplication at application level.
+    unknown_outcome: bool = false
+}
+
+fn __ch_urlencode(s: str) -> str {
+    let b = buf_new(s.byte_len() + 16)
+    let hex = "0123456789ABCDEF"
+    for i in 0..s.byte_len() {
+        let c = s.byte(i)
+        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~' {
+            buf_byte(b, c)
+        } else {
+            buf_byte(b, '%')
+            buf_byte(b, hex.byte(c >> 4))
+            buf_byte(b, hex.byte(c & 15))
+        }
+    }
+    return buf_str(b)
+}
+
+// HTTP query parameters are parsed by ClickHouse as escaped values.
+fn __ch_param(s: str) -> str {
+    let b = buf_new(s.byte_len() + 16)
+    for i in 0..s.byte_len() {
+        let c = s.byte(i)
+        if c == '\\' {
+            buf_add(b, "\\\\")
+        } else if c == '\n' {
+            buf_add(b, "\\n")
+        } else if c == '\r' {
+            buf_add(b, "\\r")
+        } else if c == '\t' {
+            buf_add(b, "\\t")
+        } else if c == 0 {
+            buf_add(b, "\\0")
+        } else {
+            buf_byte(b, c)
+        }
+    }
+    return __ch_urlencode(buf_str(b))
+}
+
+fn __ch_identifier(s: str) -> bool {
+    if s.byte_len() == 0 || s.byte_len() > 256 {
+        return false
+    }
+    for i in 0..s.byte_len() {
+        let c = s.byte(i)
+        if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || (i > 0 && c >= '0' && c <= '9')) {
+            return false
+        }
+    }
+    return true
+}
+
+fn __ch_config_error(c: ChConfig) -> str {
+    if c.timeout_ms <= 0 || c.timeout_ms > 3600000 {
+        return "ClickHouse timeout_ms must be between 1 and 3600000"
+    }
+    if c.max_inflight < 1 || c.max_inflight > 128 {
+        return "ClickHouse max_inflight must be between 1 and 128"
+    }
+    if c.max_request_bytes <= 0 || c.max_request_bytes > 134217728 || c.max_response_bytes <= 0 || c.max_response_bytes > 134217728 {
+        return "ClickHouse byte limits must be between 1 and 134217728"
+    }
+    if c.url.byte_len() > 4096 || c.database.byte_len() > 256 || c.user.byte_len() > 1024 || c.password.byte_len() > 4096 {
+        return "ClickHouse configuration exceeds size limits"
+    }
+    for i in 0..c.url.byte_len() {
+        let ch = c.url.byte(i)
+        if ch <= 32 || ch >= 127 || ch == '@' || ch == '?' || ch == '#' || ch == '\\' {
+            return "ClickHouse URL must be HTTP(S) without credentials, query parameters or fragments"
+        }
+    }
+    if __parse_url(c.url) == none {
+        return "invalid ClickHouse HTTP(S) URL"
+    }
+    return ""
+}
+
+fn __ch_run(c: ChConfig, query: str, payload: str, params: map[str, str], cancel: bool) -> ChResult {
+    let conferr = __ch_config_error(c)
+    if conferr.byte_len() > 0 {
+        return ChResult { error: conferr }
+    }
+    if query.byte_len() > c.max_request_bytes || payload.byte_len() > c.max_request_bytes - query.byte_len() {
+        return ChResult { error: "ClickHouse request exceeds max_request_bytes" }
+    }
+    if params.len() > 128 {
+        return ChResult { error: "too many ClickHouse parameters" }
+    }
+    let u = __parse_url(c.url) else {
+        return ChResult { error: "invalid ClickHouse URL" }
+    }
+    let id = "khrip-" + random_str(24)
+    var target = u.target + "?database=" + __ch_urlencode(c.database) + "&query_id=" + id
+    target += "&default_format=RowBinaryWithNamesAndTypes&wait_end_of_query=1&buffer_size=" + c.max_response_bytes.to_str()
+    target += "&max_result_bytes=" + c.max_response_bytes.to_str() + "&result_overflow_mode=throw"
+    target += "&send_progress_in_http_headers=0&enable_http_compression=0&output_format_binary_encode_types_in_binary_format=0"
+    target += "&input_format_with_names_use_header=1&input_format_with_types_use_header=1&input_format_skip_unknown_fields=0"
+    target += "&max_execution_time=" + (c.timeout_ms / 1000).to_str() + "." + __pad(c.timeout_ms % 1000, 3)
+    if c.async_insert && !cancel {
+        target += "&async_insert=1&wait_for_async_insert=1"
+    }
+    for k, v in params {
+        if !__ch_identifier(k) || v.byte_len() > 65536 {
+            return ChResult { error: "invalid ClickHouse parameter name or oversized value" }
+        }
+        target += "&param_" + k + "=" + __ch_param(v)
+        if target.byte_len() > 262144 {
+            return ChResult { error: "ClickHouse parameters exceed URL size limit" }
+        }
+    }
+    let auth = __b64_encode(c.user + ":" + c.password)
+    let head = "POST {target} HTTP/1.1\r\nHost: {u.host}:{u.port}\r\nAuthorization: Basic {auth}\r\nContent-Type: application/octet-stream\r\nAccept-Encoding: identity\r\nContent-Length: {query.byte_len() + payload.byte_len()}\r\n\r\n"
+    let ctx = __ctx()
+    let held = load64(ctx + CTX_STORE_HELD) != 0
+    if held {
+        __store_unlock()
+    }
+    let r = __dh_exchange(u, head, query, payload, now_ms() + c.timeout_ms, c.max_response_bytes, c.max_inflight)
+    if held {
+        __store_lock()
+    }
+    if r.status == 0 {
+        return ChResult { error: r.body, query_id: id, unknown_outcome: (r.headers["x-khrip-unknown-outcome"] ?? "") == "1" }
+    }
+    let code = r.headers["x-clickhouse-exception-code"] ?? "0"
+    if r.status < 200 || r.status >= 300 || code != "0" {
+        return ChResult { status: r.status, error: r.body, query_id: id }
+    }
+    return ChResult { ok: true, status: r.status, body: r.body, query_id: id }
+}
+
+// SELECT without FORMAT defaults to RowBinaryWithNamesAndTypes, for ch_decode.
+// DDL and other SQL are supported as well. No automatic retries: after a network
+// failure the caller must treat a write's outcome as unknown.
+fn ch_query(c: ChConfig, query: str) -> ChResult {
+    return __ch_run(c, query, "", {}, false)
+}
+
+fn ch_query_params(c: ChConfig, query: str, params: map[str, str]) -> ChResult {
+    return __ch_run(c, query, "", params, false)
+}
+
+// ch_encode includes names and exact wire types. The server validates the header
+// against its schema before interpreting values (Int64 cannot become Int32).
+fn ch_insert(c: ChConfig, table: str, body: str) -> ChResult {
+    let parts = table.split(".")
+    if parts.len() == 0 || parts.len() > 2 {
+        return ChResult { error: "invalid ClickHouse table" }
+    }
+    var names: [str] = []
+    for p in parts {
+        if !__ch_identifier(p) {
+            return ChResult { error: "invalid ClickHouse table identifier" }
+        }
+        names.push("`" + p + "`")
+    }
+    let r = __ChReader { p: __str_ptr(body), end: __str_ptr(body) + body.byte_len() }
+    let count = __ch_read_varint(r)
+    if r.error.byte_len() > 0 || count <= 0 || count > 1024 {
+        return ChResult { error: "ch_insert requires a ch_encode RowBinaryWithNamesAndTypes body" }
+    }
+    var cols: [str] = []
+    for i in 0..count {
+        let col = __ch_read_str(r)
+        if !__ch_identifier(col) || cols.contains("`" + col + "`") {
+            return ChResult { error: "invalid or duplicate ClickHouse column identifier" }
+        }
+        cols.push("`" + col + "`")
+    }
+    for i in 0..count {
+        let ty = __ch_read_str(r)
+        if ty.byte_len() == 0 || ty.byte_len() > 4096 || r.error.byte_len() > 0 {
+            return ChResult { error: "invalid RowBinary type header" }
+        }
+    }
+    let query = "INSERT INTO " + names.join(".") + " (" + cols.join(",") + ") FORMAT RowBinaryWithNamesAndTypes\n"
+    return __ch_run(c, query, body, {}, false)
+}
+
+// Cancellation is explicit and requires KILL QUERY privileges. A cancelled
+// INSERT may already have committed: cancellation is never a rollback promise.
+fn ch_cancel(c: ChConfig, query_id: str) -> ChResult {
+    return __ch_run(c, "KILL QUERY WHERE query_id = \{id:String} SYNC", "", {"id": query_id}, true)
+}
+
+fn __ch_error_set(message: str) {
+    if load64(__ctx() + CTX_WORKER) != 0 {
+        let worker = __w()
+        worker.json_err = message
+    } else {
+        __json_last_err = message
+    }
+}
+
+fn ch_error() -> str {
+    return json_error()
+}
+
+fn __ch_varint(b: Buf, value: int) {
+    var n = value
+    while n >= 128 {
+        buf_byte(b, (n & 127) | 128)
+        n = n >> 7
+    }
+    buf_byte(b, n)
+}
+
+fn __ch_type(d: int, depth: int) -> str {
+    if depth > 32 {
+        return ""
+    }
+    let kind = load64(d)
+    if kind == D_INT { return "Int64" }
+    if kind == D_FLOAT { return "Float64" }
+    if kind == D_BOOL { return "Bool" }
+    if kind == D_STR { return "String" }
+    if kind == D_OPT || kind == D_LIST {
+        let inner = __ch_type(load64(d + 8), depth + 1)
+        if inner.byte_len() == 0 { return "" }
+        if kind == D_OPT && (load64(load64(d + 8)) == D_LIST || load64(load64(d + 8)) == D_OPT) {
+            return ""
+        }
+        if kind == D_OPT { return "Nullable(" + inner + ")" }
+        return "Array(" + inner + ")"
+    }
+    return ""
+}
+
+fn __ch_string(b: Buf, value: str) {
+    __ch_varint(b, value.byte_len())
+    buf_add(b, value)
+}
+
+fn __ch_write(b: Buf, v0: int, d: int, depth: int) -> bool {
+    if depth > 32 || b.len > 134217728 {
+        __ch_error_set("RowBinary nesting or byte limit exceeded")
+        return false
+    }
+    let kind = load64(d)
+    var v = v0
+    if kind == D_OPT {
+        if v == 0 {
+            buf_byte(b, 1)
+            return true
+        }
+        buf_byte(b, 0)
+        let inner = load64(d + 8)
+        if __is_scalar(inner) {
+            v = load64(v)
+        }
+        return __ch_write(b, v, inner, depth + 1)
+    }
+    if kind == D_INT || kind == D_FLOAT {
+        buf_reserve(b, 8)
+        store64(b.data + b.len, v)
+        b.len += 8
+        return true
+    }
+    if kind == D_BOOL {
+        buf_byte(b, v)
+        return true
+    }
+    if kind == D_STR {
+        let s: str = __cast(v)
+        if s.byte_len() > 134217728 - b.len - 10 {
+            __ch_error_set("RowBinary string exceeds byte limit")
+            return false
+        }
+        __ch_varint(b, s.byte_len())
+        buf_add(b, s)
+        return true
+    }
+    if kind == D_LIST {
+        let n = load64(v + 8)
+        __ch_varint(b, n)
+        for i in 0..n {
+            if !__ch_write(b, __lget(v, i), load64(d + 8), depth + 1) {
+                return false
+            }
+        }
+        return true
+    }
+    if kind == D_STRUCT {
+        for i in 0..load64(d + 8) {
+            if !__ch_write(b, load64(v + i * 8), __field_desc(d, i), depth + 1) {
+                return false
+            }
+        }
+        return true
+    }
+    __ch_error_set("unsupported RowBinary type")
+    return false
+}
+
+fn __ch_encode(v: int, d: int) -> str {
+    __ch_error_set("")
+    if load64(d) != D_LIST {
+        __ch_error_set("ch_encode expects a list of rows")
+        return ""
+    }
+    let b = buf_new(4096)
+    let inner = load64(d + 8)
+    var names: [str] = []
+    var types: [str] = []
+    if load64(inner) == D_STRUCT {
+        let n = load64(inner + 8)
+        for i in 0..n {
+            names.push(__cast(load64(__field(inner, i))))
+            types.push(__ch_type(__field_desc(inner, i), 0))
+        }
+    } else {
+        names.push("value")
+        types.push(__ch_type(inner, 0))
+    }
+    if names.len() == 0 || names.len() > 1024 || types.contains("") {
+        __ch_error_set("unsupported RowBinary column type or column count")
+        return ""
+    }
+    __ch_varint(b, names.len())
+    for name in names { __ch_string(b, name) }
+    for ty in types { __ch_string(b, ty) }
+    for i in 0..load64(v + 8) {
+        if !__ch_write(b, __lget(v, i), inner, 0) {
+            return ""
+        }
+    }
+    if b.len > 134217728 {
+        __ch_error_set("RowBinary byte limit exceeded")
+        return ""
+    }
+    // The private buffer is never mutated after return: retain its bytes instead
+    // of copying the entire batch a second time.
+    return __str_new(b.data, b.len)
+}
+
+type __ChReader {
+    p: int
+    end: int
+    error: str = ""
+    // Memory expansion of arrays and tiny scalar columns is bounded separately.
+    items: int = 0
+}
+
+fn __ch_need(r: __ChReader, n: int) -> bool {
+    if r.error.byte_len() > 0 {
+        return false
+    }
+    if n < 0 || n > r.end - r.p {
+        r.error = "truncated RowBinary value"
+        return false
+    }
+    return true
+}
+
+fn __ch_read_varint(r: __ChReader) -> int {
+    var n = 0
+    var shift = 0
+    while shift < 63 {
+        if !__ch_need(r, 1) {
+            return 0
+        }
+        let c = load8(r.p)
+        r.p += 1
+        n = n | ((c & 127) << shift)
+        if c < 128 {
+            if shift > 0 && c == 0 {
+                r.error = "noncanonical RowBinary varint"
+            }
+            return n
+        }
+        shift += 7
+    }
+    r.error = "RowBinary length exceeds signed 64-bit range"
+    return 0
+}
+
+fn __ch_read_str(r: __ChReader) -> str {
+    let n = __ch_read_varint(r)
+    if !__ch_need(r, n) {
+        return ""
+    }
+    let value = __str_new(r.p, n)
+    r.p += n
+    return value
+}
+
+fn __ch_unwrap(t: str, name: str) -> str? {
+    let prefix = name + "("
+    if t.starts_with(prefix) && t.ends_with(")") {
+        return t.byte_slice(prefix.byte_len(), t.byte_len() - 1)
+    }
+    return none
+}
+
+fn __ch_compatible(t: str, d: int, depth: int) -> bool {
+    if depth > 32 {
+        return false
+    }
+    if let lc = __ch_unwrap(t, "LowCardinality") {
+        return __ch_compatible(lc, d, depth + 1)
+    }
+    let k = load64(d)
+    if k == D_OPT {
+        if let n = __ch_unwrap(t, "Nullable") {
+            return __ch_compatible(n, load64(d + 8), depth + 1)
+        }
+        return __ch_compatible(t, load64(d + 8), depth + 1)
+    }
+    if k == D_LIST {
+        if let a = __ch_unwrap(t, "Array") {
+            return __ch_compatible(a, load64(d + 8), depth + 1)
+        }
+        return false
+    }
+    if k == D_INT {
+        return ["Int8", "Int16", "Int32", "Int64", "UInt8", "UInt16", "UInt32", "UInt64", "Date", "Date32", "DateTime"].contains(t) || t.starts_with("DateTime(") || t.starts_with("DateTime64(")
+    }
+    if k == D_FLOAT {
+        return t == "Float64"
+    }
+    if k == D_BOOL {
+        return t == "Bool" || t == "UInt8"
+    }
+    if k == D_STR {
+        return t == "String" || t.starts_with("FixedString(")
+    }
+    return false
+}
+
+fn __ch_read_value(r: __ChReader, t: str, d: int, depth: int) -> int {
+    if r.error.byte_len() > 0 {
+        return 0
+    }
+    r.items += 1
+    if depth > 32 || r.items > 4000000 {
+        r.error = "RowBinary nesting or item limit exceeded"
+        return 0
+    }
+    if let lc = __ch_unwrap(t, "LowCardinality") {
+        return __ch_read_value(r, lc, d, depth + 1)
+    }
+    let k = load64(d)
+    if k == D_OPT {
+        var inner_type = t
+        if let n = __ch_unwrap(t, "Nullable") {
+            inner_type = n
+            if !__ch_need(r, 1) {
+                return 0
+            }
+            let flag = load8(r.p)
+            r.p += 1
+            if flag == 1 {
+                return 0
+            }
+            if flag != 0 {
+                r.error = "invalid RowBinary nullable flag"
+                return 0
+            }
+        }
+        let inner = load64(d + 8)
+        let value = __ch_read_value(r, inner_type, inner, depth + 1)
+        if __is_scalar(inner) {
+            let p = __alloc(8)
+            store64(p, value)
+            return p
+        }
+        return value
+    }
+    if k == D_LIST {
+        let n = __ch_read_varint(r)
+        if n > 4000000 - r.items || n > r.end - r.p {
+            r.error = "RowBinary array length exceeds limit"
+            return 0
+        }
+        let inner = load64(d + 8)
+        var es = 8
+        if load64(inner) == D_BOOL {
+            es = 1
+        }
+        let list: [int] = __cast(__list_new(n, es))
+        let inner_type = __ch_unwrap(t, "Array") ?? ""
+        for i in 0..n {
+            list.push(__ch_read_value(r, inner_type, inner, depth + 1))
+            if r.error.byte_len() > 0 {
+                return 0
+            }
+        }
+        return __cast(list)
+    }
+    if k == D_STR {
+        if t == "String" {
+            return __cast(__ch_read_str(r))
+        }
+        let n = __dh_decimal(__ch_unwrap(t, "FixedString") ?? "", 134217728)
+        if !__ch_need(r, n) {
+            return 0
+        }
+        let s = __str_new(r.p, n)
+        r.p += n
+        return __cast(s)
+    }
+    var width = 8
+    if t == "Int8" || t == "UInt8" || t == "Bool" {
+        width = 1
+    } else if t == "Int16" || t == "UInt16" || t == "Date" {
+        width = 2
+    } else if t == "Int32" || t == "UInt32" || t == "Date32" || t == "DateTime" || t.starts_with("DateTime(") {
+        width = 4
+    }
+    if !__ch_need(r, width) {
+        return 0
+    }
+    var value = 0
+    for i in 0..width {
+        value = value | (load8(r.p + i) << (i * 8))
+    }
+    r.p += width
+    if t == "UInt64" && value < 0 {
+        r.error = "ClickHouse UInt64 does not fit Khrip int"
+        return 0
+    }
+    if width < 8 && (t.starts_with("Int") || t == "Date32") {
+        let shift = 64 - width * 8
+        value = (value << shift) >> shift
+    }
+    if k == D_BOOL && value != 0 && value != 1 {
+        r.error = "ClickHouse UInt8 is not a boolean"
+        return 0
+    }
+    return value
+}
+
+fn __ch_decode(body: str, d: int) -> int {
+    __ch_error_set("")
+    if load64(d) != D_LIST || body.byte_len() > 134217728 {
+        __ch_error_set("ch_decode expects a bounded RowBinaryWithNamesAndTypes result and a list type")
+        return 0
+    }
+    let row = load64(d + 8)
+    let kind = load64(row)
+    let r = __ChReader { p: __str_ptr(body), end: __str_ptr(body) + body.byte_len() }
+    let count = __ch_read_varint(r)
+    var wanted = 1
+    if kind == D_STRUCT {
+        wanted = load64(row + 8)
+    }
+    if r.error.byte_len() > 0 || count != wanted || count <= 0 || count > 1024 {
+        __ch_error_set("RowBinary column count does not match the result type")
+        return 0
+    }
+    var names: [str] = []
+    var types: [str] = []
+    var fields: [int] = []
+    for i in 0..count {
+        let name = __ch_read_str(r)
+        if names.contains(name) {
+            r.error = "duplicate RowBinary column name"
+        }
+        names.push(name)
+    }
+    for i in 0..count {
+        types.push(__ch_read_str(r))
+    }
+    for i in 0..count {
+        var field = -1
+        var desc = row
+        if kind == D_STRUCT {
+            for j in 0..wanted {
+                let name: str = __cast(load64(__field(row, j)))
+                if name == names[i] {
+                    field = j
+                    desc = __field_desc(row, j)
+                    break
+                }
+            }
+            if field < 0 {
+                r.error = "RowBinary column '" + names[i] + "' has no matching field"
+            }
+        }
+        fields.push(field)
+        if !__ch_compatible(types[i], desc, 0) {
+            r.error = "RowBinary column '" + names[i] + "' type " + types[i] + " does not match Khrip type"
+        }
+    }
+    var es = 8
+    if kind == D_BOOL {
+        es = 1
+    }
+    let rows: [int] = __cast(__list_new(16, es))
+    while r.p < r.end && r.error.byte_len() == 0 {
+        if kind == D_STRUCT {
+            let value = __struct_alloc(row)
+            for i in 0..count {
+                let field = fields[i]
+                let v = __ch_read_value(r, types[i], __field_desc(row, field), 0)
+                store64(value + field * 8, v)
+            }
+            rows.push(value)
+        } else {
+            rows.push(__ch_read_value(r, types[0], row, 0))
+        }
+    }
+    if r.error.byte_len() > 0 {
+        __ch_error_set(r.error)
+        return 0
+    }
+    return __cast(rows)
+}

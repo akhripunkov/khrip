@@ -808,7 +808,9 @@ fn parse_index(t: int) -> int {
         emit_mov_rr(RSI, RAX)
         emit_pop(RDI)
         let vt = types[t].b
-        if is_ref(vt) {
+        // T? already has its optional representation; ty_opt(T?) is T?.
+        // Boxing again would return a pointer to the box instead of its value.
+        if is_ref(vt) || tkind(vt) == K_OPT {
             emit_call(rt_func("__map_get_ref"))
         } else {
             emit_call(rt_func("__map_get_box"))
@@ -1222,6 +1224,9 @@ fn parse_builtin(t: Token, w: int) -> int {
         emit_to_str(t1, a)
         return ty_str
     }
+    if name == "to_bson" || name == "from_bson" || name == "ch_encode" || name == "ch_decode" {
+        return parse_database_builtin(t, w)
+    }
     if name == "to_json" {
         advance()
         let a = tok()
@@ -1631,7 +1636,7 @@ fn parse_builtin(t: Token, w: int) -> int {
 }
 
 fn parse_call(t: Token, w: int) -> int {
-    if tx_depth > 0 && (t.text == "fetch" || t.text == "sleep") && !files[t.file].is_lib {
+    if tx_depth > 0 && (t.text == "fetch" || t.text == "sleep" || driver_io(t.text)) && !files[t.file].is_lib {
         error_tok(t, t.text + " inside tx runs again on every retry and holds a database connection", "call it before or after the tx block")
     }
     let bt = parse_builtin(t, w)
@@ -1773,7 +1778,7 @@ fn parse_method(rt: int, nt: Token) -> int {
         if mutating_method(name) {
             tx_mutation(nt)
         }
-        if (name == "sleep" || name == "fetch") && !files[nt.file].is_lib {
+        if (name == "sleep" || name == "fetch" || driver_io(name)) && !files[nt.file].is_lib {
             error_tok(nt, name + " inside tx: the block may run again after a conflict", "call it before or after the tx block")
         }
     }
@@ -1981,7 +1986,7 @@ fn parse_map_method(rt: int, nt: Token) -> int {
         return ty_bool
     }
     if name == "get" {
-        if is_ref(vt) {
+        if is_ref(vt) || tkind(vt) == K_OPT {
             emit_call(rt_func("__map_get_ref"))
         } else {
             emit_call(rt_func("__map_get_box"))
@@ -1989,7 +1994,7 @@ fn parse_map_method(rt: int, nt: Token) -> int {
         return ty_opt(vt)
     }
     if name == "remove" {
-        if is_ref(vt) {
+        if is_ref(vt) || tkind(vt) == K_OPT {
             emit_call(rt_func("__map_remove_ref"))
         } else {
             emit_call(rt_func("__map_remove_box"))

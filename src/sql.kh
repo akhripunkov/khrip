@@ -437,7 +437,7 @@ fn fn_effect(fi: int) -> str {
             if t.kind == T_IDENT {
                 let nk = kind_at(i + 1)
                 let dotted = i > 0 && toks[i - 1].kind == '.'
-                if (t.text == "fetch" && !dotted) || (t.text == "sleep" && nk == '(') {
+                if (t.text == "fetch" && !dotted) || ((t.text == "sleep" || driver_io(t.text)) && nk == '(') {
                     why = "calls " + t.text
                 } else if nk == '(' {
                     // f(...) и x.f(...)

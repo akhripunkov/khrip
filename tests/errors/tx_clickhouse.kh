@@ -1,0 +1,10 @@
+// expect: ch_query inside tx runs again on every retry and holds a database connection
+// expect: call it before or after the tx block
+route POST "/write" -> 204 {
+    let client = ChConfig { url: "http://localhost:8123/" }
+    tx {
+        sql "DELETE FROM events"
+        ch_query(client, "INSERT INTO events VALUES (1)")
+    }
+    return 204
+}

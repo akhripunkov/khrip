@@ -1,0 +1,10 @@
+// expect: mongo_cursor inside tx runs again on every retry and holds a database connection
+route POST "/write" -> 204 {
+    let client = Mongo { uri: "mongodb://localhost/test" }
+    let command = bson_finish(bson_new())
+    tx {
+        sql "DELETE FROM events"
+        mongo_cursor(client, "test", "events", command)
+    }
+    return 204
+}

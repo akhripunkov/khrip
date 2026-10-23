@@ -1,0 +1,5 @@
+// expect: ch_encode needs a supported value type
+// expect: use a list of rows
+fn main() {
+    ch_encode(42)
+}

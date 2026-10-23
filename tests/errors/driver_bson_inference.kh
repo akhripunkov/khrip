@@ -1,0 +1,5 @@
+// expect: from_bson needs a supported result type
+// expect: declare the optional result type
+fn main() {
+    let value = from_bson(bson_finish(bson_new()))
+}

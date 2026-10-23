@@ -1,0 +1,188 @@
+type CodecRole = Reader | Writer
+type CodecNested {
+    title: str
+}
+type CodecRow {
+    n: int
+    price: float
+    active: bool
+    title: str
+    optional: int?
+    flags: [bool]
+    values: [int]
+    nested: CodecNested
+    mapping: map[str, int]
+    role: CodecRole
+    id: BsonObjectId
+    date: BsonDate
+    bytes: BsonBinary
+    decimal: BsonDecimal128
+    timestamp: BsonTimestamp
+}
+type CodecDefaults {
+    n: int = 7, title: str = "default", optional: str?
+}
+type CodecNeed {
+    title: int
+}
+type CodecOptionals {
+    floating: float?
+    floats: [float?]
+    mapping: map[str, float?]
+    nested: CodecNested?
+}
+
+var checks: int
+var failures: int
+
+fn verify(label: str, ok: bool) {
+    checks += 1
+    if !ok {
+        failures += 1
+        print("FAIL " + label)
+    }
+}
+
+fn raw_hex(hex: str) -> str {
+    let data = __alloc(hex.byte_len() / 2 + 1)
+    let n = __unhex(hex, data)
+    return __str_new(data, n)
+}
+
+fn main() -> int {
+    let row = CodecRow {
+        n: -9223372036854775807 - 1, price: 1.25, active: true,
+        title: "Привет 🌍\0tail", optional: none, flags: [true, false, true],
+        values: [-1, 0, 9223372036854775807], nested: CodecNested {
+            title: "inside"
+        },
+        mapping: {
+            "x": 4, "y": 5
+        }, role: Writer,
+        id: BsonObjectId {
+            hex: "0123456789abcdef01234567"
+        },
+        date: BsonDate {
+            milliseconds: -123456789
+        },
+        bytes: BsonBinary {
+            data: raw_hex("00ff8001"), subtype: 128
+        },
+        decimal: BsonDecimal128 {
+            bytes: raw_hex("01000000000000000000000000004030")
+        },
+        timestamp: BsonTimestamp {
+            increment: 4294967295, seconds: 4000000000
+        }
+    }
+    let encoded = to_bson(row)
+    verify("encoded is valid", bson_valid(encoded))
+    let decoded: CodecRow? = from_bson(encoded)
+    verify("typed decode", decoded != none)
+    if let got = decoded {
+        verify("int64 exact", got.n == row.n && got.values[2] == row.values[2])
+        verify("float", got.price == 1.25)
+        verify("bool list", got.active && got.flags[0] && !got.flags[1] && got.flags[2])
+        verify("UTF8 and embedded NUL", got.title == row.title)
+        verify("optional", got.optional == none)
+        verify("nested, map and enum", got.nested.title == "inside" && got.mapping["y"] == 5 && got.role == Writer)
+        verify("ObjectId", got.id.hex == row.id.hex)
+        verify("date milliseconds", got.date.milliseconds == -123456789)
+        verify("binary exact", got.bytes.data == row.bytes.data && got.bytes.subtype == 128)
+        verify("decimal exact", got.decimal.bytes == row.decimal.bytes)
+        verify("timestamp unsigned parts", got.timestamp.increment == 4294967295 && got.timestamp.seconds == 4000000000)
+    }
+    let wrong: CodecNeed? = from_bson(encoded)
+    verify("wrong field type", wrong == none && bson_error().contains("incompatible"))
+    let empty = bson_finish(bson_new())
+    let defaults: CodecDefaults? = from_bson(empty)
+    let missing: CodecNeed? = from_bson(empty)
+    verify("missing required field", missing == none && bson_error().contains("missing"))
+    if let got = defaults {
+        verify("defaults", got.n == 7 && got.title == "default" && got.optional == none)
+    } else {
+        verify("defaults decode", false)
+    }
+    let optionals = CodecOptionals {
+        floating: 2.5, floats: [1.25, none, -3.5],
+        mapping: { "some": 4.5, "none": none },
+        nested: CodecNested { title: "optional" }
+    }
+    let optional_copy: CodecOptionals? = from_bson(to_bson(optionals))
+    verify("optional float decode", optional_copy != none)
+    if let copy = optional_copy {
+        verify("boxed optional float", (copy.floating ?? 0.0) == 2.5)
+        verify("nested optional float arrays", (copy.floats[0] ?? 0.0) == 1.25 && copy.floats[1] == none && (copy.floats[2] ?? 0.0) == -3.5)
+        verify("nested optional float maps", (copy.mapping["some"] ?? 0.0) == 4.5 && copy.mapping.has("none") && copy.mapping["none"] == none)
+        if let nested = copy.nested { verify("optional nested struct", nested.title == "optional") }
+        else { verify("optional nested struct", false) }
+    }
+    let builder = bson_new()
+    bson_int32(builder, "negative", -2147483648)
+    bson_null(builder, "null")
+    let snapshot = bson_finish(builder)
+    bson_str(builder, "later", "added")
+    verify("builder snapshots", !bson_has(snapshot, "later") && bson_has(bson_finish(builder), "later"))
+    verify("int32 sign", bson_get_int(snapshot, "negative") == -2147483648)
+    verify("null versus absent", bson_has(snapshot, "null") && bson_is_null(snapshot, "null") && !bson_has(snapshot, "missing"))
+    bson_int(builder, "negative", 8)
+    verify("duplicate builder field", bson_finish(builder).error.contains("duplicate"))
+    let badkey = bson_new()
+    bson_int(badkey, "bad\0key", 1)
+    verify("NUL key", bson_finish(badkey).error != "")
+    let badid = bson_new()
+    bson_object_id(badid, "id", "zzzzzzzzzzzzzzzzzzzzzzzz")
+    verify("ObjectId validates hex", bson_finish(badid).error != "")
+    for hex in ["c080", "eda080", "f4908080", "e282"] {
+        let invalid = bson_new()
+        bson_str(invalid, "text", raw_hex(hex))
+        verify("invalid UTF8 " + hex, bson_finish(invalid).error != "")
+    }
+    var truncated_ok = true
+    for i in 0..encoded.data.byte_len() {
+        if bson_valid(Bson {
+            data: encoded.data.byte_slice(0, i)
+        }) {
+            truncated_ok = false
+        }
+    }
+    verify("every truncated prefix rejected", truncated_ok)
+    for hex in ["0400000000", "ffffffff00", "0500000001", "0800000008780002", "0c000000027800ffffffff00"] {
+        verify("malformed BSON " + hex, !bson_valid(Bson {
+            data: raw_hex(hex)
+        }))
+    }
+    // Duplicate fields in a raw document are rejected by typed decoding.
+    let duplicate = Bson {
+        data: raw_hex("13000000107800010000001078000200000000")
+    }
+    let dupmap: map[str, int]? = from_bson(duplicate)
+    verify("duplicate typed map", dupmap == none)
+    // The request id and flags are validated before exposing any document.
+    let message = buf_new(64)
+    let ok = bson_new()
+    bson_float(ok, "ok", 1.0)
+    let okdoc = bson_finish(ok)
+    __bson_u32(message, 21 + okdoc.data.byte_len())
+    __bson_u32(message, 8)
+    __bson_u32(message, 7)
+    __bson_u32(message, 2013)
+    __bson_u32(message, 0)
+    buf_byte(message, 0)
+    buf_add(message, okdoc.data)
+    verify("OP_MSG valid", __mongo_response(buf_str(message), 7).error == "")
+    verify("OP_MSG wrong request", __mongo_response(buf_str(message), 8).error != "")
+    store32(message.data + 16, 2)
+    verify("OP_MSG unsolicited moreToCome", __mongo_response(buf_str(message), 7).error != "")
+    verify("unsupported SRV", __mongo_url("mongodb+srv://host/test").error != "")
+    verify("unsupported seed list", __mongo_url("mongodb://one,two/test").error != "")
+    verify("unsupported URI option", __mongo_url("mongodb://host/test?retryWrites=true").error != "")
+    verify("explicit /test auth source", __mongo_url("mongodb://u:p@host/test").auth_source == "test")
+    verify("omitted database auth source", __mongo_url("mongodb://u:p@host").auth_source == "admin")
+    verify("invalid URI escaping", __mongo_url("mongodb://u:%xy@host/test").error != "")
+    print("BSON/Mongo protocol: {checks} checks, {failures} failed")
+    if failures != 0 {
+        return 1
+    }
+    return 0
+}
