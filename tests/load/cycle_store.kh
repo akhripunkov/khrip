@@ -1,0 +1,22 @@
+// Цикл в store (tests/http.sh): JSON с ним — ответ 500, а снимок для KHRIP_DATA
+// не получается — сохранение сообщает об ошибке, старый файл остаётся, сервер
+// работает дальше.
+type Node { name: str, next: Node? }
+
+store nodes: map[int, Node]
+
+route POST "/cycle/{id}" (id: int) -> 204 | 404 {
+    let a = nodes[id] else {
+        return 404
+    }
+    a.next = a
+    return 204
+}
+
+route GET "/nodes/{id}" (id: int) -> Node | 404 {
+    return nodes[id] ?? 404
+}
+
+route GET "/count" -> int {
+    return nodes.len()
+}

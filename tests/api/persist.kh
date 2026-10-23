@@ -1,0 +1,203 @@
+// Копирование в store (__deep_copy): каждый объект значения копируется один
+// раз, поэтому общие части остаются общими, а циклы не зацикливают копию.
+// Запись JSON находит циклы (500 вместо переполнения стека).
+
+type Node { name: str, next: Node? }
+
+type Pair { a: [int], b: [int] }
+
+type Holder { n: int, item: Pair }
+
+type Reg { name: str, kids: map[str, Reg] }
+
+type Tree = Leaf | Branch { label: str, kids: [Tree] }
+
+type Empty {}
+
+type Box { xs: [int], e: Empty }
+
+type Two { a: Empty, b: Empty }
+
+store nodes: map[int, Node]
+store ring: [Node]
+store p: Pair = Pair { a: [], b: [] }
+store holders: [Holder]
+store regs: map[str, Reg]
+store trees: [Tree]
+store boxes: [Box]
+store twos: [Two]
+store cyclic: map[int, Node]
+
+test "an arena value with a cycle is copied once" {
+    let a = Node { name: "a", next: none }
+    a.next = a
+    nodes[1] = a
+    a.name = "arena"
+    let s = nodes[1] else {
+        expect false
+        return
+    }
+    expect s.name == "a"
+    let n = s.next else {
+        expect false
+        return
+    }
+    n.name = "changed"
+    expect s.name == "changed"
+}
+
+test "a ring of many nodes stays a ring" {
+    let first = Node { name: "0", next: none }
+    var x = first
+    for i in 1..50 {
+        let y = Node { name: i.to_str(), next: none }
+        x.next = y
+        x = y
+    }
+    x.next = first
+    ring.push(first)
+    var at = ring[0]
+    for i in 0..50 {
+        at = at.next ?? at
+    }
+    at.name = "start"
+    expect ring[0].name == "start"
+}
+
+test "sharing inside a persisted value is kept" {
+    let xs = [1]
+    p = Pair { a: xs, b: xs }
+    p.a.push(2)
+    expect p.b.len() == 2
+    let shared = Pair { a: [1], b: [] }
+    var hs: [Holder] = []
+    for i in 0..100 {
+        hs.push(Holder { n: i, item: shared })
+    }
+    holders = hs
+    holders[0].item.b.push(7)
+    expect holders[99].item.b.len() == 1
+    expect holders[99].n == 99
+}
+
+test "a map that holds its owner" {
+    let r = Reg { name: "root", kids: {} }
+    r.kids["self"] = r
+    r.kids["leaf"] = Reg { name: "leaf", kids: {} }
+    regs["r"] = r
+    let s = regs["r"] else {
+        expect false
+        return
+    }
+    let me = s.kids["self"] else {
+        expect false
+        return
+    }
+    me.name = "renamed"
+    expect s.name == "renamed"
+    expect (s.kids["leaf"] ?? s).name == "leaf"
+}
+
+test "a variant in its own list" {
+    let b = Branch { label: "b", kids: [Leaf] }
+    b.kids.push(b)
+    trees.push(b)
+    match trees[0] {
+        Branch s => {
+            expect s.label == "b" && s.kids.len() == 2
+            match s.kids[1] {
+                Branch k => k.kids.push(Leaf)
+                Leaf => expect false
+            }
+            expect s.kids.len() == 3
+        }
+        Leaf => expect false
+    }
+}
+
+test "structs without fields are distinct objects" {
+    twos.push(Two { a: Empty {}, b: Empty {} })
+    let a: int = __cast(twos[0].a)
+    let b: int = __cast(twos[0].b)
+    expect a != b
+    // структура с полем без полей переживает копирование и JSON
+    let b: Box? = from_json("\{\"e\":\{},\"xs\":[1,2]}")
+    let x = b else {
+        expect false
+        return
+    }
+    boxes.push(x)
+    expect boxes[0].xs.len() == 2
+    expect to_json(boxes[0]) == "\{\"xs\":[1,2],\"e\":\{}}"
+}
+
+route POST "/cycle" -> 204 {
+    cyclic[1] = Node { name: "a", next: none }
+    let a = cyclic[1] else {
+        return 204
+    }
+    a.next = a
+    return 204
+}
+
+route GET "/cycle" -> Node | 404 {
+    return cyclic[1] ?? 404
+}
+
+fn chain(n: int) -> Node {
+    var x = Node { name: "end", next: none }
+    for i in 0..n {
+        x = Node { name: "n", next: x }
+    }
+    return x
+}
+
+route GET "/chain/{n}" (n: int) -> Node {
+    return chain(n)
+}
+
+route GET "/twice/{n}" (n: int) -> [Node] {
+    let x = chain(n)
+    return [x, x]
+}
+
+route POST "/long-cycle/{n}" (n: int) -> 204 {
+    let first = Node { name: "0", next: none }
+    var x = first
+    for i in 1..n {
+        let y = Node { name: i.to_str(), next: none }
+        x.next = y
+        x = y
+    }
+    x.next = first
+    cyclic[2] = first
+    return 204
+}
+
+route GET "/cycle/{id}" (id: int) -> Node | 404 {
+    return cyclic[id] ?? 404
+}
+
+test "JSON of a cycle is a 500" {
+    expect (call POST "/cycle").status == 204
+    let r = call GET "/cycle"
+    expect r.status == 500
+    expect r.body == "panic: value has a cycle at Node"
+    expect (call POST "/long-cycle/3000").status == 204
+    let l = call GET "/cycle/2"
+    expect l.status == 500
+    expect l.body == "panic: value has a cycle at Node"
+}
+
+test "deep values: shared is not a cycle, too deep is a 500" {
+    let r = call GET "/chain/9999"
+    expect r.status == 200
+    expect r.body.starts_with("\{\"name\":\"n\",\"next\":\{\"name\":\"n\"")
+    expect r.body.ends_with("\{\"name\":\"end\",\"next\":null}" + "}".repeat(9999))
+    let t = call GET "/twice/1500"
+    expect t.status == 200
+    expect t.body.ends_with("null" + "}".repeat(1501) + "]")
+    let d = call GET "/chain/10000"
+    expect d.status == 500
+    expect d.body == "panic: value is nested deeper than 10000 levels"
+}

@@ -525,7 +525,7 @@ fn load_name_value(t: Token) -> int {
     let s = sym_find(t.text)
     if s >= 0 && sym_kind(s) == SK_GLOBAL {
         let g = globals[sym_idx(s)]
-        if g.is_store {
+        if global_in_store(g) {
             store_touch()
         }
         emit_load_abs(RAX, g.addr)
@@ -701,9 +701,12 @@ fn assign_name(t: Token, op: int, at: Token) {
         if tx_depth > 0 {
             error_tok(t, "store " + name + " is not rolled back with the tx block, and the block may run again after a conflict", "change it after the block, from the block's result")
         }
-        store_touch()
     } else if tx_depth > 0 {
         error_tok(t, "'" + name + "' is a global, and the tx block may run again after a conflict", "change it after the block, from the block's result")
+    }
+    let persistent = global_in_store(g)
+    if persistent {
+        store_touch()
     }
     if op == '=' {
         let vtok = tok()
@@ -714,7 +717,7 @@ fn assign_name(t: Token, op: int, at: Token) {
         emit_push(RAX)
         compound_value(op, g.ty, at)
     }
-    if g.is_store {
+    if persistent {
         store_write(g.ty)
     }
     emit_store_abs(g.addr, RAX)

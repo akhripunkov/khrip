@@ -949,6 +949,14 @@ fn store_touch() {
     patch_here(skip)
 }
 
+// Глобальная переменная живёт в store: объявленная store и, в программе с API,
+// var пользователя (такие бывают только в программах с одними тестами —
+// серверам check_api их запрещает). Иначе значение из арены теста, записанное
+// в var, повисло бы после теста.
+fn global_in_store(g: Global) -> bool {
+    return g.is_store || (api_mode && !files[toks[g.tok].file].is_lib)
+}
+
 // Значение (rax), которое записывается в store, копируется в постоянную память.
 fn store_write(t: int) {
     if !api_mode || is_scalar_ty(t) {

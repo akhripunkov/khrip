@@ -89,9 +89,13 @@ fn __field_desc(d: int, i: int) -> int {
     return load64(d + 32 + i * 40 + 16)
 }
 
-// Память под структуру по описанию: у варианта перед полями — метка.
+// Память под структуру по описанию: у варианта перед полями — метка. Хотя бы
+// одно слово: у структур без полей разные адреса, как у всех объектов.
 fn __struct_alloc(d: int) -> int {
-    let n = load64(d + 8)
+    var n = load64(d + 8)
+    if n < 1 {
+        n = 1
+    }
     let tag = load64(d + 24)
     if tag < 0 {
         return __alloc(n * 8)
@@ -115,18 +119,37 @@ fn __variant_entry(d: int, v: int) -> int {
 }
 
 // ---- Копирование в постоянную память ----
-// Объект вне арены не может ссылаться на арену: арена освобождается после
-// ответа. Поэтому значение, которое кладут внутрь такого объекта, копируется.
+// Store ссылается только на store и на данные программы (DATA: литералы,
+// варианты без полей). Арена освобождается после ответа, а обычная память
+// потока (строки из файла KHRIP_DATA, env) store не принадлежит. Поэтому
+// значение, которое кладут внутрь объекта вне арены, копируется, если оно не в
+// store и не в DATA. Барьеры для сборщика (__barrier_at, __barrier_idx,
+// __persist_root) — шаг 6 docs/design/v0.13-store-gc.md. __in_store — в
+// lib/core.kh.
+
+// DATA — [DATA_BASE, __data_end()), DATA_BASE = 0x20000000 (src/emit.kh).
+fn __in_data(p: int) -> bool {
+    return p >= 0x20000000 && p < __data_end()
+}
 
 fn __barrier(obj: int, v: int, d: int) -> int {
-    if __in_arena(obj) || !__in_arena(v) {
+    if __in_arena(obj) || v == 0 || __in_store(v) || __in_data(v) {
         return v
     }
-    return __persist(v, d)
+    return __persist_copy(v, d)
 }
 
 fn __persist(v: int, d: int) -> int {
-    if __is_scalar(d) || !__in_arena(v) {
+    if __is_scalar(d) || v == 0 || __in_store(v) || __in_data(v) {
+        return v
+    }
+    return __persist_copy(v, d)
+}
+
+fn __persist_copy(v: int, d: int) -> int {
+    if __store_ptr == 0 {
+        // store ещё нет (глобальные до __store_init, main программы с test):
+        // всё живёт в обычной памяти, копировать некуда
         return v
     }
     let on = __pmode_on()
@@ -137,9 +160,88 @@ fn __persist(v: int, d: int) -> int {
     return r
 }
 
+// Память в арене, пока выделение идёт из store: через сохранённый курсор
+// CTX_PSAVE_PTR (вне store — обычное выделение). Нулевая, как у __alloc.
+fn __arena_alloc_saved(n: int) -> int {
+    let c = __ctx()
+    let p = load64(c + CTX_PSAVE_PTR)
+    if p == 0 {
+        return __alloc(n)
+    }
+    let size = (n + 15) & ~15
+    if p + size <= load64(c + CTX_PSAVE_END) {
+        store64(c + CTX_PSAVE_PTR, p + size)
+        return p
+    }
+    // место кончилось: обычный путь (он подключит память или сообщит о её
+    // конце), потом снова store
+    __pmode_off()
+    let q = __alloc(size)
+    __pmode_on()
+    return q
+}
+
+// Хеш адреса объекта: объекты выровнены на 16 байт.
+fn __addr_hash(p: int) -> int {
+    let x = p >> 4
+    return ((x & 0xFFFFFFF) * 0x9E3779B) ^ ((x >> 28) * 0x7FEB352)
+}
+
+// Копия значения v (описание d) в текущей памяти — в store, его включил
+// __persist_copy. Без рекурсии: стек работы из троек (слот, значение, описание)
+// и таблица пересылки «исходный адрес → копия». Оболочка копии создаётся и
+// попадает в таблицу раньше детей, поэтому каждый объект копируется один раз:
+// общие части значения остаются общими, а циклы не зацикливают копирование.
+// В оболочку сначала ложатся исходные слова, слоты детей, которые надо
+// копировать, стек перезаписывает потом. Строки и ячейки T? — листья.
+// Состояние — в арене (через сохранённый курсор), не в store: [0] таблица
+// пересылки, [8] пар в ней, [16] её размер в парах, [24] стек, [32] троек в
+// нём, [40] его размер. До 16 пар таблица — перебор, дальше — открытая
+// адресация, заполненная не больше чем наполовину.
 fn __deep_copy(v: int, d: int) -> int {
+    if __dc_leaf(d) {
+        // строка или ячейка T?: таблицы не нужны
+        return __dc_copy(0, v, d)
+    }
+    let c = __ctx()
+    let mark = load64(c + CTX_PSAVE_PTR)
+    let st = __arena_alloc_saved(48 + 16 * 16 + 8 * 24)
+    store64(st, st + 48)
+    store64(st + 16, 16)
+    store64(st + 24, st + 48 + 16 * 16)
+    store64(st + 40, 8)
+    let r = __dc_copy(st, v, d)
+    while load64(st + 32) > 0 {
+        let n = load64(st + 32) - 1
+        store64(st + 32, n)
+        let e = load64(st + 24) + n * 24
+        let slot = load64(e)
+        store64(slot, __dc_copy(st, load64(e + 8), load64(e + 16)))
+    }
+    // состояние больше не нужно: арена непрерывна, и место снова свободно (и
+    // снова нулевое, как обещает выделитель)
+    if __in_arena(mark) {
+        __memset(mark, 0, load64(c + CTX_PSAVE_PTR) - mark)
+        store64(c + CTX_PSAVE_PTR, mark)
+    }
+    return r
+}
+
+// Значение типа d — лист: строка или ячейка T? (в том числе под T? ссылки).
+fn __dc_leaf(d: int) -> bool {
+    var t = d
+    while load64(t) == D_OPT {
+        if __is_scalar(load64(t + 8)) {
+            return true
+        }
+        t = load64(t + 8)
+    }
+    return load64(t) == D_STR
+}
+
+fn __dc_copy(st: int, v: int, d: int) -> int {
     let k = load64(d)
-    if k == D_INT || k == D_BOOL || k == D_FLOAT || v == 0 || !__in_arena(v) {
+    if k == D_INT || k == D_BOOL || k == D_FLOAT || v == 0 || __in_store(v) || __in_data(v) {
         return v
     }
     if k == D_STR {
@@ -153,54 +255,247 @@ fn __deep_copy(v: int, d: int) -> int {
             store64(b, load64(v))
             return b
         }
-        return __deep_copy(v, inner)
+        return __dc_copy(st, v, inner)
+    }
+    let f = __dc_find(st, v)
+    if f != 0 {
+        return f
     }
     if k == D_LIST {
         let ed = load64(d + 8)
         let n = load64(v + 8)
         let es = load64(v + 24)
         let h = __list_new(n, es)
-        __memcpy(load64(h), load64(v), n * es)
+        __dc_put(st, v, h)
+        let data = load64(h)
+        __memcpy(data, load64(v), n * es)
         store64(h + 8, n)
         if !__is_scalar(ed) {
-            let data = load64(h)
             for i in 0..n {
-                store64(data + i * 8, __deep_copy(load64(data + i * 8), ed))
+                __dc_push(st, data + i * 8, load64(data + i * 8), ed)
             }
         }
         return h
     }
     if k == D_MAP {
-        let kd = load64(d + 8)
-        let vd = load64(d + 16)
-        let m = __map_new(load64(v + 48))
-        let n = load64(load64(v) + 8)
-        for i in 0..n {
-            if __word_at(load64(v + 24), i) != 0 {
-                __map_set(m, __deep_copy(__word_at(load64(v), i), kd), __deep_copy(__word_at(load64(v + 16), i), vd))
-            }
-        }
-        return m
+        return __dc_map(st, v, d)
     }
-    if k == D_STRUCT {
-        let n = load64(d + 8)
-        let s = __struct_alloc(d)
-        for i in 0..n {
-            store64(s + i * 8, __deep_copy(load64(v + i * 8), __field_desc(d, i)))
-        }
-        return s
-    }
+    var sd = d
     if k == D_SUM {
         let e = __variant_entry(d, v)
         if e == 0 {
             return v
         }
-        return __deep_copy(v, load64(e + 8))
+        sd = load64(e + 8)
+    } else if k != D_STRUCT {
+        return v
     }
-    return v
+    let n = load64(sd + 8)
+    let s = __struct_alloc(sd)
+    __dc_put(st, v, s)
+    __memcpy(s, v, n * 8)
+    for i in 0..n {
+        let fd = __field_desc(sd, i)
+        if !__is_scalar(fd) {
+            __dc_push(st, s + i * 8, load64(s + i * 8), fd)
+        }
+    }
+    return s
+}
+
+// Словарь: живые записи — по порядку, сразу с ключами (ключи — листья),
+// значения-ссылки — через стек работы. Перестройки во время копии нет.
+fn __dc_map(st: int, v: int, d: int) -> int {
+    let kd = load64(d + 8)
+    let vd = load64(d + 16)
+    let m = __map_new_cap(load64(v + 48), load64(v + 8))
+    __dc_put(st, v, m)
+    let keys = load64(load64(m))
+    let vals = load64(load64(m + 16))
+    let alive = load64(load64(m + 24))
+    let refs = !__is_scalar(vd)
+    let n = load64(load64(v) + 8)
+    var w = 0
+    for i in 0..n {
+        if __word_at(load64(v + 24), i) != 0 {
+            let key = __dc_copy(st, __word_at(load64(v), i), kd)
+            store64(keys + w * 8, key)
+            store64(vals + w * 8, __word_at(load64(v + 16), i))
+            store64(alive + w * 8, 1)
+            __map_place(m, key, w)
+            if refs {
+                __dc_push(st, vals + w * 8, load64(vals + w * 8), vd)
+            }
+            w += 1
+        }
+    }
+    store64(load64(m) + 8, w)
+    store64(load64(m + 16) + 8, w)
+    store64(load64(m + 24) + 8, w)
+    store64(m + 8, w)
+    return m
+}
+
+// Копия src из таблицы пересылки или 0.
+fn __dc_find(st: int, src: int) -> int {
+    let t = load64(st)
+    let cap = load64(st + 16)
+    if cap == 16 {
+        let n = load64(st + 8)
+        for i in 0..n {
+            if load64(t + i * 16) == src {
+                return load64(t + i * 16 + 8)
+            }
+        }
+        return 0
+    }
+    var i = __addr_hash(src) & (cap - 1)
+    while true {
+        let k = load64(t + i * 16)
+        if k == src {
+            return load64(t + i * 16 + 8)
+        }
+        if k == 0 {
+            return 0
+        }
+        i = (i + 1) & (cap - 1)
+    }
+    return 0
+}
+
+fn __dc_put(st: int, src: int, dst: int) {
+    let n = load64(st + 8)
+    let cap = load64(st + 16)
+    store64(st + 8, n + 1)
+    if cap == 16 && n < 16 {
+        let t = load64(st)
+        store64(t + n * 16, src)
+        store64(t + n * 16 + 8, dst)
+        return
+    }
+    if (n + 1) * 2 > cap {
+        // таблица вдвое больше (после перебора — сразу на 64 пары)
+        var ncap = cap * 2
+        if cap == 16 {
+            ncap = 64
+        }
+        let old = load64(st)
+        let t = __arena_alloc_saved(ncap * 16)
+        for i in 0..cap {
+            let k = load64(old + i * 16)
+            if k != 0 {
+                __dc_place(t, ncap, k, load64(old + i * 16 + 8))
+            }
+        }
+        store64(st, t)
+        store64(st + 16, ncap)
+    }
+    __dc_place(load64(st), load64(st + 16), src, dst)
+}
+
+fn __dc_place(t: int, cap: int, src: int, dst: int) {
+    var i = __addr_hash(src) & (cap - 1)
+    while load64(t + i * 16) != 0 {
+        i = (i + 1) & (cap - 1)
+    }
+    store64(t + i * 16, src)
+    store64(t + i * 16 + 8, dst)
+}
+
+// Слот slot получит копию src. Если копировать не нужно, в слоте уже src.
+fn __dc_push(st: int, slot: int, src: int, d: int) {
+    if src == 0 || __in_store(src) || __in_data(src) {
+        return
+    }
+    let n = load64(st + 32)
+    let cap = load64(st + 40)
+    if n == cap {
+        let s = __arena_alloc_saved(cap * 2 * 24)
+        __memcpy(s, load64(st + 24), n * 24)
+        store64(st + 24, s)
+        store64(st + 40, cap * 2)
+    }
+    let e = load64(st + 24) + n * 24
+    store64(e, slot)
+    store64(e + 8, src)
+    store64(e + 16, d)
+    store64(st + 32, n + 1)
 }
 
 // ---- JSON: запись ----
+// Глубину пути считает слово CTX_JDEPTH: вход в список, словарь, структуру или
+// вариант — +1, выход — −1. Глубже JSON_DEEP структуры на пути отмечаются в
+// множестве CTX_JPATH: всякий цикл проходит через структуру (список или словарь
+// без неё не содержит сам себя), и встреча структуры, которая уже на пути, —
+// цикл. Глубже JSON_MAX_DEPTH — паника ради стека.
+
+const JSON_DEEP = 1000
+const JSON_MAX_DEPTH = 10000
+// размер множества: на пути не бывает больше JSON_MAX_DEPTH − JSON_DEEP
+// структур, так что оно заполнено не больше чем на 55%
+const JSON_PATH_SLOTS = 16384
+
+// Начало записи: глубина и множество — с нуля (паника в прошлой записи могла
+// оставить их какими угодно).
+fn __json_begin() {
+    let c = __ctx()
+    store64(c + CTX_JDEPTH, 0)
+    store64(c + CTX_JPATH, 0)
+}
+
+fn __json_in(v: int, d: int) {
+    let c = __ctx()
+    let n = load64(c + CTX_JDEPTH) + 1
+    store64(c + CTX_JDEPTH, n)
+    if n > JSON_DEEP {
+        __json_path_add(v, d, n)
+    }
+}
+
+fn __json_out(v: int, d: int) {
+    let c = __ctx()
+    let n = load64(c + CTX_JDEPTH)
+    store64(c + CTX_JDEPTH, n - 1)
+    if n > JSON_DEEP && load64(d) == D_STRUCT {
+        __json_path_del(v)
+    }
+}
+
+// Множество структур на пути: открытая адресация, 0 — пусто. Структуры уходят
+// с пути в обратном порядке, поэтому удалить — просто обнулить слот: цепочки
+// проб оставшихся (они вставлены раньше) через него не идут.
+fn __json_path_add(v: int, d: int, n: int) {
+    if n > JSON_MAX_DEPTH {
+        __panic_msg("value is nested deeper than 10000 levels")
+    }
+    if load64(d) != D_STRUCT {
+        return
+    }
+    let c = __ctx()
+    var set = load64(c + CTX_JPATH)
+    if set == 0 {
+        set = __alloc(JSON_PATH_SLOTS * 8)
+        store64(c + CTX_JPATH, set)
+    }
+    var i = __addr_hash(v) & (JSON_PATH_SLOTS - 1)
+    while load64(set + i * 8) != 0 {
+        if load64(set + i * 8) == v {
+            let name: str = __cast(load64(d + 16))
+            __panic_msg("value has a cycle at " + name)
+        }
+        i = (i + 1) & (JSON_PATH_SLOTS - 1)
+    }
+    store64(set + i * 8, v)
+}
+
+fn __json_path_del(v: int) {
+    let set = load64(__ctx() + CTX_JPATH)
+    var i = __addr_hash(v) & (JSON_PATH_SLOTS - 1)
+    while load64(set + i * 8) != v && load64(set + i * 8) != 0 {
+        i = (i + 1) & (JSON_PATH_SLOTS - 1)
+    }
+    store64(set + i * 8, 0)
+}
 
 fn __hex_digit(x: int) -> int {
     if x < 10 {
@@ -246,8 +541,38 @@ fn __json_str(b: Buf, s: str) {
     buf_byte(b, '"')
 }
 
+// Стек на уровень вложенности — маленький кадр __json_enc и кадр функции
+// контейнера (T? раскрывается без своего кадра): 10000 уровней помещаются в
+// стек потока.
 fn __json_enc(b: Buf, v: int, d: int) {
-    let k = load64(d)
+    var x = v
+    var t = d
+    var k = load64(t)
+    while k == D_OPT {
+        if x == 0 {
+            buf_add(b, "null")
+            return
+        }
+        t = load64(t + 8)
+        k = load64(t)
+        if k == D_INT || k == D_BOOL || k == D_FLOAT {
+            x = load64(x)
+        }
+    }
+    if k == D_STRUCT {
+        __json_enc_struct(b, x, t)
+    } else if k == D_LIST {
+        __json_enc_list(b, x, t)
+    } else if k == D_SUM {
+        __json_enc_sum(b, x, t)
+    } else if k == D_MAP {
+        __json_enc_map(b, x, t)
+    } else {
+        __json_enc_scalar(b, x, k)
+    }
+}
+
+fn __json_enc_scalar(b: Buf, v: int, k: int) {
     if k == D_INT {
         buf_int(b, v)
         return
@@ -271,78 +596,67 @@ fn __json_enc(b: Buf, v: int, d: int) {
         } else {
             buf_add(b, "false")
         }
-        return
     }
-    if k == D_OPT {
-        if v == 0 {
-            buf_add(b, "null")
-            return
+}
+
+fn __json_enc_struct(b: Buf, v: int, d: int) {
+    let n = load64(d + 8)
+    __json_in(v, d)
+    buf_byte(b, '\{')
+    for i in 0..n {
+        if i > 0 {
+            buf_byte(b, ',')
         }
-        let inner = load64(d + 8)
-        if __is_scalar(inner) {
-            __json_enc(b, load64(v), inner)
+        buf_add(b, __cast(load64(__field(d, i) + 8)))
+        __json_enc(b, load64(v + i * 8), __field_desc(d, i))
+    }
+    buf_byte(b, '}')
+    __json_out(v, d)
+}
+
+fn __json_enc_list(b: Buf, v: int, d: int) {
+    let ed = load64(d + 8)
+    let n = load64(v + 8)
+    __json_in(v, d)
+    buf_byte(b, '[')
+    for i in 0..n {
+        if i > 0 {
+            buf_byte(b, ',')
+        }
+        __json_enc(b, __lget(v, i), ed)
+    }
+    buf_byte(b, ']')
+    __json_out(v, d)
+}
+
+fn __json_enc_map(b: Buf, v: int, d: int) {
+    let vd = load64(d + 16)
+    let str_keys = load64(v + 48) != 0
+    let n = load64(load64(v) + 8)
+    __json_in(v, d)
+    buf_byte(b, '\{')
+    var first = true
+    for i in 0..n {
+        if __word_at(load64(v + 24), i) == 0 {
+            continue
+        }
+        if !first {
+            buf_byte(b, ',')
+        }
+        first = false
+        let key = __word_at(load64(v), i)
+        if str_keys {
+            __json_str(b, __cast(key))
         } else {
-            __json_enc(b, v, inner)
+            buf_byte(b, '"')
+            buf_int(b, key)
+            buf_byte(b, '"')
         }
-        return
+        buf_byte(b, ':')
+        __json_enc(b, __word_at(load64(v + 16), i), vd)
     }
-    if k == D_STRUCT {
-        let n = load64(d + 8)
-        buf_byte(b, '\{')
-        for i in 0..n {
-            if i > 0 {
-                buf_byte(b, ',')
-            }
-            buf_add(b, __cast(load64(__field(d, i) + 8)))
-            __json_enc(b, load64(v + i * 8), __field_desc(d, i))
-        }
-        buf_byte(b, '}')
-        return
-    }
-    if k == D_LIST {
-        let ed = load64(d + 8)
-        let n = load64(v + 8)
-        buf_byte(b, '[')
-        for i in 0..n {
-            if i > 0 {
-                buf_byte(b, ',')
-            }
-            __json_enc(b, __lget(v, i), ed)
-        }
-        buf_byte(b, ']')
-        return
-    }
-    if k == D_SUM {
-        __json_enc_sum(b, v, d)
-        return
-    }
-    if k == D_MAP {
-        let vd = load64(d + 16)
-        let str_keys = load64(v + 48) != 0
-        let n = load64(load64(v) + 8)
-        buf_byte(b, '\{')
-        var first = true
-        for i in 0..n {
-            if __word_at(load64(v + 24), i) == 0 {
-                continue
-            }
-            if !first {
-                buf_byte(b, ',')
-            }
-            first = false
-            let key = __word_at(load64(v), i)
-            if str_keys {
-                __json_str(b, __cast(key))
-            } else {
-                buf_byte(b, '"')
-                buf_int(b, key)
-                buf_byte(b, '"')
-            }
-            buf_byte(b, ':')
-            __json_enc(b, __word_at(load64(v + 16), i), vd)
-        }
-        buf_byte(b, '}')
-    }
+    buf_byte(b, '}')
+    __json_out(v, d)
 }
 
 // Вариант: без полей у всех — строка с именем, иначе объект с полем "type".
@@ -358,6 +672,7 @@ fn __json_enc_sum(b: Buf, v: int, d: int) {
         return
     }
     let vd = load64(e + 8)
+    __json_in(v, vd)
     buf_add(b, "\{\"type\":")
     __json_str(b, name)
     let n = load64(vd + 8)
@@ -367,6 +682,7 @@ fn __json_enc_sum(b: Buf, v: int, d: int) {
         __json_enc(b, load64(v + i * 8), __field_desc(vd, i))
     }
     buf_byte(b, '}')
+    __json_out(v, vd)
 }
 
 // Строка в кавычках JSON.
@@ -378,6 +694,7 @@ fn __json_quote(s: str) -> str {
 
 fn __json_encode(v: int, d: int) -> str {
     let b = buf_new(64)
+    __json_begin()
     __json_enc(b, v, d)
     return __str_new(b.data, b.len)
 }
@@ -1074,6 +1391,7 @@ fn __reply(status: int, v: int, d: int) {
         return
     }
     w.ctype = CT_JSON
+    __json_begin()
     __json_enc(w.body, v, d)
 }
 
@@ -1436,8 +1754,16 @@ fn __call(method: str, target: str, body: int, d: int, headers: int) -> Response
     // запрос — со своим соединением с базой, не с транзакцией теста
     let held = load64(c + CTX_PGHELD)
     store64(c + CTX_PGHELD, 0)
+    // запрос работает под блокировкой store теста и в конце её отпускает
+    let th = load64(c + CTX_STORE_HELD)
     __serve_one(w, req)
     store64(c + CTX_PGHELD, held)
+    if th != 0 {
+        // тест держал блокировку — снова держит (CTX_STORE_MODE сброшен в 0:
+        // монопольно); точка сборки для тестов (__gc_test_point) — шаг 5
+        // docs/design/v0.13-store-gc.md
+        __store_lock()
+    }
     let used = load64(c + CTX_PTR) - mark
     __memset(mark, 0, used)
     store64(c + CTX_PTR, mark)

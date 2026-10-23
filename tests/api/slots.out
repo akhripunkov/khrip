@@ -1,0 +1,4 @@
+ok    pop, remove_at, truncate and clear of a store list
+ok    remove and clear of a store map
+ok    the test holds the store lock after call
+3 tests: 3 passed, 0 failed

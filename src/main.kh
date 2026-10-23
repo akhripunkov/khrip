@@ -160,8 +160,13 @@ fn print_sizes() {
     print(total.to_str() + " code total, " + data_len.to_str() + " data")
 }
 
+// После sql_finish: данные программы больше не растут.
 fn resolve_fixups() {
     for fx in fixups {
+        if fx.func == FIX_DATA_END {
+            put64_at(code + fx.at, DATA_BASE + data_len)
+            continue
+        }
         let target = funcs[fx.func].code
         if target < 0 {
             report_at(0, 1, 1, "internal: function '" + funcs[fx.func].name + "' was not compiled", "")

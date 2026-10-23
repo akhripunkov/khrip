@@ -127,3 +127,77 @@ if "$KHC" -o "$tmp/inline_store" tests/load/inline_store.kh >"$tmp/inline_store.
 else
 	failed "tests/load/inline_store.kh" "$(cat "$tmp/inline_store.err")"
 fi
+
+# Цикл в store: JSON с ним — 500; сохранение KHRIP_DATA (раз в секунду и по
+# SIGTERM) сообщает об ошибке и оставляет старый файл, сервер жив.
+cyc_port=$((HTTP_PORT + 2))
+if "$KHC" -o "$tmp/cycle_store" tests/load/cycle_store.kh >"$tmp/cycle_store.err" 2>&1; then
+	printf '{"nodes":{"1":{"name":"a","next":null}}}' >"$tmp/cycle.json"
+	cp "$tmp/cycle.json" "$tmp/cycle.orig"
+	PORT=$cyc_port KHRIP_DATA="$tmp/cycle.json" "$tmp/cycle_store" 2>"$tmp/cycle.log" &
+	cyc_pid=$!
+	for _ in $(seq 100); do
+		curl -s -o /dev/null "http://127.0.0.1:$cyc_port/count" && break
+		sleep 0.05
+	done
+	r=$(curl -s "http://127.0.0.1:$cyc_port/nodes/1")
+	r="$r $(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$cyc_port/cycle/1")"
+	r="$r $(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$cyc_port/nodes/1")"
+	sleep 1.5
+	r="$r $(curl -s "http://127.0.0.1:$cyc_port/count")"
+	kill -TERM "$cyc_pid"
+	wait "$cyc_pid" 2>/dev/null
+	msgs=$(grep -c '^khrip: cannot save store: value has a cycle at Node$' "$tmp/cycle.log")
+	if [[ "$r" == '{"name":"a","next":null} 204 500 1' ]] && cmp -s "$tmp/cycle.json" "$tmp/cycle.orig" && ((msgs >= 1 && msgs <= 2)); then
+		http_ok
+	else
+		failed "http: цикл в store и KHRIP_DATA" "ответы «$r», сообщений об ошибке: $msgs, файл: $(cat "$tmp/cycle.json"); журнал: $(cat "$tmp/cycle.log")"
+	fi
+else
+	failed "tests/load/cycle_store.kh" "$(cat "$tmp/cycle_store.err")"
+fi
+
+# fetch со словарём заголовков из store, пока другие запросы меняют словарь:
+# строки запроса собираются под блокировкой store, поэтому заголовки каждого
+# запроса — одного поколения (раньше словарь читался уже без блокировки).
+fs_port=$((HTTP_PORT + 3))
+fs_up=$((HTTP_PORT + 4))
+if ! command -v python3 >/dev/null; then
+	echo "пропуск fetch со словарём из store: нет python3"
+elif "$KHC" -o "$tmp/fetch_store" tests/load/fetch_store.kh >"$tmp/fetch_store.err" 2>&1; then
+	python3 tests/load/generations.py "$fs_up" &
+	fs_up_pid=$!
+	PORT=$fs_port THREADS=4 "$tmp/fetch_store" 2>/dev/null &
+	fs_pid=$!
+	for _ in $(seq 100); do
+		curl -s -o /dev/null "http://127.0.0.1:$fs_port/gen" && break
+		sleep 0.05
+	done
+	for _ in $(seq 100); do
+		(exec 3<>"/dev/tcp/127.0.0.1/$fs_up") 2>/dev/null && break
+		sleep 0.05
+	done
+	fs_url="http://127.0.0.1:$fs_port"
+	curl -s -o /dev/null -X POST "$fs_url/churn"
+	# по соединению на curl: писатели — 8 × 75 запросов, fetch — 16 × 40
+	fs_pids=()
+	for _ in $(seq 8); do
+		curl -s -X POST $(printf "$fs_url/churn %.0s" $(seq 75)) >/dev/null &
+		fs_pids+=($!)
+	done
+	for i in $(seq 16); do
+		curl -s -w '\n' $(printf "$fs_url/relay?port=$fs_up %.0s" $(seq 40)) >"$tmp/relay.$i" &
+		fs_pids+=($!)
+	done
+	wait "${fs_pids[@]}"
+	r="$(cat "$tmp"/relay.* | grep -c '^200 ok$') $(curl -s "$fs_url/gen")"
+	kill "$fs_pid" "$fs_up_pid"
+	wait "$fs_pid" "$fs_up_pid" 2>/dev/null
+	if [[ "$r" == "640 601" ]]; then
+		http_ok
+	else
+		failed "http: fetch со словарём заголовков из store" "ожидалось «640 601», получено «$r»; не ok: $(cat "$tmp"/relay.* | grep -v '^200 ok$' | head -3)"
+	fi
+else
+	failed "tests/load/fetch_store.kh" "$(cat "$tmp/fetch_store.err")"
+fi

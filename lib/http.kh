@@ -1004,19 +1004,34 @@ fn __load_store() {
     }
 }
 
-// Снимок store под блокировкой, запись — в файл рядом и переименование.
-fn __save_store() {
+// Снимок store под блокировкой, запись — в файл рядом и переименование. Если
+// снимок не удался (паника: цикл в store), старый файл остаётся, а следующая
+// попытка — после следующего изменения store.
+fn __save_store(w: __Worker) {
+    let c = __ctx()
     let path = __data_path()
     __arena_begin()
     __store_lock()
-    let text = __store_snapshot()
     __store_saved = __store_touches
-    __store_unlock()
-    let tmp = path + ".tmp"
-    if write_file(tmp, text, false) {
-        syscall(SYS_RENAME_STORE, __cstr(tmp), __cstr(path))
+    if __setjmp(w.jb) == 0 {
+        store64(c + CTX_CATCH, w.jb)
+        let text = __store_snapshot()
+        store64(c + CTX_CATCH, 0)
+        __store_unlock()
+        let tmp = path + ".tmp"
+        if write_file(tmp, text, false) {
+            syscall(SYS_RENAME_STORE, __cstr(tmp), __cstr(path))
+        } else {
+            eprint("khrip: cannot write store to {path}")
+        }
     } else {
-        eprint("khrip: cannot write store to {path}")
+        __pmode_reset()
+        __store_unlock()
+        var msg: str = __cast(load64(c + CTX_PANIC))
+        if msg.starts_with("panic: ") {
+            msg = msg.byte_slice(7, msg.byte_len())
+        }
+        eprint("khrip: cannot save store: " + msg)
     }
     __arena_end()
 }
@@ -1069,7 +1084,7 @@ fn __timer_loop() {
         let sig = syscall(SYS_RT_SIGTIMEDWAIT, set, 0, ts, 8)
         if sig == SIGINT || sig == SIGTERM {
             if saving {
-                __save_store()
+                __save_store(w)
             }
             exit(0)
         }
@@ -1082,7 +1097,7 @@ fn __timer_loop() {
             }
         }
         if saving && __store_touches != __store_saved {
-            __save_store()
+            __save_store(w)
         }
     }
 }
@@ -1092,9 +1107,10 @@ fn __run_timers() {
     __ignore_sigpipe()
     __store_init()
     __store_rw_init()
+    // восстановленное значение копируется в store (__persist) — под блокировкой
     __store_lock()
-    __store_unlock()
     __load_store()
+    __store_unlock()
     __store_saved = __store_touches
     __db_init()
     __block_signals()
@@ -1109,9 +1125,10 @@ fn __serve() {
     __ignore_sigpipe()
     __store_init()
     __store_rw_init()
+    // восстановленное значение копируется в store (__persist) — под блокировкой
     __store_lock()
-    __store_unlock()
     __load_store()
+    __store_unlock()
     __store_saved = __store_touches
     __db_init()
     __read_cpus()

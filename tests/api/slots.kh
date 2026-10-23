@@ -1,0 +1,207 @@
+// Списки и словари в store: слоты, которые освободились (pop, remove_at,
+// truncate, clear, remove, перестройка словаря), обнуляются, а значения
+// остаются верными. И тест, который держал блокировку store, держит её и
+// после call (вложенный запрос в конце отпускает блокировку).
+
+type Item { name: str, n: int }
+
+type Group {
+    items: [Item]
+    nums: [int]
+    flags: [bool]
+    by_id: map[int, Item]
+    names: map[str, str]
+}
+
+// контейнеры значения в store — в постоянной памяти (запись копирует их туда)
+store groups: map[str, Group]
+store items: [Item]
+
+fn item(i: int) -> Item {
+    return Item { name: "i" + i.to_str(), n: i }
+}
+
+fn group() -> Group {
+    let g = Group { items: [], nums: [], flags: [], by_id: {}, names: {} }
+    groups["g"] = g
+    return groups["g"] ?? g
+}
+
+fn names_of(xs: [Item]) -> str {
+    var s = ""
+    for x in xs {
+        s += x.name + ","
+    }
+    return s
+}
+
+// За длиной списка (до его ёмкости) — нули.
+fn list_clean(xs: [Item]) -> bool {
+    let h: int = __cast(xs)
+    for i in load64(h + 8)..load64(h + 16) {
+        if load64(load64(h) + i * 8) != 0 {
+            return false
+        }
+    }
+    return true
+}
+
+// Записей в словаре, вместе с мёртвыми.
+fn entries(m: map[int, Item]) -> int {
+    let h: int = __cast(m)
+    return load64(load64(h) + 8)
+}
+
+// У мёртвых записей словаря и за последней записью (до ёмкости списков keys и
+// vals) — нули.
+fn map_clean(m: map[int, Item]) -> bool {
+    let h: int = __cast(m)
+    let keys = load64(h)
+    let vals = load64(h + 16)
+    let alive = load64(load64(h + 24))
+    for i in 0..load64(keys + 16) {
+        let dead = i >= load64(keys + 8) || load64(alive + i * 8) == 0
+        if dead && (load64(load64(keys) + i * 8) != 0 || load64(load64(vals) + i * 8) != 0) {
+            return false
+        }
+    }
+    return true
+}
+
+route POST "/items/{n}" (n: int) -> int {
+    for i in 0..n {
+        items.push(item(i))
+    }
+    return items.len()
+}
+
+route GET "/items" -> [Item] {
+    return items
+}
+
+route DELETE "/items/{i}" (i: int) -> Item | 404 {
+    if i < 0 || i >= items.len() {
+        return 404
+    }
+    return items.remove_at(i)
+}
+
+test "pop, remove_at, truncate and clear of a store list" {
+    let g = group()
+    for i in 0..10 {
+        g.items.push(item(i))
+        g.nums.push(i * 10)
+        g.flags.push(i % 3 == 0)
+    }
+    let last = g.items.pop()
+    expect last.name == "i9" && last.n == 9
+    expect list_clean(g.items)
+    expect g.nums.pop() == 90 && g.flags.pop() == true
+    let mid = g.items.remove_at(2)
+    expect mid.name == "i2" && list_clean(g.items)
+    expect g.nums.remove_at(2) == 20 && g.flags.remove_at(3) == true
+    expect names_of(g.items) == "i0,i1,i3,i4,i5,i6,i7,i8,"
+    expect g.nums.len() == 8 && g.nums[2] == 30 && g.nums[7] == 80
+    expect g.flags.len() == 8 && g.flags[0] && !g.flags[1] && g.flags[5]
+    // освободившиеся слоты снова заняты новыми значениями
+    g.items.push(item(20))
+    g.items.push(item(21))
+    expect names_of(g.items) == "i0,i1,i3,i4,i5,i6,i7,i8,i20,i21,"
+    g.items.truncate(3)
+    g.nums.truncate(1)
+    g.flags.truncate(2)
+    expect names_of(g.items) == "i0,i1,i3," && g.nums.len() == 1 && g.flags.len() == 2
+    expect list_clean(g.items)
+    g.items.push(item(30))
+    g.nums.push(5)
+    g.flags.push(true)
+    expect names_of(g.items) == "i0,i1,i3,i30," && g.nums[1] == 5 && g.flags[2]
+    expect last.name == "i9" && mid.n == 2
+    g.items.clear()
+    g.nums.clear()
+    g.flags.clear()
+    expect g.items.len() == 0 && g.nums.len() == 0 && g.flags.len() == 0
+    expect list_clean(g.items)
+    g.items.push(item(40))
+    g.nums.push(6)
+    g.flags.push(false)
+    expect names_of(g.items) == "i40," && g.nums[0] == 6 && !g.flags[0]
+}
+
+test "remove and clear of a store map" {
+    let g = group()
+    g.by_id[1] = item(1)
+    g.by_id[2] = item(2)
+    g.by_id[3] = item(3)
+    expect (g.by_id.remove(2) ?? item(-1)).n == 2
+    expect map_clean(g.by_id) && g.by_id.len() == 2
+    g.by_id.clear()
+    expect map_clean(g.by_id)
+    for i in 0..100 {
+        g.by_id[i] = item(i)
+        g.names["k{i}"] = "v{i}"
+    }
+    // удаления и перестройки (живые записи сдвигаются к началу)
+    for i in 0..100 {
+        if i % 4 != 0 {
+            let x = g.by_id.remove(i) ?? item(-1)
+            expect x.n == i
+            expect (g.names.remove("k{i}") ?? "") == "v{i}"
+        }
+    }
+    expect map_clean(g.by_id)
+    // новые записи — до перестройки: живые сдвигаются к началу, хвост — нули
+    var at = 100
+    var before = entries(g.by_id)
+    while entries(g.by_id) >= before {
+        before = entries(g.by_id)
+        g.by_id[at] = item(at)
+        at += 1
+    }
+    expect map_clean(g.by_id) && at < 300
+    for i in 100..300 {
+        g.by_id[i] = item(i)
+        g.names["k{i}"] = "v{i}"
+    }
+    expect g.by_id.len() == 225 && g.names.len() == 225
+    expect map_clean(g.by_id)
+    var ok = true
+    for k, v in g.by_id {
+        if v.n != k || v.name != "i{k}" {
+            ok = false
+        }
+    }
+    for k, v in g.names {
+        if "k" + v.byte_slice(1, v.byte_len()) != k {
+            ok = false
+        }
+    }
+    expect ok
+    expect (g.by_id[96] ?? item(-1)).name == "i96" && g.by_id[97] == none
+    expect (g.names["k299"] ?? "") == "v299" && g.names["k1"] == none
+    g.by_id.clear()
+    g.names.clear()
+    expect g.by_id.len() == 0 && g.names.len() == 0 && g.by_id[4] == none
+    expect map_clean(g.by_id)
+    g.by_id[7] = item(7)
+    g.names["a"] = "b"
+    expect (g.by_id[7] ?? item(-1)).n == 7 && (g.names["a"] ?? "") == "b"
+    expect g.by_id.keys().len() == 1 && g.names.values()[0] == "b"
+}
+
+test "the test holds the store lock after call" {
+    expect load64(__ctx() + CTX_STORE_HELD) == 0
+    expect (call POST "/items/5").body == "5"
+    // тест не держал блокировку — и после call не держит
+    expect load64(__ctx() + CTX_STORE_HELD) == 0
+    expect items.len() == 5
+    expect load64(__ctx() + CTX_STORE_HELD) == 1
+    let r = call DELETE "/items/1"
+    expect r.body == "\{\"name\":\"i1\",\"n\":1}"
+    expect load64(__ctx() + CTX_STORE_HELD) == 1
+    expect (call GET "/items").status == 200
+    expect load64(__ctx() + CTX_STORE_HELD) == 1
+    expect names_of(items) == "i0,i2,i3,i4,"
+    expect (call DELETE "/items/9").status == 404
+    expect load64(__ctx() + CTX_STORE_HELD) == 1
+}

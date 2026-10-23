@@ -177,7 +177,7 @@ fn parse_ident(w: int) -> int {
         let sk = sym_kind(s)
         if sk == SK_GLOBAL {
             let g = globals[sym_idx(s)]
-            if g.is_store {
+            if global_in_store(g) {
                 store_touch()
             }
             emit_load_abs(RAX, g.addr)
@@ -1203,6 +1203,17 @@ fn parse_builtin(t: Token, w: int) -> int {
         emit_mov_imm(RAX, sql_root())
         return ty_int
     }
+    if name == "__data_end" && files[t.file].is_lib {
+        // конец данных программы (lib/api.kh, __in_data): mov rax, imm64, а число
+        // подставит resolve_fixups, когда данные больше не растут
+        advance()
+        expect_tok(')')
+        emit8(0x48)
+        emit8(0xB8)
+        fixups.push(Fixup { at: code_len, func: FIX_DATA_END })
+        emit64(0)
+        return ty_int
+    }
     if name == "__to_str" {
         advance()
         let a = tok()
@@ -1248,7 +1259,7 @@ fn parse_builtin(t: Token, w: int) -> int {
         emit_call(rt_func("__json_decode"))
         return ty_opt(inner)
     }
-    let lib_only = name == "__fsqrt" || name.starts_with("__simd_") || name == "__sha256_x64" || name == "__sha512_x64" || name == "__cpu_aes" || name == "__aes_ctr" || name == "__ghash" || name == "__chacha_block" || name == "__mp_add" || name == "__mp_sub" || name == "__mont_mul" || name == "__madd" || name == "__msub" || name == "__wmul" || name == "__cpu_avx2" || name == "__cpu_sha" || name == "__spawn" || name == "__co_call" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset"
+    let lib_only = name == "__fsqrt" || name.starts_with("__simd_") || name == "__sha256_x64" || name == "__sha512_x64" || name == "__cpu_aes" || name == "__aes_ctr" || name == "__ghash" || name == "__chacha_block" || name == "__mp_add" || name == "__mp_sub" || name == "__mont_mul" || name == "__madd" || name == "__msub" || name == "__wmul" || name == "__cpu_avx2" || name == "__cpu_sha" || name == "__spawn" || name == "__co_call" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset" || name == "__data_end"
     if lib_only && !files[t.file].is_lib {
         return -1
     }

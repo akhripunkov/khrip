@@ -1,0 +1,4 @@
+ok    a test writes fresh values into var globals
+ok    the next test reads them after the arena reset
+ok    changes through the persisted values stay too
+3 tests: 3 passed, 0 failed

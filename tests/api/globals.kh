@@ -1,0 +1,62 @@
+// Глобальные var программы с одними тестами живут в store, как store:
+// значение, которое тест записал в var, копируется в постоянную память и
+// переживает сброс арены теста.
+
+type Note { text: str, tags: [str] }
+
+var xs: [int] = []
+var words: map[str, int] = {}
+var note: Note? = none
+var title: str = "t"
+var count: int = 0
+var log: [str] = []
+
+fn fresh(n: int) -> [int] {
+    var r: [int] = []
+    for i in 0..n {
+        r.push(i * i)
+    }
+    return r
+}
+
+test "a test writes fresh values into var globals" {
+    xs = fresh(100)
+    var m: map[str, int] = {}
+    for i in 0..30 {
+        m["w{i}"] = i
+    }
+    words = m
+    note = Note { text: "n" + count.to_str(), tags: ["a" + "b", "c"] }
+    title += "-" + 42.to_str()
+    count += 5
+    log.push("first " + count.to_str())
+    expect xs.len() == 100
+}
+
+test "the next test reads them after the arena reset" {
+    // арена прошлого теста обнулена: что осталось бы в ней, читалось бы пустым
+    let junk = fresh(1000)
+    expect junk.len() == 1000
+    expect xs.len() == 100
+    expect xs[99] == 9801
+    expect words.len() == 30
+    expect (words["w29"] ?? -1) == 29
+    let n = note else {
+        expect false
+        return
+    }
+    expect n.text == "n0"
+    expect n.tags.len() == 2 && n.tags[0] == "ab"
+    expect title == "t-42"
+    expect count == 5
+    expect log.len() == 1 && log[0] == "first 5"
+    xs.push(7)
+    n.tags.push("d" + "e")
+    title = title + "!"
+}
+
+test "changes through the persisted values stay too" {
+    expect xs.len() == 101 && xs[100] == 7
+    expect (note ?? Note { text: "", tags: [] }).tags[2] == "de"
+    expect title == "t-42!"
+}

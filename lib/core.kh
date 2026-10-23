@@ -72,6 +72,12 @@ const CTX_VCACHE = 152
 const CTX_PGPOOL = 160
 // поток уже в панике из-за памяти: остаток арены (запас) — на её обработку
 const CTX_MEMPANIC = 168
+// слова 192–239 — временные буферы системных вызовов (now_ms и __poll в
+// lib/rt.kh, peek в fetch.kh и pg.kh)
+// запись JSON (lib/api.kh; она не переключает сопрограммы): глубина вложенности
+const CTX_JDEPTH = 240
+// множество структур на пути глубже 1000 или 0
+const CTX_JPATH = 248
 // запас в конце арены для ответа 500 и журнала после исчерпания памяти
 const ARENA_RESERVE = 16777216
 const CTX_SIZE = 256
@@ -186,11 +192,21 @@ fn __in_arena(p: int) -> bool {
     return (p >> 45) == 1
 }
 
+fn __in_store(p: int) -> bool {
+    return (p >> 40) == (STORE_REGION >> 40)
+}
+
 // Память для внутренностей объекта h (рост списка, таблица словаря): объект
-// вне арены не должен ссылаться на арену, поэтому его память — постоянная.
+// вне арены не должен ссылаться на арену. У объекта в store память — в store,
+// у объекта библиотеки в обычной памяти (запасы соединений, планировщик,
+// состояние сервера) — в обычной памяти потока: в store её не найти от корней
+// store, и блокировка store ей не нужна.
 fn __alloc_for(h: int, n: int) -> int {
     let c = __ctx()
     if __in_arena(load64(c + CTX_PTR)) && !__in_arena(h) {
+        if !__in_store(h) {
+            return __alloc_heap(n)
+        }
         let on = __pmode_on()
         let p = __alloc(n)
         if on {
@@ -199,6 +215,35 @@ fn __alloc_for(h: int, n: int) -> int {
         return p
     }
     return __alloc(n)
+}
+
+// Обнулённая память в обычной памяти потока, где бы ни шло выделение сейчас:
+// курсор обычной памяти — в CTX_PTR, пока нет ни арены, ни store; в
+// CTX_SAVE_PTR, пока идёт арена (и store поверх неё); в CTX_PSAVE_PTR, если
+// store включён поверх обычной памяти. Блокировку store не берёт.
+fn __alloc_heap(n: int) -> int {
+    let size = (n + 15) & ~15
+    let c = __ctx()
+    var at = c + CTX_PTR
+    if __in_store(load64(at)) {
+        at = c + CTX_PSAVE_PTR
+    }
+    if __in_arena(load64(at)) {
+        at = c + CTX_SAVE_PTR
+    }
+    // пары «курсор, конец» лежат рядом: CTX_END = CTX_PTR + 8 и т. д.
+    let p = load64(at)
+    if p + size <= load64(at + 8) {
+        store64(at, p + size)
+        return p
+    }
+    if size >= BIG {
+        return __mmap(size)
+    }
+    let q = __mmap(CHUNK)
+    store64(at, q + size)
+    store64(at + 8, q + CHUNK)
+    return q
 }
 
 // ---- Постоянная память store: одна область на процесс ----
@@ -911,7 +956,11 @@ fn __list_pop(self: [T]) -> T {
         __panic(PANIC_EMPTY, "pop")
     }
     store64(h + 8, len - 1)
-    return __cast(__lget(h, len - 1))
+    let v = __lget(h, len - 1)
+    if __in_store(h) {
+        __lset(h, len - 1, 0)
+    }
+    return __cast(v)
 }
 
 fn __list_last(self: [T]) -> T {
@@ -925,13 +974,24 @@ fn __list_last(self: [T]) -> T {
 
 fn __list_clear(self: [T]) {
     let h: int = __cast(self)
+    __list_vacate(h, 0)
     store64(h + 8, 0)
 }
 
 fn __list_truncate(self: [T], n: int) {
     let h: int = __cast(self)
     if n >= 0 && n < load64(h + 8) {
+        __list_vacate(h, n)
         store64(h + 8, n)
+    }
+}
+
+// Список в store: элементы [from, len) больше не его — их слоты обнуляются,
+// чтобы в массиве не оставалось ссылок на то, что из него уже убрано.
+fn __list_vacate(h: int, from: int) {
+    if __in_store(h) {
+        let es = load64(h + 24)
+        __memset(load64(h) + from * es, 0, (load64(h + 8) - from) * es)
     }
 }
 
@@ -964,6 +1024,9 @@ fn __list_remove_at(self: [T], i: int) -> T {
     while j + 1 < len {
         __lset(h, j, __lget(h, j + 1))
         j += 1
+    }
+    if __in_store(h) {
+        __lset(h, len - 1, 0)
     }
     store64(h + 8, len - 1)
     return __cast(v)
@@ -1692,6 +1755,22 @@ fn __map_new(str_keys: int) -> int {
     return m
 }
 
+// Пустой словарь на n записей: n вставок обходятся без перестройки.
+fn __map_new_cap(str_keys: int, n: int) -> int {
+    var size = 16
+    while size < n * 4 {
+        size *= 2
+    }
+    let m = __alloc(64)
+    store64(m, __list_new(n, 8))
+    store64(m + 16, __list_new(n, 8))
+    store64(m + 24, __list_new(n, 8))
+    store64(m + 32, __alloc(size * 8))
+    store64(m + 40, size - 1)
+    store64(m + 48, str_keys)
+    return m
+}
+
 fn __map_hash(m: int, k: int) -> int {
     if load64(m + 48) != 0 {
         let p = load64(k)
@@ -1775,6 +1854,12 @@ fn __map_rehash(m: int) {
             w += 1
         }
         r += 1
+    }
+    if __in_store(m) {
+        // слоты [w, n) освободились: в store в них не остаётся старых ссылок
+        __memset(load64(keys) + w * 8, 0, (n - w) * 8)
+        __memset(load64(vals) + w * 8, 0, (n - w) * 8)
+        __memset(load64(alive) + w * 8, 0, (n - w) * 8)
     }
     store64(keys + 8, w)
     store64(vals + 8, w)
@@ -1865,7 +1950,13 @@ fn __map_remove_word(m: int, k: int, found: int) -> int {
     store64(m + 8, load64(m + 8) - 1)
     store64(m + 56, load64(m + 56) + 1)
     store64(found, 1)
-    return __word_at(load64(m + 16), idx)
+    let v = __word_at(load64(m + 16), idx)
+    if __in_store(m) {
+        // мёртвая запись в store не держит ни ключ, ни значение
+        store64(load64(load64(m)) + idx * 8, 0)
+        store64(load64(load64(m + 16)) + idx * 8, 0)
+    }
+    return v
 }
 
 fn __map_remove_ref(m: int, k: int) -> int {
@@ -1910,6 +2001,12 @@ fn __map_values(m: int, esize: int) -> int {
 }
 
 fn __map_clear(m: int) {
+    if __in_store(m) {
+        let n = load64(load64(m) + 8)
+        __memset(load64(load64(m)), 0, n * 8)
+        __memset(load64(load64(m + 16)), 0, n * 8)
+        __memset(load64(load64(m + 24)), 0, n * 8)
+    }
     store64(load64(m) + 8, 0)
     store64(load64(m + 16) + 8, 0)
     store64(load64(m + 24) + 8, 0)

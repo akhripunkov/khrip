@@ -822,6 +822,10 @@ fn __http_exchange(url: __Url, request: str, method: str) -> Response {
 }
 
 // fetch МЕТОД url [тело] [headers карта]: тело — str как есть или значение в JSON.
+// Всё, что читает данные запроса и store (тело, словарь заголовков — он может
+// быть в store, адрес, строки запроса), собирается под блокировкой store. Без
+// неё идёт только обмен по сети: он читает u и req (они в арене) и выделяет
+// ответ в арене дальше них.
 fn __fetch(method: str, url: str, body: int, d: int, headers: int) -> Response {
     var text = ""
     var ctype = "application/json"
@@ -838,37 +842,40 @@ fn __fetch(method: str, url: str, body: int, d: int, headers: int) -> Response {
     if headers != 0 {
         hs = __cast(headers)
     }
+    let u = __parse_url(url) else {
+        return __fetch_fail("bad URL: " + url)
+    }
+    let b = buf_new(256 + text.byte_len())
+    var target = u.target
+    // через прокси http цель запроса — адрес целиком (https идёт туннелем)
+    if !u.https && __proxy_for(["HTTP_PROXY", "http_proxy"], u.host) != none {
+        target = url
+    }
+    buf_add(b, method + " " + target + " HTTP/1.1\r\nHost: " + u.host)
+    if (u.https && u.port != 443) || (!u.https && u.port != 80) {
+        buf_add(b, ":" + u.port.to_str())
+    }
+    buf_add(b, "\r\nUser-Agent: khrip\r\nAccept: */*\r\n")
+    for k, v in hs {
+        buf_add(b, k + ": " + v + "\r\n")
+    }
+    if has_body {
+        if !hs.has("Content-Type") {
+            buf_add(b, "Content-Type: " + ctype + "\r\n")
+        }
+        buf_add(b, "Content-Length: " + text.byte_len().to_str() + "\r\n")
+    }
+    buf_add(b, "\r\n")
+    buf_add(b, text)
+    let req = __str_new(b.data, b.len)
+    // окно без блокировки store — только обмен (выпуск с публикацией — шаг 4
+    // docs/design/v0.13-store-gc.md)
     let c = __ctx()
     let held = load64(c + CTX_STORE_HELD) != 0
     if held {
         __store_unlock()
     }
-    var r = __fetch_fail("bad URL: " + url)
-    if let u = __parse_url(url) {
-        let req = buf_new(256 + text.byte_len())
-        var target = u.target
-        // через прокси http цель запроса — адрес целиком (https идёт туннелем)
-        if !u.https && __proxy_for(["HTTP_PROXY", "http_proxy"], u.host) != none {
-            target = url
-        }
-        buf_add(req, method + " " + target + " HTTP/1.1\r\nHost: " + u.host)
-        if (u.https && u.port != 443) || (!u.https && u.port != 80) {
-            buf_add(req, ":" + u.port.to_str())
-        }
-        buf_add(req, "\r\nUser-Agent: khrip\r\nAccept: */*\r\n")
-        for k, v in hs {
-            buf_add(req, k + ": " + v + "\r\n")
-        }
-        if has_body {
-            if !hs.has("Content-Type") {
-                buf_add(req, "Content-Type: " + ctype + "\r\n")
-            }
-            buf_add(req, "Content-Length: " + text.byte_len().to_str() + "\r\n")
-        }
-        buf_add(req, "\r\n")
-        buf_add(req, text)
-        r = __http_exchange(u, __str_new(req.data, req.len), method)
-    }
+    let r = __http_exchange(u, req, method)
     if held {
         __store_lock()
     }

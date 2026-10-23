@@ -1,0 +1,29 @@
+// fetch со словарём заголовков из store (tests/http.sh), пока другие запросы
+// меняют этот словарь: строки запроса собираются под блокировкой store, и в
+// каждом запросе все заголовки X-G-* — одного поколения. Сервис
+// tests/load/generations.py отвечает «ok», если это так.
+
+store hdrs: map[str, str]
+store gen: int
+
+// писатель: все значения — новое поколение; одна запись уходит, другая
+// приходит (удалённые записи копятся, и словарь перестраивается)
+route POST "/churn" -> int {
+    gen += 1
+    let v = "g" + gen.to_str()
+    for j in 0..200 {
+        hdrs["X-G-K" + j.to_str()] = v
+    }
+    hdrs.remove("X-G-R" + (gen - 1).to_str())
+    hdrs["X-G-R" + gen.to_str()] = v
+    return gen
+}
+
+route GET "/relay" (port: int) -> str {
+    let r = fetch GET "http://127.0.0.1:{port}/check" headers hdrs
+    return "{r.status} {r.body}"
+}
+
+route GET "/gen" -> int {
+    return gen
+}

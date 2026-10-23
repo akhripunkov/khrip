@@ -39,10 +39,14 @@ const HDR_SIZE = 176
 const CODE_MAX = 268435456
 const DATA_MAX = 134217728
 
+// Место в коде, которое дописывается в конце сборки: rel32 вызова функции func
+// или (func == FIX_DATA_END) imm64 с концом данных программы.
 type Fixup {
     at: int
     func: int
 }
+
+const FIX_DATA_END = -1
 
 var code: int
 var code_len: int
