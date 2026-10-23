@@ -141,6 +141,15 @@ fn none_tests(from: int, to: int, sep: int, op: int) -> [int] {
     return out
 }
 
+// Конец области видимости: локальные с номера n уходят. Запись о простом
+// значении — локальной оттуда — больше не годится: её номер займут новые.
+fn locals_to(n: int) {
+    nlocals = n
+    if simple_kind == OPK_LOCAL && simple_val >= n {
+        simple_end = -1
+    }
+}
+
 fn find_local(name: str) -> int {
     var i = nlocals - 1
     while i >= local_floor {
@@ -974,8 +983,7 @@ fn parse_or() -> int {
         }
         let at = tok()
         advance()
-        emit_test_rax()
-        holes.push(emit_jcc(CC_NE))
+        holes.push(emit_jump_bool(true))
         want = ty_err
         start = pos
         let rt = parse_and()
@@ -1011,8 +1019,7 @@ fn parse_and() -> int {
         }
         let at = tok()
         advance()
-        emit_test_rax()
-        holes.push(emit_jcc(CC_E))
+        holes.push(emit_jump_bool(false))
         want = ty_err
         start = pos
         let rt = parse_cmp()
@@ -1327,7 +1334,13 @@ fn parse_unary() -> int {
         want = ty_err
         let t = parse_unary()
         check_bool(t, at, "!")
-        emit_alu_imm(6, RAX, 1)
+        if setcc_end == code_len && setcc_at >= barrier {
+            // значение только что из setcc: обратить само условие
+            setcc_cc = setcc_cc ^ 1
+            store8(code + setcc_at + 1, 0x90 + setcc_cc)
+        } else {
+            emit_alu_imm(6, RAX, 1)
+        }
         return ty_bool
     }
     if k == '~' {

@@ -289,6 +289,9 @@ fn code_rollback(p: int) {
     if addimm_end > p {
         addimm_end = -1
     }
+    if setcc_end > p {
+        setcc_end = -1
+    }
 }
 
 // op reg, [base + disp] или [base + disp], reg: op — один байт или два
@@ -383,14 +386,50 @@ fn emit_test_rax() {
     emit8(0xC0)
 }
 
+// Последняя инструкция — rax = условие setcc_cc ? 1 : 0 (setcc_end = -1 — записи
+// нет): проверку значения можно заменить переходом по самому условию.
+var setcc_at: int
+var setcc_end: int = -1
+var setcc_cc: int
+
 // rax = условие cc ? 1 : 0
 fn emit_setcc(cc: int) {
+    setcc_at = code_len
     emit8(0x0F)
     emit8(0x90 + cc)
     emit8(0xC0)
     emit8(0x0F)
     emit8(0xB6)
     emit8(0xC0)
+    setcc_end = code_len
+    setcc_cc = cc
+}
+
+// Убрать setcc (последнюю инструкцию, без меток после её начала): флаги ещё
+// стоят по условию → условие или -1.
+fn take_setcc() -> int {
+    if setcc_end != code_len || setcc_at < barrier {
+        return -1
+    }
+    code_rollback(setcc_at)
+    return setcc_cc
+}
+
+// test rax, rax; jcc — переход, если значение bool в rax равно want (true/false);
+// значение только что из setcc — переход прямо по его условию.
+fn emit_jump_bool(want: bool) -> int {
+    let c = take_setcc()
+    if c >= 0 {
+        if want {
+            return emit_jcc(c)
+        }
+        return emit_jcc(c ^ 1)
+    }
+    emit_test_rax()
+    if want {
+        return emit_jcc(CC_NE)
+    }
+    return emit_jcc(CC_E)
 }
 
 // ---- Вызовы ----

@@ -58,7 +58,7 @@ fn parse_block() -> bool {
     }
     expect_tok('}')
     panic_mode = false
-    nlocals = saved
+    locals_to(saved)
     narrow_to(nn)
     return div
 }
@@ -1105,8 +1105,7 @@ fn cond_cmp(fl: [int]) {
         }
         error_tok(at, "condition must be bool, found " + ty_name(lt), hint)
     }
-    emit_test_rax()
-    fl.push(emit_jcc(CC_E))
+    fl.push(emit_jump_bool(false))
 }
 
 // Продолжение «??» в условии, когда левая часть уже вычислена.
@@ -1201,8 +1200,7 @@ fn cond_cmp_true(tl: [int]) {
     if lt != ty_bool && lt != ty_err {
         error_tok(at, "condition must be bool, found " + ty_name(lt), mismatch_hint(lt, ty_bool))
     }
-    emit_test_rax()
-    tl.push(emit_jcc(CC_NE))
+    tl.push(emit_jump_bool(true))
 }
 
 fn parse_if() -> bool {
@@ -1293,7 +1291,7 @@ fn parse_if_let() -> bool {
     let so = sql_outside
     let d1 = parse_block()
     let s1 = sql_branch(so, d1)
-    nlocals = saved_n
+    locals_to(saved_n)
     sql_outside = s1
     if kind() != T_ELSE {
         patch_here(none_at)
@@ -1422,7 +1420,7 @@ fn parse_for() {
     while tx_aliases.len() > mark {
         tx_aliases.pop()
     }
-    nlocals = saved_n
+    locals_to(saved_n)
 }
 
 // Сравнить локальную a с локальной b (или числом) и перейти, если меньше.
@@ -1772,7 +1770,7 @@ fn begin_fn(fi: int) -> int {
     align16()
     funcs[fi].code = here()
     narrow_to(0)
-    nlocals = 0
+    locals_to(0)
     local_floor = 0
     frame = 0
     used_regs = 0
@@ -1787,6 +1785,7 @@ fn begin_fn(fi: int) -> int {
     stored_end = -1
     regload_end = -1
     addreg_end = -1
+    setcc_end = -1
     fn_ret_ty = funcs[fi].ret
     panic_mode = false
     inline_depth = 0

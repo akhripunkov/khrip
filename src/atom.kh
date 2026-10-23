@@ -1131,15 +1131,19 @@ fn inline_call(fi: int, n: int, deferred: bool) {
         inline_rets.pop()
         code_rollback(code_len - 5)
     }
-    let end = here()
-    while inline_rets.len() > base {
-        patch_rel(inline_rets.pop(), end)
+    // метка конца — только если на неё есть переходы: иначе записи о последней
+    // инструкции тела (простое значение, setcc) годятся и после встраивания
+    if inline_rets.len() > base {
+        let end = here()
+        while inline_rets.len() > base {
+            patch_rel(inline_rets.pop(), end)
+        }
     }
     inline_stack.pop()
     quiet -= 1
     inline_depth -= 1
     pos = saved_pos
-    nlocals = saved_n
+    locals_to(saved_n)
     local_floor = saved_floor
     fn_ret_ty = saved_ret
     no_struct = saved_ns
