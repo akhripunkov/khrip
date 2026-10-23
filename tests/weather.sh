@@ -3,10 +3,10 @@
 # (tests/weather/meteo.kh), вместо Telegram — приёмник вебхуков (hook.kh).
 # Подключается из tests/run.sh (использует его KHC, tmp, failed, pass).
 
-W_METEO=18601
-W_HOOK=18602
-W_APP=18603
-W_TICK=18604
+W_METEO=${W_METEO:-18601}
+W_HOOK=${W_HOOK:-18602}
+W_APP=${W_APP:-18603}
+W_TICK=${W_TICK:-18604}
 
 w_ok() {
 	pass=$((pass + 1))
