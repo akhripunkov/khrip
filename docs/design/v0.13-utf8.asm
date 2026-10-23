@@ -12,7 +12,8 @@
 ; utf8.asm (skip, SKIP_SCALAR, VALID_SCALAR) and emit_simd_find_json; seek
 ; (validate the prefix + skip in one pass, AVX2) was added later. Changes:
 ;   - constants are loaded with vmovdqu [abs] (no RIP-relative addressing in khc);
-;   - dispatch on __simd_level: 2 = AVX2, else the scalar/SWAR path
+;   - dispatch on __simd_level: 2 = AVX2, else the scalar/SWAR path (3 = AVX2
+;     with fast PDEP: skip and seek select the k-th lead with PDEP)
 ;     (find_json_hi keeps all three paths of find_json: AVX2, SSE2, bytewise);
 ;   - the scan fallback is VALID_SCALAR with counting in rax, -1 on error;
 ;   - find_json_hi = find_json + OR of the raw high-bit mask in r9d; the result
@@ -25,7 +26,10 @@
 ; ref_skip + ref_scan of the prefix, 0 mismatches (random buffers of 0-299
 ; bytes at a page end / page start / mid-page with every k or a sample of k;
 ; every 1- and 2-byte sequence at offsets 0, 1, 29-33, 61-63 on an ASCII and a
-; Cyrillic background; every 3-byte sequence at offsets 0, 30, 31, 32).
+; Cyrillic background; every 3-byte sequence at offsets 0, 30, 31, 32). Level 3
+; (fast PDEP picks the k-th lead in the last block of skip and seek): skip and
+; seek re-checked at levels 2 and 3 with the same harness, 988,363,522 checks
+; per level, 0 mismatches.
 ; kh_case (added with seek): 77,682,688 checks against a per-character
 ; reference (random mixes of ASCII, Cyrillic and other characters at a page end /
 ; page start / mid-page, both modes, write and check; every byte pair at every
