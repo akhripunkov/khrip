@@ -1,11 +1,20 @@
-// expect: route_ascii.kh:5:11: error: write the route path in ASCII
+// expect: route_ascii.kh:10:11: error: write the route path in ASCII
+// expect: hint: clients send 'книги' percent-encoded; use an ASCII name or a parameter like {name}
+// expect: route_ascii.kh:14:11: error: write the route path in ASCII
 // expect: hint: clients send 'товары' percent-encoded; use an ASCII name or a parameter like {name}
-// expect: 1 error
-// Путь маршрута — ASCII: остальное приходит в запросе как %XX.
-route GET "/товары/{id}" (id: int) -> str {
+// expect: 2 errors
+// Путь маршрута сравнивается с запросом побайтно, а клиенты кодируют не-ASCII
+// (%D0%BA...): маршрут с кириллицей в пути не совпал бы ни с одним запросом.
+// Текст из пути — параметр, он приходит уже раскодированным и проверенным
+// (правильный UTF-8).
+route GET "/книги/{id}" (id: int) -> str {
+    return "книга {id}"
+}
+
+route GET "/api/товары" -> str {
     return "x"
 }
 
-route GET "/items/{name}" (name: str) -> str {
-    return name
+route GET "/books/{title}" (title: str) -> str {
+    return "книга «{title}»"
 }

@@ -60,3 +60,74 @@ route POST "/post" (port: int) -> str {
     let r = fetch POST "http://127.0.0.1:{port}/len" "x"
     return "{r.status}:{r.body}"
 }
+
+// ---- Кэш строк через ожидание (docs/design/v0.13-utf8.md, §8) ----
+// /walk идёт срезами по строке в 64 КБ и засыпает каждые nap шагов; пока он
+// спит, на том же потоке работают другие запросы со своими строками (/text).
+// Кэш строк — в арене запроса, поэтому после пробуждения курсор на месте, и
+// проход остаётся линейным. Счёт __strc_scanned — на поток, так что /walk
+// складывает только свои отрезки между ожиданиями (на одном потоке сопрограмма
+// между ними не прерывается).
+
+fn text_of(seed: int, size: int) -> str {
+    let parts = ["съешь", " же ", "ещё", "этих", "мягких", "😀", "French", "булок", "ǅ", "日本"]
+    var out: [str] = []
+    var x = seed
+    var bytes = 0
+    while bytes < size {
+        x = (x * 1103515245 + 12345) % 2147483648
+        let p = parts[(x >> 8) % parts.len()]
+        out.push(p)
+        bytes += p.byte_len()
+    }
+    return out.join("")
+}
+
+fn mix(h: int, s: str) -> int {
+    var r = h
+    for i in 0..s.byte_len() {
+        r = (r * 31 + s.byte(i)) % 1000000007
+    }
+    return r
+}
+
+route GET "/walk" (seed: int, nap: int) -> str {
+    let s = text_of(seed, 65536)
+    var t0 = __strc_scanned()
+    var own = 0
+    let n = s.len()
+    var h = 0
+    var i = 0
+    var steps = 0
+    while i < n {
+        h = mix(h, s[i..i + 8])
+        h = mix(h, s[i])
+        i += 8
+        steps += 1
+        if nap > 0 && steps % nap == 0 {
+            own += __strc_scanned() - t0
+            sleep(1)
+            t0 = __strc_scanned()
+        }
+    }
+    own += __strc_scanned() - t0
+    let bound = 4 * s.byte_len()
+    if own > bound {
+        return "{n} {h} scanned {own} > {bound}"
+    }
+    return "{n} {h} linear"
+}
+
+route GET "/text" (seed: int) -> str {
+    let s = text_of(seed, 3000)
+    let n = s.len()
+    var h = n
+    var i = n - 1
+    while i >= 0 {
+        h = mix(h, s[i])
+        i -= 3
+    }
+    h = mix(h, s.lower())
+    h = mix(h, s[n / 3..n / 2])
+    return "{n} {h}"
+}

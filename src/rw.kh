@@ -42,6 +42,10 @@ fn rw_safe_lib(name: str) -> bool {
     if name == "to_bson" || name == "from_bson" || name == "ch_encode" || name == "ch_decode" || name == "bson_error" || name == "ch_error" {
         return true
     }
+    // строковые операции lib/text.kh пишут только в кэш строк арены запроса
+    if name.starts_with("__text_") {
+        return true
+    }
     return name == "__to_str" || name == "print" || name == "eprint" || name == "write" || name == "args" || name == "env" || name == "read_file" || name == "write_file" || name == "exit" || name == "now" || name == "now_ms" || name == "sleep" || name == "time_iso" || name == "parse_time" || name == "parse_date" || name == "random_str" || name == "sha256" || name == "hash_password" || name == "check_password" || name == "url_encode" || name == "to_json" || name == "from_json" || name == "json_error" || name == "header" || name == "set_header" || name == "fail"
 }
 

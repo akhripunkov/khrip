@@ -77,6 +77,40 @@ r=$(ls "/proc/$coro_pid/fd" | wc -l)
 expect_count "клиенты ушли, не дождавшись: соединения закрыты" "$r" "^$fds$" 1
 r=$(curl -s "$url/sleep?ms=1&tag=alive")
 expect_count "сервер жив после ушедших клиентов" "$r" "^slept alive$" 1
+
+# Кэш строк через ожидание: четыре /walk по строкам в 64 КБ засыпают каждые 16
+# шагов, а между ними на том же потоке идут 40 запросов /text. Ответы — как у
+# тех же запросов по одному (без ожиданий), проход /walk — линейный.
+for s in 1 2 3 4; do
+	curl -s -w '\n' "$url/walk?seed=$s&nap=0"
+done >"$tmp/walk.want"
+for s in $(seq 40); do
+	curl -s -w '\n' "$url/text?seed=$s"
+done >"$tmp/text.want"
+walk_pids=()
+for s in 1 2 3 4; do
+	curl -s -o "$tmp/walk.$s" "$url/walk?seed=$s&nap=16" &
+	walk_pids+=($!)
+done
+sleep 0.05
+for s in $(seq 40); do
+	curl -s -o "$tmp/text.$s" "$url/text?seed=$s" &
+	walk_pids+=($!)
+done
+wait "${walk_pids[@]}"
+for s in 1 2 3 4; do
+	cat "$tmp/walk.$s"
+	echo
+done >"$tmp/walk.got"
+for s in $(seq 40); do
+	cat "$tmp/text.$s"
+	echo
+done >"$tmp/text.got"
+if cmp -s "$tmp/walk.want" "$tmp/walk.got" && cmp -s "$tmp/text.want" "$tmp/text.got" && [[ $(grep -c ' linear$' "$tmp/walk.got") == 4 ]]; then
+	http_ok
+else
+	failed "coro: кэш строк через ожидание" "$(diff "$tmp/walk.want" "$tmp/walk.got"; diff "$tmp/text.want" "$tmp/text.got" | head -5)"
+fi
 coro_stop
 
 # две сопрограммы на поток: остальные запросы ждут в очереди

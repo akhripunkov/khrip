@@ -1,0 +1,31 @@
+// Границы UTF-8 на настоящем сервере (tests/http.sh). Ответ -> str — с
+// charset=utf-8; тело и параметр с неправильным UTF-8 — 400. Снимок KHRIP_DATA
+// читается мягко: неправильные байты и суррогаты WTF-8 (так их хранила v0.12)
+// становятся U+FFFD, сервер запускается и пишет об этом одну строку.
+type Note {
+    title: str
+}
+
+store notes: map[str, Note]
+
+route GET "/notes/{id}" (id: str) -> Note | 404 {
+    return notes[id] ?? 404
+}
+
+route PUT "/notes/{id}" (id: str, body: Note) -> 204 {
+    notes[id] = body
+    return 204
+}
+
+route GET "/title/{id}" (id: str) -> str | 404 {
+    let n = notes[id] else {
+        return 404
+    }
+    return n.title
+}
+
+route GET "/keys" -> [str] {
+    var ks = notes.keys()
+    ks.sort()
+    return ks
+}

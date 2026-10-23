@@ -177,8 +177,9 @@ fn route_segments(path: str, at: Token) -> [str] {
             } else if seg.contains("\{") || seg.contains("}") || seg.contains(" ") || seg.contains("?") {
                 error_tok(at, "bad path segment '" + seg + "'", "a segment is either text or a parameter like \{id}")
             } else if !is_ascii(seg) {
-                // клиенты шлют такой путь в %XX, а сегменты-текст сравниваются как есть;
-                // параметр пути раскодируется
+                // сегменты-текст сравниваются с запросом побайтно, а клиенты шлют
+                // не-ASCII в %XX (%D0%BA...): такой маршрут не совпал бы ни с одним
+                // запросом. Параметр пути раскодируется и проверяется (UTF-8)
                 error_tok(at, "write the route path in ASCII", "clients send '" + seg + "' percent-encoded; use an ASCII name or a parameter like \{name}")
             }
             segs.push(seg)
@@ -1319,7 +1320,7 @@ fn gen_param(b: Buf, r: Route, i: int) {
         } else if p.ty == ty_bool {
             buf_add(b, "            let " + v + " = __param_bool(" + seg + ", " + lit + ") else \{\n                return\n            }\n")
         } else {
-            buf_add(b, "            let " + v + " = " + seg + "\n")
+            buf_add(b, "            let " + v + " = __param_text(" + seg + ", " + lit + ") else \{\n                return\n            }\n")
         }
         return
     }
@@ -1347,7 +1348,8 @@ fn gen_param(b: Buf, r: Route, i: int) {
         }
         return
     }
-    var conv = ""
+    // str — тоже через проверку: параметр должен быть правильным UTF-8
+    var conv = "__param_text"
     if inner == ty_int {
         conv = "__param_int"
     } else if inner == ty_float {
@@ -1357,15 +1359,7 @@ fn gen_param(b: Buf, r: Route, i: int) {
     }
     if !optional {
         buf_add(b, "            let " + v + "_s = " + q + " else \{\n                __missing(" + lit + ")\n                return\n            }\n")
-        if conv.byte_len() == 0 {
-            buf_add(b, "            let " + v + " = " + v + "_s\n")
-        } else {
-            buf_add(b, "            let " + v + " = " + conv + "(" + v + "_s, " + lit + ") else \{\n                return\n            }\n")
-        }
-        return
-    }
-    if conv.byte_len() == 0 {
-        buf_add(b, "            let " + v + " = " + q + "\n")
+        buf_add(b, "            let " + v + " = " + conv + "(" + v + "_s, " + lit + ") else \{\n                return\n            }\n")
         return
     }
     buf_add(b, "            var " + v + ": " + ty_name(p.ty) + " = none\n")
@@ -1397,17 +1391,15 @@ fn default_src(ti: int, ty: int) -> str {
 fn gen_default_param(b: Buf, p: Param, q: str, lit: str) {
     let v = "p_" + p.name
     let dv = default_src(p.def, p.ty)
-    if p.ty == ty_str {
-        buf_add(b, "            let " + v + " = " + q + " ?? " + dv + "\n")
-        return
-    }
     buf_add(b, "            var " + v + ": " + ty_name(p.ty) + " = " + dv + "\n")
     buf_add(b, "            if let " + v + "_s = " + q + " \{\n")
     if is_enum(p.ty) {
         gen_enum_param(b, v + "_x", p.ty, v + "_s", lit)
     } else {
         var conv = "__param_int"
-        if p.ty == ty_float {
+        if p.ty == ty_str {
+            conv = "__param_text"
+        } else if p.ty == ty_float {
             conv = "__param_float"
         } else if p.ty == ty_bool {
             conv = "__param_bool"
@@ -1522,7 +1514,9 @@ fn gen_everies(b: Buf) {
 }
 
 // Снимок всех store в JSON (KHRIP_DATA): поля необязательные, чтобы снимок
-// читался и после того, как в программе появились новые store.
+// читался и после того, как в программе появились новые store. Чтение снимка —
+// мягкое (__from_json_lenient): неправильный UTF-8 в нём становится U+FFFD, а не
+// останавливает сервер.
 fn gen_snapshot(b: Buf) {
     var has_store = false
     for g in globals {
@@ -1552,7 +1546,7 @@ fn gen_snapshot(b: Buf) {
             buf_add(b, " " + g.name + ": " + g.name)
         }
     }
-    buf_add(b, " })\n}\n\nfn __store_restore(text: str) -> bool \{\n    let __s: __Snapshot? = from_json(text)\n    let __v = __s else \{\n        return false\n    }\n")
+    buf_add(b, " })\n}\n\nfn __store_restore(text: str) -> bool \{\n    let __s: __Snapshot? = __from_json_lenient(text)\n    let __v = __s else \{\n        return false\n    }\n")
     for g in globals {
         if g.is_store && !files[toks[g.tok].file].is_lib {
             buf_add(b, "    if let __x = __v." + g.name + " \{\n        " + g.name + " = __x\n    }\n")
