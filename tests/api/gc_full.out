@@ -1,0 +1,4 @@
+FAIL  the store heap runs out while copying into it
+    panic: out of memory at region
+ok    the program goes on, and the panic text was in the arena
+2 tests: 1 passed, 1 failed

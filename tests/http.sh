@@ -259,3 +259,33 @@ if "$KHC" -o "$tmp/boot_store" tests/load/boot_store.kh >"$tmp/boot_store.err" 2
 else
 	failed "tests/load/boot_store.kh" "$(cat "$tmp/boot_store.err")"
 fi
+
+# Память кончилась (tests/load/oom_store.kh, RLIMIT_DATA 200 МБ): и в арене
+# запроса, и в куче store (паника посреди копирования в store) — ответ 500, а
+# сервер отвечает дальше. Раньше паника из-за отказа в памяти строила свой
+# текст в той же памяти и падала с переполнением стека.
+oom_port=$((HTTP_PORT + 6))
+if "$KHC" -o "$tmp/oom_store" tests/load/oom_store.kh >"$tmp/oom_store.err" 2>&1; then
+	(
+		ulimit -d 200000
+		PORT=$oom_port THREADS=1 exec "$tmp/oom_store" 2>"$tmp/oom_store.log"
+	) &
+	oom_pid=$!
+	for _ in $(seq 100); do
+		curl -s -o /dev/null "http://127.0.0.1:$oom_port/count" && break
+		sleep 0.05
+	done
+	r=""
+	for u in "POST /arena" "GET /count" "POST /arena" "POST /store" "GET /count" "POST /store" "GET /count"; do
+		r="$r $(curl -s -m 30 -o /dev/null -w '%{http_code}' -X "${u% *}" "http://127.0.0.1:$oom_port${u#* }")"
+	done
+	if [[ "$r" == " 500 200 500 500 200 500 200" ]] && kill -0 "$oom_pid" 2>/dev/null && [[ $(grep -c "^panic: out of memory" "$tmp/oom_store.log") == 4 ]]; then
+		http_ok
+	else
+		failed "http: память кончилась" "коды:$r; журнал: $(cat "$tmp/oom_store.log")"
+	fi
+	kill "$oom_pid" 2>/dev/null
+	wait "$oom_pid" 2>/dev/null
+else
+	failed "tests/load/oom_store.kh" "$(cat "$tmp/oom_store.err")"
+fi

@@ -1,0 +1,26 @@
+// Куча store кончилась посреди копирования в store (lib/gc.kh, __gc_pages):
+// паника — провал теста (у запроса — ответ 500) с текстом, а не переполнение
+// стека, и программа продолжает работать. Текст паники строится в арене, не в
+// store: выделение из store кончается до него (__panic, lib/core.kh). Чтобы не
+// заполнять 256 ГБ, ёмкость кучки страниц урезается до нынешней.
+
+type Big { a: str, b: str, c: [int] }
+
+store keep: [Big]
+
+test "the store heap runs out while copying into it" {
+    keep.push(Big { a: "first", b: "b", c: [1] })
+    store64(__gc_ph + PH_MAX, load64(__gc_ph + PH_CAP))
+    var i = 0
+    while true {
+        keep.push(Big { a: "item {i} " + "x".repeat(1000), b: "b", c: [i, i + 1] })
+        i += 1
+    }
+}
+
+test "the program goes on, and the panic text was in the arena" {
+    expect keep.len() > 100
+    expect keep[0].a == "first"
+    expect keep[keep.len() - 1].c.len() == 2
+    expect __in_arena(load64(__ctx() + CTX_PANIC))
+}

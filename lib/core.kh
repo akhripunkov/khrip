@@ -44,7 +44,8 @@ const CTX_END = 16
 // обычная память потока, пока выделение идёт из арены запроса
 const CTX_SAVE_PTR = 24
 const CTX_SAVE_END = 32
-// арена потока: начало и конец подключённой части (0 — арены нет)
+// арена потока: начало и конец подключённой части (0 — арены нет); у арены с
+// MAP_NORESERVE подключена вся
 const CTX_ARENA = 40
 const CTX_ARENA_END = 48
 // арена (или обычная память), пока выделение идёт из кучи store (0 — не идёт;
@@ -85,7 +86,8 @@ const CTX_POOL = 256
 const CTX_VCACHE = 264
 // соединения с базой этого потока (lib/pg.kh) или 0
 const CTX_PGPOOL = 272
-// поток уже в панике из-за памяти: остаток арены (запас) — на её обработку
+// поток уже в панике из-за памяти: 1 — запрос исчерпал арену, 2 — система не
+// дала памяти; остаток арены (запас) — на обработку паники
 const CTX_MEMPANIC = 280
 // пул MongoDB этого потока (lib/mongo.kh) или 0
 const CTX_MONGOPOOL = 288
@@ -97,6 +99,10 @@ const CTX_JDEPTH = 240
 const CTX_JPATH = 248
 // запас в конце арены для ответа 500 и журнала после исчерпания памяти
 const ARENA_RESERVE = 16777216
+// арена, которая подключается кусками (без MAP_NORESERVE): столько подключённой
+// памяти держится сверх нужного — на ответ 500, если система откажет в
+// следующем куске
+const ARENA_PANIC = 65536
 // кэш строк потока (lib/text.kh) для кода вне арены: fn main, __init_globals,
 // загрузка store; у запроса кэш — в начале его арены (__arena_begin)
 const CTX_STRC = 1024
@@ -210,8 +216,29 @@ fn __alloc_slow(c: int, size: int) -> int {
             syscall(1, 2, __str_ptr(fixed), __str_len(fixed))
             syscall(231, 101)
         }
-        if new_end > end && syscall(10, end, new_end - end, 3) < 0 {
-            __panic(PANIC_MEMORY, "mprotect")
+        // подключено до CTX_ARENA_END (у арены с MAP_NORESERVE — вся); кусками
+        // подключается до new_end и ещё ARENA_PANIC сверх
+        let committed = load64(c + CTX_ARENA_END)
+        var top = new_end + ARENA_PANIC
+        if top > load64(c + CTX_ARENA) + __arena_size(load64(c + CTX_ARENA)) {
+            top = load64(c + CTX_ARENA) + __arena_size(load64(c + CTX_ARENA))
+        }
+        if top > committed {
+            if syscall(10, committed, top - committed, 3) < 0 {
+                // система не дала памяти (RLIMIT_DATA, строгий учёт): паника с
+                // готовым текстом, без выделений (иначе её текст снова попросил
+                // бы память и снова паниковал — до переполнения стека), а
+                // подключённый запас — на её обработку
+                if load64(c + CTX_MEMPANIC) == 0 && committed > end {
+                    store64(c + CTX_MEMPANIC, 2)
+                    store64(c + CTX_END, committed)
+                    __panic(PANIC_MEMORY, "mprotect")
+                }
+                let fixed = "panic: out of memory: the system refused memory for the request\n"
+                syscall(1, 2, __str_ptr(fixed), __str_len(fixed))
+                syscall(231, 101)
+            }
+            store64(c + CTX_ARENA_END, top)
         }
         store64(c + CTX_END, new_end)
         store64(c + CTX_PTR, p + size)
@@ -409,9 +436,14 @@ fn __arena_begin() {
     store64(c + CTX_SAVE_END, load64(c + CTX_END))
     store64(c + CTX_PTR, load64(c + CTX_ARENA))
     // последние ARENA_RESERVE байт — запас на ответ 500 после исчерпания памяти:
-    // быстрый путь выделения до них не доходит
+    // быстрый путь выделения до них не доходит; у арены, которая подключается
+    // кусками, — и последние ARENA_PANIC подключённых байт
+    let base = load64(c + CTX_ARENA)
     var end = load64(c + CTX_ARENA_END)
-    let cap = load64(c + CTX_ARENA) + __arena_size(load64(c + CTX_ARENA)) - ARENA_RESERVE
+    if end < base + __arena_size(base) && end >= base + ARENA_PANIC {
+        end -= ARENA_PANIC
+    }
+    let cap = base + __arena_size(base) - ARENA_RESERVE
     if end > cap {
         end = cap
     }
@@ -434,19 +466,18 @@ fn __strc_clear() {
 }
 
 // Освободить всё, что выделено в арене, и вернуться к обычной памяти.
-// Арена обнуляется: выделитель обещает нулевую память.
+// Арена обнуляется: выделитель обещает нулевую память. Подключённая память
+// остаётся подключённой (CTX_ARENA_END) — для следующего запроса.
 fn __arena_end() {
     let c = __ctx()
     let base = load64(c + CTX_ARENA)
     let used = load64(c + CTX_PTR) - base
-    let end = load64(c + CTX_END)
     if used > 8 * COMMIT {
         // большой запрос: вернуть страницы системе (они вернутся нулевыми)
         syscall(28, base, (used + 4095) & ~4095, 4)
     } else {
         __memset(base, 0, used)
     }
-    store64(c + CTX_ARENA_END, end)
     store64(c + CTX_PTR, load64(c + CTX_SAVE_PTR))
     store64(c + CTX_END, load64(c + CTX_SAVE_END))
 }
@@ -518,8 +549,14 @@ fn __panic_text(kind: int) -> str {
 
 // Паника: текст запоминается в контексте; внутри запроса или теста управление
 // возвращается в рантайм (__panic_recover), иначе программа завершается.
-// Паника с готовым текстом.
+// Паника с готовым текстом. Текст паники, начатой во время копирования в
+// store (__pmode_on), строится уже в арене: выделение из store кончается, —
+// иначе паника из-за нехватки памяти store паниковала бы снова на своём тексте,
+// а текст лежал бы в store, где на него не ссылается ни один корень.
 fn __panic_msg(text: str) {
+    if load64(__ctx() + CTX_PSAVE_PTR) != 0 {
+        __pmode_off()
+    }
     let msg = "panic: " + text
     let mh: int = __cast(msg)
     store64(__ctx() + CTX_PANIC, mh)
@@ -529,9 +566,16 @@ fn __panic_msg(text: str) {
 }
 
 fn __panic(kind: int, at: str) {
-    if kind == PANIC_MEMORY && load64(__ctx() + CTX_MEMPANIC) != 0 {
+    if load64(__ctx() + CTX_PSAVE_PTR) != 0 {
+        __pmode_off()
+    }
+    let mp = load64(__ctx() + CTX_MEMPANIC)
+    if kind == PANIC_MEMORY && mp != 0 {
         // память кончилась: текст без выделений, и не исчерпать запас повторно
-        let fixed = "panic: out of memory: the request used all of its 1 GB arena"
+        var fixed = "panic: out of memory: the request used all of its 1 GB arena"
+        if mp == 2 {
+            fixed = "panic: out of memory: the system refused memory for the request"
+        }
         store64(__ctx() + CTX_PANIC, __cast(fixed))
         __panic_recover()
         eprint(fixed)
