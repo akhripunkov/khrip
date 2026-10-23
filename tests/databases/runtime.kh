@@ -128,7 +128,7 @@ route POST "/fault/{mode}" (mode: int) -> int | 409 str {
     let deadline = now_ms() + 10000
     // Checkout uses a live pooled Mongo connection when available. Cleanup must
     // decrement the pool's active count even if this request never returns it.
-    let mongo = __mongo_take(client.uri, deadline)
+    let mongo = __mongo_take(__mongo_key(client.uri), MONGO_POOL_SIZE, MONGO_IDLE_MS, deadline)
     if mongo == 0 { fail(500, "fault injection could not acquire Mongo resource") }
     let config = runtime_ch()
     let u = __parse_url(config.url) else { fail(500, "invalid test URL") }

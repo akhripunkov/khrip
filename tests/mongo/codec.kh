@@ -32,6 +32,40 @@ type CodecOptionals {
     nested: CodecNested?
 }
 
+type CodecPatch {
+    title: str?, body: str?, tags: [str]?
+}
+type CodecItem {
+    _id: BsonObjectId?, title: str
+}
+type CodecRaw {
+    amount: Bson, label: str
+}
+type CodecNumbers {
+    price: float, qty: int, big: int, half: float
+}
+type CodecQty {
+    qty: int
+}
+type CodecPrice {
+    price: float
+}
+type CodecInner {
+    b: str, n: int
+}
+type CodecDeep {
+    a: CodecInner
+}
+type CodecN {
+    n: int
+}
+type CodecOid {
+    oid: BsonObjectId
+}
+type CodecArrays {
+    docs: [CodecNested], tags: [str]
+}
+
 var checks: int
 var failures: int
 
@@ -113,7 +147,8 @@ fn main() -> int {
     if let copy = optional_copy {
         verify("boxed optional float", (copy.floating ?? 0.0) == 2.5)
         verify("nested optional float arrays", (copy.floats[0] ?? 0.0) == 1.25 && copy.floats[1] == none && (copy.floats[2] ?? 0.0) == -3.5)
-        verify("nested optional float maps", (copy.mapping["some"] ?? 0.0) == 4.5 && copy.mapping.has("none") && copy.mapping["none"] == none)
+        // none в map не пишется (как поле структуры): записи "none" нет
+        verify("nested optional float maps", (copy.mapping["some"] ?? 0.0) == 4.5 && !copy.mapping.has("none"))
         if let nested = copy.nested { verify("optional nested struct", nested.title == "optional") }
         else { verify("optional nested struct", false) }
     }
@@ -170,19 +205,237 @@ fn main() -> int {
     __bson_u32(message, 0)
     buf_byte(message, 0)
     buf_add(message, okdoc.data)
-    verify("OP_MSG valid", __mongo_response(buf_str(message), 7).error == "")
-    verify("OP_MSG wrong request", __mongo_response(buf_str(message), 8).error != "")
+    verify("OP_MSG valid", __mongo_response(buf_str(message), 7, BSON_MAX_BYTES).error == "")
+    verify("OP_MSG wrong request", __mongo_response(buf_str(message), 8, BSON_MAX_BYTES).error != "")
     store32(message.data + 16, 2)
-    verify("OP_MSG unsolicited moreToCome", __mongo_response(buf_str(message), 7).error != "")
+    verify("OP_MSG unsolicited moreToCome", __mongo_response(buf_str(message), 7, BSON_MAX_BYTES).error != "")
     verify("unsupported SRV", __mongo_url("mongodb+srv://host/test").error != "")
     verify("unsupported seed list", __mongo_url("mongodb://one,two/test").error != "")
-    verify("unsupported URI option", __mongo_url("mongodb://host/test?retryWrites=true").error != "")
+    verify("unsupported URI option", __mongo_url("mongodb://host/test?readPreference=secondary").error != "")
     verify("explicit /test auth source", __mongo_url("mongodb://u:p@host/test").auth_source == "test")
     verify("omitted database auth source", __mongo_url("mongodb://u:p@host").auth_source == "admin")
     verify("invalid URI escaping", __mongo_url("mongodb://u:%xy@host/test").error != "")
+    regressions()
     print("BSON/Mongo protocol: {checks} checks, {failures} failed")
     if failures != 0 {
         return 1
     }
     return 0
+}
+
+fn arena() -> int {
+    return load64(__ctx() + CTX_PTR)
+}
+
+// Ответ OP_MSG на запрос 7 с документом body.
+fn reply(body: str) -> str {
+    let m = buf_new(body.byte_len() + 32)
+    __bson_u32(m, 21 + body.byte_len())
+    __bson_u32(m, 8)
+    __bson_u32(m, 7)
+    __bson_u32(m, 2013)
+    __bson_u32(m, 0)
+    buf_byte(m, 0)
+    buf_add(m, body)
+    return buf_str(m)
+}
+
+// Документ {ok: 1.0, pad: "xx..."} ровно из n байт (без проверок построителя).
+fn padded(n: int) -> str {
+    let len = n - 27
+    let b = buf_new(n)
+    __bson_u32(b, n)
+    buf_byte(b, 1)
+    buf_add(b, "ok")
+    buf_byte(b, 0)
+    let one = 1.0
+    __bson_u64(b, __cast(one))
+    buf_byte(b, 2)
+    buf_add(b, "pad")
+    buf_byte(b, 0)
+    __bson_u32(b, len + 1)
+    buf_add(b, "x".repeat(len))
+    buf_byte(b, 0)
+    buf_byte(b, 0)
+    return buf_str(b)
+}
+
+// Регрессии разбора PR #1 (docs/reviews/pr1-mongo-clickhouse.md).
+fn regressions() {
+    // В1: Bson внутри to_bson — вложенный документ, как bson_doc, а не
+    // структура {data, error}.
+    let filter = to_bson({ "amount": to_bson({ "$gt": 100 }) })
+    let amount = bson_get_doc(filter, "amount") ?? filter
+    verify("nested Bson is a subdocument", filter.error == "" && bson_get_int(amount, "$gt") == 100 && !bson_has(amount, "data"))
+    let set = to_bson({ "$set": to_bson(CodecPatch { title: "new" }) })
+    let fields = bson_get_doc(set, "$set") ?? set
+    verify("$set from to_bson", bson_get_str(fields, "title") == "new" && !bson_has(fields, "error"))
+    let raw = to_bson(CodecRaw { amount: to_bson({ "$lt": 5 }), label: "x" })
+    let raw_back: CodecRaw? = from_bson(raw)
+    verify("Bson field round trip", raw_back != none && bson_get_int((raw_back ?? CodecRaw { amount: raw, label: "" }).amount, "$lt") == 5)
+    let failed = to_bson({ "bad": Bson { data: "", error: "boom" } })
+    verify("error of a nested Bson keeps its path", failed.error == "BSON field 'bad' is invalid: boom")
+    let invalid = to_bson({ "bad": Bson { data: raw_hex("0500000001") } })
+    verify("invalid nested Bson rejected", invalid.error.contains("'bad'") && invalid.error.contains("invalid BSON document"))
+    // В2: none не пишется (PATCH не стирает поля), явный null — через построитель.
+    let patch = to_bson(CodecPatch { title: "new", body: none, tags: none })
+    verify("none fields are omitted", bson_has(patch, "title") && !bson_has(patch, "body") && !bson_has(patch, "tags"))
+    verify("none _id is omitted", !bson_has(to_bson(CodecItem { _id: none, title: "x" }), "_id"))
+    let nulls = bson_new()
+    bson_null(nulls, "body")
+    verify("explicit null through the builder", bson_is_null(bson_finish(nulls), "body"))
+    // С2: числа расширяются без потерь, с потерей — ошибка.
+    let mixed = bson_new()
+    bson_int32(mixed, "price", 10)
+    bson_float(mixed, "qty", 2.0)
+    bson_float(mixed, "big", 5000000000.0)
+    bson_int(mixed, "half", 7)
+    let m = bson_finish(mixed)
+    let numbers: CodecNumbers? = from_bson(m)
+    verify("numeric widening in from_bson", numbers != none)
+    if let n = numbers {
+        verify("widened values", n.price == 10.0 && n.qty == 2 && n.big == 5000000000 && n.half == 7.0)
+    }
+    verify("bson_get_int reads a whole double", bson_get_int(m, "big") == 5000000000)
+    verify("bson_get_float reads int32 and int64", bson_get_float(m, "price") == 10.0 && bson_get_float(m, "half") == 7.0)
+    let fraction = bson_new()
+    bson_float(fraction, "qty", 2.5)
+    let q: CodecQty? = from_bson(bson_finish(fraction))
+    verify("fractional double is not an int", q == none && bson_error().contains("'qty'") && bson_error().contains("whole"))
+    let beyond = bson_new()
+    bson_float(beyond, "qty", 10000000000000000000.0)
+    let q2: CodecQty? = from_bson(bson_finish(beyond))
+    verify("double beyond int64", q2 == none)
+    let nan: float = __cast(0x7FF8000000000000)
+    let not_number = bson_new()
+    bson_float(not_number, "qty", nan)
+    let q3: CodecQty? = from_bson(bson_finish(not_number))
+    verify("NaN is not an int", q3 == none)
+    let precise = bson_new()
+    bson_int(precise, "price", 9007199254740993)
+    let p1: CodecPrice? = from_bson(bson_finish(precise))
+    verify("int64 that float cannot hold", p1 == none && bson_error().contains("'price'"))
+    let edge = bson_new()
+    bson_int(edge, "price", -9223372036854775807 - 1)
+    bson_float(edge, "qty", -9223372036854775808.0)
+    let e = bson_finish(edge)
+    let p2: CodecPrice? = from_bson(e)
+    let q4: CodecQty? = from_bson(e)
+    verify("int64 minimum widens both ways", p2 != none && q4 != none && (q4 ?? CodecQty { qty: 0 }).qty == -9223372036854775807 - 1)
+    // С3, Н6: UTF-8 проверяется при превращении в str — с путём поля; другие
+    // поля того же документа читаются.
+    let inner_hex = "1a000000" + "026200" + "03000000fffe00" + "126e00" + "0100000000000000" + "00"
+    let deep = Bson { data: raw_hex("22000000" + "036100" + inner_hex + "00") }
+    let d: CodecDeep? = from_bson(deep)
+    verify("UTF-8 error names the field path", d == none && bson_error() == "BSON field 'a.b' is not valid UTF-8")
+    let inner = Bson { data: raw_hex(inner_hex) }
+    let only_n: CodecN? = from_bson(inner)
+    verify("other fields of the document decode", (only_n ?? CodecN { n: 0 }).n == 1)
+    verify("bson_get_str checks UTF-8", bson_get_str(inner, "b") == none && bson_error().contains("'b'") && bson_error().contains("UTF-8"))
+    verify("bson_valid still checks UTF-8", !bson_valid(deep) && __bson_check(__str_ptr(deep.data), deep.data.byte_len(), 0, false, false))
+    let batch = bson_new()
+    bson_int(batch, "id", 0)
+    bson_str(batch, "ns", "db.items")
+    bson_array(batch, "firstBatch", [bson_finish(bson_new()), Bson { data: raw_hex(inner_hex), checked: true }])
+    let body = bson_new()
+    bson_doc(body, "cursor", bson_finish(batch))
+    bson_float(body, "ok", 1.0)
+    let with_bad = __mongo_response(reply(bson_finish(body).data), 7, BSON_MAX_BYTES)
+    verify("a bad string does not fail the reply", with_bad.error == "" && !with_bad.unknown_outcome)
+    let cursor = MongoCursor { client: Mongo { uri: "mongodb://h/db" }, database: "db", collection: "items" }
+    __mongo_cursor_batch(cursor, with_bad, "firstBatch")
+    verify("a bad string does not fail the batch", cursor.error == "" && cursor.documents.len() == 2 && cursor.ns == "db.items")
+    // С1: ответ до maxBsonObjectSize + 16 КиБ; больше — ошибка с размером.
+    let big = __mongo_response(reply(padded(16777216 + 1000)), 7, BSON_MAX_BYTES)
+    verify("reply over 16 MiB with the cursor envelope", big.error == "")
+    let huge = __mongo_response(reply(padded(16777216 + 20000)), 7, BSON_MAX_BYTES)
+    verify("oversized reply names its size", huge.unknown_outcome && huge.error.contains("16797216") && huge.error.contains("16793600"))
+    // С13: object_id и исходная ошибка с путём поля.
+    let id1 = object_id()
+    let id2 = object_id()
+    var hex_ok = id1.byte_len() == 24 && id1 != id2
+    for i in 0..id1.byte_len() {
+        hex_ok = hex_ok && __hex_val(id1.byte(i)) >= 0
+    }
+    verify("object_id is 24 hex digits", hex_ok)
+    let raw1 = __alloc(12)
+    let raw2 = __alloc(12)
+    __unhex(id1, raw1)
+    __unhex(id2, raw2)
+    let seconds = load8(raw1) * 16777216 + load8(raw1 + 1) * 65536 + load8(raw1 + 2) * 256 + load8(raw1 + 3)
+    let c1 = load8(raw1 + 9) * 65536 + load8(raw1 + 10) * 256 + load8(raw1 + 11)
+    let c2 = load8(raw2 + 9) * 65536 + load8(raw2 + 10) * 256 + load8(raw2 + 11)
+    verify("object_id: time, process value, counter", (seconds - now()).abs() <= 5 && __memeq(raw1 + 4, raw2 + 4, 5) && c2 == (c1 + 1) % 16777216)
+    let ids: map[str, bool] = {}
+    for i in 0..10000 {
+        ids[object_id()] = true
+    }
+    verify("object_id is unique", ids.len() == 10000)
+    let bad_id = to_bson(CodecOid { oid: BsonObjectId { hex: "zz" } })
+    verify("to_bson error names the field", bad_id.error == "BSON field 'oid' needs 24 hexadecimal digits for an ObjectId")
+    let insert = mongo_insert(Mongo { uri: "mongodb://127.0.0.1:1/test" }, "test", "c", [bad_id])
+    verify("insert keeps the original error and path", insert.error.contains("'documents.0.oid'") && insert.error.contains("ObjectId") && !insert.unknown_outcome)
+    // В8: аксессоры и проверка массивов не выделяют память на каждое поле.
+    let wide = bson_new()
+    for i in 0..1000 {
+        bson_int(wide, "f{i}", i)
+    }
+    let w = bson_finish(wide)
+    // Память потока вне запроса — куски по 1 МиБ: замер, перешедший в новый
+    // кусок, повторяется.
+    var cost = -1
+    var found = 0
+    for attempt in 0..3 {
+        let before = arena()
+        found = 0
+        for i in 0..100 {
+            found += bson_get_int(w, "f999") ?? 0
+            if bson_has(w, "absent") {
+                found += 1
+            }
+        }
+        let delta = arena() - before
+        if delta >= 0 && delta < 1048576 {
+            cost = delta
+            break
+        }
+    }
+    verify("accessors walk without allocating per field", found == 99900 && cost >= 0 && cost < 100 * 64)
+    var many: [int] = []
+    for i in 0..10000 {
+        many.push(i)
+    }
+    let arr = bson_new()
+    bson_int_array(arr, "xs", many)
+    let xs = bson_finish(arr)
+    let before2 = arena()
+    verify("array keys checked in place", bson_valid(xs) && arena() == before2)
+    let badkeys = raw_hex("1800000004610010000000123100010000000000000000" + "00")
+    verify("array keys must count from 0", !bson_valid(Bson { data: badkeys }))
+    // С14: стандартные опции URI.
+    let opts = __mongo_url("mongodb://h/db?retryWrites=true&w=majority&wtimeoutMS=500&journal=true&appName=svc&maxPoolSize=4&minPoolSize=1&maxIdleTimeMS=1000&connectTimeoutMS=200&serverSelectionTimeoutMS=100&readPreference=primary&compressors=zlib,snappy&replicaSet=rs0&directConnection=true&ReTryReads=false&socketTimeoutMS=9")
+    verify("standard URI options accepted", opts.error == "" && opts.w == "majority" && opts.wtimeout == 500 && opts.journal == 1 && opts.app_name == "svc" && opts.max_pool == 4 && opts.idle_ms == 1000 && opts.connect_ms == 200 && opts.replica_set == "rs0" && opts.direct)
+    verify("numeric w", __mongo_url("mongodb://h/db?w=2").w_number == 2)
+    for bad in ["w=0", "readPreference=secondaryPreferred", "tlsInsecure=true", "tlsAllowInvalidCertificates=true", "loadBalanced=true", "authMechanism=SCRAM-SHA-1", "readConcernLevel=majority", "maxStalenessSeconds=90", "maxPoolSize=-1", "w=-1", "foo=bar", "retryWrites=true&retrywrites=false"] {
+        verify("rejected URI option " + bad, __mongo_url("mongodb://h/db?" + bad).error != "")
+    }
+    let insert_cmd = bson_new()
+    bson_str(insert_cmd, "insert", "c")
+    bson_array(insert_cmd, "documents", [bson_finish(bson_new())])
+    let concern = __mongo_prepare(Mongo { uri: "mongodb://h/db?w=majority&wtimeoutMS=500" }, "db", bson_finish(insert_cmd))
+    verify("URI write concern added to writes", concern.error == "" && concern.wire.contains("writeConcern") && concern.wire.contains("majority") && concern.wire.contains("wtimeout"))
+    let find_cmd = bson_new()
+    bson_str(find_cmd, "find", "c")
+    let reading = __mongo_prepare(Mongo { uri: "mongodb://h/db?w=majority" }, "db", bson_finish(find_cmd))
+    verify("URI write concern not added to reads", reading.error == "" && !reading.wire.contains("writeConcern"))
+    let own = bson_new()
+    bson_str(own, "insert", "c")
+    let w1 = bson_new()
+    bson_int32(w1, "w", 1)
+    bson_doc(own, "writeConcern", bson_finish(w1))
+    let explicit = __mongo_prepare(Mongo { uri: "mongodb://h/db?w=majority" }, "db", bson_finish(own))
+    verify("command write concern wins", explicit.error == "" && !explicit.wire.contains("majority"))
+    let arrays = to_bson(CodecArrays { docs: [CodecNested { title: "a" }], tags: ["x"] })
+    verify("bson_get_array reads documents", (bson_get_array(arrays, "docs") ?? []).len() == 1)
+    verify("bson_get_array fails on scalars", bson_get_array(arrays, "tags") == none && bson_error().contains("'tags.0'"))
 }

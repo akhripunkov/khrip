@@ -1,12 +1,26 @@
-// BSON 1.1 codec. Documents preserve order and BSON types; no JSON round trip.
-// Public builders never interpolate input as query syntax. Limits apply before
-// dereferencing untrusted lengths. See https://bsonspec.org/spec.html.
+// BSON 1.1 (https://bsonspec.org/spec.html). Документ хранит порядок полей и
+// точные типы BSON, без JSON посередине. Построители не превращают переданные
+// значения в синтаксис запроса. Длины из чужих байтов сверяются с границами
+// до чтения по ним.
+//
+// Документ проверяется один раз — на границе доверия: bson_parse, bson_finish,
+// to_bson и ответ сервера (lib/mongo.kh). Результат помечен checked: его не
+// проверяют снова, когда вкладывают в другой документ или отправляют.
+// Аксессоры, обходы и from_bson не проверяют документ заранее и не строят
+// списков полей: каждый шаг сверяет длину значения с границами документа,
+// поэтому они безопасны и на непроверенных байтах (испорченная часть просто не
+// находится). UTF-8 строки проверяется там, где значение становится str
+// (from_bson, bson_get_str, имена полей map), — с путём поля в ошибке: одна
+// испорченная строка не мешает читать остальной ответ.
 
 const BSON_MAX_BYTES = 16777216
 const BSON_MAX_DEPTH = 64
 
 type Bson {
-    data: str, error: str = ""
+    data: str
+    error: str = ""
+    // байты проверены (ставит библиотека): вложение и отправка их не перепроверяют
+    checked: bool = false
 }
 type BsonBuilder {
     buffer: Buf, error: str = "", keys: map[str, bool] = {}
@@ -20,7 +34,7 @@ type BsonDate {
 type BsonBinary {
     data: str, subtype: int = 0
 }
-// Exact IEEE decimal128 bytes, little endian. Decimal arithmetic is not implied.
+// Точные байты IEEE decimal128 (little endian). Арифметики decimal нет.
 type BsonDecimal128 {
     bytes: str
 }
@@ -30,8 +44,17 @@ type BsonTimestamp {
 type BsonField {
     name: str, kind: int, data: str
 }
+// Чтение from_bson: текст ошибки и путь поля (каждый уровень дописывает своё
+// имя спереди, только при ошибке).
 type __BsonRead {
     error: str = ""
+    path: str = ""
+}
+// Запись to_bson: один буфер на весь документ, вложенные документы — на месте.
+type __BsonOut {
+    b: Buf
+    error: str = ""
+    path: str = ""
 }
 
 fn __bson_u32(b: Buf, n: int) {
@@ -46,60 +69,37 @@ fn __bson_u64(b: Buf, n: int) {
     b.len += 8
 }
 
+// Знаковое int32 по адресу p.
+fn __bson_i32(p: int) -> int {
+    let v = load32(p)
+    if v > 2147483647 {
+        return v - 4294967296
+    }
+    return v
+}
+
+// Первый нулевой байт в [p, end) или -1.
 fn __bson_zero(p: int, end: int) -> int {
-    var i = p
-    while i < end {
-        if load8(i) == 0 {
-            return i
-        }
-        i += 1
+    let i = __find_byte(p, end - p, 0)
+    if i >= end - p {
+        return -1
     }
-    return -1
+    return p + i
 }
 
-// BSON strings and field names are UTF-8; arbitrary bytes belong in Binary.
-// Reject overlong encodings, lone continuations, surrogates and > U+10FFFF.
-fn __bson_utf8(p: int, n: int) -> bool {
-    var i = 0
-    while i < n {
-        let lead = load8(p + i)
-        if lead < 128 {
-            i += 1
-            continue
-        }
-        var size = 0
-        if lead >= 194 && lead <= 223 {
-            size = 2
-        } else if lead >= 224 && lead <= 239 {
-            size = 3
-        } else if lead >= 240 && lead <= 244 {
-            size = 4
-        } else {
-            return false
-        }
-        if size > n - i {
-            return false
-        }
-        let second = load8(p + i + 1)
-        if second < 128 || second > 191 {
-            return false
-        }
-        if (lead == 224 && second < 160) || (lead == 237 && second >= 160) || (lead == 240 && second < 144) || (lead == 244 && second >= 144) {
-            return false
-        }
-        for j in 2..size {
-            let c = load8(p + i + j)
-            if c < 128 || c > 191 {
-                return false
-            }
-        }
-        i += size
+// Конец полей документа [p, p + n) — адрес завершающего нуля — или 0, если
+// длина в заголовке или завершающий ноль не сходятся с n.
+fn __bson_body(p: int, n: int) -> int {
+    if n < 5 || load32(p) != n || load8(p + n - 1) != 0 {
+        return 0
     }
-    return true
+    return p + n - 1
 }
 
-// Returns the byte after one value, or -1. All nested documents validated.
-fn __bson_value_end(kind: int, p: int, end: int, depth: int) -> int {
+// Конец значения вида kind, которое начинается в p, или -1, если оно выходит за
+// end. Только границы: вложенные документы и UTF-8 здесь не проверяются, поэтому
+// обход документа читает каждое значение один раз.
+fn __bson_skip(kind: int, p: int, end: int) -> int {
     var n = 0
     if kind == 1 || kind == 9 || kind == 17 || kind == 18 {
         n = 8
@@ -109,22 +109,16 @@ fn __bson_value_end(kind: int, p: int, end: int, depth: int) -> int {
         n = 12
     } else if kind == 19 {
         n = 16
+    } else if kind == 8 {
+        n = 1
     } else if kind == 6 || kind == 10 || kind == 127 || kind == 255 {
         return p
-    } else if kind == 8 {
-        if p >= end || load8(p) > 1 {
-            return -1
-        }
-        return p + 1
     } else if kind == 2 || kind == 13 || kind == 14 {
-        if end - p < 4 {
+        if end - p < 5 {
             return -1
         }
         n = load32(p)
-        if n < 1 || n > end - p - 4 || load8(p + 4 + n - 1) != 0 {
-            return -1
-        }
-        if !__bson_utf8(p + 4, n - 1) {
+        if n < 1 || n > end - p - 4 || load8(p + 3 + n) != 0 {
             return -1
         }
         return p + 4 + n
@@ -133,7 +127,7 @@ fn __bson_value_end(kind: int, p: int, end: int, depth: int) -> int {
             return -1
         }
         n = load32(p)
-        if n < 5 || n > end - p || !__bson_valid_doc(p, n, depth + 1, kind == 4) {
+        if n < 5 || n > end - p || load8(p + n - 1) != 0 {
             return -1
         }
         return p + n
@@ -145,11 +139,6 @@ fn __bson_value_end(kind: int, p: int, end: int, depth: int) -> int {
         if n > end - p - 5 {
             return -1
         }
-        if load8(p + 4) == 2 {
-            if n < 4 || load32(p + 5) != n - 4 {
-                return -1
-            }
-        }
         return p + 5 + n
     } else if kind == 11 {
         let z = __bson_zero(p, end)
@@ -160,12 +149,9 @@ fn __bson_value_end(kind: int, p: int, end: int, depth: int) -> int {
         if z2 < 0 {
             return -1
         }
-        if !__bson_utf8(p, z - p) || !__bson_utf8(z + 1, z2 - z - 1) {
-            return -1
-        }
         return z2 + 1
     } else if kind == 12 {
-        let z = __bson_value_end(2, p, end, depth)
+        let z = __bson_skip(2, p, end)
         if z < 0 || end - z < 12 {
             return -1
         }
@@ -178,15 +164,7 @@ fn __bson_value_end(kind: int, p: int, end: int, depth: int) -> int {
         if n < 14 || n > end - p {
             return -1
         }
-        let code_end = __bson_value_end(2, p + 4, p + n, depth)
-        if code_end < 0 {
-            return -1
-        }
-        let scope_end = __bson_value_end(3, code_end, p + n, depth)
-        if scope_end != p + n {
-            return -1
-        }
-        return scope_end
+        return p + n
     } else {
         return -1
     }
@@ -196,14 +174,62 @@ fn __bson_value_end(kind: int, p: int, end: int, depth: int) -> int {
     return p + n
 }
 
-fn __bson_valid_doc(p: int, n: int, depth: int, array: bool) -> bool {
-    if depth > BSON_MAX_DEPTH || n < 5 || n > BSON_MAX_BYTES {
+// Ключ [p, p + n) — десятичная запись index без ведущих нулей (ключ элемента
+// массива). Сравнение цифр на месте, без строк.
+fn __bson_index_key(p: int, n: int, index: int) -> bool {
+    var digits = 1
+    var v = index
+    while v >= 10 {
+        v = v / 10
+        digits += 1
+    }
+    if n != digits {
         return false
     }
-    if load32(p) != n || load8(p + n - 1) != 0 {
+    v = index
+    var i = n - 1
+    while i >= 0 {
+        if load8(p + i) != '0' + v % 10 {
+            return false
+        }
+        v = v / 10
+        i -= 1
+    }
+    return true
+}
+
+// Ключ элемента массива index — прямо в буфер.
+fn __bson_put_index(b: Buf, index: int) {
+    var digits = 1
+    var v = index
+    while v >= 10 {
+        v = v / 10
+        digits += 1
+    }
+    buf_reserve(b, digits + 1)
+    v = index
+    var i = digits - 1
+    while i >= 0 {
+        store8(b.data + b.len + i, '0' + v % 10)
+        v = v / 10
+        i -= 1
+    }
+    store8(b.data + b.len + digits, 0)
+    b.len += digits + 1
+}
+
+// Проверка документа [p, p + n): длины, завершающие нули, виды значений,
+// булевы 0/1, ключи массивов "0", "1", ..., глубина; с utf8 — ещё строки и имена
+// полей. Каждый байт читается один раз: рекурсия — только во вложенные
+// документы. Ответы сервера проверяются без utf8 (там UTF-8 проверяет чтение).
+fn __bson_check(p: int, n: int, depth: int, array: bool, utf8: bool) -> bool {
+    if depth > BSON_MAX_DEPTH {
         return false
     }
-    let end = p + n - 1
+    let end = __bson_body(p, n)
+    if end == 0 {
+        return false
+    }
     var at = p + 4
     var index = 0
     while at < end {
@@ -212,28 +238,240 @@ fn __bson_valid_doc(p: int, n: int, depth: int, array: bool) -> bool {
         if z < 0 {
             return false
         }
-        if !__bson_utf8(at + 1, z - at - 1) {
+        if array {
+            if !__bson_index_key(at + 1, z - at - 1, index) {
+                return false
+            }
+        } else if utf8 && __utf8_scan(at + 1, z - at - 1) < 0 {
             return false
         }
-        if array && __str_new(at + 1, z - at - 1) != index.to_str() {
+        let v = z + 1
+        let next = __bson_skip(kind, v, end)
+        if next < 0 {
             return false
         }
-        at = __bson_value_end(kind, z + 1, end, depth)
-        if at < 0 {
-            return false
+        if kind == 3 || kind == 4 {
+            if !__bson_check(v, next - v, depth + 1, kind == 4, utf8) {
+                return false
+            }
+        } else if kind == 8 {
+            if load8(v) > 1 {
+                return false
+            }
+        } else if kind == 5 {
+            // старый подтип 2: внутри ещё одна длина
+            let m = load32(v)
+            if load8(v + 4) == 2 && (m < 4 || load32(v + 5) != m - 4) {
+                return false
+            }
+        } else if kind == 2 || kind == 13 || kind == 14 {
+            if utf8 && __utf8_scan(v + 4, next - v - 5) < 0 {
+                return false
+            }
+        } else if kind == 11 {
+            let z2 = __bson_zero(v, end)
+            if utf8 && (__utf8_scan(v, z2 - v) < 0 || __utf8_scan(z2 + 1, next - z2 - 2) < 0) {
+                return false
+            }
+        } else if kind == 12 {
+            if utf8 && __utf8_scan(v + 4, next - v - 17) < 0 {
+                return false
+            }
+        } else if kind == 15 {
+            // код с областью: общая длина, строка кода, документ области
+            let code_end = __bson_skip(2, v + 4, next)
+            if code_end < 0 || __bson_skip(3, code_end, next) != next {
+                return false
+            }
+            if utf8 && __utf8_scan(v + 8, code_end - v - 9) < 0 {
+                return false
+            }
+            if !__bson_check(code_end, next - code_end, depth + 1, false, utf8) {
+                return false
+            }
         }
+        at = next
         index += 1
     }
-    return at == end
+    return true
 }
 
+// Поле key документа [p, p + n): адрес его байта вида или 0 — поля нет или
+// документ испорчен раньше него. Ключ сравнивается на месте; значение
+// найденного поля целиком внутри документа. Значение — по адресу at + 2 + длина
+// ключа.
+fn __bson_find(p: int, n: int, key: str) -> int {
+    let end = __bson_body(p, n)
+    if end == 0 {
+        return 0
+    }
+    let kp = __str_ptr(key)
+    let kn = key.byte_len()
+    var at = p + 4
+    while at < end {
+        let z = __bson_zero(at + 1, end)
+        if z < 0 {
+            return 0
+        }
+        let next = __bson_skip(load8(at), z + 1, end)
+        if next < 0 {
+            return 0
+        }
+        if z - at - 1 == kn && __memeq(at + 1, kp, kn) {
+            return at
+        }
+        at = next
+    }
+    return 0
+}
+
+// Ключ [kp, kp + kn) равен строке name.
+fn __bson_key_is(kp: int, kn: int, name: str) -> bool {
+    return name.byte_len() == kn && __memeq(kp, __str_ptr(name), kn)
+}
+
+fn __bson_kind_name(kind: int) -> str {
+    if kind == 1 {
+        return "double"
+    }
+    if kind == 2 {
+        return "string"
+    }
+    if kind == 3 {
+        return "document"
+    }
+    if kind == 4 {
+        return "array"
+    }
+    if kind == 5 {
+        return "binary"
+    }
+    if kind == 7 {
+        return "objectId"
+    }
+    if kind == 8 {
+        return "bool"
+    }
+    if kind == 9 {
+        return "date"
+    }
+    if kind == 10 {
+        return "null"
+    }
+    if kind == 16 {
+        return "int32"
+    }
+    if kind == 17 {
+        return "timestamp"
+    }
+    if kind == 18 {
+        return "int64"
+    }
+    if kind == 19 {
+        return "decimal128"
+    }
+    return "type {kind}"
+}
+
+// Тип Khrip по описанию — для текста ошибки.
+fn __bson_type_name(d: int) -> str {
+    let k = load64(d)
+    if k == D_INT {
+        return "int"
+    }
+    if k == D_FLOAT {
+        return "float"
+    }
+    if k == D_BOOL {
+        return "bool"
+    }
+    if k == D_STR {
+        return "str"
+    }
+    if k == D_OPT {
+        return __bson_type_name(load64(d + 8)) + "?"
+    }
+    if k == D_LIST {
+        return "[" + __bson_type_name(load64(d + 8)) + "]"
+    }
+    if k == D_MAP {
+        return "map"
+    }
+    let name: str = __cast(load64(d + 16))
+    return name
+}
+
+// Путь name.path (path пуст — только name).
+fn __bson_join(name: str, path: str) -> str {
+    if path == "" {
+        return name
+    }
+    return name + "." + path
+}
+
+// Ошибка документа, вложенного по пути prefix: "BSON field 'x' ..." становится
+// "BSON field 'prefix.x' ...", другой текст — "BSON field 'prefix' is invalid: текст".
+fn __bson_nest_error(prefix: str, error: str) -> str {
+    let head = "BSON field '"
+    if error.starts_with(head) {
+        return head + prefix + "." + error.byte_slice(head.byte_len(), error.byte_len())
+    }
+    return head + prefix + "' is invalid: " + error
+}
+
+// Текст ошибки — в слот json_error() запроса (или программы вне запроса):
+// bson_error() — причина последнего неудачного from_bson или bson_get_*.
+fn __bson_report(message: str) {
+    if load64(__ctx() + CTX_WORKER) != 0 {
+        let worker = __w()
+        worker.json_err = message
+    } else {
+        __json_last_err = message
+    }
+}
+
+// ---- Числа: расширение без потерь (как Go-драйвер) ----
+
+// double — целое из диапазона int64 (NaN не проходит сравнений). Граница 2^63 —
+// точное число double; x.to_int() паникует на -2^63, поэтому оно отдельно.
+fn __bson_whole(f: float) -> bool {
+    let two63 = 9223372036854775808.0
+    if !(f >= -two63 && f < two63) {
+        return false
+    }
+    if f == -two63 {
+        return true
+    }
+    return f.to_int().to_float() == f
+}
+
+// Целое значение double, для которого __bson_whole.
+fn __bson_to_int(f: float) -> int {
+    if f == -9223372036854775808.0 {
+        return -9223372036854775807 - 1
+    }
+    return f.to_int()
+}
+
+// float хранит int64 v точно.
+fn __bson_exact_float(v: int) -> bool {
+    if v == -9223372036854775807 - 1 {
+        return true
+    }
+    let f = v.to_float()
+    return f < 9223372036854775808.0 && f.to_int() == v
+}
+
+// ---- Разбор и проверка ----
+
 fn bson_valid(doc: Bson) -> bool {
-    return doc.error == "" && __bson_valid_doc(__str_ptr(doc.data), doc.data.byte_len(), 0, false)
+    let n = doc.data.byte_len()
+    return doc.error == "" && n <= BSON_MAX_BYTES && __bson_check(__str_ptr(doc.data), n, 0, false, true)
 }
 
 fn bson_parse(data: str) -> Bson {
     let doc = Bson {
-        data
+        data, checked: true
     }
     if !bson_valid(doc) {
         return Bson {
@@ -242,6 +480,8 @@ fn bson_parse(data: str) -> Bson {
     }
     return doc
 }
+
+// ---- Построитель ----
 
 fn bson_new() -> BsonBuilder {
     let b = BsonBuilder {
@@ -259,12 +499,12 @@ fn __bson_key(b: BsonBuilder, key: str, kind: int, size: int) -> bool {
         b.error = "BSON field name contains NUL"
         return false
     }
-    if !__bson_utf8(__str_ptr(key), key.byte_len()) {
+    if __utf8_scan(__str_ptr(key), key.byte_len()) < 0 {
         b.error = "BSON field name is not UTF-8"
         return false
     }
     if b.keys.has(key) {
-        b.error = "duplicate BSON field: " + key
+        b.error = "BSON field '" + key + "' is duplicated"
         return false
     }
     if size < 0 || size > BSON_MAX_BYTES || key.byte_len() > BSON_MAX_BYTES - size - 2 || b.buffer.len > BSON_MAX_BYTES - size - key.byte_len() - 3 {
@@ -278,6 +518,17 @@ fn __bson_key(b: BsonBuilder, key: str, kind: int, size: int) -> bool {
     return true
 }
 
+fn __bson_fail(b: BsonBuilder, key: str, message: str) {
+    if b.error != "" {
+        return
+    }
+    if __utf8_scan(__str_ptr(key), key.byte_len()) < 0 {
+        b.error = "BSON field name is not UTF-8"
+        return
+    }
+    b.error = "BSON field '" + key + "' " + message
+}
+
 fn bson_int(b: BsonBuilder, key: str, value: int) {
     if __bson_key(b, key, 18, 8) {
         __bson_u64(b.buffer, value)
@@ -286,7 +537,7 @@ fn bson_int(b: BsonBuilder, key: str, value: int) {
 
 fn bson_int32(b: BsonBuilder, key: str, value: int) {
     if value < -2147483648 || value > 2147483647 {
-        b.error = "BSON int32 out of range"
+        __bson_fail(b, key, "does not fit int32")
         return
     }
     if __bson_key(b, key, 16, 4) {
@@ -301,8 +552,8 @@ fn bson_float(b: BsonBuilder, key: str, value: float) {
 }
 
 fn bson_str(b: BsonBuilder, key: str, value: str) {
-    if !__bson_utf8(__str_ptr(value), value.byte_len()) {
-        b.error = "BSON string is not UTF-8; use BsonBinary for bytes"
+    if __utf8_scan(__str_ptr(value), value.byte_len()) < 0 {
+        __bson_fail(b, key, "is not UTF-8; use BsonBinary for bytes")
         return
     }
     if __bson_key(b, key, 2, value.byte_len() + 5) {
@@ -326,9 +577,25 @@ fn bson_null(b: BsonBuilder, key: str) {
     __bson_key(b, key, 10, 0)
 }
 
+// Вложенный документ годится: без ошибки и проверен (непроверенный проверяется
+// сейчас, один раз). → "" или текст ошибки с путём key.
+fn __bson_nested(key: str, value: Bson) -> str {
+    if value.error != "" {
+        return __bson_nest_error(key, value.error)
+    }
+    if !value.checked && !bson_valid(value) {
+        return "BSON field '" + key + "' holds an invalid BSON document"
+    }
+    return ""
+}
+
 fn __bson_doc(b: BsonBuilder, key: str, value: Bson, kind: int) {
-    if !bson_valid(value) {
-        b.error = "invalid nested BSON document"
+    if b.error != "" {
+        return
+    }
+    let bad = __bson_nested(key, value)
+    if bad != "" {
+        b.error = bad
         return
     }
     if __bson_key(b, key, kind, value.data.byte_len()) {
@@ -340,25 +607,54 @@ fn bson_doc(b: BsonBuilder, key: str, value: Bson) {
     __bson_doc(b, key, value, 3)
 }
 
+// Массив документов пишется сразу в буфер построителя: без промежуточного
+// документа, словаря ключей и строк индексов.
 fn bson_array(b: BsonBuilder, key: str, values: [Bson]) {
-    let a = bson_new()
-    for i in 0..values.len() {
-        bson_doc(a, i.to_str(), values[i])
+    if b.error != "" {
+        return
     }
-    __bson_doc(b, key, bson_finish(a), 4)
+    var size = 5
+    for i in 0..values.len() {
+        let value = values[i]
+        if value.error != "" || (!value.checked && !bson_valid(value)) {
+            b.error = __bson_nested(key + "." + i.to_str(), value)
+            return
+        }
+        size += value.data.byte_len() + 12
+    }
+    if !__bson_key(b, key, 4, size) {
+        return
+    }
+    buf_reserve(b.buffer, size)
+    let start = b.buffer.len
+    __bson_u32(b.buffer, 0)
+    for i in 0..values.len() {
+        buf_byte(b.buffer, 3)
+        __bson_put_index(b.buffer, i)
+        buf_add(b.buffer, values[i].data)
+    }
+    buf_byte(b.buffer, 0)
+    store32(b.buffer.data + start, b.buffer.len - start)
 }
 
 fn bson_int_array(b: BsonBuilder, key: str, values: [int]) {
-    let a = bson_new()
-    for i in 0..values.len() {
-        bson_int(a, i.to_str(), values[i])
+    if !__bson_key(b, key, 4, 5 + values.len() * 21) {
+        return
     }
-    __bson_doc(b, key, bson_finish(a), 4)
+    let start = b.buffer.len
+    __bson_u32(b.buffer, 0)
+    for i in 0..values.len() {
+        buf_byte(b.buffer, 18)
+        __bson_put_index(b.buffer, i)
+        __bson_u64(b.buffer, values[i])
+    }
+    buf_byte(b.buffer, 0)
+    store32(b.buffer.data + start, b.buffer.len - start)
 }
 
 fn bson_binary(b: BsonBuilder, key: str, value: str, subtype: int = 0) {
     if subtype < 0 || subtype > 255 || subtype == 2 {
-        b.error = "invalid or legacy BSON binary subtype"
+        __bson_fail(b, key, "has an invalid or legacy binary subtype")
         return
     }
     if __bson_key(b, key, 5, value.byte_len() + 5) {
@@ -368,19 +664,26 @@ fn bson_binary(b: BsonBuilder, key: str, value: str, subtype: int = 0) {
     }
 }
 
-fn bson_object_id(b: BsonBuilder, key: str, hex: str) {
-    let raw = __alloc(12)
+// 12 байт ObjectId из 24 шестнадцатеричных цифр в raw; false — не цифры.
+fn __bson_oid_raw(hex: str, raw: int) -> bool {
     if hex.byte_len() != 24 {
-        b.error = "ObjectId needs 24 hexadecimal digits"
-        return
+        return false
     }
     for i in 0..24 {
         if __hex_val(hex.byte(i)) < 0 {
-            b.error = "ObjectId needs 24 hexadecimal digits"
-            return
+            return false
         }
     }
     __unhex(hex, raw)
+    return true
+}
+
+fn bson_object_id(b: BsonBuilder, key: str, hex: str) {
+    let raw = __alloc(12)
+    if !__bson_oid_raw(hex, raw) {
+        __bson_fail(b, key, "needs 24 hexadecimal digits for an ObjectId")
+        return
+    }
     if __bson_key(b, key, 7, 12) {
         buf_add_raw(b.buffer, raw, 12)
     }
@@ -394,7 +697,7 @@ fn bson_date(b: BsonBuilder, key: str, milliseconds: int) {
 
 fn bson_decimal128(b: BsonBuilder, key: str, bytes: str) {
     if bytes.byte_len() != 16 {
-        b.error = "decimal128 needs exactly 16 bytes"
+        __bson_fail(b, key, "needs exactly 16 bytes for decimal128")
         return
     }
     if __bson_key(b, key, 19, 16) {
@@ -404,7 +707,7 @@ fn bson_decimal128(b: BsonBuilder, key: str, bytes: str) {
 
 fn bson_timestamp(b: BsonBuilder, key: str, increment: int, seconds: int) {
     if increment < 0 || increment > 4294967295 || seconds < 0 || seconds > 4294967295 {
-        b.error = "timestamp parts must fit uint32"
+        __bson_fail(b, key, "has timestamp parts that do not fit uint32")
         return
     }
     if __bson_key(b, key, 17, 8) {
@@ -413,153 +716,323 @@ fn bson_timestamp(b: BsonBuilder, key: str, increment: int, seconds: int) {
     }
 }
 
+// Документ из построителя. Каждая часть проверена, когда её добавляли, поэтому
+// результат помечен проверенным без нового прохода. Снимок: повторный
+// bson_finish или новые поля после него документ не меняют.
 fn bson_finish(b: BsonBuilder) -> Bson {
     if b.error != "" {
         return Bson {
             data: "", error: b.error
         }
     }
-    // Snapshot: finishing twice or appending later does not mutate the document.
-    let data = __alloc(b.buffer.len + 1)
+    let n = b.buffer.len + 1
+    if n > BSON_MAX_BYTES {
+        return Bson {
+            data: "", error: "BSON document exceeds 16 MiB"
+        }
+    }
+    let data = __alloc(n)
     __memcpy(data, b.buffer.data, b.buffer.len)
-    store32(data, b.buffer.len + 1)
-    store8(data + b.buffer.len, 0)
-    return bson_parse(__str_new(data, b.buffer.len + 1))
+    store32(data, n)
+    store8(data + n - 1, 0)
+    return Bson {
+        data: __str_new(data, n), checked: true
+    }
 }
 
-fn __bson_fields(doc: Bson) -> [BsonField] {
+// ---- Чтение полей ----
+
+fn bson_fields(doc: Bson) -> [BsonField] {
     var fields: [BsonField] = []
-    let base = __str_ptr(doc.data)
-    let end = base + doc.data.byte_len() - 1
-    var at = base + 4
+    let p = __str_ptr(doc.data)
+    let end = __bson_body(p, doc.data.byte_len())
+    if end == 0 {
+        return fields
+    }
+    var at = p + 4
     while at < end {
-        let kind = load8(at)
         let z = __bson_zero(at + 1, end)
-        let next = __bson_value_end(kind, z + 1, end, 0)
+        if z < 0 {
+            return []
+        }
+        let next = __bson_skip(load8(at), z + 1, end)
+        if next < 0 {
+            return []
+        }
         fields.push(BsonField {
-            name: __str_new(at + 1, z - at - 1), kind, data: __str_new(z + 1, next - z - 1)
+            name: __str_new(at + 1, z - at - 1), kind: load8(at), data: __str_new(z + 1, next - z - 1)
         })
         at = next
     }
     return fields
 }
 
-fn bson_fields(doc: Bson) -> [BsonField] {
-    if !bson_valid(doc) {
-        return []
-    }
-    return __bson_fields(doc)
-}
-
 fn bson_get(doc: Bson, key: str) -> BsonField? {
-    if !bson_valid(doc) {
+    let p = __str_ptr(doc.data)
+    let n = doc.data.byte_len()
+    let at = __bson_find(p, n, key)
+    if at == 0 {
         return none
     }
-    for field in __bson_fields(doc) {
-        if field.name == key {
-            return field
-        }
+    let v = at + 2 + key.byte_len()
+    let next = __bson_skip(load8(at), v, p + n - 1)
+    return BsonField {
+        name: key, kind: load8(at), data: __str_new(v, next - v)
     }
-    return none
 }
 
 fn bson_has(doc: Bson, key: str) -> bool {
-    return bson_get(doc, key) != none
+    return __bson_find(__str_ptr(doc.data), doc.data.byte_len(), key) != 0
 }
 
 fn bson_is_null(doc: Bson, key: str) -> bool {
-    let field = bson_get(doc, key) else {
-        return false
-    }
-    return field.kind == 10
+    let at = __bson_find(__str_ptr(doc.data), doc.data.byte_len(), key)
+    return at != 0 && load8(at) == 10
 }
 
-fn bson_get_int(doc: Bson, key: str) -> int? {
-    let f = bson_get(doc, key) else {
+// Поле для bson_get_*: адрес байта вида или 0. С report причина неудачи
+// bson_get_* — в bson_error(); драйвер читает ответы без report, чтобы не
+// затирать ошибку пользователя.
+fn __bson_lookup(doc: Bson, key: str, report: bool) -> int {
+    let at = __bson_find(__str_ptr(doc.data), doc.data.byte_len(), key)
+    if at == 0 && report {
+        __bson_report("BSON field '" + key + "' is missing")
+    }
+    return at
+}
+
+fn __bson_get_fail(report: bool, key: str, message: str) {
+    if report {
+        __bson_report("BSON field '" + key + "' " + message)
+    }
+}
+
+fn __bson_wrong(kind: int, expected: str) -> str {
+    return "has an incompatible type: BSON " + __bson_kind_name(kind) + ", expected " + expected
+}
+
+// int: Int64, Int32 и целый double из диапазона int64.
+fn __bson_get_int(doc: Bson, key: str, report: bool) -> int? {
+    let at = __bson_lookup(doc, key, report)
+    if at == 0 {
         return none
     }
-    if f.kind == 18 {
-        return load64(__str_ptr(f.data))
+    let kind = load8(at)
+    let v = at + 2 + key.byte_len()
+    if kind == 18 {
+        return load64(v)
     }
-    if f.kind == 16 {
-        let v = load32(__str_ptr(f.data))
-        if v > 2147483647 {
-            return v - 4294967296
+    if kind == 16 {
+        return __bson_i32(v)
+    }
+    if kind == 1 {
+        let f: float = __cast(load64(v))
+        if __bson_whole(f) {
+            return __bson_to_int(f)
         }
-        return v
+        __bson_get_fail(report, key, "holds a double that is not a whole int64")
+        return none
     }
+    __bson_get_fail(report, key, __bson_wrong(kind, "int"))
     return none
 }
 
+fn bson_get_int(doc: Bson, key: str) -> int? {
+    return __bson_get_int(doc, key, true)
+}
+
+// float: double, Int32 и Int64, которое float хранит точно.
+fn bson_get_float(doc: Bson, key: str) -> float? {
+    let at = __bson_lookup(doc, key, true)
+    if at == 0 {
+        return none
+    }
+    let kind = load8(at)
+    let v = at + 2 + key.byte_len()
+    if kind == 1 {
+        let f: float = __cast(load64(v))
+        return f
+    }
+    if kind == 16 {
+        return __bson_i32(v).to_float()
+    }
+    if kind == 18 {
+        let n = load64(v)
+        if __bson_exact_float(n) {
+            return n.to_float()
+        }
+        __bson_get_fail(true, key, "holds an int64 that float cannot represent exactly")
+        return none
+    }
+    __bson_get_fail(true, key, __bson_wrong(kind, "float"))
+    return none
+}
+
+fn __bson_get_str(doc: Bson, key: str, report: bool) -> str? {
+    let at = __bson_lookup(doc, key, report)
+    if at == 0 {
+        return none
+    }
+    let kind = load8(at)
+    if kind != 2 {
+        __bson_get_fail(report, key, __bson_wrong(kind, "str"))
+        return none
+    }
+    let v = at + 2 + key.byte_len()
+    let n = load32(v) - 1
+    if __utf8_scan(v + 4, n) < 0 {
+        __bson_get_fail(report, key, "is not valid UTF-8")
+        return none
+    }
+    return __str_new(v + 4, n)
+}
+
 fn bson_get_str(doc: Bson, key: str) -> str? {
-    let f = bson_get(doc, key) else {
+    return __bson_get_str(doc, key, true)
+}
+
+fn __bson_get_bool(doc: Bson, key: str, report: bool) -> bool? {
+    let at = __bson_lookup(doc, key, report)
+    if at == 0 {
         return none
     }
-    if f.kind != 2 {
+    let kind = load8(at)
+    if kind != 8 || load8(at + 2 + key.byte_len()) > 1 {
+        __bson_get_fail(report, key, __bson_wrong(kind, "bool"))
         return none
     }
-    return f.data.byte_slice(4, f.data.byte_len() - 1)
+    return load8(at + 2 + key.byte_len()) == 1
 }
 
 fn bson_get_bool(doc: Bson, key: str) -> bool? {
-    let f = bson_get(doc, key) else {
+    return __bson_get_bool(doc, key, true)
+}
+
+fn __bson_get_doc(doc: Bson, key: str, report: bool) -> Bson? {
+    let at = __bson_lookup(doc, key, report)
+    if at == 0 {
         return none
     }
-    if f.kind != 8 {
+    let kind = load8(at)
+    if kind != 3 {
+        __bson_get_fail(report, key, __bson_wrong(kind, "document"))
         return none
     }
-    return f.data.byte(0) == 1
+    let v = at + 2 + key.byte_len()
+    return Bson {
+        data: __str_new(v, load32(v)), checked: doc.checked
+    }
 }
 
 fn bson_get_doc(doc: Bson, key: str) -> Bson? {
-    let f = bson_get(doc, key) else {
-        return none
-    }
-    if f.kind != 3 {
-        return none
-    }
-    return Bson {
-        data: f.data
-    }
+    return __bson_get_doc(doc, key, true)
 }
 
-fn bson_get_array(doc: Bson, key: str) -> [Bson] {
-    let f = bson_get(doc, key) else {
-        return []
+// Массив документов. none — нет поля, не массив или элемент не документ
+// (причина — в bson_error()).
+fn bson_get_array(doc: Bson, key: str) -> [Bson]? {
+    let at = __bson_lookup(doc, key, true)
+    if at == 0 {
+        return none
     }
-    if f.kind != 4 {
-        return []
+    let kind = load8(at)
+    if kind != 4 {
+        __bson_get_fail(true, key, __bson_wrong(kind, "array"))
+        return none
     }
+    let p = at + 2 + key.byte_len()
+    let end = p + load32(p) - 1
     var out: [Bson] = []
-    for e in __bson_fields(Bson {
-        data: f.data
-    }) {
-        if e.kind != 3 {
-            return []
+    var e = p + 4
+    var i = 0
+    while e < end {
+        let z = __bson_zero(e + 1, end)
+        var next = -1
+        if z >= 0 {
+            next = __bson_skip(load8(e), z + 1, end)
+        }
+        if next < 0 {
+            __bson_get_fail(true, key, "holds an invalid array")
+            return none
+        }
+        if load8(e) != 3 {
+            __bson_get_fail(true, key + "." + i.to_str(), "is a BSON " + __bson_kind_name(load8(e)) + ", not a document")
+            return none
         }
         out.push(Bson {
-            data: e.data
+            data: __str_new(z + 1, next - z - 1), checked: doc.checked
         })
+        e = next
+        i += 1
     }
     return out
 }
 
-fn bson_get_binary(doc: Bson, key: str) -> BsonBinary? {
-    let f = bson_get(doc, key) else {
+fn __bson_get_binary(doc: Bson, key: str, report: bool) -> BsonBinary? {
+    let at = __bson_lookup(doc, key, report)
+    if at == 0 {
         return none
     }
-    if f.kind != 5 {
+    let kind = load8(at)
+    if kind != 5 {
+        __bson_get_fail(report, key, __bson_wrong(kind, "binary"))
         return none
     }
-    let subtype = f.data.byte(4)
-    var start = 5
+    let v = at + 2 + key.byte_len()
+    let n = load32(v)
+    let subtype = load8(v + 4)
     if subtype == 2 {
-        start = 9
+        if n < 4 || load32(v + 5) != n - 4 {
+            __bson_get_fail(report, key, "holds an invalid binary value")
+            return none
+        }
+        return BsonBinary {
+            data: __str_new(v + 9, n - 4), subtype
+        }
     }
     return BsonBinary {
-        data: f.data.byte_slice(start, f.data.byte_len()), subtype
+        data: __str_new(v + 5, n), subtype
     }
 }
+
+fn bson_get_binary(doc: Bson, key: str) -> BsonBinary? {
+    return __bson_get_binary(doc, key, true)
+}
+
+// ---- ObjectId ----
+
+// Блок генератора ObjectId (общий для потоков): [0, 5) — случайное значение
+// процесса, [8] — счётчик.
+var __objectid_block: int
+
+// Новый ObjectId — 24 шестнадцатеричные цифры: секунды Unix (4 байта, старшим
+// вперёд), случайное значение процесса (5 байт) и счётчик (3 байта) со
+// случайного начала, как требует спецификация BSON. Счётчик увеличивается
+// атомарно. Гонка первого вызова безвредна: поток, чей блок не остался в
+// __objectid_block, выдал свои id со своим случайным значением.
+fn object_id() -> str {
+    var block = __objectid_block
+    if block == 0 {
+        block = __mmap(4096)
+        __random_bytes(block, 8)
+        store64(block + 8, load64(block) >> 40)
+        __objectid_block = block
+    }
+    let count = __xadd(block + 8, 1)
+    let t = now()
+    let raw = __alloc(16)
+    store8(raw, (t >> 24) & 255)
+    store8(raw + 1, (t >> 16) & 255)
+    store8(raw + 2, (t >> 8) & 255)
+    store8(raw + 3, t & 255)
+    __memcpy(raw + 4, block, 5)
+    store8(raw + 9, (count >> 16) & 255)
+    store8(raw + 10, (count >> 8) & 255)
+    store8(raw + 11, count & 255)
+    return __hex_bytes(raw, 12)
+}
+
+// ---- to_bson ----
 
 fn __bson_struct_name(d: int) -> str {
     if load64(d) != D_STRUCT {
@@ -568,126 +1041,348 @@ fn __bson_struct_name(d: int) -> str {
     return __cast(load64(d + 16))
 }
 
-fn __bson_encode_value(b: BsonBuilder, key: str, v: int, d: int, depth: int) {
-    if depth > BSON_MAX_DEPTH {
-        b.error = "BSON nesting exceeds 64"
+// Ошибка значения поля, ключ которого начинается в o.b по смещению key: путь —
+// пока только это имя, вызывающие допишут свои спереди.
+fn __bson_out_fail(o: __BsonOut, key: int, message: str) {
+    if o.error != "" {
         return
     }
-    let kind = load64(d)
-    if kind == D_OPT {
-        if v == 0 {
-            bson_null(b, key)
+    o.error = message
+    let kp = o.b.data + key
+    o.path = __str_copy(kp, __bson_zero(kp, o.b.data + o.b.len) - kp)
+}
+
+// Документ вложен в поле с ключом по смещению key: при ошибке внутри — имя этого
+// поля спереди пути.
+fn __bson_out_up(o: __BsonOut, key: int) {
+    if o.error != "" {
+        let kp = o.b.data + key
+        o.path = __bson_join(__str_copy(kp, __bson_zero(kp, o.b.data + o.b.len) - kp), o.path)
+    }
+}
+
+// Поле: байт вида, ключ [kp, kp + kn), значение v по описанию d. none у поля
+// структуры и у записи map пропускается (как spread и PATCH в Khrip и omitempty
+// в Go): явный null — только bson_null или $unset. В массиве none — null, чтобы
+// не сдвинуть индексы (это делает ветка D_LIST).
+fn __bson_out_field(o: __BsonOut, kp: int, kn: int, v: int, d: int, depth: int) {
+    var dd = d
+    var vv = v
+    if load64(dd) == D_OPT {
+        if vv == 0 {
             return
         }
-        let inner = load64(d + 8)
-        var value = v
-        if __is_scalar(inner) {
-            value = load64(v)
+        dd = load64(d + 8)
+        if __is_scalar(dd) {
+            vv = load64(v)
         }
-        __bson_encode_value(b, key, value, inner, depth)
-    } else if kind == D_INT {
-        bson_int(b, key, v)
-    } else if kind == D_BOOL {
-        bson_bool(b, key, v != 0)
-    } else if kind == D_FLOAT {
-        bson_float(b, key, __cast(v))
-    } else if kind == D_STR {
-        bson_str(b, key, __cast(v))
-    } else if kind == D_STRUCT && __bson_struct_name(d) == "BsonObjectId" {
-        bson_object_id(b, key, __cast(load64(v)))
-    } else if kind == D_STRUCT && __bson_struct_name(d) == "BsonDate" {
-        bson_date(b, key, load64(v))
-    } else if kind == D_STRUCT && __bson_struct_name(d) == "BsonBinary" {
-        bson_binary(b, key, __cast(load64(v)), load64(v + 8))
-    } else if kind == D_STRUCT && __bson_struct_name(d) == "BsonDecimal128" {
-        bson_decimal128(b, key, __cast(load64(v)))
-    } else if kind == D_STRUCT && __bson_struct_name(d) == "BsonTimestamp" {
-        bson_timestamp(b, key, load64(v), load64(v + 8))
-    } else if kind == D_STRUCT || kind == D_MAP {
-        __bson_doc(b, key, __bson_encode_doc(v, d, depth + 1), 3)
-    } else if kind == D_LIST {
-        let a = bson_new()
+    }
+    let at = o.b.len
+    buf_reserve(o.b, kn + 2)
+    buf_byte(o.b, 0)
+    buf_add_raw(o.b, kp, kn)
+    buf_byte(o.b, 0)
+    let kind = __bson_out_value(o, at + 1, vv, dd, depth)
+    store8(o.b.data + at, kind)
+}
+
+// Значение по описанию d; ключ поля — в o.b по смещению key. → вид BSON.
+fn __bson_out_value(o: __BsonOut, key: int, v: int, d: int, depth: int) -> int {
+    let b = o.b
+    let kind = load64(d)
+    if kind == D_INT {
+        __bson_u64(b, v)
+        return 18
+    }
+    if kind == D_BOOL {
+        if v != 0 {
+            buf_byte(b, 1)
+        } else {
+            buf_byte(b, 0)
+        }
+        return 8
+    }
+    if kind == D_FLOAT {
+        __bson_u64(b, v)
+        return 1
+    }
+    if kind == D_STR {
+        let s: str = __cast(v)
+        let n = s.byte_len()
+        if n >= BSON_MAX_BYTES {
+            __bson_out_fail(o, key, "exceeds 16 MiB")
+            return 2
+        }
+        if __utf8_scan(__str_ptr(s), n) < 0 {
+            __bson_out_fail(o, key, "is not UTF-8; use BsonBinary for bytes")
+            return 2
+        }
+        __bson_u32(b, n + 1)
+        buf_add(b, s)
+        buf_byte(b, 0)
+        return 2
+    }
+    if kind == D_STRUCT {
+        let name = __bson_struct_name(d)
+        if name.byte_len() >= 4 && name.byte(0) == 'B' && name.byte(1) == 's' {
+            let special = __bson_out_special(o, key, name, v)
+            if special != 0 {
+                return special
+            }
+        }
+    }
+    if depth >= BSON_MAX_DEPTH {
+        __bson_out_fail(o, key, "is nested deeper than 64 levels")
+        return 3
+    }
+    if kind == D_STRUCT || kind == D_MAP {
+        __bson_out_doc(o, v, d, depth + 1)
+        __bson_out_up(o, key)
+        return 3
+    }
+    if kind == D_LIST {
+        let start = b.len
+        __bson_u32(b, 0)
         let ed = load64(d + 8)
+        let bools = load64(ed) == D_BOOL
         let n = load64(v + 8)
         let data = load64(v)
         for i in 0..n {
+            if o.error != "" {
+                break
+            }
             var value = 0
-            if load64(ed) == D_BOOL {
+            if bools {
                 value = load8(data + i)
             } else {
                 value = load64(data + i * 8)
             }
-            __bson_encode_value(a, i.to_str(), value, ed, depth + 1)
+            // ключ — цифры индекса: прямо в буфер, затем значение
+            let at = b.len
+            buf_byte(b, 0)
+            __bson_put_index(b, i)
+            if load64(ed) == D_OPT && value == 0 {
+                store8(b.data + at, 10)
+                continue
+            }
+            var ev = value
+            var edd = ed
+            if load64(ed) == D_OPT {
+                edd = load64(ed + 8)
+                if __is_scalar(edd) {
+                    ev = load64(value)
+                }
+            }
+            // вид — после значения: оно может перенести буфер
+            let ek = __bson_out_value(o, at + 1, ev, edd, depth + 1)
+            store8(b.data + at, ek)
         }
-        __bson_doc(b, key, bson_finish(a), 4)
-    } else if kind == D_SUM {
+        buf_byte(b, 0)
+        store32(b.data + start, b.len - start)
+        __bson_out_up(o, key)
+        return 4
+    }
+    if kind == D_SUM {
         let e = __variant_entry(d, v)
         if e == 0 {
-            b.error = "invalid variant"
-            return
+            __bson_out_fail(o, key, "holds an invalid variant")
+            return 10
         }
         let name: str = __cast(load64(e))
         if load64(d + 24) != 0 {
-            bson_str(b, key, name)
-        } else {
-            let a = bson_new()
-            bson_str(a, "type", name)
-            __bson_encode_struct(a, v, load64(e + 8), depth + 1)
-            __bson_doc(b, key, bson_finish(a), 3)
+            __bson_u32(b, name.byte_len() + 1)
+            buf_add(b, name)
+            buf_byte(b, 0)
+            return 2
         }
-    } else {
-        b.error = "unsupported BSON value type"
+        // вариант с полями — документ {"type": имя, поля...}
+        let start = b.len
+        __bson_u32(b, 0)
+        buf_byte(b, 2)
+        buf_add(b, "type")
+        buf_byte(b, 0)
+        __bson_u32(b, name.byte_len() + 1)
+        buf_add(b, name)
+        buf_byte(b, 0)
+        __bson_out_fields(o, v, load64(e + 8), depth + 1)
+        buf_byte(b, 0)
+        store32(b.data + start, b.len - start)
+        __bson_out_up(o, key)
+        return 3
     }
+    __bson_out_fail(o, key, "has a type that BSON cannot hold")
+    return 10
 }
 
-fn __bson_encode_struct(b: BsonBuilder, v: int, d: int, depth: int) {
+// Обёртки точных типов BSON и вложенный Bson. → вид или 0 (обычная структура).
+fn __bson_out_special(o: __BsonOut, key: int, name: str, v: int) -> int {
+    let b = o.b
+    if name == "Bson" {
+        // готовый документ вкладывается как есть, как в bson_doc
+        let doc: Bson = __cast(v)
+        if doc.error != "" {
+            // исходная ошибка документа — с путём: "BSON field 'путь' сказуемое"
+            __bson_out_fail(o, key, "is invalid: " + doc.error)
+            let head = "BSON field '"
+            if doc.error.starts_with(head) {
+                let rest = doc.error.byte_slice(head.byte_len(), doc.error.byte_len())
+                if let q = rest.byte_find("' ") {
+                    o.path = o.path + "." + rest.byte_slice(0, q)
+                    o.error = rest.byte_slice(q + 2, rest.byte_len())
+                }
+            }
+            return 3
+        }
+        if !doc.checked && !bson_valid(doc) {
+            __bson_out_fail(o, key, "holds an invalid BSON document")
+            return 3
+        }
+        buf_add(b, doc.data)
+        return 3
+    }
+    if name == "BsonObjectId" {
+        let hex: str = __cast(load64(v))
+        buf_reserve(b, 12)
+        if !__bson_oid_raw(hex, b.data + b.len) {
+            __bson_out_fail(o, key, "needs 24 hexadecimal digits for an ObjectId")
+            return 7
+        }
+        b.len += 12
+        return 7
+    }
+    if name == "BsonDate" {
+        __bson_u64(b, load64(v))
+        return 9
+    }
+    if name == "BsonBinary" {
+        let data: str = __cast(load64(v))
+        let subtype = load64(v + 8)
+        if subtype < 0 || subtype > 255 || subtype == 2 {
+            __bson_out_fail(o, key, "has an invalid or legacy binary subtype")
+            return 5
+        }
+        if data.byte_len() >= BSON_MAX_BYTES {
+            __bson_out_fail(o, key, "exceeds 16 MiB")
+            return 5
+        }
+        __bson_u32(b, data.byte_len())
+        buf_byte(b, subtype)
+        buf_add(b, data)
+        return 5
+    }
+    if name == "BsonDecimal128" {
+        let bytes: str = __cast(load64(v))
+        if bytes.byte_len() != 16 {
+            __bson_out_fail(o, key, "needs exactly 16 bytes for decimal128")
+            return 19
+        }
+        buf_add(b, bytes)
+        return 19
+    }
+    if name == "BsonTimestamp" {
+        let increment = load64(v)
+        let seconds = load64(v + 8)
+        if increment < 0 || increment > 4294967295 || seconds < 0 || seconds > 4294967295 {
+            __bson_out_fail(o, key, "has timestamp parts that do not fit uint32")
+            return 17
+        }
+        __bson_u32(b, increment)
+        __bson_u32(b, seconds)
+        return 17
+    }
+    return 0
+}
+
+fn __bson_out_fields(o: __BsonOut, v: int, d: int, depth: int) {
     for i in 0..load64(d + 8) {
+        if o.error != "" {
+            return
+        }
         let f = __field(d, i)
         let key: str = __cast(load64(f))
-        __bson_encode_value(b, key, load64(v + i * 8), load64(f + 16), depth)
+        __bson_out_field(o, __str_ptr(key), key.byte_len(), load64(v + i * 8), load64(f + 16), depth)
     }
 }
 
-fn __bson_encode_doc(v: int, d: int, depth: int) -> Bson {
-    if depth > BSON_MAX_DEPTH {
-        return Bson {
-            data: "", error: "BSON nesting exceeds 64"
-        }
-    }
-    let b = bson_new()
+// Документ из структуры или map[str, T] — на месте, в o.b.
+fn __bson_out_doc(o: __BsonOut, v: int, d: int, depth: int) {
+    let b = o.b
+    let start = b.len
+    __bson_u32(b, 0)
     if load64(d) == D_STRUCT {
-        __bson_encode_struct(b, v, d, depth)
-    } else if load64(d) == D_MAP && load64(load64(d + 8)) == D_STR {
-        let keys: [str] = __cast(__map_keys(v))
-        for key in keys {
-            __bson_encode_value(b, key, __map_get_or0(v, __cast(key)), load64(d + 16), depth)
+        __bson_out_fields(o, v, d, depth)
+    } else if load64(load64(d + 8)) == D_STR {
+        let vd = load64(d + 16)
+        let m: map[str, int] = __cast(v)
+        for key, value in m {
+            if o.error != "" {
+                break
+            }
+            let kp = __str_ptr(key)
+            let kn = key.byte_len()
+            if __find_byte(kp, kn, 0) < kn {
+                o.error = "has a field name with NUL"
+                return
+            }
+            if __utf8_scan(kp, kn) < 0 {
+                o.error = "has a field name that is not UTF-8"
+                return
+            }
+            __bson_out_field(o, kp, kn, value, vd, depth)
         }
     } else {
-        b.error = "BSON root must be a struct or map[str, T]"
+        o.error = "needs a struct or map[str, T] for a BSON document"
+        return
     }
-    return bson_finish(b)
+    buf_byte(b, 0)
+    store32(b.data + start, b.len - start)
 }
 
 fn __bson_encode(v: int, d: int) -> Bson {
-    return __bson_encode_doc(v, d, 0)
+    let k = load64(d)
+    if k != D_STRUCT && !(k == D_MAP && load64(load64(d + 8)) == D_STR) {
+        return Bson {
+            data: "", error: "BSON root must be a struct or map[str, T]"
+        }
+    }
+    let o = __BsonOut {
+        b: buf_new(128)
+    }
+    __bson_out_doc(o, v, d, 0)
+    if o.error == "" && o.b.len > BSON_MAX_BYTES {
+        o.error = "exceeds 16 MiB"
+    }
+    if o.error != "" {
+        var message = "BSON document " + o.error
+        if o.path != "" {
+            message = "BSON field '" + o.path + "' " + o.error
+        }
+        return Bson {
+            data: "", error: message
+        }
+    }
+    // буфер — последний выделенный блок: его хвост возвращается выделителю
+    __alloc_trim(o.b.data, o.b.cap, o.b.len)
+    return Bson {
+        data: __str_new(o.b.data, o.b.len), checked: true
+    }
 }
 
-fn __bson_decode_value(r: __BsonRead, f: BsonField, d: int, depth: int) -> int {
-    if r.error != "" {
-        return 0
-    }
-    if depth > BSON_MAX_DEPTH {
-        r.error = "BSON nesting exceeds 64"
-        return 0
-    }
-    let kind = load64(d)
-    let p = __str_ptr(f.data)
-    if kind == D_OPT {
-        if f.kind == 10 {
+// ---- from_bson ----
+
+// Значение вида kind в [p, end) как тип d. При ошибке — 0 и r.error; путь
+// дописывают вызывающие (имена полей, индексы массивов).
+fn __bson_read(r: __BsonRead, kind: int, p: int, end: int, d: int, depth: int) -> int {
+    let dk = load64(d)
+    if dk == D_OPT {
+        if kind == 10 {
             return 0
         }
         let inner = load64(d + 8)
-        let value = __bson_decode_value(r, f, inner, depth)
+        let value = __bson_read(r, kind, p, end, inner, depth)
+        if r.error != "" {
+            return 0
+        }
         if __is_scalar(inner) {
             let cell = __alloc(8)
             store64(cell, value)
@@ -695,145 +1390,231 @@ fn __bson_decode_value(r: __BsonRead, f: BsonField, d: int, depth: int) -> int {
         }
         return value
     }
-    if kind == D_INT && f.kind == 18 {
-        return load64(p)
-    }
-    if kind == D_INT && f.kind == 16 {
-        let value = load32(p)
-        if value > 2147483647 {
-            return value - 4294967296
+    if dk == D_INT {
+        if kind == 18 {
+            return load64(p)
         }
-        return value
+        if kind == 16 {
+            return __bson_i32(p)
+        }
+        if kind == 1 {
+            let f: float = __cast(load64(p))
+            if __bson_whole(f) {
+                return __bson_to_int(f)
+            }
+            r.error = "holds a double that is not a whole int64"
+            return 0
+        }
+    } else if dk == D_FLOAT {
+        if kind == 1 {
+            return load64(p)
+        }
+        if kind == 16 {
+            let f = __bson_i32(p).to_float()
+            return __cast(f)
+        }
+        if kind == 18 {
+            let n = load64(p)
+            if __bson_exact_float(n) {
+                let f = n.to_float()
+                return __cast(f)
+            }
+            r.error = "holds an int64 that float cannot represent exactly"
+            return 0
+        }
+    } else if dk == D_BOOL {
+        if kind == 8 {
+            if load8(p) <= 1 {
+                return load8(p)
+            }
+            r.error = "holds an invalid boolean"
+            return 0
+        }
+    } else if dk == D_STR {
+        if kind == 2 {
+            let n = load32(p) - 1
+            if __utf8_scan(p + 4, n) < 0 {
+                r.error = "is not valid UTF-8"
+                return 0
+            }
+            return __cast(__str_new(p + 4, n))
+        }
+    } else if dk == D_STRUCT {
+        let name = __bson_struct_name(d)
+        if name.byte_len() >= 4 && name.byte(0) == 'B' && name.byte(1) == 's' {
+            let special = __bson_read_special(r, kind, p, end, name)
+            if special != 0 || r.error != "" {
+                return special
+            }
+        }
+        if kind == 3 {
+            return __bson_read_struct(r, p, end, d, depth + 1)
+        }
+    } else if dk == D_LIST {
+        if kind == 4 {
+            return __bson_read_list(r, p, end, d, depth + 1)
+        }
+    } else if dk == D_MAP {
+        if kind == 3 && load64(load64(d + 8)) == D_STR {
+            return __bson_read_map(r, p, end, d, depth + 1)
+        }
+    } else if dk == D_SUM {
+        return __bson_read_sum(r, kind, p, end, d, depth + 1)
     }
-    if kind == D_BOOL && f.kind == 8 {
-        return load8(p)
+    r.error = __bson_wrong(kind, __bson_type_name(d))
+    return 0
+}
+
+// Обёртки точных типов BSON и вложенный Bson. → значение или 0 (не подходит).
+fn __bson_read_special(r: __BsonRead, kind: int, p: int, end: int, name: str) -> int {
+    if name == "Bson" && kind == 3 {
+        // вложенный документ как есть: проверяется его структура
+        if !__bson_check(p, end - p, 0, false, false) {
+            r.error = "holds an invalid BSON document"
+            return 0
+        }
+        return __cast(Bson {
+            data: __str_new(p, end - p), checked: true
+        })
     }
-    if kind == D_FLOAT && f.kind == 1 {
-        return load64(p)
-    }
-    if kind == D_STR && f.kind == 2 {
-        return __cast(f.data.byte_slice(4, f.data.byte_len() - 1))
-    }
-    let name = __bson_struct_name(d)
-    if name == "BsonObjectId" && f.kind == 7 {
+    if name == "BsonObjectId" && kind == 7 {
         return __cast(BsonObjectId {
             hex: __hex_bytes(p, 12)
         })
     }
-    if name == "BsonDate" && f.kind == 9 {
+    if name == "BsonDate" && kind == 9 {
         return __cast(BsonDate {
             milliseconds: load64(p)
         })
     }
-    if name == "BsonBinary" && f.kind == 5 {
+    if name == "BsonBinary" && kind == 5 {
+        let n = load32(p)
         let subtype = load8(p + 4)
-        var skip = 5
         if subtype == 2 {
-            skip = 9
+            if n < 4 || load32(p + 5) != n - 4 {
+                r.error = "holds an invalid binary value"
+                return 0
+            }
+            return __cast(BsonBinary {
+                data: __str_new(p + 9, n - 4), subtype
+            })
         }
         return __cast(BsonBinary {
-            data: f.data.byte_slice(skip, f.data.byte_len()), subtype
+            data: __str_new(p + 5, n), subtype
         })
     }
-    if name == "BsonDecimal128" && f.kind == 19 {
+    if name == "BsonDecimal128" && kind == 19 {
         return __cast(BsonDecimal128 {
-            bytes: f.data
+            bytes: __str_new(p, 16)
         })
     }
-    if name == "BsonTimestamp" && f.kind == 17 {
+    if name == "BsonTimestamp" && kind == 17 {
         return __cast(BsonTimestamp {
             increment: load32(p), seconds: load32(p + 4)
         })
     }
-    if kind == D_LIST && f.kind == 4 {
-        let ed = load64(d + 8)
-        var size = 8
-        if load64(ed) == D_BOOL {
-            size = 1
-        }
-        let xs: [int] = __cast(__list_new(4, size))
-        for e in __bson_fields(Bson {
-            data: f.data
-        }) {
-            xs.push(__bson_decode_value(r, e, ed, depth + 1))
-        }
-        return __cast(xs)
-    }
-    if kind == D_STRUCT && f.kind == 3 {
-        return __bson_decode_struct(r, Bson {
-            data: f.data
-        }, d, depth + 1)
-    }
-    if kind == D_MAP && f.kind == 3 && load64(load64(d + 8)) == D_STR {
-        let m = __map_new(1)
-        let seen: map[str, bool] = {}
-        for e in __bson_fields(Bson {
-            data: f.data
-        }) {
-            if seen.has(e.name) {
-                r.error = "duplicate BSON field: " + e.name
-                return 0
-            }
-            seen[e.name] = true
-            __map_set(m, __cast(e.name), __bson_decode_value(r, e, load64(d + 16), depth + 1))
-            if r.error != "" {
-                return 0
-            }
-        }
-        return m
-    }
-    if kind == D_SUM {
-        var tag = ""
-        if load64(d + 24) != 0 && f.kind == 2 {
-            tag = f.data.byte_slice(4, f.data.byte_len() - 1)
-        } else if f.kind == 3 {
-            tag = bson_get_str(Bson {
-                data: f.data
-            }, "type") ?? ""
-        }
-        for i in 0..load64(d + 8) {
-            let e = d + 32 + i * 24
-            let ename: str = __cast(load64(e))
-            if ename == tag {
-                if load64(e + 16) != 0 {
-                    return load64(e + 16)
-                }
-                return __bson_decode_struct(r, Bson {
-                    data: f.data
-                }, load64(e + 8), depth + 1)
-            }
-        }
-    }
-    r.error = "BSON field '" + f.name + "' has an incompatible type"
     return 0
 }
 
-fn __bson_decode_struct(r: __BsonRead, doc: Bson, d: int, depth: int) -> int {
+fn __bson_read_list(r: __BsonRead, p: int, end: int, d: int, depth: int) -> int {
+    if depth > BSON_MAX_DEPTH {
+        r.error = "is nested deeper than 64 levels"
+        return 0
+    }
+    let ed = load64(d + 8)
+    var size = 8
+    if load64(ed) == D_BOOL {
+        size = 1
+    }
+    let xs: [int] = __cast(__list_new(4, size))
+    let body = end - 1
+    var at = p + 4
+    var i = 0
+    while at < body {
+        let kind = load8(at)
+        let z = __bson_zero(at + 1, body)
+        var next = -1
+        if z >= 0 {
+            next = __bson_skip(kind, z + 1, body)
+        }
+        if next < 0 {
+            r.error = "holds an invalid array"
+            return 0
+        }
+        let value = __bson_read(r, kind, z + 1, next, ed, depth)
+        if r.error != "" {
+            r.path = __bson_join(i.to_str(), r.path)
+            return 0
+        }
+        xs.push(value)
+        at = next
+        i += 1
+    }
+    return __cast(xs)
+}
+
+// Индекс поля структуры d (n полей) с именем [kp, kp + kn) или -1. Сначала —
+// поле hint: обычно поля документа идут в порядке структуры.
+fn __bson_field_index(d: int, n: int, kp: int, kn: int, hint: int) -> int {
+    if hint < n {
+        let name: str = __cast(load64(__field(d, hint)))
+        if __bson_key_is(kp, kn, name) {
+            return hint
+        }
+    }
+    for i in 0..n {
+        let name: str = __cast(load64(__field(d, i)))
+        if __bson_key_is(kp, kn, name) {
+            return i
+        }
+    }
+    return -1
+}
+
+fn __bson_read_struct(r: __BsonRead, p: int, end: int, d: int, depth: int) -> int {
+    if depth > BSON_MAX_DEPTH {
+        r.error = "is nested deeper than 64 levels"
+        return 0
+    }
     let n = load64(d + 8)
     let out = __struct_alloc(d)
     let seen = __alloc(n + 1)
-    let keys: map[str, bool] = {}
-    for e in __bson_fields(doc) {
-        if keys.has(e.name) {
-            r.error = "duplicate BSON field: " + e.name
+    let body = end - 1
+    var at = p + 4
+    var hint = 0
+    while at < body {
+        let kind = load8(at)
+        let z = __bson_zero(at + 1, body)
+        var next = -1
+        if z >= 0 {
+            next = __bson_skip(kind, z + 1, body)
+        }
+        if next < 0 {
+            r.error = "holds an invalid BSON document"
             return 0
         }
-        keys[e.name] = true
-        for i in 0..n {
+        let i = __bson_field_index(d, n, at + 1, z - at - 1, hint)
+        if i >= 0 {
             let f = __field(d, i)
-            let key: str = __cast(load64(f))
-            if key == e.name {
-                store64(out + i * 8, __bson_decode_value(r, e, load64(f + 16), depth))
-                if r.error != "" {
-                    return 0
-                }
-                store8(seen + i, 1)
-                if e.kind == 10 && load64(load64(f + 16)) == D_OPT && i < 62 {
-                    __json_null_mark(out, i)
-                }
-                break
+            let name: str = __cast(load64(f))
+            if load8(seen + i) != 0 {
+                r.error = "is duplicated"
+                r.path = name
+                return 0
             }
+            let fd = load64(f + 16)
+            store64(out + i * 8, __bson_read(r, kind, z + 1, next, fd, depth))
+            if r.error != "" {
+                r.path = __bson_join(name, r.path)
+                return 0
+            }
+            store8(seen + i, 1)
+            if kind == 10 && load64(fd) == D_OPT && i < 62 {
+                __json_null_mark(out, i)
+            }
+            hint = i + 1
         }
+        at = next
     }
     for i in 0..n {
         if load8(seen + i) != 0 {
@@ -848,31 +1629,114 @@ fn __bson_decode_struct(r: __BsonRead, doc: Bson, d: int, depth: int) -> int {
         } else if dk == 3 {
             store64(out + i * 8, __map_new(load64(f + 32)))
         } else if load64(load64(f + 16)) != D_OPT {
-            let name: str = __cast(load64(f))
-            r.error = "missing BSON field: " + name
+            r.error = "is missing"
+            r.path = __cast(load64(f))
+            return 0
         }
     }
     return out
 }
 
-// Error stored in existing request-local JSON diagnostic slot, not shared global
-// state between coroutines. bson_error() and json_error() describe last decode.
+fn __bson_read_map(r: __BsonRead, p: int, end: int, d: int, depth: int) -> int {
+    if depth > BSON_MAX_DEPTH {
+        r.error = "is nested deeper than 64 levels"
+        return 0
+    }
+    let vd = load64(d + 16)
+    let m = __map_new(1)
+    let body = end - 1
+    var at = p + 4
+    while at < body {
+        let kind = load8(at)
+        let z = __bson_zero(at + 1, body)
+        var next = -1
+        if z >= 0 {
+            next = __bson_skip(kind, z + 1, body)
+        }
+        if next < 0 {
+            r.error = "holds an invalid BSON document"
+            return 0
+        }
+        if __utf8_scan(at + 1, z - at - 1) < 0 {
+            r.error = "has a field name that is not valid UTF-8"
+            return 0
+        }
+        let key = __str_new(at + 1, z - at - 1)
+        if __map_has(m, __cast(key)) {
+            r.error = "is duplicated"
+            r.path = key
+            return 0
+        }
+        let value = __bson_read(r, kind, z + 1, next, vd, depth)
+        if r.error != "" {
+            r.path = __bson_join(key, r.path)
+            return 0
+        }
+        __map_set(m, __cast(key), value)
+        at = next
+    }
+    return m
+}
+
+// Вариант: перечисление — строка с именем, вариант с полями — документ с полем
+// "type".
+fn __bson_read_sum(r: __BsonRead, kind: int, p: int, end: int, d: int, depth: int) -> int {
+    var tp = 0
+    var tn = -1
+    if load64(d + 24) != 0 && kind == 2 {
+        tp = p + 4
+        tn = load32(p) - 1
+    } else if kind == 3 {
+        let at = __bson_find(p, end - p, "type")
+        if at != 0 && load8(at) == 2 {
+            tp = at + 10
+            tn = load32(at + 6) - 1
+        }
+    }
+    if tn < 0 {
+        r.error = __bson_wrong(kind, __bson_type_name(d))
+        return 0
+    }
+    for i in 0..load64(d + 8) {
+        let e = d + 32 + i * 24
+        let ename: str = __cast(load64(e))
+        if __bson_key_is(tp, tn, ename) {
+            if load64(e + 16) != 0 {
+                return load64(e + 16)
+            }
+            if kind != 3 {
+                break
+            }
+            return __bson_read_struct(r, p, end, load64(e + 8), depth)
+        }
+    }
+    r.error = "holds an unknown variant of " + __bson_type_name(d)
+    return 0
+}
+
+// Ошибка — в слоте json_error() запроса (или программы вне запроса), а не в
+// общем состоянии потоков: bson_error() и json_error() описывают последнее
+// чтение.
 fn __bson_decode(doc: Bson, d: int) -> int {
     let r = __BsonRead {}
     var result = 0
-    if !bson_valid(doc) {
-        r.error = "invalid BSON document"
+    let p = __str_ptr(doc.data)
+    let n = doc.data.byte_len()
+    if doc.error != "" {
+        r.error = doc.error
+    } else if __bson_body(p, n) == 0 {
+        r.error = "is invalid"
     } else {
-        result = __bson_decode_value(r, BsonField {
-            name: "", kind: 3, data: doc.data
-        }, d, 0)
+        result = __bson_read(r, 3, p, p + n, d, 0)
     }
-    if load64(__ctx() + CTX_WORKER) != 0 {
-        let worker = __w()
-        worker.json_err = r.error
-    } else {
-        __json_last_err = r.error
+    var message = r.error
+    if doc.error == "" && r.error != "" {
+        message = "BSON document " + r.error
+        if r.path != "" {
+            message = "BSON field '" + r.path + "' " + r.error
+        }
     }
+    __bson_report(message)
     if r.error != "" {
         return 0
     }

@@ -1,0 +1,33 @@
+// expect: store 'pages' holds MongoCursor, which lives for one request: mongo_next and mongo_close change it and fill it with the request's memory
+// expect: read the cursor to the end in the request and keep the documents or the last _id to continue from
+// expect: store 'drafts' holds BsonBuilder, which lives for one request
+// expect: bson_finish(b) gives a Bson
+// К1 (docs/reviews/pr1-mongo-clickhouse.md): mongo_next меняет курсор и кладёт
+// в него документы арены запроса. Курсор в store после запроса указывал бы в
+// освобождённую арену: другой запрос читал мусор, процесс падал.
+type Draft { title: str, body: BsonBuilder }
+
+store pages: map[str, MongoCursor]
+store drafts: [Draft]
+
+fn client() -> Mongo {
+    return Mongo { uri: env("MONGODB_URI") ?? "" }
+}
+
+route POST "/start" -> 200 str {
+    let c = mongo_find(client(), "app", "rows", bson_finish(bson_new()), 3)
+    pages["p"] = c
+    return "start {c.documents.len()} {c.error}"
+}
+
+route POST "/next" -> 200 str {
+    let c = pages["p"] else {
+        return "none"
+    }
+    let ok = mongo_next(c)
+    return "next {ok} {c.documents.len()}"
+}
+
+route GET "/drafts" -> int {
+    return drafts.len()
+}

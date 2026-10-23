@@ -24,7 +24,8 @@
 Реплика требует
 `directConnection=true` и подключения к текущему primary. Автоматического поиска
 primary, DNS SRV, клиентских сессий, транзакций и retryable writes пока нет.
-Неизвестные параметры URI отклоняются, а не игнорируются.
+Параметры URI, меняющие смысл, которого драйвер не поддерживает, отклоняются,
+а не игнорируются (список — в конце раздела).
 
 ```khrip
 type Event { _id: int, title: str, tags: [str] }
@@ -45,19 +46,59 @@ if saved.error != "" {
 `data` и `error`. `from_bson(document)` выводит ожидаемый тип из аннотации:
 `let event: Event? = from_bson(document)`. При несовпадении типов возвращается
 `none`, причина доступна через `bson_error()`. Данные идут непосредственно в BSON.
-Промежуточного преобразования в JSON нет.
+Промежуточного преобразования в JSON нет. Поле `checked` у `Bson` ставит
+библиотека: документ уже проверен (`bson_finish`, `to_bson`, `bson_parse`,
+ответ сервера), и при вложении и отправке проверка не повторяется.
+
+- Поле со значением `none` — у структуры и у записи `map` — не пишется, как
+  spread и PATCH в Khrip (`{...old, ...patch}`, `SET {patch}`) и `omitempty` в Go.
+  Поэтому `to_bson({"$set": patch})` меняет только присланные поля, а
+  `_id: BsonObjectId?` со значением `none` не попадает в документ, и id
+  назначает сервер. Явный null — `bson_null(b, key)` в построителе или `$unset`.
+  В массиве `none` — Null: индексы не сдвигаются.
+- Значение типа `Bson` вкладывается как готовый документ, как `bson_doc`:
+  `to_bson({"amount": to_bson({"$gt": 100})})`, `to_bson({"$set": to_bson(patch)})`.
+  Поля `Bson` в структурах и `map[str, Bson]` — короткий способ собрать
+  неоднородный документ или конвейер. `from_bson` читает вложенный документ в
+  поле типа `Bson` как есть.
+- Ошибка называет путь поля: `BSON field 'items.3.title' is not UTF-8; use
+  BsonBinary for bytes`. Ошибка вложенного документа не теряется: `mongo_insert`
+  с ним вернёт `invalid BSON command: BSON field 'documents.0.oid' needs 24
+  hexadecimal digits for an ObjectId`.
 
 Точные BSON-типы представлены обёртками:
 
 | Тип Khrip | BSON |
 |---|---|
 | `int`, `float`, `bool`, `str` | Int64, Double, Boolean, UTF-8 String |
-| `[T]`, структура, `map[str, T]`, `T?` | Array, Document, Document, значение или Null |
+| `[T]`, структура, `map[str, T]` | Array, Document, Document |
+| `T?` | значение; `none` в поле или записи `map` не пишется, в массиве — Null; Null и отсутствующее поле читаются как `none` |
+| `Bson` | вложенный документ как есть |
 | `BsonObjectId { hex }` | ObjectId (24 шестнадцатеричных символа) |
 | `BsonDate { milliseconds }` | Date (миллисекунды Unix) |
 | `BsonBinary { data, subtype }` | Binary |
 | `BsonDecimal128 { bytes }` | Decimal128: 16 точных байт; арифметика не реализована |
 | `BsonTimestamp { increment, seconds }` | Timestamp |
+
+Числа читаются (`from_bson`, `bson_get_int`, `bson_get_float`) с расширением
+без потерь, как в Go-драйвере: mongosh и Node пишут целые как Int32, а большие —
+как Double.
+
+| Поле Khrip | Принимает | Ошибка |
+|---|---|---|
+| `int` | Int64, Int32, Double с целым значением из диапазона int64 | дробный Double, NaN, ±Inf, вне int64 |
+| `float` | Double, Int32, Int64, которое Double хранит точно | Int64, теряющее точность (например, 2^53 + 1) |
+
+Ответ сервера проверяется один раз и только структурно. UTF-8 строки
+проверяется там, где значение становится `str`: `from_bson`, `bson_get_str`,
+имена полей `map`. Документ с неверным UTF-8 (его мог записать другой драйвер)
+не губит порцию и соединение: `from_bson` этого документа вернёт `none`, а
+`bson_error()` — `BSON field 's' is not valid UTF-8`. Остальные документы
+читаются. Для байтов служит `BsonBinary`.
+
+`object_id()` — новый ObjectId, 24 шестнадцатеричные цифры (время, случайное
+значение процесса, счётчик): `BsonObjectId { hex: object_id() }` даёт id до
+вставки.
 
 Для фильтров, обновлений, индексов и команд служат `bson_new`, `bson_int`,
 `bson_str`, `bson_bool`, `bson_doc`, `bson_array`, `bson_null`, `bson_finish`.
@@ -75,6 +116,13 @@ let changed = mongo_update(primary, "app", "events",
     bson_finish(filter), bson_finish(update))
 ```
 
+Поля читают `bson_get_int`, `bson_get_float`, `bson_get_str`, `bson_get_bool`,
+`bson_get_doc`, `bson_get_binary` (результат `T?`) и `bson_get_array` (`[Bson]?`:
+`none`, если элемент не документ; массивы скаляров читает `from_bson`).
+Причина `none` — в `bson_error()`, как у `from_bson`. `bson_has`, `bson_is_null`,
+`bson_get`, `bson_fields` ошибок не пишут. Аксессоры обходят документ без
+повторной проверки и без выделения памяти на каждое поле.
+
 Основные операции:
 
 - `mongo_command(client, database, command)` — произвольная BSON-команда;
@@ -82,12 +130,26 @@ let changed = mongo_update(primary, "app", "events",
 - `mongo_update(client, database, collection, filter, update, many=false, upsert=false)`;
 - `mongo_delete(client, database, collection, filter, many=false)`;
 - `mongo_find(client, database, collection, filter, batch_size=100, limit=0)`;
+- `mongo_find_with(client, database, collection, filter, MongoFindOptions { ... })` —
+  find с полями `sort`, `projection` (`Bson?`), `skip`, `limit`, `batch_size`,
+  `max_bytes`;
 - `mongo_cursor(client, database, collection, command)` — собственный `find`
-  с проекцией/сортировкой или `aggregate` с конвейером;
+  или `aggregate` с конвейером;
 - `mongo_next(cursor)` — получить следующую порцию;
-- `mongo_close(cursor)` — закрыть незавершённый серверный курсор.
+- `mongo_close(cursor)` — закрыть незавершённый серверный курсор;
+- `mongo_create_indexes(client, database, collection, [MongoIndex { keys, ... }])` —
+  createIndexes; поля `name` (по умолчанию — по ключам, как у официальных
+  драйверов: `email_1`), `unique`, `expire_after_seconds` (TTL). Повторный вызов
+  с теми же индексами — не ошибка, его можно делать при старте.
 
-У курсора есть `documents: [Bson]`, `id`, `error`, `code`. Сначала обработайте
+```khrip
+let recent = mongo_find_with(primary, "app", "events", to_bson({ "user": user_id }),
+    MongoFindOptions { sort: to_bson({ "ts": -1 }), limit: 20 })
+mongo_create_indexes(primary, "app", "users",
+    [MongoIndex { keys: to_bson({ "email": 1 }), unique: true }])
+```
+
+У курсора есть `documents: [Bson]`, `id`, `error`, `code`, `ns`. Сначала обработайте
 `documents` после `mongo_find`, затем вызывайте `mongo_next`. После цикла проверьте
 `cursor.error`. При раннем выходе вызовите `mongo_close`. Порции уменьшают размер
 одного сетевого ответа; выделенные объекты остаются в арене до конца запроса.
@@ -97,6 +159,24 @@ let changed = mongo_update(primary, "app", "events",
 а не точная оценка памяти декодированных объектов. При превышении драйвер
 пытается закрыть серверный курсор и возвращает ошибку.
 
+Курсор живёт один запрос: `mongo_next` и `mongo_close` меняют его поля, а
+документы лежат в памяти запроса. Хранить `MongoCursor` (и `BsonBuilder`) в
+`store` нельзя — это ошибка компиляции. Чтобы продолжить выборку в следующем
+запросе, сохраните последний `_id` и запросите снова с фильтром
+`{"_id": {"$gt": last}}`.
+
+getMore и killCursors идут по пространству имён из ответа сервера (`cursor.ns`),
+а не по аргументу `collection`: listCollections и aggregate с другим аргументом
+работают. `aggregate` без поля `cursor` получает `cursor: {}` сам.
+
+Курсоры, которые запрос не дочитал и не закрыл, в том числе после `fail` и
+panic, закрываются. Конец запроса ставит их в очередь рабочего потока, и
+killCursors уходит перед следующей командой через соединение с тем же URI.
+Отправить его прямо из очистки нельзя: она не ждёт сеть и не выделяет память
+(может идти после паники из-за памяти). Если команд с этим URI больше не будет,
+курсор закроет сервер через 10 минут (cursorTimeoutMillis). Очередь — до 128
+курсоров на поток.
+
 У `MongoResult` есть `document`, `error`, `code`, `unknown_outcome`. Последнее
 поле означает, что запись могла выполниться, хотя подтверждение не получено.
 Автоматических повторов нет. Для повторяемых прикладных операций используйте
@@ -104,15 +184,48 @@ let changed = mongo_update(primary, "app", "events",
 Неподтверждаемые записи (`writeConcern.w=0`) отклоняются.
 
 Пул хранит до 32 соединений на рабочий поток; соединения разделены по полному
-URI, включая аутентификацию. Ограничение сообщения задаётся
-`max_message_bytes` (по умолчанию 48 000 000, максимум 64 МиБ); BSON-документ —
-до 16 МиБ. Вставка сейчас передаёт массив документов внутри одной команды:
-разбивайте большие наборы на пакеты, помещающиеся в этот предел.
+URI, включая аутентификацию. Ключи SCRAM (ClientKey и ServerKey) кэшируются на
+поток по паролю, соли и числу итераций, как у официальных драйверов: PBKDF2
+считается один раз, и новое соединение не тратит на него ~16 мс. После ответов
+«узел больше не primary» и «узел выключается» (коды SDAM 91, 189, 10058, 10107,
+11600, 11602, 13435, 13436) соединение в пул не возвращается.
 
-Поддержанные параметры URI: `authSource`, `authMechanism=SCRAM-SHA-256`,
-`directConnection=true`, `tls`, `tlsCAFile`. Пароль SCRAM пока должен состоять из
-печатных ASCII-символов: Unicode SASLprep не реализован. TLS требует сервера,
-поддерживающего TLS 1.3. Компрессия протокола не реализована.
+Ограничение сообщения задаётся `max_message_bytes` (по умолчанию 48 000 000,
+максимум 64 МиБ); BSON-документ — до 16 МиБ. Ответ сервера — до
+maxBsonObjectSize + 16 КиБ (документы плюс обёртка курсора) и не больше
+`max_message_bytes`; при превышении ошибка называет размер. Вставка сейчас
+передаёт массив документов внутри одной команды: разбивайте большие наборы на
+пакеты, помещающиеся в 16 МиБ.
+
+Параметры URI (имена — без учёта регистра):
+
+- применяются: `authSource`, `authMechanism=SCRAM-SHA-256`, `directConnection`,
+  `tls` (`ssl`), `tlsCAFile`; `w`, `wtimeoutMS`, `journal` — writeConcern команд
+  записи (insert, update, delete, findAndModify, команды индексов и коллекций),
+  если команда не задала свой; `appName` — метаданные рукопожатия; `maxPoolSize`
+  — предел занятых соединений рабочего потока, не больше 32; `maxIdleTimeMS` —
+  не больше 30 с;
+  `connectTimeoutMS` — TCP и TLS; `timeoutMS` — не больше `timeout_ms`;
+  `replicaSet` — имя сверяется с ответом сервера; `readPreference=primary`,
+  `readConcernLevel=local`, `loadBalanced=false`;
+- принимаются и не действуют: `retryWrites`, `retryReads` (повторов нет, вместо
+  них `unknown_outcome`); `minPoolSize`, `maxConnecting`, `waitQueueTimeoutMS`,
+  `serverSelectionTimeoutMS`, `serverSelectionTryOnce`, `heartbeatFrequencyMS`,
+  `localThresholdMS`, `socketTimeoutMS` (каждую операцию и так ограничивает
+  `timeout_ms`, выбирать сервер не из чего); `compressors`,
+  `zlibCompressionLevel` (сжатия нет, сервер отвечает без него);
+  `uuidRepresentation` (UUID пишется явно, через `BsonBinary`);
+- отклоняются, потому что меняют смысл, которого драйвер не поддерживает:
+  `w=0`, `readPreference` кроме `primary`, `readPreferenceTags`,
+  `maxStalenessSeconds`, `readConcernLevel` кроме `local` (задайте readConcern в
+  команде), `loadBalanced=true`, другие `authMechanism`,
+  `authMechanismProperties`, любые `tls*`, кроме `tls` и `tlsCAFile`
+  (`tlsInsecure`, `tlsAllowInvalidCertificates`, клиентские сертификаты), и
+  неизвестные имена.
+
+Пароль SCRAM пока должен состоять из печатных ASCII-символов: Unicode SASLprep
+не реализован. TLS требует сервера, поддерживающего TLS 1.3. Компрессия
+протокола не реализована.
 
 ## ClickHouse
 
@@ -207,7 +320,10 @@ bash tests/databases/compiler.sh
 bash tests/databases/runtime.sh
 ```
 
-Кодеки и проверки повреждённых сообщений не требуют БД. `runtime.sh` проверяет
+Кодеки и проверки повреждённых сообщений не требуют БД. С `MONGODB_URI`
+`tests/mongo.sh` также запускает `khc test tests/mongo/request.kh`: память арены
+на 100 000 документов и курсоре больше 20 МБ в одном запросе, закрытие курсоров
+после `fail` и panic. `runtime.sh` проверяет
 совместную работу драйверов, переключение сопрограмм и освобождение ресурсов
 после `fail`/`panic` на одном и двух потоках; ему нужны оба адреса БД.
 Настоящие подключения

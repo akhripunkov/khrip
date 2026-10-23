@@ -1,7 +1,8 @@
-// Native MongoDB OP_MSG client (MongoDB 6+). Static, no libc or proxy process.
-// Direct endpoint only: standalone, mongos, or an explicitly selected primary.
-// No SDAM, SRV, sessions, transactions, retryable writes, or implicit retries.
-// Calls return errors, including an explicit unknown-outcome bit after lost I/O.
+// Клиент MongoDB по OP_MSG (MongoDB 6+): статический, без libc и процесса-
+// посредника. Только прямое подключение: standalone, mongos или явно выбранный
+// primary. Нет SDAM, SRV, сессий, транзакций, retryable writes и неявных
+// повторов. Вызовы возвращают ошибки, в том числе признак «исход неизвестен»
+// после потерянного обмена.
 
 type Mongo {
     uri: str, timeout_ms: int = 10000, max_message_bytes: int = 48000000
@@ -9,6 +10,10 @@ type Mongo {
 type MongoResult {
     document: Bson, error: str = "", code: int = 0, unknown_outcome: bool = false
 }
+// Курсор живёт один запрос: mongo_next и mongo_close меняют его поля, а
+// документы лежат в памяти запроса. Поэтому в store курсор не положить (ошибка
+// компиляции, src/api.kh), а курсоры, не закрытые к концу запроса,
+// закрываются сами (__mongo_request_end).
 type MongoCursor {
     client: Mongo
     database: str
@@ -18,10 +23,31 @@ type MongoCursor {
     error: str = ""
     code: int = 0
     batch_size: int = 100
-    // Reply documents are immutable arena snapshots. Bound their total size;
-    // typed decoded values have their own additional arena cost.
+    // Документы ответа — неизменяемые снимки в арене. Бюджет — их общий
+    // размер; типизированные значения занимают память сверх него.
     bytes_read: int = 0
     max_bytes: int = 67108864
+    // пространство имён из ответа сервера, "база.коллекция": по нему идут
+    // getMore и killCursors
+    ns: str = ""
+}
+// Параметры find сверх фильтра (mongo_find_with).
+type MongoFindOptions {
+    sort: Bson?
+    projection: Bson?
+    skip: int = 0
+    limit: int = 0
+    batch_size: int = 100
+    max_bytes: int = 67108864
+}
+// Индекс для mongo_create_indexes; keys — например to_bson({"email": 1}).
+type MongoIndex {
+    keys: Bson
+    // пусто — имя по ключам, как у официальных драйверов: "email_1"
+    name: str = ""
+    unique: bool = false
+    // TTL: документ удаляется через столько секунд после даты в поле ключа
+    expire_after_seconds: int?
 }
 
 type __MongoUrl {
@@ -35,15 +61,42 @@ type __MongoUrl {
     tls: bool = false
     root: str = ""
     direct: bool = false
+    // writeConcern из URI: w строкой ("majority", имя набора тегов) или числом,
+    // wtimeout и j (-1 — не задано)
+    w: str = ""
+    w_number: int = -1
+    wtimeout: int = -1
+    journal: int = -1
+    app_name: str = ""
+    max_pool: int = 32
+    idle_ms: int = 30000
+    connect_ms: int = 0
+    timeout_ms: int = 0
+    replica_set: str = ""
+    error: str = ""
+}
+
+// Команда, готовая до окна без блокировки store (как __fetch): адрес разобран,
+// байты OP_MSG собраны; в окне — только пул, обмен и возврат соединения.
+type __MongoCall {
+    url: __MongoUrl
+    // ключ пула: SHA-256 полного URI (32 байта)
+    key: int = 0
+    wire: str = ""
+    request: int = 0
+    // размер документа команды — сверяется с maxBsonObjectSize сервера
+    body: int = 0
+    deadline: int = 0
+    limit: int = 0
     error: str = ""
 }
 
 const MONGO_BLOCK = 4096
 const MONGO_POOL_SIZE = 32
 const MONGO_IDLE_MS = 30000
+// Блок соединения (mmap, MONGO_BLOCK байт).
 const MB_FD = 0
 const MB_TLS = 8
-const MB_REQ = 16
 const MB_MAX = 24
 const MB_DOC = 32
 const MB_BATCH = 40
@@ -51,6 +104,35 @@ const MB_LAST = 48
 const MB_IN = 56
 const MB_KEY = 96
 const MB_POOL = 128
+const MB_IDLE = 136
+// Страница пула потока (CTX_MONGOPOOL): [0] — занятые соединения, [8 + 8·i] —
+// свободные (MONGO_POOL_SIZE мест), дальше — эти слова.
+// последний requestID потока
+const MP_REQ = 512
+// реестр курсоров потока (mmap) или 0
+const MP_CURSORS = 520
+// сколько раз поток считал PBKDF2 (по нему тесты проверяют кэш SCRAM)
+const MP_PBKDF2 = 528
+// следующее место кэша SCRAM
+const MP_KEYS_NEXT = 536
+// кэш ключей SCRAM: MONGO_KEYS записей по 96 байт — SHA-256 от (пользователь,
+// пароль, соль, итерации), ClientKey, ServerKey
+const MP_KEYS = 1024
+const MONGO_KEYS = 8
+// Реестр курсоров: MONGO_CURSORS записей по MC_SIZE байт.
+const MONGO_CURSORS = 128
+const MC_SIZE = 384
+// 0 — свободна, 1 — курсор открыт запросом, 2 — запрос кончился: закрыть
+const MC_STATE = 0
+// CTX_CORO запроса, открывшего курсор
+const MC_OWNER = 8
+const MC_ID = 16
+const MC_TIME = 24
+// ключ пула (32 байта): killCursors идёт тому же серверу от того же пользователя
+const MC_KEY = 32
+const MC_NSLEN = 64
+const MC_NS = 72
+const MC_NSMAX = 312
 
 fn __mongo_percent(s: str) -> str? {
     let out = buf_new(s.byte_len() + 1)
@@ -78,6 +160,23 @@ fn __mongo_percent(s: str) -> str? {
         return none
     }
     return value
+}
+
+// Неотрицательное целое опции URI или -1.
+fn __mongo_uint(value: str) -> int {
+    let n = value.to_int() ?? -1
+    if n < 0 || value.byte_len() == 0 || value.byte(0) == '+' {
+        return -1
+    }
+    return n
+}
+
+// Опции URI, которые драйвер принимает и не применяет: пул, выбор сервера,
+// мониторинг и сжатие. Каждую операцию и так ограничивает timeout_ms, серверов
+// для выбора нет, сжатия нет (сервер отвечает без него), повторов записи нет
+// (вместо них — unknown_outcome).
+fn __mongo_ignored_option(key: str) -> bool {
+    return key == "retrywrites" || key == "retryreads" || key == "minpoolsize" || key == "maxconnecting" || key == "waitqueuetimeoutms" || key == "serverselectiontimeoutms" || key == "serverselectiontryonce" || key == "heartbeatfrequencyms" || key == "localthresholdms" || key == "sockettimeoutms" || key == "compressors" || key == "zlibcompressionlevel" || key == "uuidrepresentation"
 }
 
 fn __mongo_url(uri: str) -> __MongoUrl {
@@ -121,8 +220,8 @@ fn __mongo_url(uri: str) -> __MongoUrl {
         u.user = user ?? ""
         u.password = password ?? ""
         u.auth = true
-        // ASCII printable passwords already satisfy SASLprep. Unicode password
-        // normalization is intentionally rejected until Unicode tables exist.
+        // Печатный ASCII уже удовлетворяет SASLprep. Нормализация паролей Unicode
+        // сознательно отклоняется: таблиц SASLprep нет.
         for i in 0..u.password.byte_len() {
             if u.password.byte(i) < 32 || u.password.byte(i) > 126 {
                 u.error = "SCRAM-SHA-256 currently requires a printable ASCII password (SASLprep)"
@@ -161,34 +260,128 @@ fn __mongo_url(uri: str) -> __MongoUrl {
             u.error = "invalid MongoDB URI option encoding"
             return u
         }
-        if seen.has(name) {
+        // имена опций URI не различают регистр (спецификация строки подключения)
+        var key = name.ascii_lower()
+        if key == "ssl" {
+            key = "tls"
+        }
+        if seen.has(key) {
             u.error = "duplicate MongoDB URI option: " + name
             return u
         }
-        seen[name] = true
-        if name == "authSource" {
+        seen[key] = true
+        let bool_value = value == "true" || value == "false"
+        let number = __mongo_uint(value)
+        if key == "authsource" {
             u.auth_source = value
-        } else if name == "authMechanism" {
+        } else if key == "authmechanism" {
             if value != "SCRAM-SHA-256" {
                 u.error = "only SCRAM-SHA-256 is supported"
                 return u
             }
-        } else if name == "directConnection" {
-            if value != "true" {
-                u.error = "only directConnection=true is supported"
+        } else if key == "directconnection" {
+            if !bool_value {
+                u.error = "directConnection must be true or false"
                 return u
             }
-            u.direct = true
-        } else if name == "tls" {
-            if value != "true" && value != "false" {
+            u.direct = value == "true"
+        } else if key == "tls" {
+            if !bool_value {
                 u.error = "tls must be true or false"
                 return u
             }
             u.tls = value == "true"
-        } else if name == "tlsCAFile" {
+        } else if key == "tlscafile" {
             u.root = value
             u.tls = true
-        } else {
+        } else if key == "w" {
+            if value == "0" {
+                u.error = "unacknowledged MongoDB writes (w=0) are not supported"
+                return u
+            }
+            if number > 0 && number <= 2147483647 {
+                u.w_number = number
+            } else if value != "" && number < 0 && value.byte(0) != '-' {
+                u.w = value
+            } else {
+                u.error = "invalid MongoDB write concern w=" + value
+                return u
+            }
+        } else if key == "wtimeoutms" {
+            if number < 0 {
+                u.error = "wtimeoutMS must be a non-negative integer"
+                return u
+            }
+            u.wtimeout = number
+        } else if key == "journal" {
+            if !bool_value {
+                u.error = "journal must be true or false"
+                return u
+            }
+            u.journal = 0
+            if value == "true" {
+                u.journal = 1
+            }
+        } else if key == "appname" {
+            if value.byte_len() > 128 || __utf8_scan(__str_ptr(value), value.byte_len()) < 0 {
+                u.error = "appName must be UTF-8 of at most 128 bytes"
+                return u
+            }
+            u.app_name = value
+        } else if key == "maxpoolsize" {
+            if number < 0 {
+                u.error = "maxPoolSize must be a non-negative integer"
+                return u
+            }
+            // 0 — без предела: предел пула потока
+            if number > 0 && number < MONGO_POOL_SIZE {
+                u.max_pool = number
+            }
+        } else if key == "maxidletimems" {
+            if number < 0 {
+                u.error = "maxIdleTimeMS must be a non-negative integer"
+                return u
+            }
+            if number > 0 && number < MONGO_IDLE_MS {
+                u.idle_ms = number
+            }
+        } else if key == "connecttimeoutms" {
+            if number < 0 {
+                u.error = "connectTimeoutMS must be a non-negative integer"
+                return u
+            }
+            u.connect_ms = number
+        } else if key == "timeoutms" {
+            if number < 0 {
+                u.error = "timeoutMS must be a non-negative integer"
+                return u
+            }
+            u.timeout_ms = number
+        } else if key == "replicaset" {
+            if value == "" {
+                u.error = "replicaSet needs a name"
+                return u
+            }
+            u.replica_set = value
+        } else if key == "readpreference" {
+            if value != "primary" {
+                u.error = "readPreference=" + value + " is not supported: the driver reads only from the primary"
+                return u
+            }
+        } else if key == "readconcernlevel" {
+            if value != "local" {
+                u.error = "readConcernLevel=" + value + " is not supported in the URI; set readConcern in the command"
+                return u
+            }
+        } else if key == "loadbalanced" {
+            if value != "false" {
+                u.error = "loadBalanced=true is not supported"
+                return u
+            }
+        } else if key.starts_with("tls") && key != "tlscafile" {
+            u.error = "unsupported MongoDB URI option: " + name + " (only tls and tlsCAFile; certificate checks cannot be weakened)"
+            return u
+        } else if !__mongo_ignored_option(key) {
             u.error = "unsupported MongoDB URI option: " + name
             return u
         }
@@ -200,7 +393,7 @@ fn __mongo_url(uri: str) -> __MongoUrl {
 }
 
 fn __mongo_db_name(name: str) -> bool {
-    if name.byte_len() == 0 || name.byte_len() > 63 {
+    if name.byte_len() == 0 || name.byte_len() > 63 || __utf8_scan(__str_ptr(name), name.byte_len()) < 0 {
         return false
     }
     for i in 0..name.byte_len() {
@@ -220,6 +413,13 @@ fn __mongo_failure(error: str, unknown: bool = false) -> MongoResult {
     }
 }
 
+// Ключ пула для URI: SHA-256 (32 байта).
+fn __mongo_key(uri: str) -> int {
+    let key = __alloc(32)
+    __hash(32, __str_ptr(uri), uri.byte_len(), key)
+    return key
+}
+
 fn __mongo_pool() -> int {
     let cx = __ctx()
     var p = load64(cx + CTX_MONGOPOOL)
@@ -227,8 +427,15 @@ fn __mongo_pool() -> int {
         p = __mmap(4096)
         store64(cx + CTX_MONGOPOOL, p)
     }
-    // p[0] active count, p[8...] idle connection pointers.
     return p
+}
+
+// requestID следующего сообщения потока: ответ сверяется с ним (responseTo).
+fn __mongo_request_id() -> int {
+    let pool = __mongo_pool()
+    let id = (load64(pool + MP_REQ) + 1) & 0x7FFFFFFF
+    store64(pool + MP_REQ, id)
+    return id
 }
 
 fn __mongo_free(c: int) {
@@ -263,17 +470,43 @@ fn __mongo_discard(c: int) {
     __mongo_free(c)
 }
 
-// Called on normal completion, fail(), panic and aborted request cleanup.
+// Конец запроса: после ответа, fail(), panic и прерванного запроса. Не ждёт
+// сеть и не выделяет память (может идти после паники из-за памяти).
+//   - Взятое соединение закрывается: обмен мог оборваться посередине.
+//   - Курсоры, которые запрос не дочитал и не закрыл, ставятся в очередь
+//     потока: killCursors уйдёт перед следующей командой через соединение с
+//     тем же URI (__mongo_kill_pending). Послать его отсюда нельзя — это сеть
+//     и выделение памяти в очистке. Если команд с этим URI больше не будет,
+//     курсор закроет сервер через cursorTimeoutMillis (10 минут).
+//   - Вложенный запрос теста (call: CTX_CATCH — буфер теста) курсоры не
+//     трогает: среди них могут быть курсоры самого теста; их поставит в очередь
+//     конец теста.
 fn __mongo_request_end() {
-    let c = load64(__ctx() + CTX_MONGOHELD)
+    let cx = __ctx()
+    let c = load64(cx + CTX_MONGOHELD)
     if c != 0 {
         __mongo_discard(c)
+    }
+    let pool = load64(cx + CTX_MONGOPOOL)
+    if pool == 0 || load64(cx + CTX_CATCH) != 0 {
+        return
+    }
+    let reg = load64(pool + MP_CURSORS)
+    if reg == 0 {
+        return
+    }
+    let owner = load64(cx + CTX_CORO)
+    for i in 0..MONGO_CURSORS {
+        let e = reg + i * MC_SIZE
+        if load64(e + MC_STATE) == 1 && load64(e + MC_OWNER) == owner {
+            store64(e + MC_STATE, 2)
+        }
     }
 }
 
 fn __mongo_buffer(c: int) -> Buf {
-    // Keep the buffer header in the connection itself. A grow followed by a
-    // coroutine yield/panic must not leave cleanup with the old unmapped data.
+    // Заголовок буфера — в самом соединении: рост буфера, а затем переключение
+    // сопрограммы или паника не оставят очистке старый, уже снятый адрес.
     return __cast(c + MB_IN)
 }
 
@@ -303,7 +536,7 @@ fn __mongo_put(c: int) {
 }
 
 fn __mongo_live(c: int, deadline: int) -> bool {
-    if now_ms() - load64(c + MB_LAST) > MONGO_IDLE_MS {
+    if now_ms() - load64(c + MB_LAST) > load64(c + MB_IDLE) {
         return false
     }
     let tls = load64(c + MB_TLS)
@@ -312,9 +545,9 @@ fn __mongo_live(c: int, deadline: int) -> bool {
     if tls == 0 {
         return syscall(SYS_RECVFROM, fd, peek, 1, MSG_PEEK | MSG_DONTWAIT, 0, 0) == -EAGAIN
     }
-    // TLS 1.3 tickets can arrive after authentication. Consume a bounded number
-    // of post-handshake records rather than reconnecting/authenticating again.
-    // The caller has already removed this connection from the idle pool.
+    // Билеты TLS 1.3 приходят и после аутентификации: ограниченное число
+    // записей после рукопожатия читается, а не повод для нового подключения.
+    // Соединение уже вынуто из пула вызывающим.
     for i in 0..8 {
         if now_ms() >= deadline { return false }
         let r = syscall(SYS_RECVFROM, fd, peek, 1, MSG_PEEK | MSG_DONTWAIT, 0, 0)
@@ -330,18 +563,18 @@ fn __mongo_live(c: int, deadline: int) -> bool {
     return false
 }
 
-fn __mongo_take(uri: str, deadline: int) -> int {
+// Соединение для ключа пула key: свободное живое или новый блок (ещё не
+// подключён: MB_FD < 0). limit — maxPoolSize, idle — maxIdleTimeMS из URI.
+fn __mongo_take(key: int, limit: int, idle: int, deadline: int) -> int {
     if now_ms() >= deadline { return 0 }
     let pool = __mongo_pool()
-    while load64(pool) >= MONGO_POOL_SIZE {
+    while load64(pool) >= limit {
         if now_ms() >= deadline {
             return 0
         }
         sleep(1)
     }
-    let key = __alloc(32)
-    __hash(32, __str_ptr(uri), uri.byte_len(), key)
-    var idle = 0
+    var free = 0
     var oldest = -1
     for i in 0..MONGO_POOL_SIZE {
         let slot = pool + 8 + i * 8
@@ -349,12 +582,12 @@ fn __mongo_take(uri: str, deadline: int) -> int {
         if c == 0 {
             continue
         }
-        if now_ms() - load64(c + MB_LAST) > MONGO_IDLE_MS {
+        if now_ms() - load64(c + MB_LAST) > load64(c + MB_IDLE) {
             store64(slot, 0)
             __mongo_free(c)
             continue
         }
-        idle += 1
+        free += 1
         if oldest < 0 || load64(c + MB_LAST) < load64(load64(pool + 8 + oldest * 8) + MB_LAST) {
             oldest = i
         }
@@ -364,10 +597,10 @@ fn __mongo_take(uri: str, deadline: int) -> int {
             store64(__ctx() + CTX_MONGOHELD, c)
             if __mongo_live(c, deadline) { return c }
             __mongo_discard(c)
-            return __mongo_take(uri, deadline)
+            return __mongo_take(key, limit, idle, deadline)
         }
     }
-    if idle + load64(pool) >= MONGO_POOL_SIZE && oldest >= 0 {
+    if free + load64(pool) >= MONGO_POOL_SIZE && oldest >= 0 {
         let slot = pool + 8 + oldest * 8
         __mongo_free(load64(slot))
         store64(slot, 0)
@@ -378,6 +611,7 @@ fn __mongo_take(uri: str, deadline: int) -> int {
     store64(c + MB_MAX, 48000000)
     store64(c + MB_DOC, BSON_MAX_BYTES)
     store64(c + MB_BATCH, 100000)
+    store64(c + MB_IDLE, idle)
     __memcpy(c + MB_KEY, key, 32)
     store64(pool, load64(pool) + 1)
     store64(__ctx() + CTX_MONGOHELD, c)
@@ -400,7 +634,54 @@ fn __mongo_crc32c(p: int, n: int) -> int {
     return crc ^ 0xFFFFFFFF
 }
 
-fn __mongo_response(raw: str, request: int) -> MongoResult {
+// Код ошибки из значения вида kind по адресу v: int32, int64 или целый double;
+// иначе -1.
+fn __mongo_code_at(kind: int, v: int) -> int {
+    if kind == 16 {
+        return __bson_i32(v)
+    }
+    if kind == 18 {
+        return load64(v)
+    }
+    if kind == 1 {
+        let f: float = __cast(load64(v))
+        if __bson_whole(f) {
+            return __bson_to_int(f)
+        }
+    }
+    return -1
+}
+
+// Документ ошибки записи ({code, errmsg}): → ошибка или "" (поля не те).
+fn __mongo_error_doc(p: int) -> MongoResult? {
+    let n = load32(p)
+    let code = __bson_find(p, n, "code")
+    let message = __bson_find(p, n, "errmsg")
+    if code == 0 || message == 0 || load8(message) != 2 {
+        return none
+    }
+    let value = __mongo_code_at(load8(code), code + 6)
+    if value < 0 && load8(code) != 16 && load8(code) != 18 {
+        return none
+    }
+    let m = message + 8
+    var text = __str_new(m + 4, load32(m) - 1)
+    if __utf8_scan(m + 4, load32(m) - 1) < 0 {
+        text = "MongoDB error message is not valid UTF-8"
+    }
+    return MongoResult {
+        document: Bson {
+            data: ""
+        }, error: text, code: value
+    }
+}
+
+// Ответ OP_MSG. Проверка — один раз: заголовок, флаги, контрольная сумма и
+// структура документа (без UTF-8: строки проверяет их чтение, и одна
+// испорченная строка не губит ответ и соединение). Документ — до
+// maxBsonObjectSize + 16 КиБ: столько сервер может прислать с обёрткой курсора.
+// Верхний уровень читается за один проход.
+fn __mongo_response(raw: str, request: int, max_doc: int) -> MongoResult {
     let p = __str_ptr(raw)
     let n = raw.byte_len()
     if n < 26 || load32(p) != n || load32(p + 8) != request || load32(p + 12) != 2013 {
@@ -420,69 +701,130 @@ fn __mongo_response(raw: str, request: int) -> MongoResult {
     if load8(p + 20) != 0 || end < 26 {
         return __mongo_failure("expected MongoDB response body section", true)
     }
-    let len = load32(p + 21)
-    if len != end - 21 {
+    let size = load32(p + 21)
+    if size != end - 21 {
         return __mongo_failure("invalid MongoDB response body length", true)
     }
-    let doc = bson_parse(raw.byte_slice(21, end))
-    if doc.error != "" {
-        return __mongo_failure(doc.error, true)
+    let limit = max_doc + 16384
+    if size > limit {
+        return __mongo_failure("MongoDB response document of {size} bytes exceeds the {limit}-byte limit", true)
     }
-    let keys: map[str, bool] = {}
-    for field in __bson_fields(doc) {
-        if keys.has(field.name) {
+    let body = p + 21
+    // сервер хранит документы до 100 уровней вложенности, ответ добавляет
+    // обёртку курсора: проверка ответа разрешает 128
+    if !__bson_check(body, size, BSON_MAX_DEPTH - 128, false, false) {
+        return __mongo_failure("invalid BSON in MongoDB response", true)
+    }
+    let doc = Bson {
+        data: __str_new(body, size), checked: true
+    }
+    var ok = 0
+    var message = 0
+    var code = 0
+    var write_errors = 0
+    var concern = 0
+    var cursor = 0
+    let last = body + size - 1
+    var at = body + 4
+    while at < last {
+        let z = __bson_zero(at + 1, last)
+        let next = __bson_skip(load8(at), z + 1, last)
+        let kp = at + 1
+        let kn = z - at - 1
+        var dup = false
+        if __bson_key_is(kp, kn, "ok") {
+            dup = ok != 0
+            ok = at
+        } else if __bson_key_is(kp, kn, "errmsg") {
+            dup = message != 0
+            message = at
+        } else if __bson_key_is(kp, kn, "code") {
+            dup = code != 0
+            code = at
+        } else if __bson_key_is(kp, kn, "writeErrors") {
+            dup = write_errors != 0
+            write_errors = at
+        } else if __bson_key_is(kp, kn, "writeConcernError") {
+            dup = concern != 0
+            concern = at
+        } else if __bson_key_is(kp, kn, "cursor") {
+            dup = cursor != 0
+            cursor = at
+        }
+        if dup {
             return __mongo_failure("duplicate MongoDB response field", true)
         }
-        keys[field.name] = true
+        at = next
     }
-    let ok = bson_get(doc, "ok") else {
+    if ok == 0 {
         return __mongo_failure("MongoDB response is missing ok", true)
     }
     var success = false
-    if ok.kind == 1 {
-        let number: float = __cast(load64(__str_ptr(ok.data)))
+    let kind = load8(ok)
+    if kind == 1 {
+        let number: float = __cast(load64(ok + 4))
         if number != 0.0 && number != 1.0 { return __mongo_failure("invalid MongoDB ok value", true) }
         success = number == 1.0
-    } else if ok.kind == 16 || ok.kind == 18 {
-        let number = bson_get_int(doc, "ok") ?? -1
+    } else if kind == 16 || kind == 18 {
+        let number = __mongo_code_at(kind, ok + 4)
         if number != 0 && number != 1 { return __mongo_failure("invalid MongoDB ok value", true) }
         success = number == 1
     } else {
         return __mongo_failure("invalid MongoDB ok type", true)
     }
     if !success {
-        return MongoResult {
-            document: doc, error: bson_get_str(doc, "errmsg") ?? "MongoDB command failed", code: bson_get_int(doc, "code") ?? -1
-        }
-    }
-    if let errors_field = bson_get(doc, "writeErrors") {
-        if errors_field.kind != 4 { return __mongo_failure("invalid MongoDB writeErrors type", true) }
-        for entry in __bson_fields(Bson { data: errors_field.data }) {
-            if entry.kind != 3 { return __mongo_failure("invalid MongoDB writeErrors entry", true) }
-            let error_doc = Bson { data: entry.data }
-            if bson_get_int(error_doc, "code") == none || bson_get_str(error_doc, "errmsg") == none {
-                return __mongo_failure("invalid MongoDB write error fields", true)
+        var text = "MongoDB command failed"
+        if message != 0 && load8(message) == 2 {
+            let m = message + 8
+            if __utf8_scan(m + 4, load32(m) - 1) >= 0 {
+                text = __str_new(m + 4, load32(m) - 1)
             }
+        }
+        var value = -1
+        if code != 0 {
+            value = __mongo_code_at(load8(code), code + 6)
+        }
+        return MongoResult {
+            document: doc, error: text, code: value
         }
     }
     var uncertain = false
-    if let concern_field = bson_get(doc, "writeConcernError") {
-        if concern_field.kind != 3 { return __mongo_failure("invalid MongoDB writeConcernError type", true) }
-        let concern_doc = Bson { data: concern_field.data }
-        if bson_get_int(concern_doc, "code") == none || bson_get_str(concern_doc, "errmsg") == none {
+    var concern_error: MongoResult? = none
+    if concern != 0 {
+        if load8(concern) != 3 { return __mongo_failure("invalid MongoDB writeConcernError type", true) }
+        concern_error = __mongo_error_doc(concern + 19)
+        if concern_error == none {
             return __mongo_failure("invalid MongoDB write concern error fields", true)
         }
         uncertain = true
     }
-    let errors = bson_get_array(doc, "writeErrors")
-    if errors.len() > 0 {
-        return MongoResult {
-            document: doc, error: bson_get_str(errors[0], "errmsg") ?? "MongoDB write failed", code: bson_get_int(errors[0], "code") ?? -1, unknown_outcome: uncertain
+    if write_errors != 0 {
+        if load8(write_errors) != 4 { return __mongo_failure("invalid MongoDB writeErrors type", true) }
+        let a = write_errors + 13
+        let a_end = a + load32(a) - 1
+        var first: MongoResult? = none
+        var e = a + 4
+        while e < a_end {
+            let z = __bson_zero(e + 1, a_end)
+            let next = __bson_skip(load8(e), z + 1, a_end)
+            if load8(e) != 3 { return __mongo_failure("invalid MongoDB writeErrors entry", true) }
+            let entry = __mongo_error_doc(z + 1) else {
+                return __mongo_failure("invalid MongoDB write error fields", true)
+            }
+            if first == none {
+                first = entry
+            }
+            e = next
+        }
+        if let w = first {
+            return MongoResult {
+                document: doc, error: w.error, code: w.code, unknown_outcome: uncertain
+            }
         }
     }
-    if let concern = bson_get_doc(doc, "writeConcernError") {
+    if let wc = concern_error {
         return MongoResult {
-            document: doc, error: bson_get_str(concern, "errmsg") ?? "MongoDB write concern failed", code: bson_get_int(concern, "code") ?? -1, unknown_outcome: true
+            document: doc, error: wc.error, code: wc.code, unknown_outcome: true
         }
     }
     return MongoResult {
@@ -490,73 +832,59 @@ fn __mongo_response(raw: str, request: int) -> MongoResult {
     }
 }
 
-fn __mongo_exchange(c: int, database: str, command: Bson, deadline: int, limit: int) -> MongoResult {
-    if !bson_valid(command) {
-        return __mongo_failure("invalid BSON command: " + command.error)
-    }
-    if bson_has(command, "$db") {
-        return __mongo_failure("pass the database separately, not as $db")
-    }
-    if let concern = bson_get_doc(command, "writeConcern") {
-        if let w = bson_get(concern, "w") {
-            if w.kind != 2 && w.kind != 16 && w.kind != 18 {
-                return __mongo_failure("MongoDB writeConcern.w must be a positive integer or a named write concern")
-            }
-            if w.kind != 2 && (bson_get_int(concern, "w") ?? 0) <= 0 {
-                return __mongo_failure("unacknowledged MongoDB writes are not supported")
-            }
-        }
-    }
-    let body = bson_new()
-    // Preserve the first field: MongoDB determines the command by its name.
-    let fields = __bson_fields(command)
-    if fields.len() == 0 {
-        return __mongo_failure("MongoDB command is empty")
-    }
-    for f in fields {
-        if __bson_key(body, f.name, f.kind, f.data.byte_len()) {
-            buf_add(body.buffer, f.data)
-        }
-    }
-    bson_str(body, "$db", database)
-    let doc = bson_finish(body)
-    if doc.error != "" {
-        return __mongo_failure(doc.error)
-    }
-    if doc.data.byte_len() > load64(c + MB_DOC) || doc.data.byte_len() + 21 > load64(c + MB_MAX) || doc.data.byte_len() + 21 > limit {
-        return __mongo_failure("MongoDB command exceeds the message or document limit")
-    }
-    let req = (load64(c + MB_REQ) + 1) & 0x7FFFFFFF
-    store64(c + MB_REQ, req)
-    let wire = buf_new(doc.data.byte_len() + 21)
-    __bson_u32(wire, doc.data.byte_len() + 21)
-    __bson_u32(wire, req)
-    __bson_u32(wire, 0)
-    __bson_u32(wire, 2013)
-    __bson_u32(wire, 0)
-    buf_byte(wire, 0)
-    buf_add(wire, doc.data)
+// Байты OP_MSG: заголовок, флаги, секция 0 — поля command, затем extra (готовые
+// поля BSON) и "$db". Один проход копирования.
+fn __mongo_wire(command: Bson, extra: str, database: str, request: int) -> str {
+    let fields = command.data.byte_len() - 5
+    let b = buf_new(21 + 4 + fields + extra.byte_len() + 10 + database.byte_len() + 1)
+    __bson_u32(b, 0)
+    __bson_u32(b, request)
+    __bson_u32(b, 0)
+    __bson_u32(b, 2013)
+    __bson_u32(b, 0)
+    buf_byte(b, 0)
+    __bson_u32(b, 0)
+    buf_add_raw(b, __str_ptr(command.data) + 4, fields)
+    buf_add(b, extra)
+    buf_byte(b, 2)
+    buf_add(b, "$db")
+    buf_byte(b, 0)
+    __bson_u32(b, database.byte_len() + 1)
+    buf_add(b, database)
+    buf_byte(b, 0)
+    buf_byte(b, 0)
+    store32(b.data, b.len)
+    store32(b.data + 21, b.len - 21)
+    return __str_new(b.data, b.len)
+}
+
+// Отправить готовое сообщение и прочитать ответ на него.
+fn __mongo_send(c: int, wire: str, request: int, deadline: int, limit: int) -> MongoResult {
     let tls = load64(c + MB_TLS)
     var handle = load64(c + MB_FD)
     if tls != 0 {
         handle = tls
     }
-    if !__link_write(tls, handle, wire.data, wire.len, deadline) {
+    if !__link_write(tls, handle, __str_ptr(wire), wire.byte_len(), deadline) {
         return __mongo_failure("MongoDB connection failed while sending; outcome unknown", true)
     }
+    let max = limit.min(load64(c + MB_MAX))
     let b = __mongo_buffer(c)
     b.len = 0
     while true {
         if b.len >= 4 {
             let n = load32(b.data)
-            if n < 26 || n > limit || n > load64(c + MB_MAX) {
-                return __mongo_failure("MongoDB response exceeds configured limit or has invalid length", true)
+            if n < 26 {
+                return __mongo_failure("invalid MongoDB response length", true)
+            }
+            if n > max {
+                return __mongo_failure("MongoDB response of {n} bytes exceeds the {max}-byte message limit", true)
             }
             if b.len >= n {
                 if b.len != n {
                     return __mongo_failure("unexpected bytes after MongoDB response", true)
                 }
-                return __mongo_response(__str_copy(b.data, n), req)
+                return __mongo_response(__str_copy(b.data, n), request, load64(c + MB_DOC))
             }
         }
         if now_ms() >= deadline {
@@ -569,6 +897,44 @@ fn __mongo_exchange(c: int, database: str, command: Bson, deadline: int, limit: 
         }
     }
     return __mongo_failure("MongoDB protocol failure", true)
+}
+
+// Служебная команда (hello, SCRAM, killCursors) по уже взятому соединению.
+fn __mongo_exchange(c: int, database: str, command: Bson, deadline: int, limit: int) -> MongoResult {
+    if command.error != "" {
+        return __mongo_failure("invalid BSON command: " + command.error)
+    }
+    let request = __mongo_request_id()
+    return __mongo_send(c, __mongo_wire(command, "", database, request), request, deadline, limit)
+}
+
+// Ключи SCRAM (ClientKey и ServerKey, по 32 байта) для пароля, соли и числа
+// итераций. PBKDF2 (около 16 мс на 15 000 итераций) считается один раз на
+// поток, дальше ключи — из кэша, как у официальных драйверов. → 64 байта.
+fn __mongo_scram_keys(u: __MongoUrl, salt: Buf, iterations: int) -> int {
+    let pool = __mongo_pool()
+    let id = __alloc(32)
+    let text = u.user + "\0" + u.password + "\0" + __b64_encode(buf_str(salt)) + "\0" + iterations.to_str()
+    __hash(32, __str_ptr(text), text.byte_len(), id)
+    let out = __alloc(64)
+    for i in 0..MONGO_KEYS {
+        let e = pool + MP_KEYS + i * 96
+        if __memeq(e, id, 32) {
+            __memcpy(out, e + 32, 64)
+            return out
+        }
+    }
+    let salted = __alloc(32)
+    __pbkdf2(u.password, salt.data, salt.len, iterations, salted)
+    store64(pool + MP_PBKDF2, load64(pool + MP_PBKDF2) + 1)
+    __hmac(32, salted, 32, __str_ptr("Client Key"), 10, out)
+    __hmac(32, salted, 32, __str_ptr("Server Key"), 10, out + 32)
+    let slot = load64(pool + MP_KEYS_NEXT) % MONGO_KEYS
+    store64(pool + MP_KEYS_NEXT, slot + 1)
+    let e = pool + MP_KEYS + slot * 96
+    __memcpy(e, id, 32)
+    __memcpy(e + 32, out, 64)
+    return out
 }
 
 fn __mongo_scram(c: int, u: __MongoUrl, deadline: int) -> str {
@@ -587,10 +953,10 @@ fn __mongo_scram(c: int, u: __MongoUrl, deadline: int) -> str {
     if reply.error != "" {
         return reply.error
     }
-    let conversation = bson_get_int(reply.document, "conversationId") else {
+    let conversation = __bson_get_int(reply.document, "conversationId", false) else {
         return "SCRAM response is missing conversationId"
     }
-    let payload = bson_get_binary(reply.document, "payload") else {
+    let payload = __bson_get_binary(reply.document, "payload", false) else {
         return "SCRAM response is missing payload"
     }
     if payload.subtype != 0 {
@@ -616,20 +982,18 @@ fn __mongo_scram(c: int, u: __MongoUrl, deadline: int) -> str {
     }
     let salt = buf_new(128)
     __b64_decode(__str_ptr(salt64), salt64.byte_len(), salt)
-    // Existing optimized PBKDF2 helper accepts a one-block HMAC input:
-    // salt + the four-byte block counter must fit 55 bytes before SHA padding.
+    // Готовый PBKDF2 берёт вход HMAC в один блок: соль и четыре байта номера
+    // блока должны уместиться в 55 байт до дополнения SHA.
     if salt.len == 0 || salt.len > 51 || __b64_encode(buf_str(salt)) != salt64 {
         return "invalid or oversized SCRAM salt encoding"
     }
-    let salted = __alloc(32)
-    __pbkdf2(u.password, salt.data, salt.len, iterations, salted)
+    let keys = __mongo_scram_keys(u, salt, iterations)
     if now_ms() >= deadline {
         return "SCRAM deadline exceeded"
     }
-    let client_key = __alloc(32)
+    let client_key = keys
     let stored_key = __alloc(32)
     let signature = __alloc(32)
-    __hmac(32, salted, 32, __str_ptr("Client Key"), 10, client_key)
     __hash(32, client_key, 32, stored_key)
     let final = "c=biws,r=" + rnonce
     let auth = first + "," + server_first + "," + final
@@ -646,20 +1010,18 @@ fn __mongo_scram(c: int, u: __MongoUrl, deadline: int) -> str {
     if last.error != "" {
         return last.error
     }
-    if bson_get_int(last.document, "conversationId") != conversation {
+    if __bson_get_int(last.document, "conversationId", false) != conversation {
         return "SCRAM conversation changed"
     }
-    let server_key = __alloc(32)
-    __hmac(32, salted, 32, __str_ptr("Server Key"), 10, server_key)
-    __hmac(32, server_key, 32, __str_ptr(auth), auth.byte_len(), signature)
-    let server_proof = bson_get_binary(last.document, "payload") else {
+    __hmac(32, keys + 32, 32, __str_ptr(auth), auth.byte_len(), signature)
+    let server_proof = __bson_get_binary(last.document, "payload", false) else {
         return "SCRAM response is missing server proof"
     }
     let expected = "v=" + __b64_encode(__str_new(signature, 32))
     if server_proof.data.byte_len() != expected.byte_len() || !__memeq(__str_ptr(server_proof.data), __str_ptr(expected), expected.byte_len()) {
         return "SCRAM server proof mismatch"
     }
-    if bson_get_bool(last.document, "done") == true {
+    if __bson_get_bool(last.document, "done", false) == true {
         return ""
     }
     let finish = bson_new()
@@ -670,47 +1032,73 @@ fn __mongo_scram(c: int, u: __MongoUrl, deadline: int) -> str {
     if done.error != "" {
         return done.error
     }
-    if bson_get_bool(done.document, "done") != true || bson_get_int(done.document, "conversationId") != conversation {
+    if __bson_get_bool(done.document, "done", false) != true || __bson_get_int(done.document, "conversationId", false) != conversation {
         return "SCRAM conversation did not finish"
     }
     return ""
 }
 
 fn __mongo_connect(c: int, u: __MongoUrl, deadline: int) -> str {
-    let ip = __resolve(u.host, deadline) else {
+    // connectTimeoutMS ограничивает TCP и TLS; дальше — общий срок операции
+    var opening = deadline
+    if u.connect_ms > 0 {
+        opening = deadline.min(now_ms() + u.connect_ms)
+    }
+    let ip = __resolve(u.host, opening) else {
         return "cannot resolve MongoDB host"
     }
-    let fd = __connect(ip, u.port, deadline)
+    let fd = __connect(ip, u.port, opening)
     if fd < 0 {
         return "cannot connect to MongoDB"
     }
     store64(c + MB_FD, fd)
     if u.tls {
-        let tc = __tls_connect_roots(fd, u.host, u.port, u.root, TLS_VERIFY_FULL, deadline)
+        let tc = __tls_connect_roots(fd, u.host, u.port, u.root, TLS_VERIFY_FULL, opening)
         if tc.blk == 0 {
             return tc.err
         }
         store64(c + MB_TLS, tc.blk)
     }
+    // Метаданные клиента (спецификация рукопожатия): видны в журнале сервера и
+    // currentOp, appName из URI — имя приложения.
+    let driver = bson_new()
+    bson_str(driver, "name", "khrip")
+    bson_str(driver, "version", "0.13")
+    let os = bson_new()
+    bson_str(os, "type", "Linux")
+    bson_str(os, "architecture", "x86_64")
+    let client = bson_new()
+    if u.app_name != "" {
+        let app = bson_new()
+        bson_str(app, "name", u.app_name)
+        bson_doc(client, "application", bson_finish(app))
+    }
+    bson_doc(client, "driver", bson_finish(driver))
+    bson_doc(client, "os", bson_finish(os))
     let hello = bson_new()
     bson_int32(hello, "hello", 1)
     bson_bool(hello, "helloOk", true)
+    bson_doc(hello, "client", bson_finish(client))
     let r = __mongo_exchange(c, "admin", bson_finish(hello), deadline, 1048576)
     if r.error != "" {
         return r.error
     }
-    if (bson_get_int(r.document, "maxWireVersion") ?? 0) < 17 {
+    if (__bson_get_int(r.document, "maxWireVersion", false) ?? 0) < 17 {
         return "MongoDB 6.0 or newer is required"
     }
-    if bson_has(r.document, "setName") && !u.direct {
+    let set_name = __bson_get_str(r.document, "setName", false)
+    if set_name != none && !u.direct {
         return "replica-set endpoint requires directConnection=true; automatic discovery is not supported"
     }
-    if bson_get_bool(r.document, "isWritablePrimary") != true {
+    if u.replica_set != "" && set_name != u.replica_set {
+        return "MongoDB endpoint is not a member of replica set " + u.replica_set
+    }
+    if __bson_get_bool(r.document, "isWritablePrimary", false) != true {
         return "MongoDB endpoint is not a writable primary"
     }
-    let max_message = bson_get_int(r.document, "maxMessageSizeBytes") ?? 48000000
-    let max_doc = bson_get_int(r.document, "maxBsonObjectSize") ?? BSON_MAX_BYTES
-    let max_batch = bson_get_int(r.document, "maxWriteBatchSize") ?? 100000
+    let max_message = __bson_get_int(r.document, "maxMessageSizeBytes", false) ?? 48000000
+    let max_doc = __bson_get_int(r.document, "maxBsonObjectSize", false) ?? BSON_MAX_BYTES
+    let max_batch = __bson_get_int(r.document, "maxWriteBatchSize", false) ?? 100000
     if max_message < 1024 || max_doc < 5 || max_batch < 1 {
         return "invalid MongoDB server limits"
     }
@@ -723,51 +1111,191 @@ fn __mongo_connect(c: int, u: __MongoUrl, deadline: int) -> str {
     return ""
 }
 
-fn __mongo_command(client: Mongo, database: str, command: Bson) -> MongoResult {
-    if client.timeout_ms < 1 || client.timeout_ms > 3600000 || client.max_message_bytes < 1024 || client.max_message_bytes > 67108864 {
-        return __mongo_failure("invalid MongoDB timeout or message limit")
+// Коды «узел больше не primary» и «узел выключается» из спецификации SDAM:
+// NotWritablePrimary, NotPrimaryNoSecondaryOk, LegacyNotPrimary,
+// InterruptedAtShutdown, InterruptedDueToReplStateChange,
+// NotPrimaryOrSecondary, PrimarySteppedDown, ShutdownInProgress. Соединение с
+// таким узлом не переиспользуется.
+fn __mongo_reset_code(code: int) -> bool {
+    return code == 10107 || code == 13435 || code == 10058 || code == 11600 || code == 11602 || code == 13436 || code == 189 || code == 91
+}
+
+// Первое поле команды — её имя (MongoDB определяет команду по нему).
+fn __mongo_command_name(command: Bson) -> str {
+    let p = __str_ptr(command.data)
+    let end = __bson_body(p, command.data.byte_len())
+    if end == 0 || p + 4 >= end {
+        return ""
+    }
+    let z = __bson_zero(p + 5, end)
+    if z < 0 {
+        return ""
+    }
+    return __str_new(p + 5, z - p - 5)
+}
+
+// Команды записи: им writeConcern из URI добавляется, если его нет в команде.
+// aggregate с $out/$merge — нет: там writeConcern задаётся в самой команде.
+fn __mongo_write_command(name: str) -> bool {
+    return name == "insert" || name == "update" || name == "delete" || name == "findAndModify" || name == "findandmodify" || name == "create" || name == "createIndexes" || name == "drop" || name == "dropIndexes" || name == "dropDatabase" || name == "collMod" || name == "renameCollection"
+}
+
+// Поле writeConcern из опций URI (готовые байты элемента BSON) или "".
+fn __mongo_concern(u: __MongoUrl) -> str {
+    if u.w == "" && u.w_number < 0 && u.wtimeout < 0 && u.journal < 0 {
+        return ""
+    }
+    let wc = bson_new()
+    if u.w != "" {
+        bson_str(wc, "w", u.w)
+    } else if u.w_number > 0 {
+        bson_int32(wc, "w", u.w_number)
+    }
+    if u.wtimeout >= 0 {
+        bson_int(wc, "wtimeout", u.wtimeout)
+    }
+    if u.journal >= 0 {
+        bson_bool(wc, "j", u.journal == 1)
+    }
+    let field = bson_new()
+    bson_doc(field, "writeConcern", bson_finish(wc))
+    let doc = bson_finish(field)
+    return doc.data.byte_slice(4, doc.data.byte_len() - 1)
+}
+
+// Проверки команды до отправки: → "" или ошибка.
+fn __mongo_command_check(command: Bson) -> str {
+    if command.error != "" {
+        return "invalid BSON command: " + command.error
+    }
+    if !command.checked && !bson_valid(command) {
+        return "invalid BSON command"
+    }
+    let p = __str_ptr(command.data)
+    let n = command.data.byte_len()
+    if n <= 5 {
+        return "MongoDB command is empty"
+    }
+    if __bson_find(p, n, "$db") != 0 {
+        return "pass the database separately, not as $db"
+    }
+    let wc = __bson_find(p, n, "writeConcern")
+    if wc != 0 && load8(wc) == 3 {
+        let v = wc + 14
+        let w = __bson_find(v, load32(v), "w")
+        if w != 0 {
+            let kind = load8(w)
+            if kind != 2 && kind != 16 && kind != 18 {
+                return "MongoDB writeConcern.w must be a positive integer or a named write concern"
+            }
+            if kind != 2 && __mongo_code_at(kind, w + 3) <= 0 {
+                return "unacknowledged MongoDB writes are not supported"
+            }
+        }
+    }
+    return ""
+}
+
+// Всё, что читает client и command, — до окна без блокировки store: поля
+// client копируются, адрес разбирается, байты запроса собираются (v0.13-store-
+// gc.md §6.5: в окне — только обмен).
+fn __mongo_prepare(client: Mongo, database: str, command: Bson) -> __MongoCall {
+    let uri = client.uri
+    let timeout = client.timeout_ms
+    let limit = client.max_message_bytes
+    let q = __MongoCall {
+        url: __MongoUrl {}, limit
+    }
+    if timeout < 1 || timeout > 3600000 || limit < 1024 || limit > 67108864 {
+        q.error = "invalid MongoDB timeout or message limit"
+        return q
     }
     if !__mongo_db_name(database) {
-        return __mongo_failure("invalid MongoDB database name")
+        q.error = "invalid MongoDB database name"
+        return q
     }
-    if !bson_valid(command) {
-        return __mongo_failure("invalid BSON command: " + command.error)
+    let bad = __mongo_command_check(command)
+    if bad != "" {
+        q.error = bad
+        return q
     }
+    let u = __mongo_url(uri)
+    if u.error != "" {
+        q.error = u.error
+        return q
+    }
+    q.url = u
+    var extra = ""
+    if __mongo_write_command(__mongo_command_name(command)) && !bson_has(command, "writeConcern") {
+        extra = __mongo_concern(u)
+    }
+    q.body = command.data.byte_len() + extra.byte_len() + 10 + database.byte_len()
+    if q.body > BSON_MAX_BYTES || q.body + 21 > limit {
+        q.error = "MongoDB command exceeds the message or document limit"
+        return q
+    }
+    var ms = timeout
+    if u.timeout_ms > 0 {
+        ms = ms.min(u.timeout_ms)
+    }
+    q.key = __mongo_key(uri)
+    q.request = __mongo_request_id()
+    q.wire = __mongo_wire(command, extra, database, q.request)
+    q.deadline = now_ms() + ms
+    return q
+}
+
+// Окно: пул, подключение, обмен. Читает только q (свежие объекты) и mmap.
+fn __mongo_run(q: __MongoCall) -> MongoResult {
     if load64(__ctx() + CTX_MONGOHELD) != 0 {
         return __mongo_failure("nested MongoDB operation")
     }
-    let u = __mongo_url(client.uri)
-    if u.error != "" {
-        return __mongo_failure(u.error)
-    }
-    let deadline = now_ms() + client.timeout_ms
-    let c = __mongo_take(client.uri, deadline)
-    if c == 0 {
-        return __mongo_failure("MongoDB connection pool deadline exceeded")
-    }
-    if load64(c + MB_FD) < 0 {
-        let err = __mongo_connect(c, u, deadline)
-        if err != "" {
-            __mongo_discard(c)
-            return __mongo_failure(err)
+    while true {
+        let c = __mongo_take(q.key, q.url.max_pool, q.url.idle_ms, q.deadline)
+        if c == 0 {
+            return __mongo_failure("MongoDB connection pool deadline exceeded")
         }
+        if load64(c + MB_FD) < 0 {
+            let err = __mongo_connect(c, q.url, q.deadline)
+            if err != "" {
+                __mongo_discard(c)
+                return __mongo_failure(err)
+            }
+        }
+        if !__mongo_kill_pending(c, q.key, q.deadline) {
+            // обмен ради killCursors сорвался, а команда ещё не отправлялась:
+            // соединение — в отходы, команда — по другому
+            __mongo_discard(c)
+            continue
+        }
+        if q.body > load64(c + MB_DOC) || q.wire.byte_len() > load64(c + MB_MAX) {
+            __mongo_put(c)
+            return __mongo_failure("MongoDB command exceeds the message or document limit")
+        }
+        let r = __mongo_send(c, q.wire, q.request, q.deadline, q.limit)
+        // Сбой обмена оставляет кадры неопределёнными: соединение — в отходы.
+        if r.unknown_outcome || __mongo_reset_code(r.code) {
+            __mongo_discard(c)
+        } else {
+            __mongo_put(c)
+        }
+        return r
     }
-    let r = __mongo_exchange(c, database, command, deadline, client.max_message_bytes)
-    // Protocol/transport failure leaves framing uncertain; never reuse it.
-    if r.unknown_outcome || r.code == 10107 || r.code == 13435 || r.code == 11600 || r.code == 11602 || r.code == 91 {
-        __mongo_discard(c)
-    } else {
-        __mongo_put(c)
-    }
-    return r
+    return __mongo_failure("MongoDB protocol failure")
 }
 
 fn mongo_command(client: Mongo, database: str, command: Bson) -> MongoResult {
+    let q = __mongo_prepare(client, database, command)
+    if q.error != "" {
+        return __mongo_failure(q.error)
+    }
+    // окно без блокировки store — только обмен (выпуск с публикацией — шаг 4
+    // docs/design/v0.13-store-gc.md)
     let held = load64(__ctx() + CTX_STORE_HELD) != 0
     if held {
         __store_unlock()
     }
-    let result = __mongo_command(client, database, command)
+    let result = __mongo_run(q)
     if held {
         __store_lock()
     }
@@ -811,6 +1339,182 @@ fn mongo_delete(client: Mongo, database: str, collection: str, filter: Bson, man
     return mongo_command(client, database, bson_finish(command))
 }
 
+// Имя индекса по ключам, как у официальных драйверов: {"a": 1, "b": -1} →
+// "a_1_b_-1", {"title": "text"} → "title_text".
+fn __mongo_index_name(keys: Bson) -> str {
+    var name = ""
+    for f in bson_fields(keys) {
+        if name != "" {
+            name += "_"
+        }
+        name += f.name + "_"
+        let p = __str_ptr(f.data)
+        if f.kind == 2 {
+            name += f.data.byte_slice(4, f.data.byte_len() - 1)
+        } else if f.kind == 1 {
+            let v: float = __cast(load64(p))
+            if __bson_whole(v) {
+                name += __bson_to_int(v).to_str()
+            } else {
+                name += v.to_str()
+            }
+        } else {
+            name += __mongo_code_at(f.kind, p).to_str()
+        }
+    }
+    return name
+}
+
+// createIndexes: индексы создаются одной командой; уже существующий индекс с
+// теми же ключами и параметрами — не ошибка.
+fn mongo_create_indexes(client: Mongo, database: str, collection: str, indexes: [MongoIndex]) -> MongoResult {
+    if indexes.len() == 0 {
+        return __mongo_failure("createIndexes needs at least one index")
+    }
+    var specs: [Bson] = []
+    for index in indexes {
+        let spec = bson_new()
+        bson_doc(spec, "key", index.keys)
+        var name = index.name
+        if name == "" {
+            name = __mongo_index_name(index.keys)
+        }
+        bson_str(spec, "name", name)
+        if index.unique {
+            bson_bool(spec, "unique", true)
+        }
+        if let ttl = index.expire_after_seconds {
+            bson_int(spec, "expireAfterSeconds", ttl)
+        }
+        specs.push(bson_finish(spec))
+    }
+    let command = bson_new()
+    bson_str(command, "createIndexes", collection)
+    bson_array(command, "indexes", specs)
+    return mongo_command(client, database, bson_finish(command))
+}
+
+// ---- Курсоры ----
+
+// Реестр курсоров потока (mmap; создаётся при первом курсоре).
+fn __mongo_cursors() -> int {
+    let pool = __mongo_pool()
+    var reg = load64(pool + MP_CURSORS)
+    if reg == 0 {
+        reg = __mmap(MONGO_CURSORS * MC_SIZE)
+        store64(pool + MP_CURSORS, reg)
+    }
+    return reg
+}
+
+// Сервер открыл курсор id: запомнить, чтобы закрыть, если запрос его не
+// дочитает и не закроет. Мест нет — вытесняется самая старая запись очереди
+// (её курсор закроет таймаут сервера) или курсор не запоминается.
+fn __mongo_cursor_open(key: int, id: int, ns: str) {
+    if ns.byte_len() > MC_NSMAX {
+        return
+    }
+    let reg = __mongo_cursors()
+    var slot = -1
+    var oldest = -1
+    for i in 0..MONGO_CURSORS {
+        let e = reg + i * MC_SIZE
+        let state = load64(e + MC_STATE)
+        if state == 0 {
+            slot = i
+            break
+        }
+        if state == 2 && (oldest < 0 || load64(e + MC_TIME) < load64(reg + oldest * MC_SIZE + MC_TIME)) {
+            oldest = i
+        }
+    }
+    if slot < 0 {
+        slot = oldest
+    }
+    if slot < 0 {
+        return
+    }
+    let e = reg + slot * MC_SIZE
+    store64(e + MC_OWNER, load64(__ctx() + CTX_CORO))
+    store64(e + MC_ID, id)
+    store64(e + MC_TIME, now_ms())
+    __memcpy(e + MC_KEY, key, 32)
+    store64(e + MC_NSLEN, ns.byte_len())
+    __memcpy(e + MC_NS, __str_ptr(ns), ns.byte_len())
+    store64(e + MC_STATE, 1)
+}
+
+// Курсор id закрыт: дочитан или killCursors прошёл.
+fn __mongo_cursor_closed(key: int, id: int) {
+    let reg = load64(__mongo_pool() + MP_CURSORS)
+    if reg == 0 {
+        return
+    }
+    for i in 0..MONGO_CURSORS {
+        let e = reg + i * MC_SIZE
+        if load64(e + MC_STATE) != 0 && load64(e + MC_ID) == id && __memeq(e + MC_KEY, key, 32) {
+            store64(e + MC_STATE, 0)
+        }
+    }
+}
+
+// Перед командой через соединение c (ключ пула key): killCursors для курсоров
+// закончившихся запросов с тем же URI — по команде на пространство имён.
+// Записи освобождаются до обмена: при сбое курсор закроет таймаут сервера.
+// → false, если обмен сорвался (соединение больше не годится).
+fn __mongo_kill_pending(c: int, key: int, deadline: int) -> bool {
+    let reg = load64(__mongo_pool() + MP_CURSORS)
+    if reg == 0 {
+        return true
+    }
+    for i in 0..MONGO_CURSORS {
+        let e = reg + i * MC_SIZE
+        if load64(e + MC_STATE) != 2 || !__memeq(e + MC_KEY, key, 32) {
+            continue
+        }
+        let ns = __str_copy(e + MC_NS, load64(e + MC_NSLEN))
+        var ids: [int] = []
+        for j in i..MONGO_CURSORS {
+            let f = reg + j * MC_SIZE
+            if load64(f + MC_STATE) == 2 && __memeq(f + MC_KEY, key, 32) && load64(f + MC_NSLEN) == ns.byte_len() && __memeq(f + MC_NS, __str_ptr(ns), ns.byte_len()) {
+                ids.push(load64(f + MC_ID))
+                store64(f + MC_STATE, 0)
+            }
+        }
+        let dot = ns.byte_find(".") ?? 0
+        let database = ns.byte_slice(0, dot)
+        if !__mongo_db_name(database) {
+            continue
+        }
+        let command = bson_new()
+        bson_str(command, "killCursors", ns.byte_slice(dot + 1, ns.byte_len()))
+        bson_int_array(command, "cursors", ids)
+        let r = __mongo_exchange(c, database, bson_finish(command), deadline, 16777216)
+        if r.unknown_outcome {
+            return false
+        }
+    }
+    return true
+}
+
+// База и коллекция курсора — из ns ответа ("база.коллекция"; у listCollections
+// это "база.$cmd.listCollections"), без него — из аргументов.
+fn __mongo_ns_db(cursor: MongoCursor) -> str {
+    if let dot = cursor.ns.byte_find(".") {
+        return cursor.ns.byte_slice(0, dot)
+    }
+    return cursor.database
+}
+
+fn __mongo_ns_collection(cursor: MongoCursor) -> str {
+    if let dot = cursor.ns.byte_find(".") {
+        return cursor.ns.byte_slice(dot + 1, cursor.ns.byte_len())
+    }
+    return cursor.collection
+}
+
+// Порция курсора из ответа: поля cursor (id, ns, порция) — за один проход.
+// Документы — срезы ответа, уже проверенного __mongo_response.
 fn __mongo_cursor_batch(cursor: MongoCursor, result: MongoResult, field: str) {
     cursor.documents = []
     if result.error != "" {
@@ -818,43 +1522,103 @@ fn __mongo_cursor_batch(cursor: MongoCursor, result: MongoResult, field: str) {
         cursor.code = result.code
         return
     }
-    let value = bson_get_doc(result.document, "cursor") else {
+    let doc = result.document
+    let at = __bson_find(__str_ptr(doc.data), doc.data.byte_len(), "cursor")
+    if at == 0 || load8(at) != 3 {
         cursor.error = "MongoDB response is missing cursor"
         return
     }
-    let id = bson_get_int(value, "id") else {
+    let p = at + 8
+    let end = p + load32(p) - 1
+    var id = 0
+    var ns = 0
+    var batch = 0
+    var e = p + 4
+    while e < end {
+        let z = __bson_zero(e + 1, end)
+        let next = __bson_skip(load8(e), z + 1, end)
+        let kp = e + 1
+        let kn = z - e - 1
+        var dup = false
+        if __bson_key_is(kp, kn, "id") {
+            dup = id != 0
+            id = e
+        } else if __bson_key_is(kp, kn, "ns") {
+            dup = ns != 0
+            ns = e
+        } else if __bson_key_is(kp, kn, field) {
+            dup = batch != 0
+            batch = e
+        }
+        if dup {
+            cursor.error = "duplicate MongoDB cursor field"
+            return
+        }
+        e = next
+    }
+    if id == 0 || (load8(id) != 18 && load8(id) != 16) {
         cursor.error = "MongoDB cursor is missing id"
         return
     }
-    cursor.id = id
-    let batch = bson_get(value, field) else {
+    cursor.id = __mongo_code_at(load8(id), id + 4)
+    if ns != 0 && load8(ns) == 2 {
+        let v = ns + 4
+        if __utf8_scan(v + 4, load32(v) - 1) >= 0 {
+            cursor.ns = __str_new(v + 4, load32(v) - 1)
+        }
+    }
+    if batch == 0 {
         cursor.error = "MongoDB cursor is missing batch"
         return
     }
-    if batch.kind != 4 {
+    if load8(batch) != 4 {
         cursor.error = "invalid MongoDB cursor batch"
         return
     }
-    if batch.data.byte_len() > cursor.max_bytes - cursor.bytes_read {
+    let a = batch + 2 + field.byte_len()
+    let size = load32(a)
+    if size > cursor.max_bytes - cursor.bytes_read {
         cursor.error = "MongoDB cursor exceeded max_bytes; use a smaller query or increase the explicit budget"
         return
     }
-    cursor.bytes_read += batch.data.byte_len()
-    for item in __bson_fields(Bson {
-        data: batch.data
-    }) {
-        if item.kind != 3 {
+    cursor.bytes_read += size
+    let a_end = a + size - 1
+    var item = a + 4
+    while item < a_end {
+        let z = __bson_zero(item + 1, a_end)
+        let next = __bson_skip(load8(item), z + 1, a_end)
+        if load8(item) != 3 {
             cursor.error = "invalid MongoDB cursor document"
             return
         }
         cursor.documents.push(Bson {
-            data: item.data
+            data: __str_new(z + 1, next - z - 1), checked: true
         })
+        item = next
     }
 }
 
-// Accept a native find/aggregate command, including projection, sort, hint and
-// server-side pipeline stages. The returned documents retain exact BSON types.
+// Команда aggregate без поля cursor: сервер требует его, cursor: {} — сам.
+fn __mongo_with_cursor(command: Bson) -> Bson {
+    let n = command.data.byte_len()
+    let b = buf_new(n + 16)
+    __bson_u32(b, 0)
+    buf_add_raw(b, __str_ptr(command.data) + 4, n - 5)
+    buf_byte(b, 3)
+    buf_add(b, "cursor")
+    buf_byte(b, 0)
+    __bson_u32(b, 5)
+    buf_byte(b, 0)
+    buf_byte(b, 0)
+    store32(b.data, b.len)
+    return Bson {
+        data: __str_new(b.data, b.len), checked: command.checked
+    }
+}
+
+// Собственная команда find или aggregate: проекция, сортировка, hint, стадии
+// конвейера. Документы сохраняют точные типы BSON. getMore и killCursors идут
+// по ns из ответа, а не по collection.
 fn mongo_cursor(client: Mongo, database: str, collection: str, command: Bson, batch_size: int = 100, max_bytes: int = 67108864) -> MongoCursor {
     let cursor = MongoCursor {
         client, database, collection, batch_size, max_bytes
@@ -863,30 +1627,54 @@ fn mongo_cursor(client: Mongo, database: str, collection: str, command: Bson, ba
         cursor.error = "invalid MongoDB batch size or cursor byte budget"
         return cursor
     }
-    __mongo_cursor_batch(cursor, mongo_command(client, database, command), "firstBatch")
+    var full = command
+    if command.error == "" && __mongo_command_name(command) == "aggregate" && !bson_has(command, "cursor") {
+        full = __mongo_with_cursor(command)
+    }
+    __mongo_cursor_batch(cursor, mongo_command(client, database, full), "firstBatch")
+    if cursor.id != 0 {
+        __mongo_cursor_open(__mongo_key(client.uri), cursor.id, cursor.ns)
+    }
     if cursor.error != "" && cursor.id != 0 {
         mongo_close(cursor)
     }
     return cursor
 }
 
-fn mongo_find(client: Mongo, database: str, collection: str, filter: Bson, batch_size: int = 100, limit: int = 0, max_bytes: int = 67108864) -> MongoCursor {
-    if limit < 0 {
+fn mongo_find_with(client: Mongo, database: str, collection: str, filter: Bson, options: MongoFindOptions) -> MongoCursor {
+    if options.limit < 0 || options.skip < 0 {
         let cursor = MongoCursor {
-            client, database, collection, batch_size, max_bytes
+            client, database, collection, batch_size: options.batch_size, max_bytes: options.max_bytes
         }
-        cursor.error = "invalid MongoDB query limit"
+        cursor.error = "invalid MongoDB query limit or skip"
         return cursor
     }
     let command = bson_new()
     bson_str(command, "find", collection)
     bson_doc(command, "filter", filter)
-    bson_int32(command, "batchSize", batch_size)
-    if limit > 0 {
-        bson_int(command, "limit", limit)
+    if let sort = options.sort {
+        bson_doc(command, "sort", sort)
+    }
+    if let projection = options.projection {
+        bson_doc(command, "projection", projection)
+    }
+    if options.skip > 0 {
+        bson_int(command, "skip", options.skip)
+    }
+    if options.limit > 0 {
+        bson_int(command, "limit", options.limit)
+    }
+    if options.batch_size >= 1 && options.batch_size <= 100000 {
+        bson_int32(command, "batchSize", options.batch_size)
     }
     bson_int(command, "maxTimeMS", client.timeout_ms)
-    return mongo_cursor(client, database, collection, bson_finish(command), batch_size, max_bytes)
+    return mongo_cursor(client, database, collection, bson_finish(command), options.batch_size, options.max_bytes)
+}
+
+fn mongo_find(client: Mongo, database: str, collection: str, filter: Bson, batch_size: int = 100, limit: int = 0, max_bytes: int = 67108864) -> MongoCursor {
+    return mongo_find_with(client, database, collection, filter, MongoFindOptions {
+        batch_size, limit, max_bytes
+    })
 }
 
 fn mongo_next(cursor: MongoCursor) -> bool {
@@ -894,11 +1682,15 @@ fn mongo_next(cursor: MongoCursor) -> bool {
         cursor.documents = []
         return false
     }
+    let id = cursor.id
     let command = bson_new()
-    bson_int(command, "getMore", cursor.id)
-    bson_str(command, "collection", cursor.collection)
+    bson_int(command, "getMore", id)
+    bson_str(command, "collection", __mongo_ns_collection(cursor))
     bson_int32(command, "batchSize", cursor.batch_size)
-    __mongo_cursor_batch(cursor, mongo_command(cursor.client, cursor.database, bson_finish(command)), "nextBatch")
+    __mongo_cursor_batch(cursor, mongo_command(cursor.client, __mongo_ns_db(cursor), bson_finish(command)), "nextBatch")
+    if cursor.id == 0 {
+        __mongo_cursor_closed(__mongo_key(cursor.client.uri), id)
+    }
     if cursor.error != "" && cursor.id != 0 {
         mongo_close(cursor)
     }
@@ -912,10 +1704,11 @@ fn mongo_close(cursor: MongoCursor) -> MongoResult {
         }
     }
     let command = bson_new()
-    bson_str(command, "killCursors", cursor.collection)
+    bson_str(command, "killCursors", __mongo_ns_collection(cursor))
     bson_int_array(command, "cursors", [cursor.id])
-    let result = mongo_command(cursor.client, cursor.database, bson_finish(command))
+    let result = mongo_command(cursor.client, __mongo_ns_db(cursor), bson_finish(command))
     if result.error == "" {
+        __mongo_cursor_closed(__mongo_key(cursor.client.uri), cursor.id)
         cursor.id = 0
         cursor.documents = []
     }

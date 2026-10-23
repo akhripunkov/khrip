@@ -15,6 +15,34 @@ type MongoTypeNames {
     oid: str, date: str, blob: str, decimal: str, ts: str, number: str, real: str
     date_ms: int, oid_text: str, decimal_text: str, blob_size: int
 }
+type MongoTestAmount {
+    _id: int, amount: int
+}
+type MongoTestNote {
+    _id: str, title: str, body: str, tags: [str]
+}
+type MongoTestPatch {
+    title: str?, body: str?, tags: [str]?
+}
+type MongoTestItem {
+    _id: BsonObjectId?, title: str
+}
+type MongoTestText {
+    _id: int, s: str
+}
+type MongoTestMixed {
+    _id: int, price: float, qty: int, big: int
+}
+type MongoTestN {
+    n: int
+}
+type MongoTestUser {
+    _id: int, email: str
+}
+type MongoTestId {
+    _id: BsonObjectId
+}
+
 var checks: int
 var failures: int
 
@@ -170,9 +198,212 @@ fn main() -> int {
     let drop = bson_new()
     bson_str(drop, "drop", collection)
     result("drop test collection", mongo_command(client, database, bson_finish(drop)))
+    regressions(client, uri, database, collection)
     print("MongoDB integration: {checks} checks, {failures} failed")
     if failures != 0 {
         return 1
     }
     return 0
+}
+
+fn drop_collection(client: Mongo, database: str, collection: str) {
+    let command = bson_new()
+    bson_str(command, "drop", collection)
+    mongo_command(client, database, bson_finish(command))
+}
+
+fn with_options(uri: str, options: str) -> str {
+    if uri.contains("?") {
+        return uri + "&" + options
+    }
+    return uri + "?" + options
+}
+
+fn idle_connections() -> int {
+    let pool = load64(__ctx() + CTX_MONGOPOOL)
+    var idle = 0
+    for i in 0..MONGO_POOL_SIZE {
+        if load64(pool + 8 + i * 8) != 0 {
+            idle += 1
+        }
+    }
+    return idle
+}
+
+// Все документы курсора (без проверки ошибок порций).
+fn read_all(cursor: MongoCursor) -> [Bson] {
+    var out: [Bson] = []
+    while cursor.error == "" {
+        for d in cursor.documents {
+            out.push(d)
+        }
+        if !mongo_next(cursor) {
+            break
+        }
+    }
+    return out
+}
+
+// Регрессии разбора PR #1 на настоящем сервере.
+fn regressions(client: Mongo, uri: str, database: str, base: str) {
+    let all = bson_finish(bson_new())
+    // В1: Bson внутри to_bson — фильтр и $set.
+    let c1 = base + "_b1"
+    result("insert amounts", mongo_insert(client, database, c1, [to_bson(MongoTestAmount { _id: 1, amount: 50 }), to_bson(MongoTestAmount { _id: 2, amount: 150 }), to_bson(MongoTestAmount { _id: 3, amount: 250 })]))
+    let over = mongo_find(client, database, c1, to_bson({ "amount": to_bson({ "$gt": 100 }) }))
+    verify("filter with nested to_bson", over.error == "" && over.documents.len() == 2)
+    let set = mongo_update(client, database, c1, to_bson({ "_id": 1 }), to_bson({ "$set": to_bson({ "amount": 75 }) }))
+    verify("$set from nested to_bson", set.error == "" && bson_get_int(set.document, "nModified") == 1)
+    let one = mongo_find(client, database, c1, to_bson({ "_id": 1 }))
+    let changed: MongoTestAmount? = from_bson(one.documents[0])
+    verify("$set changed the field", (changed ?? MongoTestAmount { _id: 0, amount: 0 }).amount == 75 && !bson_has(one.documents[0], "data"))
+    drop_collection(client, database, c1)
+    // В2: PATCH через $set не стирает поля, none _id назначает сервер.
+    let c2 = base + "_b2"
+    result("insert note", mongo_insert(client, database, c2, [to_bson(MongoTestNote { _id: "n1", title: "old", body: "text", tags: ["a"] })]))
+    let patch = MongoTestPatch { title: "new title" }
+    result("patch note", mongo_update(client, database, c2, to_bson({ "_id": "n1" }), to_bson({ "$set": to_bson(patch) })))
+    let note_doc = mongo_find(client, database, c2, to_bson({ "_id": "n1" }))
+    let note: MongoTestNote? = from_bson(note_doc.documents[0])
+    verify("patch keeps other fields", note != none && (note ?? MongoTestNote { _id: "", title: "", body: "", tags: [] }).body == "text")
+    let items = [to_bson(MongoTestItem { title: "x" }), to_bson(MongoTestItem { title: "y" })]
+    let inserted = mongo_insert(client, database, c2, items)
+    verify("none _id is assigned by the server", inserted.error == "" && bson_get_int(inserted.document, "n") == 2)
+    let assigned = mongo_find(client, database, c2, to_bson({ "title": "x" }))
+    let item: MongoTestItem? = from_bson(assigned.documents[0])
+    verify("server-assigned ObjectId reads back", item != none && ((item ?? MongoTestItem { title: "" })._id ?? BsonObjectId { hex: "" }).hex.byte_len() == 24)
+    drop_collection(client, database, c2)
+    // С2: Int32 и целый double, как их пишут mongosh и Node.
+    let c3 = base + "_c2"
+    let mixed = bson_new()
+    bson_int32(mixed, "_id", 1)
+    bson_int32(mixed, "price", 10)
+    bson_float(mixed, "qty", 2.0)
+    bson_float(mixed, "big", 5000000000.0)
+    result("insert mixed numbers", mongo_insert(client, database, c3, [bson_finish(mixed)]))
+    let mixed_doc = mongo_find(client, database, c3, all)
+    let mixed_row: MongoTestMixed? = from_bson(mixed_doc.documents[0])
+    verify("server numbers widen", mixed_row != none && (mixed_row ?? MongoTestMixed { _id: 0, price: 0.0, qty: 0, big: 0 }).big == 5000000000)
+    drop_collection(client, database, c3)
+    // С3: документ с неверным UTF-8 (так пишут другие драйверы) не губит порцию
+    // и соединение; ошибка — при чтении поля, с его именем.
+    let c4 = base + "_c3"
+    var texts: [Bson] = []
+    for i in 0..10 {
+        texts.push(to_bson(MongoTestText { _id: i, s: "ok {i}" }))
+    }
+    // {_id: 10, s: "\xff\xfe"}: сырые байты, проверка построителя обойдена
+    let bad = __alloc(32)
+    __unhex("18000000" + "105f6964000a000000" + "027300" + "03000000fffe00" + "00", bad)
+    let raw = Bson { data: __str_new(bad, 24), checked: true }
+    let insert_bad = bson_new()
+    bson_str(insert_bad, "insert", c4)
+    bson_array(insert_bad, "documents", [raw])
+    result("insert invalid UTF-8 raw", mongo_command(client, database, bson_finish(insert_bad)))
+    result("insert valid texts", mongo_insert(client, database, c4, texts))
+    let texts_cursor = mongo_find(client, database, c4, all)
+    var good = 0
+    var bad_error = ""
+    for d in texts_cursor.documents {
+        let t: MongoTestText? = from_bson(d)
+        if t != none {
+            good += 1
+        } else {
+            bad_error = bson_error()
+        }
+    }
+    verify("bad string does not fail the batch", texts_cursor.error == "" && texts_cursor.documents.len() == 11 && good == 10)
+    verify("bad string error names the field", bad_error == "BSON field 's' is not valid UTF-8")
+    verify("connection kept after a bad string", idle_connections() == 1)
+    drop_collection(client, database, c4)
+    // С1: порция курсора больше 16 МиБ вместе с обёрткой.
+    let c5 = base + "_c1"
+    let pad = "x".repeat(1048542)
+    for i in 0..10 {
+        let pair = [to_bson(MongoTestText { _id: i * 2, s: pad }), to_bson(MongoTestText { _id: i * 2 + 1, s: pad })]
+        result("insert 1 MiB documents", mongo_insert(client, database, c5, pair))
+    }
+    let large = mongo_find(client, database, c5, all, 100, 0, 67108864)
+    let first = large.bytes_read
+    let large_docs = read_all(large)
+    verify("cursor reply over 16 MiB", large.error == "" && large_docs.len() == 20 && first > 16777216 - 1048576)
+    drop_collection(client, database, c5)
+    // Н1: getMore и killCursors — по ns ответа; cursor: {} у aggregate — сам.
+    let c6 = base + "_n1"
+    var ns_docs: [Bson] = []
+    for i in 0..5 {
+        ns_docs.push(to_bson(MongoTestN { n: i }))
+    }
+    result("insert for namespaces", mongo_insert(client, database, c6, ns_docs))
+    result("second collection", mongo_insert(client, database, c6 + "_b", ns_docs))
+    let list = bson_new()
+    bson_int32(list, "listCollections", 1)
+    let list_options = bson_new()
+    bson_int32(list_options, "batchSize", 1)
+    bson_doc(list, "cursor", bson_finish(list_options))
+    let collections = mongo_cursor(client, database, "", bson_finish(list), 1)
+    verify("listCollections getMore by ns", read_all(collections).len() >= 2 && collections.error == "")
+    let aggregate = bson_new()
+    bson_str(aggregate, "aggregate", c6)
+    bson_array(aggregate, "pipeline", [])
+    let agg = mongo_cursor(client, database, "something else", bson_finish(aggregate), 2)
+    verify("aggregate without cursor and another collection argument", read_all(agg).len() == 5 && agg.error == "")
+    let early = mongo_cursor(client, database, "", bson_finish(list), 1)
+    result("killCursors by ns", mongo_close(early))
+    drop_collection(client, database, c6)
+    drop_collection(client, database, c6 + "_b")
+    // С14: опции URI, опции find, createIndexes.
+    let c7 = base + "_c14"
+    let options = Mongo { uri: with_options(uri, "retryWrites=true&w=majority&wtimeoutMS=5000&appName=khrip-test&maxPoolSize=4&readPreference=primary&compressors=zlib&serverSelectionTimeoutMS=2000") }
+    var rows: [Bson] = []
+    for i in 0..10 {
+        rows.push(to_bson(MongoTestN { n: i }))
+    }
+    result("insert with URI options", mongo_insert(options, database, c7, rows))
+    let w5 = Mongo { uri: with_options(uri, "w=5") }
+    let unreplicated = mongo_insert(w5, database, c7, [to_bson(MongoTestN { n: 99 })])
+    verify("URI write concern reaches the server", unreplicated.error.contains("replicated"))
+    let page = mongo_find_with(client, database, c7, all, MongoFindOptions { sort: to_bson({ "n": -1 }), projection: to_bson({ "n": 1, "_id": 0 }), skip: 2, limit: 3 })
+    var got: [int] = []
+    for d in page.documents {
+        got.push(bson_get_int(d, "n") ?? -1)
+        verify("projection", !bson_has(d, "_id"))
+    }
+    verify("find sort, skip, limit", page.error == "" && got.len() == 3 && got[0] == 7 && got[1] == 6 && got[2] == 5)
+    drop_collection(client, database, c7)
+    let index = mongo_create_indexes(client, database, c7, [MongoIndex { keys: to_bson({ "email": 1 }), unique: true }, MongoIndex { keys: to_bson({ "n": -1 }), name: "by_n" }])
+    result("createIndexes", index)
+    result("createIndexes again", mongo_create_indexes(client, database, c7, [MongoIndex { keys: to_bson({ "email": 1 }), unique: true }]))
+    result("first user", mongo_insert(client, database, c7, [to_bson(MongoTestUser { _id: 100, email: "a@x" })]))
+    let dup = mongo_insert(client, database, c7, [to_bson(MongoTestUser { _id: 101, email: "a@x" })])
+    verify("unique index", dup.code == 11000)
+    let indexes = bson_new()
+    bson_str(indexes, "listIndexes", c7)
+    var names = ""
+    for d in read_all(mongo_cursor(client, database, c7, bson_finish(indexes))) {
+        names += (bson_get_str(d, "name") ?? "") + ","
+    }
+    verify("index names", names.contains("email_1,") && names.contains("by_n,"))
+    drop_collection(client, database, c7)
+    // Н7: ключи SCRAM — из кэша: новые соединения с теми же учётными данными
+    // (другой appName — другой ключ пула) не считают PBKDF2.
+    let u = __mongo_url(uri)
+    if u.auth {
+        let pool = load64(__ctx() + CTX_MONGOPOOL)
+        let before = load64(pool + MP_PBKDF2)
+        for i in 0..3 {
+            let other = Mongo { uri: with_options(uri, "appName=cache-{i}") }
+            let ping = bson_new()
+            bson_int32(ping, "ping", 1)
+            result("ping over a new connection", mongo_command(other, database, bson_finish(ping)))
+        }
+        verify("SCRAM keys cached", load64(pool + MP_PBKDF2) == before && before >= 1)
+    }
+    // С13: object_id на сервере.
+    let c8 = base + "_oid"
+    let oid = object_id()
+    result("insert object_id", mongo_insert(client, database, c8, [to_bson(MongoTestId { _id: BsonObjectId { hex: oid } })]))
+    let by_id = mongo_find(client, database, c8, to_bson({ "_id": BsonObjectId { hex: oid } }))
+    verify("object_id round trip", by_id.documents.len() == 1)
+    drop_collection(client, database, c8)
 }

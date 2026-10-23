@@ -1,0 +1,155 @@
+// MongoDB в запросе (khc test, у каждого теста своя арена, как у запроса):
+// память арены на больших объёмах (В8) и курсоры, которые запрос не закрыл
+// (С9). Нужен MONGODB_URI; имена коллекций — из KHRIP_MONGO_REQUEST.
+type RequestScale {
+    _id: int, s: str
+}
+
+store leaked: int
+
+fn client() -> Mongo {
+    return Mongo { uri: env("MONGODB_URI") ?? "mongodb://127.0.0.1:27017/khrip_test" }
+}
+
+fn database() -> str {
+    return "khrip_test"
+}
+
+fn collection(suffix: str) -> str {
+    return (env("KHRIP_MONGO_REQUEST") ?? "khrip_request") + "_" + suffix
+}
+
+fn arena() -> int {
+    return load64(__ctx() + CTX_PTR)
+}
+
+fn drop(name: str) {
+    let command = bson_new()
+    bson_str(command, "drop", name)
+    mongo_command(client(), database(), bson_finish(command))
+}
+
+// getMore по id курсора → код ошибки сервера (0 — курсор жив).
+fn get_more(id: int) -> int {
+    let command = bson_new()
+    bson_int(command, "getMore", id)
+    bson_str(command, "collection", collection("leak"))
+    bson_int32(command, "batchSize", 2)
+    let r = mongo_command(client(), database(), bson_finish(command))
+    if r.error == "" {
+        return 0
+    }
+    return r.code
+}
+
+fn ping() -> bool {
+    let command = bson_new()
+    bson_int32(command, "ping", 1)
+    return mongo_command(client(), database(), bson_finish(command)).error == ""
+}
+
+// Запрос открывает курсор и завершается ошибкой: закрыть его некому.
+route POST "/fail" -> 409 str {
+    let cursor = mongo_find(client(), database(), collection("leak"), bson_finish(bson_new()), 2)
+    leaked = cursor.id
+    fail(409, "left open")
+}
+
+route POST "/panic" -> int {
+    let cursor = mongo_find(client(), database(), collection("leak"), bson_finish(bson_new()), 2)
+    leaked = cursor.id
+    let zero = cursor.documents.len() - 2
+    return 10 / zero
+}
+
+test "seed" {
+    drop(collection("leak"))
+    var docs: [Bson] = []
+    for i in 0..10 {
+        docs.push(to_bson(RequestScale { _id: i, s: "row {i}" }))
+    }
+    expect mongo_insert(client(), database(), collection("leak"), docs).error == ""
+}
+
+test "a request ended by fail leaves a cursor" {
+    expect (call POST "/fail").status == 409
+    expect leaked != 0
+    // курсор жив, пока не кончился запрос теста: call — вложенный запрос
+    expect get_more(leaked) == 0
+}
+
+test "the next command kills it" {
+    expect ping()
+    // 43 — CursorNotFound
+    expect get_more(leaked) == 43
+}
+
+test "a request ended by panic leaves a cursor" {
+    leaked = 0
+    expect (call POST "/panic").status == 500
+    expect leaked != 0
+}
+
+test "the next command kills it after panic" {
+    expect ping()
+    expect get_more(leaked) == 43
+    drop(collection("leak"))
+}
+
+// Вставка 100 000 документов одной командой (10,8 МБ RSS на документ раньше:
+// 835 МБ): to_bson пишет документ в один буфер, массив и команда собираются
+// без перепроверок.
+test "insert 100k documents in one request" {
+    drop(collection("scale"))
+    let before = arena()
+    var docs: [Bson] = []
+    for i in 0..100000 {
+        docs.push(to_bson(RequestScale { _id: i, s: "item" }))
+    }
+    let r = mongo_insert(client(), database(), collection("scale"), docs)
+    let used = arena() - before
+    expect r.error == ""
+    expect bson_get_int(r.document, "n") == 100000
+    expect used < 48 * 1048576
+    drop(collection("scale"))
+}
+
+// Курсор больше 20 МБ в одном запросе: 100 000 документов по 216 байт. Ответ
+// проверяется один раз, порции — срезы ответа, from_bson не копирует строки.
+// Раньше каждая проверка и каждый аксессор заново проверяли весь ответ и
+// выделяли память на каждое поле и элемент массива.
+test "a cursor over 20 MB in one request" {
+    drop(collection("big"))
+    let pad = "x".repeat(190)
+    var id = 0
+    for batch in 0..2 {
+        var docs: [Bson] = []
+        for i in 0..50000 {
+            docs.push(to_bson(RequestScale { _id: id, s: pad }))
+            id += 1
+        }
+        expect mongo_insert(client(), database(), collection("big"), docs).error == ""
+    }
+    let before = arena()
+    let cursor = mongo_find(client(), database(), collection("big"), bson_finish(bson_new()), 1000)
+    var count = 0
+    var bytes = 0
+    while cursor.error == "" {
+        for d in cursor.documents {
+            bytes += d.data.byte_len()
+            let row: RequestScale? = from_bson(d)
+            if row != none {
+                count += 1
+            }
+        }
+        if !mongo_next(cursor) {
+            break
+        }
+    }
+    let used = arena() - before
+    expect cursor.error == ""
+    expect count == 100000
+    expect bytes > 20000000
+    expect used < bytes * 2 + 8 * 1048576
+    drop(collection("big"))
+}

@@ -2,7 +2,7 @@
 // компилятор передаёт ей то же описание типа, которое использует JSON.
 
 fn driver_io(name: str) -> bool {
-    return name == "mongo_command" || name == "mongo_insert" || name == "mongo_update" || name == "mongo_delete" || name == "mongo_cursor" || name == "mongo_find" || name == "mongo_next" || name == "mongo_close" || name == "ch_query" || name == "ch_query_params" || name == "ch_insert" || name == "ch_cancel"
+    return name == "mongo_command" || name == "mongo_insert" || name == "mongo_update" || name == "mongo_delete" || name == "mongo_cursor" || name == "mongo_find" || name == "mongo_find_with" || name == "mongo_create_indexes" || name == "mongo_next" || name == "mongo_close" || name == "ch_query" || name == "ch_query_params" || name == "ch_insert" || name == "ch_cancel"
 }
 
 fn driver_ch_type(t: int, row: bool, depth: int) -> bool {

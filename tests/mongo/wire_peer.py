@@ -139,6 +139,14 @@ class Handler(socketserver.BaseRequestHandler):
                 elif mode == 'required_flag':
                     sock.sendall(message(request, bson({'ok': 1.0}), 4))
                     return
+                elif mode.startswith('code_'):
+                    # ошибка команды: «не primary» и прочие (Н8)
+                    sock.sendall(message(request, bson({
+                        'ok': 0.0, 'code': int(mode[5:]), 'errmsg': 'state change'})))
+                elif mode in ('big_ok', 'big_bad'):
+                    # документ ответа больше 16 МиБ: до +16 КиБ — законно (С1)
+                    size = 16 * 1024 * 1024 + (1000 if mode == 'big_ok' else 20000)
+                    sock.sendall(message(request, bson({'ok': 1.0, 'pad': 'x' * (size - 27)})))
                 else:
                     assert mode == 'recover'
                     sock.sendall(wire)
@@ -160,7 +168,9 @@ def main():
         expected = {'fragmented': 1, 'checksum': 1, 'optional_flag': 1,
                     'truncated': 1, 'oversized': 1, 'wrong_id': 1,
                     'timeout': 1, 'disconnect': 1, 'bad_bson': 1,
-                    'bad_checksum': 1, 'required_flag': 1, 'recover': 8}
+                    'bad_checksum': 1, 'required_flag': 1, 'recover': 14,
+                    'code_59': 1, 'code_189': 1, 'code_13436': 1,
+                    'code_10058': 1, 'big_ok': 1, 'big_bad': 1}
         if dict(good.counts) != expected or bad.counts:
             print('FAIL command delivery counts (unexpected retry or handshake send)',
                   dict(good.counts), dict(bad.counts))

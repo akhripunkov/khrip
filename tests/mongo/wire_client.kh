@@ -4,6 +4,18 @@ fn probe(client: Mongo, mode: str) -> MongoResult {
     return mongo_command(client, "test", bson_finish(command))
 }
 
+// Свободные соединения пула потока.
+fn idle_connections() -> int {
+    let pool = load64(__ctx() + CTX_MONGOPOOL)
+    var idle = 0
+    for i in 0..MONGO_POOL_SIZE {
+        if load64(pool + 8 + i * 8) != 0 {
+            idle += 1
+        }
+    }
+    return idle
+}
+
 fn main() -> int {
     let client = Mongo { uri: args()[1], timeout_ms: 300, max_message_bytes: 4096 }
     var failed = 0
@@ -30,6 +42,35 @@ fn main() -> int {
             failed += 1
         }
     }
+    // Н8: после ответов «узел не primary / выключается» соединение не
+    // возвращается в пул; после обычной ошибки команды — возвращается.
+    for code in [59, 189, 13436, 10058] {
+        let r = probe(client, "code_" + code.to_str())
+        let kept = idle_connections() == 1
+        if r.code != code || r.unknown_outcome || kept != (code == 59) {
+            print("FAIL code {code}: pooled={kept}")
+            failed += 1
+        }
+        if probe(client, "recover").error != "" {
+            print("FAIL code {code} recovery")
+            failed += 1
+        }
+    }
+    // С1: документ ответа до maxBsonObjectSize + 16 КиБ читается, больше —
+    // ошибка с размером.
+    let wide = Mongo { uri: args()[1], timeout_ms: 5000 }
+    let big = probe(wide, "big_ok")
+    if big.error != "" || (bson_get_str(big.document, "pad") ?? "").byte_len() != 16777216 + 1000 - 27 {
+        print("FAIL big reply: " + big.error)
+        failed += 1
+    }
+    probe(wide, "recover")
+    let too_big = probe(wide, "big_bad")
+    if !too_big.unknown_outcome || !too_big.error.contains("16797216") {
+        print("FAIL oversized reply: " + too_big.error)
+        failed += 1
+    }
+    probe(wide, "recover")
     // Failed authentication/handshake means the application command was not sent.
     let handshake = Mongo { uri: args()[2], timeout_ms: 300 }
     let h = probe(handshake, "never_sent")

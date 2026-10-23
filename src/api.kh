@@ -111,7 +111,7 @@ fn uses_api() -> bool {
 
 // Расширения подключают библиотеку и в обычных CLI-программах без route.
 fn database_api_name(name: str) -> bool {
-    return name == "to_bson" || name == "from_bson" || name.starts_with("bson_") || name.starts_with("Bson") || name.starts_with("mongo_") || name.starts_with("Mongo") || name.starts_with("ch_") || name == "ChConfig" || name == "ChResult"
+    return name == "to_bson" || name == "from_bson" || name == "object_id" || name.starts_with("bson_") || name.starts_with("Bson") || name.starts_with("mongo_") || name.starts_with("Mongo") || name.starts_with("ch_") || name == "ChConfig" || name == "ChResult"
 }
 
 fn uses_driver(prefix: str) -> bool {
@@ -478,8 +478,13 @@ fn prescan_every() {
     everies.push(EveryDecl { ms: nt.val * ms, fi: funcs.len() - 1 })
 }
 
-// Структура библиотеки с сырым указателем (Buf, служебные __-типы) внутри
-// типа t: в store её не увидит сборщик памяти. → имя или "".
+// Тип библиотеки, которому не место в store, внутри типа t → имя или "":
+//   - Buf и служебные __-типы — сырой указатель: в store его не увидит
+//     сборщик памяти;
+//   - MongoCursor и BsonBuilder живут один запрос: функции библиотеки
+//     (mongo_next, mongo_close, bson_*) меняют их поля и кладут в них память
+//     запроса, а барьеров store в библиотеке нет. После запроса объект store
+//     указывал бы в освобождённую арену.
 fn store_raw_type(t: int, seen: [int]) -> str {
     let k = tkind(t)
     if k == K_LIST || k == K_OPT {
@@ -504,7 +509,7 @@ fn store_raw_type(t: int, seen: [int]) -> str {
         if !dup {
             seen.push(si)
             let st = structs[si]
-            if st.tok >= 0 && files[toks[st.tok].file].is_lib && (st.name == "Buf" || st.name.starts_with("__")) {
+            if st.tok >= 0 && files[toks[st.tok].file].is_lib && (st.name == "Buf" || st.name.starts_with("__") || store_request_type(st.name)) {
                 return st.name
             }
             for f in st.fields {
@@ -518,6 +523,11 @@ fn store_raw_type(t: int, seen: [int]) -> str {
     return ""
 }
 
+// Тип библиотеки, который живёт один запрос: библиотека меняет его на месте.
+fn store_request_type(name: str) -> bool {
+    return name == "MongoCursor" || name == "BsonBuilder"
+}
+
 // Проверки программы-сервера после предварительного прохода.
 fn check_api() {
     for g in globals {
@@ -526,10 +536,20 @@ fn check_api() {
             var seen: [int] = []
             let bad = store_raw_type(g.ty, seen)
             if bad.byte_len() > 0 {
-                if g.is_store {
-                    error_tok(toks[g.tok], "store '" + g.name + "' holds " + bad + ", which is a byte buffer of the library, not a value", "store the text instead: buf_str(b) gives a str")
+                var what = "store '" + g.name + "'"
+                var why = ""
+                if !g.is_store {
+                    what = "global '" + g.name + "'"
+                    why = " (in a program with tests, globals live in store)"
+                }
+                if bad == "MongoCursor" {
+                    error_tok(toks[g.tok], what + " holds MongoCursor, which lives for one request: mongo_next and mongo_close change it and fill it with the request's memory" + why, "read the cursor to the end in the request and keep the documents or the last _id to continue from")
+                } else if bad == "BsonBuilder" {
+                    error_tok(toks[g.tok], what + " holds BsonBuilder, which lives for one request: bson_* functions change it in place" + why, "keep the finished document instead: bson_finish(b) gives a Bson")
+                } else if g.is_store {
+                    error_tok(toks[g.tok], what + " holds " + bad + ", which is a byte buffer of the library, not a value", "store the text instead: buf_str(b) gives a str")
                 } else {
-                    error_tok(toks[g.tok], "global '" + g.name + "' holds " + bad + ", which is a byte buffer of the library, not a value (in a program with tests, globals live in store)", "keep the text instead: buf_str(b) gives a str")
+                    error_tok(toks[g.tok], what + " holds " + bad + ", which is a byte buffer of the library, not a value" + why, "keep the text instead: buf_str(b) gives a str")
                 }
             }
         }
