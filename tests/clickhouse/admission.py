@@ -84,6 +84,26 @@ def main(binary, mock):
                 assert request(base, "/run/admission")["ok"]
                 assert request(base, "/active") == 0
 
+            # the __ch_run window releases the store lock: while a writer that
+            # holds a store string waits for ClickHouse, a store reader on the
+            # same single thread answers at once (a held lock would stop the
+            # thread for good), and the held string survives the window
+            request(mock, "/reset")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                stored = pool.submit(request, base, "/stored/w", "POST")
+                for _ in range(200):
+                    if request(mock, "/stats")["active"] == 1:
+                        break
+                    time.sleep(0.002)
+                else:
+                    raise AssertionError("the store writer did not reach ClickHouse")
+                t0 = time.monotonic()
+                marks = request(base, "/marks")
+                read_s = time.monotonic() - t0
+                assert marks >= 1 and request(mock, "/stats")["active"] == 1, (marks, read_s)
+                assert read_s < 0.3, f"store read took {read_s:.3f}s while a writer waited"
+                assert stored.result()["ok"], stored.result()
+
             # FIFO: with one slot, requests are served in arrival order (the
             # sleep(1) poll let late requests overtake early ones)
             request(mock, "/reset")
@@ -129,7 +149,7 @@ def main(binary, mock):
             assert sum(r["ok"] for r in results) >= 3, results[:5]
             assert all(r["ok"] or r["error"] for r in results), results
             assert request(base, "/active") == 0 and request(base, "/waiting") == 0
-            print(f"ClickHouse admission: peak=2, queued deadline, broken I/O and panic/fail release, FIFO, budget {budget:.3f}s, {spent:.3f}s CPU for 300 waiters: ok")
+            print(f"ClickHouse admission: peak=2, queued deadline, broken I/O and panic/fail release, store read during a window, FIFO, budget {budget:.3f}s, {spent:.3f}s CPU for 300 waiters: ok")
         except Exception:
             log.seek(0)
             sys.stderr.write(log.read().decode(errors="replace")[-10000:])

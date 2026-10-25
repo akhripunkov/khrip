@@ -1,0 +1,65 @@
+// Проба: цена публикации записи контекста сборщика store (lib/gc.kh,
+// docs/design/v0.13-store-gc.md §6.2, §16: не больше 0,5 мкс). Запускается
+// как тесты: khc test bench/gc/pinprobe.kh (KHRIP_SIMD=0 — без SIMD).
+//
+// Тест держит store (как запрос перед ожиданием) и на глубине стека depth
+// кадров с указателями в store в каждом публикует и отзывает свою запись —
+// то, что добавляет каждое окно без блокировки (__store_release_keep и
+// __store_lock): регистры, стек, слова контекста, __Worker, буферы __setjmp,
+// границы арены. Печатает слова, которые просмотрела запись, найденные
+// указатели и нс на пару «публикация + отзыв» (лучший из пяти замеров).
+
+store items: [str]
+
+fn now_ns() -> int {
+    let ts = __ctx() + 192
+    syscall(228, 1, ts)
+    return load64(ts) * 1000000000 + load64(ts + 8)
+}
+
+// n кадров, в каждом — указатель в store и несколько чисел.
+fn deep(n: int, iters: int) -> int {
+    let s = items[n % items.len()]
+    let a = n * 3
+    let b = a + s.byte_len()
+    if n == 0 {
+        return measure(iters) + b
+    }
+    return deep(n - 1, iters) + b - a
+}
+
+fn measure(iters: int) -> int {
+    let c = __ctx()
+    let r = load64(c + CTX_PINREC)
+    let rec: __Pin = __cast(r)
+    // прогрев: буфер записи уже нужного размера
+    __pin_publish(r)
+    __pin_withdraw(rec)
+    var best = 1000000000
+    for round in 0..5 {
+        let t0 = now_ns()
+        for i in 0..iters {
+            __pin_publish(r)
+            __pin_withdraw(rec)
+        }
+        let dt = now_ns() - t0
+        if dt < best {
+            best = dt
+        }
+    }
+    let sp = load64(rec.regs + 8)
+    let words = 8 + (rec.top - sp) / 8 + (CTX_CO_END - 8) / 8 + WORKER_WORDS + 16
+    print("  words scanned {words}, store pointers {rec.len}, arena {(rec.hi - rec.lo) / 1024} KB: {best / iters} ns per publish + withdraw")
+    return 0
+}
+
+test "publication cost" {
+    for i in 0..64 {
+        items.push("item-{i}")
+    }
+    print("")
+    for d in [0, 10, 40, 160] {
+        print("depth {d}:")
+        deep(d, 200000)
+    }
+}
