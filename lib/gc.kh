@@ -1529,6 +1529,7 @@ var __gc_marked_objs: int
 // память страниц store после неё
 var __gc_st_why: int
 var __gc_st_before: int
+var __gc_st_after: int
 var __gc_st_recs: int
 var __gc_st_words: int
 var __gc_st_arenas: int
@@ -1581,6 +1582,7 @@ fn __gc_collect_now(self: int, why: int) {
     __gc_sweep_all()
     __gc_pace()
     let t3 = __gc_now_us()
+    __gc_st_after = __heap_live
     __gc_st_start = t1 - t0
     __gc_st_mark = t2 - t1
     __gc_st_sweep = t3 - t2
@@ -2443,7 +2445,7 @@ fn __gc_line() -> str {
         why = "window"
     }
     let pause = __gc_st_start + __gc_st_mark + __gc_st_sweep
-    var line = "gc {__gc_cycle_no} ({why}): heap {__gc_mbs(__gc_st_before)}->{__gc_mbs(__heap_live)} MB, live {__gc_mbs(__heap_marked)} MB ({__gc_marked_objs} obj), m 1, pins {__gc_st_recs} rec/{__gc_st_words} words, arenas {__gc_st_arenas} ({(__gc_st_abytes + 1023) / 1024} KB), pause {__gc_ms(pause)} ms (start {__gc_ms(__gc_st_start)}, mark {__gc_ms(__gc_st_mark)}, sweep {__gc_ms(__gc_st_sweep)}), released {__gc_mbs(__gc_st_released)} MB, rss-store {__gc_mbs(__gc_st_rss)} MB"
+    var line = "gc {__gc_cycle_no} ({why}): heap {__gc_mbs(__gc_st_before)}->{__gc_mbs(__gc_st_after)} MB, live {__gc_mbs(__heap_marked)} MB ({__gc_marked_objs} obj), m 1, pins {__gc_st_recs} rec/{__gc_st_words} words, arenas {__gc_st_arenas} ({(__gc_st_abytes + 1023) / 1024} KB), pause {__gc_ms(pause)} ms (start {__gc_ms(__gc_st_start)}, mark {__gc_ms(__gc_st_mark)}, sweep {__gc_ms(__gc_st_sweep)}), released {__gc_mbs(__gc_st_released)} MB, rss-store {__gc_mbs(__gc_st_rss)} MB"
     if __gc_st_long > 0 {
         line += ", long holders {__gc_st_long} ({__gc_st_long_age} cycles, {__gc_st_long_words} words)"
     }

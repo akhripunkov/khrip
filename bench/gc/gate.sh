@@ -4,7 +4,8 @@
 # store не растёт — с RSS каждую секунду и паузами из KHRIP_GC_LOG; затем
 # удаление 90% store (подряд и вразнобой) с простоем.
 #
-#   bench/gc/gate.sh [секунд soak] [папка khc]   (по умолчанию 60 и корень репозитория)
+#   bench/gc/gate.sh [секунд soak] [корень khc]   (по умолчанию 60 и этот репозиторий;
+#                                                 khc — <корень>/build/khc)
 #
 # Сервер на ядрах SERVER_CPUS, wrk на CLIENT_CPUS, порт 8080 (как eval/perf.sh).
 # Пишет в OUT (по умолчанию bench/gc/out): soak.tsv (секунда, RSS КБ),
@@ -67,7 +68,9 @@ if p:
     print(f"cycles {len(p)}, pause median {p[len(p) // 2]:.2f} ms, p99 {p[int(len(p) * 0.99)]:.2f} ms, max {p[-1]:.2f} ms; heap before {heap[-1][0]} MB, live {heap[-1][2]} MB ({heap[-1][3]} objects)")
 PY
 
-# --- удаление 90%: подряд и вразнобой ---
+# --- удаление 90%: подряд и вразнобой (DELETE=0 — без него, например для
+# khc без сборщика) ---
+[[ ${DELETE:-1} == 1 ]] || exit 0
 "$kroot/build/khc" -o "$tmp/delete" "$here/delete.kh" || exit 1
 : >"$OUT/delete.txt"
 for how in oldest random; do
