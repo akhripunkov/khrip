@@ -214,6 +214,49 @@ if [[ "${KHRIP_GC_STRESS:-}" != 1 ]]; then
 	done
 fi
 
+# Проверка конца разметки сама по себе (lib/gc_verify.kh: снимок начала
+# сборки независим от разметки): на копиях библиотеки, где разметка теряет
+# слова записей, кусок арены или барьер pop, tests/api/gc_snapshot.kh с
+# KHRIP_GC_VERIFY=1 останавливается на ней, хотя потерянный объект больше ни
+# от чего не достижим; и с KHRIP_GC_FAULT=hbuf (системе не хватило памяти на
+# hbuf передачи арены: контекст размечает её сам) — тот же вывод.
+snap_ok=1
+for cut in pins arena pop; do
+	rm -rf "${tmp:?}/snaplib"
+	mkdir -p "$tmp/snaplib"
+	cp lib/*.kh "$tmp/snaplib/"
+	if ! python3 - "$tmp/snaplib" "$cut" <<'PY'
+import sys
+d, m = sys.argv[1], sys.argv[2]
+cuts = {
+    "pins": ("gc.kh", "            __gc_pins_add(rec.buf, rec.len)\n", ""),
+    "arena": ("gc.kh", "                var p = from\n                var k = 0\n", "                var p = from + 4096\n                var k = 0\n"),
+    "pop": ("core.kh", "        __gc_shade(v)\n", ""),
+}
+f, old, new = cuts[m]
+s = open(f"{d}/{f}").read()
+if s.count(old) != 1:
+    sys.exit(1)
+open(f"{d}/{f}", "w").write(s.replace(old, new))
+PY
+	then
+		snap_ok=0
+		failed "проверка конца разметки ($cut)" "место для подложенной ошибки не найдено в lib/"
+		continue
+	fi
+	KHRIP_LIB="$tmp/snaplib" KHRIP_GC_VERIFY=1 "$KHC" test tests/api/gc_snapshot.kh >"$tmp/snap.txt" 2>&1
+	if ! grep -q '^khrip: gc verify: an object at 0x[0-9a-f]* reachable at the start of the cycle is not marked' "$tmp/snap.txt"; then
+		snap_ok=0
+		failed "проверка конца разметки ($cut)" "не нашла потерянный объект:"$'\n'"$(cat "$tmp/snap.txt")"
+	fi
+done
+KHRIP_GC_VERIFY=1 KHRIP_GC_FAULT=hbuf "$KHC" test tests/api/gc_snapshot.kh 2>&1 | grep -v '^khrip: gc verify (boot): ' >"$tmp/snap.txt"
+if ! diff -u tests/api/gc_snapshot.out "$tmp/snap.txt" >"$tmp/snap.diff"; then
+	snap_ok=0
+	failed "tests/api/gc_snapshot.kh (KHRIP_GC_FAULT=hbuf)" "$(cat "$tmp/snap.diff")"
+fi
+[[ $snap_ok -eq 1 ]] && pass=$((pass + 1))
+
 # Примеры учебника (docs/TUTORIAL.md) и ответы к заданиям: программы
 # выполняются, API проходят свои блоки test.
 for src in docs/tutorial/*.kh docs/tutorial/answers/*.kh; do

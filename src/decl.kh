@@ -612,7 +612,8 @@ fn prescan_fn(kind_: int) {
     funcs[fi].inline_ok = can_inline(fi)
 }
 
-// Маленькие нерекурсивные функции без циклов встраиваются в место вызова.
+// Маленькие нерекурсивные функции без циклов встраиваются в место вызова
+// (кроме помеченных __noinline() в библиотеке).
 fn can_inline(fi: int) -> bool {
     let f = funcs[fi]
     if f.body_end - f.body > 48 || f.params.len() > 6 || f.kind != FK_USER || f.name == "main" {
@@ -624,7 +625,7 @@ fn can_inline(fi: int) -> bool {
         if k == T_WHILE || k == T_FOR {
             return false
         }
-        if k == T_IDENT && (toks[i].text == f.name || toks[i].text.starts_with("__simd_") || toks[i].text == "tx") {
+        if k == T_IDENT && (toks[i].text == f.name || toks[i].text.starts_with("__simd_") || toks[i].text == "tx" || toks[i].text == "__noinline") {
             return false
         }
         i += 1

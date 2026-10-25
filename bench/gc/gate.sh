@@ -74,14 +74,14 @@ def stats(name, xs, unit):
 # сборки целиком (в запросе, в простое): пауза; инкрементальные (поток
 # сборщика): начало, самый долгий кусок разметки, конец разметки, уборка
 p = [float(x) for x in re.findall(r"pause ([0-9.]+) ms", log)]
-inc = re.findall(r"start (\d+) µs, mark ([0-9.]+) ms in (\d+) slices \(max (\d+) µs\) over ([0-9.]+) ms, term (\d+) µs.*?, sweep ([0-9.]+) ms", log)
+inc = re.findall(r"start (\d+) µs, mark ([0-9.]+) ms in (\d+) slices \(max (\d+) µs, cpu (\d+) µs\) over ([0-9.]+) ms, term (\d+) µs.*?, sweep ([0-9.]+) ms", log)
 if heap:
     print(f"cycles {len(heap)} ({len(inc)} incremental, {len(p)} whole); heap before {heap[-1][0]} MB, live {heap[-1][2]} MB ({heap[-1][3]} objects)")
 if p:
     print(stats("whole-cycle pause", p, "ms"))
 if inc:
-    print(stats("start", [int(r[0]) / 1000 for r in inc], "ms") + "; " + stats("max slice", [int(r[3]) / 1000 for r in inc], "ms"))
-    print(stats("termination", [int(r[5]) / 1000 for r in inc], "ms") + "; " + stats("sweep", [float(r[6]) for r in inc], "ms") + f"; slices per cycle median {sorted(int(r[2]) for r in inc)[len(inc) // 2]}")
+    print(stats("start", [int(r[0]) / 1000 for r in inc], "ms") + "; " + stats("max slice", [int(r[3]) / 1000 for r in inc], "ms") + "; " + stats("max slice cpu", [int(r[4]) / 1000 for r in inc], "ms"))
+    print(stats("termination", [int(r[6]) / 1000 for r in inc], "ms") + "; " + stats("sweep", [float(r[7]) for r in inc], "ms") + f"; slices per cycle median {sorted(int(r[2]) for r in inc)[len(inc) // 2]}")
 PY
 
 # --- удаление 90%: подряд и вразнобой (DELETE=0 — без него, например для

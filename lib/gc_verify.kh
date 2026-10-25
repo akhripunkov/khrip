@@ -20,7 +20,16 @@ fn __gc_verify_init() {
         __gc_verify = true
         __gc_verify_slow = true
     }
+    // отказ памяти на hbuf передачи арены (tests/gc.sh): запасной путь
+    // __pin_self_fallback
+    __gcv_hbuf_fault = (env("KHRIP_GC_FAULT") ?? "") == "hbuf"
     __gc_slow_update()
+}
+
+var __gcv_hbuf_fault: bool
+
+fn __gc_hbuf_fault() -> bool {
+    return __gcv_hbuf_fault
 }
 
 // KHRIP_GC_VERIFY: каждые 1024 операции — дерево против карты.
@@ -237,20 +246,121 @@ fn __gc_verify_records(self: int, acquiring: bool) {
     __gc_vlinked += linked
 }
 
-// Конец разметки, до уборки (§8.7 п. 2): независимая разметка должна найти
-// только помеченное — иначе уборка освободила бы живой объект. Сначала — всё,
-// что держали записи в начале сборки: их слова (массив записей), слова их арен
-// (те, что разметка нашла сама, и те, что передали контексты) и всё, до чего
-// от них можно дойти по битам PTRB сейчас; затем — граф от корней по типам
-// (__gc_verify_run: каждая ссылка, ещё и помечена ли её цель) вместе с кучей
-// (до уборки в ней и мусор, и __heap_live его считает). Списки записей потоков
-// здесь не читаются: конец разметки идёт под мьютексом писателей, и читатели
-// тем временем публикуют и отзывают свои записи; записи, опубликованные во
-// время разметки, держат только достижимое (помеченное) или чёрное.
+// Начало сборки (§8.7 п. 2), под исключительной блокировкой: всё, что
+// достижимо сейчас, — снимок (бит на каждые 16 байт STORE ниже __gc_hwb, как
+// MARK). Независимо от разметки: корни, слова записей потоков (по реестру
+// всех записей, без массива записей) и слова их арен [lo, hi) — прямо из
+// записей, без захвата, кусков арен и hbuf, — и всё, до чего от них доходят
+// биты PTRB. Конец разметки проверяет, что помечен каждый объект снимка: SATB
+// обещает ровно это, и потерянный разметкой (слово записи, кусок арены,
+// барьер, после которого объект держит только ожидающий контекст) находится,
+// даже если он больше ни от чего не достижим.
+var __gcv_snap: int
+var __gcv_snapsz: int
+
+fn __gc_verify_snap() {
+    __gcv_snapsz = ((__gc_hwb >> 10) + 1) * 8
+    __gcv_snap = syscall(SYS_MMAP, 0, __gcv_snapsz, 3, 0x4022, -1, 0)
+    let st = syscall(SYS_MMAP, 0, 64, 3, 0x22, -1, 0)
+    if __gcv_snap < 0 || st < 0 {
+        __gcv_snap = 0
+        eprint("khrip: gc verify (start): skipped, no memory for the snapshot")
+        return
+    }
+    store64(st, __gcv_map(st, 1024 * 16))
+    store64(st + 16, 1024)
+    store64(st + 48, -1)
+    let roots = __gc_roots()
+    for i in 0..load64(roots) {
+        __gcv_snap_word(st, load64(load64(roots + 8 + i * 16)))
+    }
+    var r = load64(__gc_reg)
+    while r != 0 {
+        let rec: __Pin = __cast(r)
+        if rec.linked {
+            for j in 0..rec.len {
+                __gcv_snap_word(st, load64(rec.buf + j * 8))
+            }
+            var p = rec.lo
+            if rec.hi - rec.lo >= STRC_SIZE {
+                p = rec.lo + STRC_SIZE
+            }
+            while p < rec.hi {
+                let w = load64(p)
+                if (w >> 38) == 0x40 {
+                    __gcv_snap_word(st, w)
+                }
+                p += 8
+            }
+        }
+        r = rec.all
+    }
+    while load64(st + 8) > 0 && load64(st + 56) == 0 {
+        let k = load64(st + 8) - 1
+        store64(st + 8, k)
+        let o = load64(load64(st) + k * 16)
+        if ((load64(__gc_span_of(o) + S_INFO) >> 48) & F_NOSCAN) == 0 {
+            let e = o + __gc_obj_size(o)
+            var q = o
+            while q < e {
+                if ((load64(((q >> 9) << 3) + GC_PTRB_P) >> ((q >> 3) & 63)) & 1) != 0 {
+                    __gcv_snap_word(st, load64(q))
+                }
+                q += 8
+            }
+        }
+    }
+    if load64(st + 56) != 0 {
+        syscall(SYS_MUNMAP, __gcv_snap, __gcv_snapsz)
+        __gcv_snap = 0
+        eprint("khrip: gc verify (start): skipped, no memory for the snapshot")
+    }
+    if load64(st) != 0 {
+        syscall(SYS_MUNMAP, load64(st), load64(st + 16) * 16)
+    }
+    syscall(SYS_MUNMAP, st, 64)
+}
+
+// Слово снимка: объект, внутри которого оно лежит, — в снимок; первая встреча
+// — в стек.
+fn __gcv_snap_word(st: int, w: int) {
+    let o = __gc_obj_of(w)
+    if o == 0 {
+        return
+    }
+    let g = (o - STORE_REGION) >> 4
+    let a = __gcv_snap + ((g >> 6) << 3)
+    let b = 1 << (g & 63)
+    if (load64(a) & b) == 0 {
+        store64(a, load64(a) | b)
+        __gcv_push(st, o, 0)
+    }
+}
+
+// Конец разметки, до уборки: помечен каждый объект снимка начала (иначе
+// уборка освободила бы объект, который был достижим в начале сборки), а затем
+// — граф от корней по типам (__gc_verify_run: каждая ссылка, ещё и помечена ли
+// её цель; так находится и объект, выделенный во время разметки без бита MARK)
+// вместе с кучей (до уборки в ней и мусор, и __heap_live его считает).
+// Записи, опубликованные во время разметки, не проверяются: их неточные слова
+// стека и арены бывают устаревшими (указывают на мусор начала сборки).
 var __gcv_marks: bool
 
 fn __gc_verify_marks() {
-    __gc_verify_pins()
+    if __gcv_snap != 0 {
+        for k in 0..__gcv_snapsz >> 3 {
+            var lost = load64(__gcv_snap + k * 8)
+            if lost != 0 {
+                lost = lost & ~load64(GC_MARK + k * 8)
+            }
+            if lost != 0 {
+                let o = STORE_REGION + (((k << 6) + __ctz(lost)) << 4)
+                __gc_fatal("an object at " + __gc_hex(o) + " reachable at the start of the cycle is not marked (the marker lost it, or a barrier is missing)")
+            }
+        }
+        syscall(SYS_MUNMAP, __gcv_snap, __gcv_snapsz)
+        __gcv_snap = 0
+    }
     __gcv_marks = true
     __gc_verify_run("gc", false)
     __gcv_marks = false
@@ -259,15 +369,10 @@ fn __gc_verify_marks() {
 // После уборки (§8.7): уборка оставила ровно живое (помеченное разметкой и
 // выделенное чёрным за время разметки, kept — байт оставленных объектов); куча
 // согласована — учёт байтов, свободные слоты без битов PTRB, записи спанов,
-// кучка страниц. Слова арен, найденные разметкой, больше 1 МБ — системе.
+// кучка страниц.
 fn __gc_verify_swept(kept: int) {
     if kept != __heap_marked {
         __gc_fatal("the sweep kept {kept} bytes, but marking counted {__heap_marked} ({__gc_black_bytes} of them allocated black)")
-    }
-    if __gc_vwcap * 8 > GC_MB {
-        syscall(SYS_MUNMAP, __gc_vw, __gc_vwcap * 8)
-        __gc_vw = 0
-        __gc_vwcap = 0
     }
     let st = syscall(SYS_MMAP, 0, 64, 3, 0x22, -1, 0)
     if st < 0 {
@@ -276,72 +381,6 @@ fn __gc_verify_swept(kept: int) {
     store64(st + 48, -1)
     __gc_verify_heap(st, "sweep")
     syscall(SYS_MUNMAP, st, 64)
-}
-
-// Записи начала сборки: каждый объект, на который указывает их слово или
-// слово их арены, помечен, и всё, до чего от него доходят биты PTRB, — тоже.
-fn __gc_verify_pins() {
-    let st = syscall(SYS_MMAP, 0, 64, 3, 0x22, -1, 0)
-    if st < 0 {
-        eprint("khrip: gc verify (gc): skipped, no memory for the check")
-        return
-    }
-    store64(st, __gcv_map(st, 1024 * 16))
-    store64(st + 16, 1024)
-    store64(st + 24, __gcv_map(st, 4096 * 8))
-    store64(st + 40, 4096)
-    store64(st + 48, -1)
-    for j in 0..__gc_npins {
-        __gcv_pin(st, load64(__gc_pins + j * 8))
-    }
-    for j in 0..__gc_nvw {
-        __gcv_pin(st, load64(__gc_vw + j * 8))
-    }
-    for i in 0..__gc_ncap {
-        let rec: __Pin = __cast(load64(__gc_capl + i * 8))
-        if rec.aoff < 0 {
-            for j in 0..rec.hlen {
-                __gcv_pin(st, load64(rec.hbuf + j * 8))
-            }
-        }
-    }
-    while load64(st + 8) > 0 && load64(st + 56) == 0 {
-        let k = load64(st + 8) - 1
-        store64(st + 8, k)
-        let o = load64(load64(st) + k * 16)
-        let es = __gc_obj_size(o)
-        if ((load64(__gc_span_of(o) + S_INFO) >> 48) & F_NOSCAN) == 0 {
-            var q = o
-            while q < o + es {
-                if ((load64(((q >> 9) << 3) + GC_PTRB_P) >> ((q >> 3) & 63)) & 1) != 0 {
-                    __gcv_pin(st, load64(q))
-                }
-                q += 8
-            }
-        }
-    }
-    if load64(st) != 0 {
-        syscall(SYS_MUNMAP, load64(st), load64(st + 16) * 16)
-    }
-    if load64(st + 24) != 0 {
-        syscall(SYS_MUNMAP, load64(st + 24), load64(st + 40) * 8)
-    }
-    syscall(SYS_MUNMAP, st, 64)
-}
-
-// Слово записи или объекта, найденного от записи: объект, внутри которого оно
-// лежит, помечен; первая встреча — в стек.
-fn __gcv_pin(st: int, w: int) {
-    let o = __gc_obj_of(w)
-    if o == 0 {
-        return
-    }
-    if !__gc_bit(GC_MARK, o) {
-        __gcv_fail(st, "gc", "an object at " + __gc_hex(o) + " held by a waiting context is not marked")
-    }
-    if __gcv_first(st, o) {
-        __gcv_push(st, o, 0)
-    }
 }
 
 // Проверка графа и кучи со строкой об итоге.
@@ -788,17 +827,6 @@ fn __gcv_place(t: int, cap: int, p: int) {
         i = (i + 1) & (cap - 1)
     }
     store64(t + i * 8, p)
-}
-
-// Слово арены w, которое разметка нашла сама (__gc_resolve_range): его снова
-// проверит конец разметки (__gc_verify_pins).
-fn __gc_vnote(w: int) {
-    if __gc_nvw == __gc_vwcap {
-        __gc_vw = __gc_regrow(__gc_vw, __gc_nvw, __gc_vwcap, 8, 0)
-        __gc_vwcap = __gc_regrow_cap
-    }
-    store64(__gc_vw + __gc_nvw * 8, w)
-    __gc_nvw += 1
 }
 
 // KHRIP_GC_STRESS без потока сборщика (khc test): шаг сборки вместо сборки

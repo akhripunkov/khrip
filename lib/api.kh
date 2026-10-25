@@ -155,28 +155,36 @@ fn __barrier(obj: int, v: int, d: int) -> int {
 }
 
 // x.f = v: поле со смещением off объекта obj (src/stmt.kh, assign_field).
+// Старое значение серится (SATB, lib/gc.kh) после копии: её проверка предела
+// может начать сборку (шаг KHRIP_GC_STRESS в khc test), и тогда старое
+// значение — в снимке начала, а затираемое без барьера оно бы потерялось.
 fn __barrier_at(obj: int, off: int, v: int, d: int) -> int {
     if __in_arena(obj) {
         return v
     }
-    __gc_field(obj, off)
-    if v == 0 || __in_store(v) || __in_data(v) {
-        return v
+    __store_mut(obj)
+    var r = v
+    if v != 0 && !__in_store(v) && !__in_data(v) {
+        r = __persist_copy(v, d)
     }
-    return __persist_copy(v, d)
+    __gc_field(obj, off)
+    return r
 }
 
 // xs[i] = v (src/stmt.kh, assign_index); границы проверяются после барьера:
-// за границей старого значения нет.
+// за границей старого значения нет. Старый элемент серится после копии, как
+// в __barrier_at.
 fn __barrier_idx(xs: int, i: int, v: int, d: int) -> int {
     if __in_arena(xs) {
         return v
     }
-    __gc_elem(xs, i)
-    if v == 0 || __in_store(v) || __in_data(v) {
-        return v
+    __store_mut(xs)
+    var r = v
+    if v != 0 && !__in_store(v) && !__in_data(v) {
+        r = __persist_copy(v, d)
     }
-    return __persist_copy(v, d)
+    __gc_elem(xs, i)
+    return r
 }
 
 fn __persist(v: int, d: int) -> int {
@@ -186,14 +194,16 @@ fn __persist(v: int, d: int) -> int {
     return __persist_copy(v, d)
 }
 
-// Глобальная store или var теста (store_write): старое значение корня slot
-// серится, пока идёт разметка; новое копируется, как у __persist.
+// Глобальная store или var теста (store_write): новое значение копируется,
+// как у __persist; затем старое значение корня slot серится, пока идёт
+// разметка (после копии — как в __barrier_at).
 fn __persist_root(v: int, d: int, slot: int) -> int {
-    __gc_root(slot)
-    if __is_scalar(d) || v == 0 || __in_store(v) || __in_data(v) {
-        return v
+    var r = v
+    if !__is_scalar(d) && v != 0 && !__in_store(v) && !__in_data(v) {
+        r = __persist_copy(v, d)
     }
-    return __persist_copy(v, d)
+    __gc_root(slot)
+    return r
 }
 
 fn __persist_copy(v: int, d: int) -> int {

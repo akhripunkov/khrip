@@ -20,7 +20,7 @@ cd "${1:-.}" || exit 2
 # схем ClickHouse) и проверка владельца (lib/gc_verify.kh).
 rules=(
 	"= __store_release_keep( lib/rt.kh:__store_release_keep lib/rt.kh:__co_wait lib/fetch.kh:__fetch lib/crypto.kh:__pbkdf2_unlocked lib/mongo.kh:mongo_command lib/clickhouse.kh:__ch_run"
-	"= __store_unlock_raw( lib/rt.kh:__store_unlock_raw lib/rt.kh:__store_release_keep lib/rt.kh:__store_release_final"
+	"= __store_unlock_raw( lib/rt.kh:__store_unlock_raw lib/rt.kh:__store_release_keep lib/rt.kh:__store_release_final lib/gc.kh:__pin_self_fallback"
 	"= __store_write_unlock( lib/rt.kh:__store_write_unlock lib/rt.kh:__store_unlock_raw lib/rt.kh:__store_unlock_gc"
 	"< __store_unlock_gc( lib/rt.kh:__store_unlock_gc lib/gc.kh:* tests/api/gc_records.kh:*"
 	"< __store_unlock_marker( lib/rt.kh:__store_unlock_marker lib/gc.kh:* tests/api/gc_records.kh:*"
