@@ -1413,19 +1413,31 @@ fn __pin_unfinished(c: int) -> bool {
 // сборщика (граф и куча после работы под исключительной блокировкой), хук
 // писателя — сборка, если куча дошла до жёсткого предела (§8.4; с
 // KHRIP_GC_STRESS — каждые 64 КБ): публиковать ничего не нужно, контекст со
-// store закончил (I8). Помощь разметке — шаг 6. Работа закончена.
+// store закончил (I8). Кроме запроса внутри call теста (__gc_nested): его
+// последнее отпускание — не конец работы теста, кадры и арена теста над ним
+// ещё держат указатели в store; собирать — точке сборки теста сразу после
+// запроса, которая публикует тест. Помощь разметке — шаг 6. Работа
+// закончена.
 fn __pin_final(c: int) {
     __gc_verify_release()
     let r = load64(c + CTX_PINREC)
-    if __heap_live >= __gc_limit && load64(c + CTX_STORE_HELD) == 1 && !__gc_busy && !__store_on() {
+    if __heap_live >= __gc_limit && load64(c + CTX_STORE_HELD) == 1 && !__gc_busy && !__store_on() && !__gc_nested(c) {
         __gc_collect_now(r, GC_WHY_RELEASE)
-        __gc_scavenge(false, true, __gc_runs)
+        __gc_release_locked()
         __gc_report()
     }
     if r != 0 {
         let rec: __Pin = __cast(r)
         rec.touched = false
     }
+}
+
+// Запрос вложен в call теста (lib/api.kh, __call): __serve_one вернул в
+// CTX_CATCH буфер теста (у запроса сервера, задачи, сохранения, загрузки и в
+// конце теста там 0; так же их различает __mongo_request_end). Его последнее
+// отпускание — не конец работы контекста: тест над ним держит свои значения.
+fn __gc_nested(c: int) -> bool {
+    return load64(c + CTX_CATCH) != 0
 }
 
 // KHRIP_GC_VERIFY (__co_put): сопрограмма закончила запрос последним
@@ -1478,10 +1490,13 @@ const GC_WHY_RELEASE = 4
 const GC_WHY_TEST = 5
 const GC_WHY_CALL = 6
 const GC_WHY_WINDOW = 7
+const GC_WHY_FORCED = 8
 // запись опубликована столько сборок назад — долгий держатель (§8.6)
 const GC_LONG = 10
 // тиков (по секунде) без выделений — простой: всё свободное — системе
 const GC_IDLE_TICKS = 10
+// store брали на запись, а сборки не было две минуты — сборка (мкс)
+const GC_FORCE_US = 120000000
 // серий страниц за один возврат памяти системе
 const GC_SCAV_RUNS = 256
 // стек потока сборщика
@@ -1504,6 +1519,12 @@ var __gc_hard: int
 var __gc_limit: int
 // поток сборщика уже разбужен в этом цикле
 var __gc_poked: bool
+// сборка под блокировкой контекста оставила возврат памяти потоку сборщика
+var __gc_scav_due: bool
+// __store_touches в начале последней сборки и её конец (мкс): простой и
+// сборка раз в две минуты смотрят, брали ли store на запись с тех пор
+var __gc_touches: int
+var __gc_last_us: int
 // поток сборщика запущен (__gc_spawn)
 var __gc_has_thread: bool
 // слово futex потока сборщика (кусок mmap): 1 — его будят
@@ -1540,6 +1561,10 @@ var __gc_st_long_words: int
 var __gc_st_start: int
 var __gc_st_mark: int
 var __gc_st_sweep: int
+var __gc_st_release: int
+var __gc_st_pause: int
+// возврат памяти этой сборки отдан потоку сборщика
+var __gc_st_handed: bool
 var __gc_st_released: int
 var __gc_st_rss: int
 // за всё время: паузы (мкс), наибольшая пауза, байт возвращено системе
@@ -1586,12 +1611,39 @@ fn __gc_collect_now(self: int, why: int) {
     __gc_st_start = t1 - t0
     __gc_st_mark = t2 - t1
     __gc_st_sweep = t3 - t2
+    __gc_st_release = 0
+    __gc_st_handed = false
+    __gc_st_pause = t3 - t0
     __gc_total_pause += t3 - t0
     if t3 - t0 > __gc_max_pause {
         __gc_max_pause = t3 - t0
     }
+    __gc_last_us = t3
     __gc_poked = false
     __gc_busy = false
+}
+
+// Возврат памяти после сборки, которую контекст сделал под своей
+// исключительной блокировкой (запрос, задача, тест). Есть поток сборщика —
+// возврат ему: он вернёт память без блокировки, а не в паузе запроса. Нет
+// (khc test) — здесь, и его время — часть паузы (журнал, __gc_stats).
+fn __gc_release_locked() {
+    if __gc_has_thread {
+        __gc_scav_due = true
+        __gc_st_handed = true
+        store64(__gc_ctl, 1)
+        syscall(SYS_FUTEX, __gc_ctl, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0)
+        return
+    }
+    let t0 = __gc_now_us()
+    __gc_scavenge(false, true, __gc_runs)
+    let dt = __gc_now_us() - t0
+    __gc_st_release = dt
+    __gc_st_pause += dt
+    __gc_total_pause += dt
+    if __gc_st_pause > __gc_max_pause {
+        __gc_max_pause = __gc_st_pause
+    }
 }
 
 // Начало (§7.2): номер сборки и номер кэшей строк (их ключи могли бы указать на
@@ -1604,6 +1656,7 @@ fn __gc_start(self: int) {
     }
     __gc_cycle_no += 1
     __store_epoch += 1
+    __gc_touches = __store_touches
     __gc_set_marking(true)
     __gc_phase = GC_PH_MARK
     __gc_hwb = load64(__gc_ph + PH_HW) << GC_PAGE_SHIFT
@@ -2107,7 +2160,7 @@ fn __gc_emergency(why: int) {
     __pin_publish(r)
     __gc_collect_now(r, why)
     __pin_withdraw(__cast(r))
-    __gc_scavenge(false, true, __gc_runs)
+    __gc_release_locked()
     __gc_report()
 }
 
@@ -2131,7 +2184,7 @@ fn __gc_test_point(end: bool) {
     }
     __store_lock_gc()
     __gc_collect_now(load64(__ctx() + CTX_PINREC), GC_WHY_TEST)
-    __gc_scavenge(false, true, __gc_runs)
+    __gc_release_locked()
     __store_unlock_gc()
     __gc_report()
 }
@@ -2146,7 +2199,7 @@ fn __gc_window_point() {
     }
     __store_lock_gc()
     __gc_collect_now(0, GC_WHY_WINDOW)
-    __gc_scavenge(false, true, __gc_runs)
+    __gc_release_locked()
     __store_unlock_gc()
     __gc_report()
 }
@@ -2174,7 +2227,7 @@ fn __gc_collect_self(why: int) {
     if r != 0 {
         __pin_withdraw(__cast(r))
     }
-    __gc_scavenge(false, true, __gc_runs)
+    __gc_release_locked()
     __store_unlock_gc()
     __gc_report()
 }
@@ -2355,14 +2408,20 @@ fn __gc_spawn() {
         __panic(PANIC_MEMORY, "mmap")
     }
     __gc_has_thread = true
+    // загрузка — не запись после сборки: отсчёт простоя и двух минут — отсюда
+    __gc_touches = __store_touches
+    __gc_last_us = __gc_now_us()
     __spawn(stack + GC_STACK, -2)
 }
 
 // Поток сборщика (lib/http.kh, __thread_main(-2)): ждёт, пока его разбудят
-// (куча дошла до порога), но не дольше секунды; сборка — под исключительной
-// блокировкой сборщика, возврат памяти — без неё. Десять секунд без выделений
-// в store — простой: сборка, если с прошлой выделено больше 1 МБ, и вся
-// свободная память — системе. Строки журнала — в своей арене потока.
+// (куча дошла до порога или сборка под чужой блокировкой оставила ему возврат
+// памяти), но не дольше секунды; сборка — под исключительной блокировкой
+// сборщика, возврат памяти — без неё. Десять секунд без выделений в store —
+// простой (раз на период): сборка, если с прошлой выделено больше 1 МБ или
+// store брали на запись, и вся свободная память — системе. Store брали на
+// запись, а сборки не было две минуты — сборка. Строки журнала — в своей
+// арене потока.
 fn __gc_thread_main() {
     __arena_init()
     let ts = __alloc(16)
@@ -2388,12 +2447,19 @@ fn __gc_thread_main() {
             idle_done = false
         }
         if idle >= GC_IDLE_TICKS && !idle_done {
+            // простой — раз на период без выделений: сборка, если с прошлой
+            // выделено больше 1 МБ или store брали на запись (удаления и
+            // замены освобождают, не выделяя), и всё свободное — системе
             idle_done = true
-            if __heap_live > __heap_marked + GC_MB {
+            if __heap_live > __heap_marked + GC_MB || __store_touches != __gc_touches {
                 __gc_thread_cycle(GC_WHY_IDLE, runs)
             } else {
                 __gc_scavenge(true, false, runs)
             }
+        } else if __store_touches != __gc_touches && __gc_now_us() - __gc_last_us >= GC_FORCE_US {
+            // store меняют, а куча не растёт (одни удаления): сборка раз в
+            // две минуты, как у Go
+            __gc_thread_cycle(GC_WHY_FORCED, runs)
         }
         last_live = __heap_live
         last_cycle = __gc_cycle_no
@@ -2404,14 +2470,19 @@ fn __gc_thread_cycle(why: int, runs: int) {
     __store_lock_gc()
     store64(__gc_ctl, 0)
     var ran = false
-    if why == GC_WHY_IDLE || __heap_live >= __gc_trigger {
+    if why != GC_WHY_PACE || __heap_live >= __gc_trigger {
         __gc_collect_now(0, why)
         ran = true
     }
+    // и возврат памяти, который оставила сборка под чужой блокировкой
+    let scav = ran || __gc_scav_due
+    __gc_scav_due = false
     __gc_poked = false
     __store_unlock_gc()
-    if ran {
+    if scav {
         __gc_scavenge(why == GC_WHY_IDLE, false, runs)
+    }
+    if ran {
         if __gc_log {
             __arena_begin()
             eprint(__gc_line())
@@ -2443,9 +2514,16 @@ fn __gc_line() -> str {
         why = "explicit"
     } else if __gc_st_why == GC_WHY_WINDOW {
         why = "window"
+    } else if __gc_st_why == GC_WHY_FORCED {
+        why = "forced"
     }
-    let pause = __gc_st_start + __gc_st_mark + __gc_st_sweep
-    var line = "gc {__gc_cycle_no} ({why}): heap {__gc_mbs(__gc_st_before)}->{__gc_mbs(__gc_st_after)} MB, live {__gc_mbs(__heap_marked)} MB ({__gc_marked_objs} obj), m 1, pins {__gc_st_recs} rec/{__gc_st_words} words, arenas {__gc_st_arenas} ({(__gc_st_abytes + 1023) / 1024} KB), pause {__gc_ms(pause)} ms (start {__gc_ms(__gc_st_start)}, mark {__gc_ms(__gc_st_mark)}, sweep {__gc_ms(__gc_st_sweep)}), released {__gc_mbs(__gc_st_released)} MB, rss-store {__gc_mbs(__gc_st_rss)} MB"
+    let pause = __gc_st_pause
+    var line = "gc {__gc_cycle_no} ({why}): heap {__gc_mbs(__gc_st_before)}->{__gc_mbs(__gc_st_after)} MB, live {__gc_mbs(__heap_marked)} MB ({__gc_marked_objs} obj), m 1, pins {__gc_st_recs} rec/{__gc_st_words} words, arenas {__gc_st_arenas} ({(__gc_st_abytes + 1023) / 1024} KB), pause {__gc_ms(pause)} ms (start {__gc_ms(__gc_st_start)}, mark {__gc_ms(__gc_st_mark)}, sweep {__gc_ms(__gc_st_sweep)}, release {__gc_ms(__gc_st_release)})"
+    if __gc_st_handed {
+        line += ", pages released by the GC thread"
+    } else {
+        line += ", released {__gc_mbs(__gc_st_released)} MB, rss-store {__gc_mbs(__gc_st_rss)} MB"
+    }
     if __gc_st_long > 0 {
         line += ", long holders {__gc_st_long} ({__gc_st_long_age} cycles, {__gc_st_long_words} words)"
     }

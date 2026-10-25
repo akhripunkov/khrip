@@ -25,6 +25,7 @@ store counter: int
 store seen: map[int, int]
 store hdrs: map[str, str]
 store target: str
+store big: [int]
 
 const N = 2000
 
@@ -364,6 +365,26 @@ route POST "/feed/{n}" (n: int) -> str {
         feed = feed[200..]
     }
     return "ok"
+}
+
+// простой (tests/gc.sh): большой список, сборка, замена пустым — мусор без
+// новых выделений; сборку после этого делает простой потока сборщика
+route POST "/big/{n}" (n: int) -> str {
+    for i in 0..n {
+        big.push(i)
+    }
+    __gc_collect()
+    return "{big.len()}"
+}
+
+route POST "/big-drop" -> str {
+    big = []
+    return "ok"
+}
+
+route GET "/gcstats" -> str {
+    let s = __gc_stats()
+    return "{s.cycles} {s.heap} {s.live}"
 }
 
 route GET "/every" -> str {

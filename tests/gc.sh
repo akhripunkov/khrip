@@ -6,7 +6,8 @@
 # KHRIP_GC_STRESS=1 (сборка очень часто, с проверками KHRIP_GC_VERIFY=1): ни
 # одного неверного ответа, ни одной ошибки проверок, счётчик и деньги сходятся,
 # память store ограничена. Затем KHRIP_DATA: сохранение под нагрузкой (SIGTERM),
-# перезапуск и восстановление со сборками — снимок цел. И тест внутри
+# перезапуск и восстановление со сборками — снимок цел. Сборка в простое после
+# записи без выделений. И тест внутри
 # tests/gc/server.kh: khc test держит товар через call, без проверок и со
 # KHRIP_GC_STRESS=1. Подключается из tests/run.sh (использует KHC, tmp, failed,
 # http_ok).
@@ -124,6 +125,29 @@ if "$KHC" -o "$tmp/gcsrv" tests/gc/server.kh 2>"$tmp/gcsrv.err" && KHRIP_GC_STRE
 	else
 		failed "gc: KHRIP_DATA под сборкой" "снимок под нагрузкой: $c1; после восстановления: $r1 $r2 $r3, сборок $cyc; второй снимок: $c2"$'\n'"$(grep -v '^gc [0-9]' "$tmp/gc.log" | tail -5)"
 	fi
+	# простой: 32 МБ store становятся мусором без новых выделений (замена
+	# пустым списком) — сборку делает простой потока сборщика (10 с без
+	# выделений, но store брали на запись), и память уходит системе
+	gc_start "$tmp/gcsrv"
+	curl -s -o /dev/null -X POST "$gc_url/big/4000000"
+	read -r c0 _ < <(curl -s "$gc_url/gcstats")
+	r0=$(awk '/^VmRSS:/ { print $2 }' "/proc/$gc_pid/status")
+	curl -s -o /dev/null -X POST "$gc_url/big-drop"
+	c1=$c0
+	for _ in $(seq 40); do
+		sleep 0.5
+		read -r c1 _ < <(curl -s "$gc_url/gcstats")
+		((c1 > c0)) && break
+	done
+	sleep 0.5
+	r1=$(awk '/^VmRSS:/ { print $2 }' "/proc/$gc_pid/status")
+	gc_stop
+	if ((c1 > c0 && r0 - r1 > 24 * 1024)) && grep -q '^gc [0-9]* (idle)' "$tmp/gc.log"; then
+		http_ok
+	else
+		failed "gc: сборка в простое после записи без выделений" "сборок $c0 -> $c1, RSS $r0 -> $r1 КБ"$'\n'"$(tail -3 "$tmp/gc.log")"
+	fi
+
 	for mode in "" KHRIP_GC_STRESS=1; do
 		# shellcheck disable=SC2086
 		env -u KHRIP_GC_VERIFY $mode "$KHC" test tests/gc/server.kh 2>&1 | grep -v '^khrip: gc verify (boot): ' >"$tmp/gctest.out"
