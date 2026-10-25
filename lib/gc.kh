@@ -1602,21 +1602,22 @@ const GC_SYS_SCHED_YIELD = 24
 const GC_SYS_MREMAP = 25
 // Разметка (§7.4): объект больше GC_FRAME_MIN байт смотрится кусками по
 // GC_CHUNK байт — кадр; кадров не больше GC_FRAMES, остальные большие ждут в
-// отложенных. Порог и кусок — 4 КБ (512 слов), а не 16 КБ (2048 слов), как в
-// проекте: 2048 ссылок на холодные разбросанные объекты — 160–200 мкс, почти
-// весь кусок разметки, и куски выходили за 0,3 мс. Арена — кусками до
-// GC_ACHUNK байт и не больше GC_AWORDS слов со значением в STORE (плотная
-// арена — те же ссылки на холодные объекты), найденное контекстом (hbuf) — по
-// GC_AWORDS слов, слова записей — по GC_PIN_BATCH. Часы — через каждые
-// GC_CLOCK_WORK единиц работы: единица — маленький объект или 8 слов объекта
-// больше; кусок кадра, кусок арены, пачка hbuf и пачка слов записей — не
-// меньше GC_CLOCK_WORK, так что после каждого из них часы смотрятся сразу.
-const GC_FRAME_MIN = 4096
-const GC_CHUNK = 4096
+// отложенных. Порог и кусок — 2 КБ (256 слов), а не 16 КБ (2048 слов), как в
+// проекте: ссылка на холодный объект в большой куче — до 0,75 мкс (промахи
+// кэша и TLB по карте страниц, спану, START, MARK), и 512 ссылок одного
+// объекта занимали до 0,4 мс. Арена — кусками до GC_ACHUNK байт и не больше
+// GC_AWORDS слов со значением в STORE (плотная арена — те же ссылки),
+// найденное контекстом (hbuf) — по GC_AWORDS слов, слова записей — по
+// GC_AWORDS. Часы — через каждые GC_CLOCK_WORK единиц работы: единица —
+// примерно два слова, которые смотрит разметка; самая долгая неделимая работа
+// (кусок кадра, серый объект до GC_FRAME_MIN, кусок арены, пачка hbuf или слов
+// записей — до 256 ссылок) — не меньше GC_CLOCK_WORK, так что после неё часы
+// смотрятся сразу.
+const GC_FRAME_MIN = 2048
+const GC_CHUNK = 2048
 const GC_FRAMES = 8
 const GC_ACHUNK = 262144
-const GC_AWORDS = 512
-const GC_PIN_BATCH = 1024
+const GC_AWORDS = 256
 const GC_CLOCK_WORK = 128
 // новые слова из арен, hbuf и записей берутся, пока в сером стеке меньше
 // GC_GREY_SOFT пар: иначе сначала серое (у плотной арены в сотни тысяч ссылок
@@ -2109,7 +2110,7 @@ fn __gc_mark_unit() -> int {
     }
     if __gc_pinpos < __gc_npins && __gc_gn < GC_GREY_SOFT {
         let a = __gc_pinpos
-        var e = a + GC_PIN_BATCH
+        var e = a + GC_AWORDS
         if e > __gc_npins {
             e = __gc_npins
         }
@@ -2119,7 +2120,7 @@ fn __gc_mark_unit() -> int {
             j += 1
         }
         __gc_pinpos = e
-        return 1 + ((e - a) >> 2)
+        return 1 + ((e - a) >> 1)
     }
     if __gc_gn > 0 {
         __gc_gn -= 1
@@ -2131,7 +2132,7 @@ fn __gc_mark_unit() -> int {
             return 1
         }
         __gc_scan(o, es)
-        return 1 + (es >> 6)
+        return 1 + (es >> 4)
     }
     if __gc_nfr > 0 {
         return __gc_frame_unit()
@@ -2186,9 +2187,9 @@ fn __gc_cap_unit() -> int {
                 } else if rec.hlen > 0 {
                     rec.ast = (s & ~7) | PIN_HANDED
                 } else {
-                    return __gc_cap_done(r, i, 1 + (k >> 2) + ((p - from) >> 10))
+                    return __gc_cap_done(r, i, 1 + (k >> 1) + ((p - from) >> 11))
                 }
-                return 1 + (k >> 2) + ((p - from) >> 10)
+                return 1 + (k >> 1) + ((p - from) >> 11)
             }
         } else if st == PIN_HANDED {
             let n = rec.hlen
@@ -2203,13 +2204,13 @@ fn __gc_cap_unit() -> int {
             }
             rec.hlen = a
             if a > 0 {
-                return 1 + ((n - a) >> 2)
+                return 1 + ((n - a) >> 1)
             }
             // признак передачи в этой сборке (__gc_handed_off; новая сборка
             // снова обнулит aoff)
             rec.aoff = -1
             __gc_st_handoffs += 1
-            return __gc_cap_done(r, i, 1 + (n >> 2))
+            return __gc_cap_done(r, i, 1 + (n >> 1))
         } else {
             i += 1
         }

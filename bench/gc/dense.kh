@@ -1,0 +1,47 @@
+// Плотные арены держателей (bench/gc/dense.sh; найдено независимым ревью шага
+// 6a): store — 300 000 товаров, читатели копируют каждую ссылку в список в
+// своей арене и ждут, писатель мусорит. Арена в сотни тысяч ссылок — проверка,
+// что куски разметки, передача арены и конец разметки остаются короткими, а
+// память передачи (hbuf) возвращается системе.
+
+type Item { id: int, name: str }
+
+store big: [Item]
+store junk: [str]
+
+route POST "/seed/{n}" (n: int) -> int {
+    for i in 0..n {
+        big.push(Item { id: i, name: "item {i}" })
+    }
+    return big.len()
+}
+
+// читатель: каждая ссылка — в арену, затем ожидание
+route GET "/hold" (ms: int = 50) -> str {
+    var xs: [Item] = []
+    for it in big {
+        xs.push(it)
+    }
+    sleep(ms)
+    var bad = 0
+    for i in 0..xs.len() {
+        if xs[i].id != i {
+            bad += 1
+        }
+    }
+    return "ok {bad}"
+}
+
+route POST "/churn/{n}" (n: int) -> str {
+    for i in 0..n {
+        junk.push("junk {i} xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+    }
+    if junk.len() > 20000 {
+        junk = []
+    }
+    return "ok"
+}
+
+route GET "/stats" -> str {
+    return "{__gc_stats().cycles}"
+}
