@@ -1102,14 +1102,17 @@ fn gc_root_table() -> int {
     return DATA_BASE + gc_roots_off
 }
 
-// Значение (rax), которое записывается в store, копируется в постоянную память.
-fn store_write(t: int) {
+// Значение (rax), которое записывается в глобальную store по адресу addr,
+// копируется в постоянную память; пока идёт разметка сборщика, старое
+// значение серится (__persist_root, lib/api.kh).
+fn store_write(t: int, addr: int) {
     if !api_mode || is_scalar_ty(t) {
         return
     }
     emit_mov_rr(RDI, RAX)
     emit_mov_imm(RSI, type_desc(t))
-    emit_call(rt_func("__persist"))
+    emit_mov_imm(RDX, addr)
+    emit_call(rt_func("__persist_root"))
 }
 
 fn barrier_on(t: int) -> bool {
@@ -1126,6 +1129,32 @@ fn emit_barrier(off: int, t: int) {
     emit_load(RDI, RSP, off)
     emit_mov_imm(RDX, type_desc(t))
     emit_call(rt_func("__barrier"))
+}
+
+// Значение (rax) ложится в поле со смещением field объекта [rsp]: то же, что
+// emit_barrier, и старое значение поля серится, пока идёт разметка
+// (__barrier_at).
+fn emit_field_barrier(field: int, t: int) {
+    if !barrier_on(t) {
+        return
+    }
+    emit_mov_rr(RDX, RAX)
+    emit_load(RDI, RSP, 0)
+    emit_mov_imm(RSI, field)
+    emit_mov_imm(RCX, type_desc(t))
+    emit_call(rt_func("__barrier_at"))
+}
+
+// Значение (rax) ложится в элемент [rsp] списка [rsp + 8] (__barrier_idx).
+fn emit_index_barrier(t: int) {
+    if !barrier_on(t) {
+        return
+    }
+    emit_mov_rr(RDX, RAX)
+    emit_load(RDI, RSP, 8)
+    emit_load(RSI, RSP, 0)
+    emit_mov_imm(RCX, type_desc(t))
+    emit_call(rt_func("__barrier_idx"))
 }
 
 // ---- test, expect, call ----

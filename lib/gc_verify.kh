@@ -173,7 +173,9 @@ fn __gc_verify_release() {
 // контекста (опубликована на время сборки, или он со store закончил: тогда её
 // не проверяют). Опубликованная запись — у контекста, который брал store, и
 // она в списке своего потока (списки записанных потоков содержат ровно
-// опубликованные записи); передачи арены вне разметки нет (I9).
+// опубликованные записи); передачи арены вне разметки нет (I9), а во время
+// разметки — только этой сборки, и под исключительной блокировкой никто не
+// смотрит арену (ни GC, ни SELF).
 fn __gc_verify_start(self: int) {
     __gc_verify_records(self, true)
 }
@@ -199,8 +201,14 @@ fn __gc_verify_records(self: int, acquiring: bool) {
         if rec.linked {
             linked += 1
         }
-        if (rec.ast & 7) != PIN_IDLE {
-            __gc_fatal("an arena hand-off outside marking (I9)")
+        let st = rec.ast & 7
+        if st != PIN_IDLE {
+            if __gc_phase != GC_PH_MARK || (rec.ast >> 3) != __gc_cycle_no {
+                __gc_fatal("an arena hand-off outside marking (I9)")
+            }
+            if st == PIN_GC || st == PIN_SELF || st > PIN_DONE {
+                __gc_fatal("an arena is being scanned under the exclusive lock (I9)")
+            }
         }
         r = rec.all
     }
@@ -231,10 +239,14 @@ fn __gc_verify_records(self: int, acquiring: bool) {
 
 // Конец разметки, до уборки (§8.7 п. 2): независимая разметка должна найти
 // только помеченное — иначе уборка освободила бы живой объект. Сначала — всё,
-// что держат опубликованные записи: их слова, арены (как у разметки — без кэша
-// строк) и всё, до чего от них можно дойти по битам PTRB; затем — граф от
-// корней по типам (__gc_verify_run: каждая ссылка, ещё и помечена ли её цель)
-// вместе с кучей (до уборки в ней и мусор, и __heap_live его считает).
+// что держали записи в начале сборки: их слова (массив записей), слова их арен
+// (те, что разметка нашла сама, и те, что передали контексты) и всё, до чего
+// от них можно дойти по битам PTRB сейчас; затем — граф от корней по типам
+// (__gc_verify_run: каждая ссылка, ещё и помечена ли её цель) вместе с кучей
+// (до уборки в ней и мусор, и __heap_live его считает). Списки записей потоков
+// здесь не читаются: конец разметки идёт под мьютексом писателей, и читатели
+// тем временем публикуют и отзывают свои записи; записи, опубликованные во
+// время разметки, держат только достижимое (помеченное) или чёрное.
 var __gcv_marks: bool
 
 fn __gc_verify_marks() {
@@ -256,7 +268,7 @@ fn __gc_verify_swept() {
     syscall(SYS_MUNMAP, st, 64)
 }
 
-// Опубликованные записи: каждый объект, на который указывает их слово или
+// Записи начала сборки: каждый объект, на который указывает их слово или
 // слово их арены, помечен, и всё, до чего от него доходят биты PTRB, — тоже.
 fn __gc_verify_pins() {
     let st = syscall(SYS_MMAP, 0, 64, 3, 0x22, -1, 0)
@@ -269,32 +281,18 @@ fn __gc_verify_pins() {
     store64(st + 24, __gcv_map(st, 4096 * 8))
     store64(st + 40, 4096)
     store64(st + 48, -1)
-    let nt = load64(__gc_reg + 8)
-    for i in 0..nt {
-        let c = load64(__gc_reg + 16 + i * 8)
-        var r = 0
-        if c != 0 {
-            r = load64(c + CTX_PINLIST)
-        }
-        while r != 0 {
-            let rec: __Pin = __cast(r)
-            for j in 0..rec.len {
-                __gcv_pin(st, load64(rec.buf + j * 8))
+    for j in 0..__gc_npins {
+        __gcv_pin(st, load64(__gc_pins + j * 8))
+    }
+    for j in 0..__gc_nvw {
+        __gcv_pin(st, load64(__gc_vw + j * 8))
+    }
+    for i in 0..__gc_ncap {
+        let rec: __Pin = __cast(load64(__gc_capl + i * 8))
+        if rec.aoff < 0 {
+            for j in 0..rec.hlen {
+                __gcv_pin(st, load64(rec.hbuf + j * 8))
             }
-            if rec.hi > rec.lo {
-                var p = rec.lo
-                if rec.hi - rec.lo >= STRC_SIZE {
-                    p = rec.lo + STRC_SIZE
-                }
-                while p < rec.hi {
-                    let w = load64(p)
-                    if (w >> 38) == 0x40 {
-                        __gcv_pin(st, w)
-                    }
-                    p += 8
-                }
-            }
-            r = rec.next
         }
     }
     while load64(st + 8) > 0 && load64(st + 56) == 0 {

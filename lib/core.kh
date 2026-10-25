@@ -413,7 +413,12 @@ fn __pmode_off() {
 }
 
 // Изменяющие операции контейнеров начинаются с __store_mut(h) (lib/gc.kh;
-// в программах без store — пустая, lib/nostore.kh).
+// в программах без store — пустая, lib/nostore.kh). Пока идёт разметка
+// (__gc_marking != 0), они серят то, что убирают из контейнера store, и
+// соблюдают правило частичного массива (барьер SATB, docs/design/
+// v0.13-store-gc.md §7.5): __gc_shade, __gc_shade_in, __gc_shade_words,
+// __gc_moved, __gc_permute — в lib/gc.kh (заглушки — lib/nostore.kh и
+// bootstrap/shim.kh). Без разметки это одна загрузка и переход.
 
 // Блокировка store (__store_lock, __store_release_keep, __store_release_final)
 // — в lib/rt.kh: ей нужны атомарные операции.
@@ -1263,6 +1268,11 @@ fn __list_grow(h: int, need: int) {
     // новый массив списка в store — того же вида, что старый ([int] — без ссылок)
     let data = __alloc_for_k(h, cap * es, K_LIST_DATA, 0)
     __memcpy(data, load64(h), load64(h + 8) * es)
+    if __gc_marking != 0 {
+        // SATB (lib/gc.kh, §7.5): заголовок больше не ссылается на старый
+        // массив, а новый — чёрный, разметка его не смотрит
+        __gc_shade_in(h, load64(h))
+    }
     store64(h, data)
     store64(h + 16, cap)
 }
@@ -1288,6 +1298,9 @@ fn __list_pop(self: [T]) -> T {
     store64(h + 8, len - 1)
     let v = __lget(h, len - 1)
     if __in_store(h) {
+        if __gc_marking != 0 {
+            __gc_shade(v)
+        }
         __lset(h, len - 1, 0)
     }
     return __cast(v)
@@ -1323,6 +1336,9 @@ fn __list_truncate(self: [T], n: int) {
 fn __list_vacate(h: int, from: int) {
     if __in_store(h) {
         let es = load64(h + 24)
+        if __gc_marking != 0 && es == 8 {
+            __gc_shade_words(h, load64(h) + from * 8, load64(h + 8) - from)
+        }
         __memset(load64(h) + from * es, 0, (load64(h + 8) - from) * es)
     }
 }
@@ -1354,6 +1370,11 @@ fn __list_remove_at(self: [T], i: int) -> T {
         __panic(PANIC_INDEX, "remove_at")
     }
     let v = __lget(h, i)
+    if __gc_marking != 0 {
+        // ушедший элемент и правило частичного массива (lib/gc.kh, §7.5)
+        __gc_shade_in(h, v)
+        __gc_moved(h, load64(h), i, len)
+    }
     var j = i
     while j + 1 < len {
         __lset(h, j, __lget(h, j + 1))
@@ -1370,6 +1391,9 @@ fn __list_remove_at(self: [T], i: int) -> T {
 fn __list_reverse(self: [T]) -> [T] {
     let h: int = __cast(self)
     __store_mut(h)
+    if __gc_marking != 0 {
+        __gc_permute(h, load64(h), load64(h + 8))
+    }
     var a = 0
     var b = load64(h + 8) - 1
     while a < b {
@@ -1694,6 +1718,9 @@ fn __sort_words(data: int, n: int, by_str: bool) {
 fn __sort_by(self: [T], keys: [int], by_str: bool) -> [T] {
     let h: int = __cast(self)
     __store_mut(h)
+    if __gc_marking != 0 {
+        __gc_permute(h, load64(h), load64(h + 8))
+    }
     let kh: int = __cast(keys)
     let n = load64(h + 8)
     let kd = load64(kh)
@@ -2065,6 +2092,9 @@ fn __opt_eq_str(a: int, b: int) -> bool {
 fn __list_sort_int(self: [int]) -> [int] {
     let h: int = __cast(self)
     __store_mut(h)
+    if __gc_marking != 0 {
+        __gc_permute(h, load64(h), load64(h + 8))
+    }
     __sort_words(load64(h), load64(h + 8), false)
     return self
 }
@@ -2072,6 +2102,9 @@ fn __list_sort_int(self: [int]) -> [int] {
 fn __list_sort_str(self: [str]) -> [str] {
     let h: int = __cast(self)
     __store_mut(h)
+    if __gc_marking != 0 {
+        __gc_permute(h, load64(h), load64(h + 8))
+    }
     __sort_words(load64(h), load64(h + 8), true)
     return self
 }
@@ -2200,6 +2233,11 @@ fn __map_rehash(m: int) {
     let vals = load64(m + 16)
     let alive = load64(m + 24)
     let n = load64(keys + 8)
+    if __gc_marking != 0 {
+        // сжатие переставляет записи на месте (lib/gc.kh, §7.5)
+        __gc_permute(m, load64(keys), n)
+        __gc_permute(m, load64(vals), n)
+    }
     var w = 0
     var r = 0
     while r < n {
@@ -2225,7 +2263,11 @@ fn __map_rehash(m: int) {
     while size < w * 4 {
         size *= 2
     }
-    store64(m + 32, __alloc_for_k(m, size * 8, K_NOSCAN, 0))
+    let ns = __alloc_for_k(m, size * 8, K_NOSCAN, 0)
+    if __gc_marking != 0 {
+        __gc_shade_in(m, load64(m + 32))
+    }
+    store64(m + 32, ns)
     store64(m + 40, size - 1)
     var i = 0
     while i < w {
@@ -2238,7 +2280,11 @@ fn __map_set(m: int, k: int, v: int) {
     __store_mut(m)
     let idx = __map_find(m, k)
     if idx >= 0 {
-        store64(load64(load64(m + 16)) + idx * 8, v)
+        let a = load64(load64(m + 16)) + idx * 8
+        if __gc_marking != 0 {
+            __gc_shade_in(m, load64(a))
+        }
+        store64(a, v)
         return
     }
     let used = load64(load64(m) + 8) + 1
@@ -2310,6 +2356,13 @@ fn __map_remove_word(m: int, k: int, found: int) -> int {
     store64(found, 1)
     let v = __word_at(load64(m + 16), idx)
     if __in_store(m) {
+        if __gc_marking != 0 {
+            // SATB (lib/gc.kh, §7.5): ключ-строка и значение уходят
+            if load64(m + 48) != 0 {
+                __gc_shade(__word_at(load64(m), idx))
+            }
+            __gc_shade(v)
+        }
         // мёртвая запись в store не держит ни ключ, ни значение
         store64(load64(load64(m)) + idx * 8, 0)
         store64(load64(load64(m + 16)) + idx * 8, 0)
@@ -2362,6 +2415,12 @@ fn __map_clear(m: int) {
     __store_mut(m)
     if __in_store(m) {
         let n = load64(load64(m) + 8)
+        if __gc_marking != 0 {
+            if load64(m + 48) != 0 {
+                __gc_shade_words(m, load64(load64(m)), n)
+            }
+            __gc_shade_words(m, load64(load64(m + 16)), n)
+        }
         __memset(load64(load64(m)), 0, n * 8)
         __memset(load64(load64(m + 16)), 0, n * 8)
         __memset(load64(load64(m + 24)), 0, n * 8)
@@ -2372,7 +2431,11 @@ fn __map_clear(m: int) {
     store64(m + 8, 0)
     store64(m + 56, 0)
     // словарь в store: новая таблица — тоже в постоянной памяти, не в арене
-    store64(m + 32, __alloc_for_k(m, 16 * 8, K_NOSCAN, 0))
+    let ns = __alloc_for_k(m, 16 * 8, K_NOSCAN, 0)
+    if __gc_marking != 0 {
+        __gc_shade_in(m, load64(m + 32))
+    }
+    store64(m + 32, ns)
     store64(m + 40, 15)
 }
 

@@ -2,9 +2,10 @@
 // классы размеров, спаны, кучка страниц, битовые карты), загрузка store (§5.3),
 // записи контекстов (§3.4, §6: что держат запросы, задачи и тесты, когда
 // отпускают store посреди работы) и сама сборка (§7, §8). Сборка пока целиком
-// под исключительной блокировкой (шаг 5 проекта, «остановка мира»): разметка
-// от корней и опубликованных записей, уборка всех спанов, возврат страниц
-// системе. Инкрементальная разметка кусками — шаг 6.
+// инкрементальная (шаг 6a проекта): начало — под исключительной блокировкой,
+// разметка — кусками под мьютексом писателей (читающие запросы идут дальше,
+// пишущие — между кусками, с барьером SATB), конец разметки и уборка — тоже под
+// ним. Уборка кусками — шаг 6b.
 //
 // Программы без store вместо этого файла получают lib/nostore.kh; проверки
 // (KHRIP_GC_VERIFY) — в lib/gc_verify.kh или заглушки lib/gc_noverify.kh;
@@ -30,6 +31,8 @@ var __gc_pct: int
 var __gc_min: int
 var __gc_log: bool
 var __gc_stress: bool
+// KHRIP_GC_SLICE_US — кусок разметки, мкс (200; с KHRIP_GC_STRESS — 5)
+var __gc_slice_us: int
 const GC_MB = 1048576
 const GC_STRESS_STEP = 65536
 const GC_MAX = 0x7FFFFFFFFFFFFFFF
@@ -56,6 +59,17 @@ fn __gc_init() {
     }
     __gc_log = (env("KHRIP_GC_LOG") ?? "") == "1"
     __gc_stress = (env("KHRIP_GC_STRESS") ?? "") == "1"
+    __gc_slice_us = 200
+    if __gc_stress {
+        __gc_slice_us = 5
+    }
+    if let v = env("KHRIP_GC_SLICE_US") {
+        if let n = v.to_int() {
+            if n >= 1 && n <= 1000000 {
+                __gc_slice_us = n
+            }
+        }
+    }
     __gc_goal = GC_MAX
     __gc_trigger = GC_MAX
     __gc_hard = GC_MAX
@@ -313,7 +327,11 @@ fn __salloc_slow(n: int, kind: int, mask: int) -> int {
     }
     let es = load64(s + S_SIZE)
     if __gc_marking != 0 {
+        // новый объект — чёрный (§7.5): разметка его не смотрит, уборка
+        // оставит; его байты — в живое этой сборки
         __gc_bit_set(GC_MARK, p)
+        __gc_black_bytes += es
+        __gc_black_objs += 1
     }
     if ((load64(s + S_INFO) >> 48) & F_NEEDZERO) != 0 {
         if __gc_verify {
@@ -406,7 +424,7 @@ fn __store_for(h: int) -> bool {
 // Изменение контейнера h (список, словарь; lib/core.kh): у контейнера в store
 // — только под исключительной блокировкой. Иначе маршрут, который компилятор
 // счёл читающим (src/rw.kh), менял бы store одновременно с другими читателями
-// и (шаг 6) с разметкой сборщика: лучше ответ 500, чем гонка.
+// и с разметкой сборщика: лучше ответ 500, чем гонка.
 fn __store_mut(h: int) {
     if (h >> 40) == (STORE_REGION >> 40) && load64(__ctx() + CTX_STORE_HELD) != 1 {
         __store_mut_slow()
@@ -533,6 +551,8 @@ fn __salloc_large(n: int, kind: int, mask: int) -> int {
     __gc_bit_set(GC_START, base)
     if __gc_marking != 0 {
         __gc_bit_set(GC_MARK, base)
+        __gc_black_bytes += bytes
+        __gc_black_objs += 1
     }
     if __gc_took_dirty {
         if __gc_verify {
@@ -1298,12 +1318,11 @@ fn __pin_cap(cap: int, need: int) -> int {
 
 // Отзыв (взятие store, блокировка уже взята): запись уходит из списка потока.
 // С KHRIP_GC_VERIFY арена ниже опубликованной границы должна быть той же
-// (W1). Если сборка, начатая в окне, ещё не просмотрела арену (PENDING),
-// контекст просматривает её сам и передаёт найденное (HANDED): после отзыва он
-// снова пишет в арену; если сборщик смотрит её кусок (GC) — подождать (кусок
-// не больше 256 КБ). Пока сборка идёт целиком под исключительной блокировкой
-// (шаг 5), контекст не может взять store посреди неё, и здесь состояние —
-// IDLE: конец разметки возвращает все записи в IDLE.
+// (W1). Если сборка, начатая в окне, ещё не досмотрела арену (PENDING),
+// контекст досматривает её сам и передаёт найденное (HANDED, I9): после отзыва
+// он снова пишет в арену; если сборщик смотрит её кусок (GC; так бывает только
+// у читателя — писатель держит мьютекс писателей, и кусков нет) — подождать
+// (кусок не больше GC_ACHUNK байт). IDLE, DONE, HANDED — делать нечего.
 fn __pin_withdraw(rec: __Pin) {
     let c = __ctx()
     let r: int = __cast(rec)
@@ -1326,6 +1345,7 @@ fn __pin_withdraw(rec: __Pin) {
     if __gc_verify && __pin_hash(rec.lo, rec.hi) != rec.whash {
         __gc_fatal("code in a store window changed a store pointer in the arena below the published bound (W1)")
     }
+    var spins = 0
     while true {
         let s = rec.ast
         let st = s & 7
@@ -1336,7 +1356,8 @@ fn __pin_withdraw(rec: __Pin) {
                 break
             }
         } else if st == PIN_GC {
-            __cpu_pause()
+            __gc_spin(spins)
+            spins += 1
         } else {
             break
         }
@@ -1416,7 +1437,7 @@ fn __pin_unfinished(c: int) -> bool {
 // store закончил (I8). Кроме запроса внутри call теста (__gc_nested): его
 // последнее отпускание — не конец работы теста, кадры и арена теста над ним
 // ещё держат указатели в store; собирать — точке сборки теста сразу после
-// запроса, которая публикует тест. Помощь разметке — шаг 6. Работа
+// запроса, которая публикует тест. Помощь разметке — шаг 6b. Работа
 // закончена.
 fn __pin_final(c: int) {
     __gc_verify_release()
@@ -1465,15 +1486,27 @@ fn __gc_register_thread(c: int) {
     store64(c + CTX_REGISTERED, 1)
 }
 
-// ---- Сборка (§7; шаг 5 — цикл целиком под исключительной блокировкой) ----
-// Цикл: начало (корни, опубликованные записи), разметка до пустого серого
-// стека, конец разметки, уборка всех спанов. Собирает тот, кто держит store
-// исключительно: поток сборщика (__store_lock_gc), запрос или задача у
-// жёсткого предела (опубликовав себя), последнее отпускание у жёсткого
-// предела, тест (после call и в конце теста). Никто другой в это время store
-// не держит, а каждый контекст, который держит указатели в store без
-// блокировки, опубликовал запись (I3) и, чтобы продолжить, возьмёт store —
-// уже после сборки.
+// ---- Сборка (§7) ----
+// Цикл: начало под исключительной блокировкой — номер сборки, корни, слова
+// опубликованных записей (в массив записей), их арены (в список захваченных);
+// разметка кусками под мьютексом писателей (__store_lock_marker); конец
+// разметки и уборка всех спанов — тоже под ним. Читающие запросы идут всё это
+// время: граф они не меняют, а всё, что они достают из store, достижимо и
+// будет помечено. Пишущие идут между кусками: каждое затирание ссылки сначала
+// серит старое значение (SATB, I6: барьеры компилятора __barrier_at,
+// __barrier_idx и __persist_root в lib/api.kh, хуки операций контейнеров в
+// lib/core.kh), а каждый новый объект сразу помечен (чёрный, __salloc_slow).
+// Так к концу разметки помечено всё, что было достижимо в начале, и всё новое;
+// остальное уходит в уборку.
+//
+// Начинает сборку поток сборщика (по порогу). Целиком («остановкой мира»)
+// собирает тот, кто держит store исключительно: запрос или задача у жёсткого
+// предела (опубликовав себя), последнее отпускание у жёсткого предела, тест
+// (после call и в конце теста), __gc_collect(). Идущую разметку они
+// дорабатывают с того, что есть (§8.4), затем делают новую сборку целиком: в
+// её начале каждый контекст, который держит указатели в store без блокировки,
+// опубликовал запись (I3), а сам собирающий опубликован или со store
+// закончил (I8).
 
 // Фазы (§7.1)
 const GC_PH_IDLE = 0
@@ -1481,8 +1514,8 @@ const GC_PH_MARK = 1
 const GC_PH_SWEEP = 2
 // Кто собирает (журнал): поток сборщика — по порогу и после простоя; запрос
 // или задача посреди работы у жёсткого предела; последнее отпускание у
-// жёсткого предела; khc test; __gc_collect(); окно в khc test с
-// KHRIP_GC_STRESS
+// жёсткого предела; khc test; __gc_collect() и шаги тестов; окно в khc test
+// с KHRIP_GC_STRESS; сборка раз в две минуты; шаг KHRIP_GC_STRESS в khc test
 const GC_WHY_PACE = 1
 const GC_WHY_IDLE = 2
 const GC_WHY_EMERGENCY = 3
@@ -1491,6 +1524,7 @@ const GC_WHY_TEST = 5
 const GC_WHY_CALL = 6
 const GC_WHY_WINDOW = 7
 const GC_WHY_FORCED = 8
+const GC_WHY_STRESS = 9
 // запись опубликована столько сборок назад — долгий держатель (§8.6)
 const GC_LONG = 10
 // тиков (по секунде) без выделений — простой: всё свободное — системе
@@ -1504,15 +1538,36 @@ const GC_STACK = 1048576
 // madvise(MADV_DONTNEED): страницы — системе, при следующем касании — нули
 const GC_SYS_MADVISE = 28
 const GC_DONTNEED = 4
+const GC_SYS_SCHED_YIELD = 24
+// Разметка (§7.4): объект больше GC_FRAME_MIN байт смотрится кусками по
+// GC_CHUNK байт (2048 слов) — кадр; кадров не больше GC_FRAMES, остальные
+// большие ждут в отложенных. Арена — кусками по GC_ACHUNK байт, слова записей
+// — по GC_PIN_BATCH. Часы — через каждые GC_CLOCK_WORK единиц работы (единица
+// — примерно объект).
+const GC_FRAME_MIN = 16384
+const GC_CHUNK = 16384
+const GC_FRAMES = 8
+const GC_ACHUNK = 262144
+const GC_PIN_BATCH = 1024
+const GC_CLOCK_WORK = 256
+// Конец разметки (§7.6): дорисовать дольше GC_TERM_US — отпустить мьютекс и
+// продолжить кусками; с GC_TERM_TRIES-й попытки — до конца
+const GC_TERM_US = 2000
+const GC_TERM_TRIES = 4
+// шаг KHRIP_GC_STRESS в khc test — столько единиц разметки; сборка начинается,
+// когда выделено столько байт сверх помеченного (у кучи больше 32 КБ —
+// четверть помеченного)
+const GC_STRESS_WORK = 256
+const GC_STRESS_TEST_STEP = 8192
 
 var __gc_phase: int
-// идёт сборка: повторно не входить
+// идёт сборка или кусок разметки: повторно не входить
 var __gc_busy: bool
 // байт помеченных объектов: после последней сборки — живые данные
 var __heap_marked: int
 // Темп (§8.2): цель, порог, жёсткий предел. __gc_limit — порог сборки внутри
 // работы (__gc_hard_check, последнее отпускание): жёсткий предел, а с
-// KHRIP_GC_STRESS — помеченное + 64 КБ.
+// KHRIP_GC_STRESS — помеченное + шаг.
 var __gc_goal: int
 var __gc_trigger: int
 var __gc_hard: int
@@ -1532,22 +1587,47 @@ var __gc_ctl: int
 // серии страниц возврата памяти для сборок под блокировкой (у потока
 // сборщика — свои: он возвращает память без блокировки)
 var __gc_runs: int
-// граница занятых страниц в начале сборки, байт от STORE_REGION
+// граница занятых страниц в начале сборки, байт от STORE_REGION: объекты выше
+// неё созданы во время разметки — чёрные
 var __gc_hwb: int
 // серый стек: пары (слот, размер слота), кусок mmap
 var __gc_grey: int
 var __gc_gn: int
 var __gc_gcap: int
-// захваченные арены: записи, чью арену просмотрит разметка (кусок mmap)
+// массив записей: слова опубликованных записей, скопированные в начале (запись
+// может смениться, пока идёт разметка); разобраны [0, __gc_pinpos)
+var __gc_pins: int
+var __gc_npins: int
+var __gc_pinpos: int
+var __gc_pincap: int
+// захваченные арены: записи, чью арену просмотрит разметка (кусок mmap);
+// [0, __gc_capdone) — уже DONE
 var __gc_capl: int
 var __gc_ncap: int
 var __gc_capcap: int
-// помечено в этой сборке: байт и объектов
+var __gc_capdone: int
+// кадры: GC_FRAMES × (объект, байт просмотрено, размер слота); отложенные —
+// пары (объект, размер)
+var __gc_fr: int
+var __gc_nfr: int
+var __gc_ovf: int
+var __gc_novf: int
+var __gc_ovfcap: int
+// KHRIP_GC_VERIFY: слова арен, которые разметка нашла сама (их проверит конец
+// разметки: арена контекста, который продолжил, уже другая)
+var __gc_vw: int
+var __gc_nvw: int
+var __gc_vwcap: int
+// помечено в этой сборке: байт и объектов; выделено во время разметки (чёрное)
 var __gc_marked_bytes: int
 var __gc_marked_objs: int
+var __gc_black_bytes: int
+var __gc_black_objs: int
+// попыток конца разметки в этой сборке
+var __gc_term_tries: int
 // последняя сборка (журнал, __gc_stats): кто, куча до неё, записи и слова,
-// арены и их байты, долгие держатели, времена (мкс), возвращено системе,
-// память страниц store после неё
+// арены, их байты и сколько передали сами контексты, долгие держатели, времена
+// (мкс), возвращено системе, память страниц store после неё
 var __gc_st_why: int
 var __gc_st_before: int
 var __gc_st_after: int
@@ -1555,6 +1635,7 @@ var __gc_st_recs: int
 var __gc_st_words: int
 var __gc_st_arenas: int
 var __gc_st_abytes: int
+var __gc_st_handoffs: int
 var __gc_st_long: int
 var __gc_st_long_age: int
 var __gc_st_long_words: int
@@ -1563,14 +1644,31 @@ var __gc_st_mark: int
 var __gc_st_sweep: int
 var __gc_st_release: int
 var __gc_st_pause: int
+// инкрементальная сборка: кусков, самый долгий, конец разметки (мкс), кто
+// доделал её целиком (0 — она сама)
+var __gc_st_inc: bool
+var __gc_st_slices: int
+var __gc_st_slice_max: int
+var __gc_st_term: int
+var __gc_st_fin: int
+// конец начала и время от него до конца разметки (мкс)
+var __gc_st_t1: int
+var __gc_st_wall: int
 // возврат памяти этой сборки отдан потоку сборщика
-var __gc_st_handed: bool
+var __gc_st_relhanded: bool
 var __gc_st_released: int
 var __gc_st_rss: int
-// за всё время: паузы (мкс), наибольшая пауза, байт возвращено системе
+// за всё время: паузы целиком (мкс), наибольшая, байт возвращено системе;
+// куски разметки, самый долгий кусок, начало и конец разметки; арен передано
+// самими контекстами
 var __gc_total_pause: int
 var __gc_max_pause: int
 var __gc_total_released: int
+var __gc_total_slices: int
+var __gc_max_slice: int
+var __gc_max_start: int
+var __gc_max_term: int
+var __gc_total_handoffs: int
 
 // Память сборщика — только куски mmap: если система откажет, продолжать нельзя
 // (метаданные полуразмечены), и сообщение — без выделений.
@@ -1590,19 +1688,40 @@ fn __gc_now_us() -> int {
     return load64(ts) * 1000000 + load64(ts + 8) / 1000
 }
 
-// Цикл сборки целиком. Вызывающий держит store исключительно (мьютекс
-// писателей, читателей нет). self — запись собирающего контекста или 0 (поток
-// сборщика): она опубликована (запрос посреди работы, тест после call) или
-// контекст со store уже закончил (последнее отпускание, конец теста, I8).
+// Поток спит us микросекунд (тот же буфер контекста).
+fn __gc_sleep_us(us: int) {
+    let ts = __ctx() + 192
+    store64(ts, us / 1000000)
+    store64(ts + 8, (us % 1000000) * 1000)
+    syscall(SYS_NANOSLEEP, ts, 0)
+}
+
+fn __gc_pause_add(us: int) {
+    __gc_total_pause += us
+    if us > __gc_max_pause {
+        __gc_max_pause = us
+    }
+}
+
+// Сборка целиком под исключительной блокировкой вызывающего (мьютекс
+// писателей, читателей нет): идущая разметка сначала дорабатывается
+// (__gc_finish_stw), затем — новая сборка от начала до уборки. self — запись
+// собирающего контекста или 0 (поток сборщика): она опубликована (запрос
+// посреди работы, тест после call) или контекст со store уже закончил
+// (последнее отпускание, конец теста, I8).
 fn __gc_collect_now(self: int, why: int) {
     __gc_busy = true
+    if __gc_phase == GC_PH_MARK {
+        __gc_finish_stw(why)
+    }
     let t0 = __gc_now_us()
     __gc_st_why = why
+    __gc_st_inc = false
     __gc_st_before = __heap_live
     __gc_start(self)
     let t1 = __gc_now_us()
-    __gc_drain()
-    __gc_terminate()
+    __gc_drain(0)
+    __gc_mark_done()
     let t2 = __gc_now_us()
     __gc_sweep_all()
     __gc_pace()
@@ -1612,15 +1731,38 @@ fn __gc_collect_now(self: int, why: int) {
     __gc_st_mark = t2 - t1
     __gc_st_sweep = t3 - t2
     __gc_st_release = 0
-    __gc_st_handed = false
+    __gc_st_relhanded = false
     __gc_st_pause = t3 - t0
-    __gc_total_pause += t3 - t0
-    if t3 - t0 > __gc_max_pause {
-        __gc_max_pause = t3 - t0
-    }
+    __gc_pause_add(t3 - t0)
     __gc_last_us = t3
-    __gc_poked = false
     __gc_busy = false
+}
+
+// Идущая разметка дорабатывается под исключительной блокировкой вызывающего с
+// того, что есть (§8.4): захваченные арены, слова записей, серое, кадры; затем
+// конец разметки и уборка. Строка журнала — о ней (by — кто доработал). Сам
+// вызывающий публиковаться не обязан: всё, что он держал в начале сборки, — в
+// её записи (иначе он не держал ничего), а всё, что достал потом, достижимо и
+// помечено или чёрное.
+fn __gc_finish_stw(by: int) {
+    let t0 = __gc_now_us()
+    __gc_drain(0)
+    __gc_mark_done()
+    let t1 = __gc_now_us()
+    __gc_sweep_all()
+    __gc_pace()
+    let t2 = __gc_now_us()
+    __gc_st_fin = by
+    __gc_st_term = t1 - t0
+    __gc_st_wall = t1 - __gc_st_t1
+    __gc_st_sweep = t2 - t1
+    __gc_st_after = __heap_live
+    __gc_st_release = 0
+    __gc_st_relhanded = false
+    __gc_st_released = 0
+    __gc_pause_add(t2 - t0)
+    __gc_last_us = t2
+    __gc_report()
 }
 
 // Возврат памяти после сборки, которую контекст сделал под своей
@@ -1630,7 +1772,7 @@ fn __gc_collect_now(self: int, why: int) {
 fn __gc_release_locked() {
     if __gc_has_thread {
         __gc_scav_due = true
-        __gc_st_handed = true
+        __gc_st_relhanded = true
         store64(__gc_ctl, 1)
         syscall(SYS_FUTEX, __gc_ctl, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0)
         return
@@ -1646,10 +1788,28 @@ fn __gc_release_locked() {
     }
 }
 
+// Начало инкрементальной сборки (поток сборщика, шаги тестов и
+// KHRIP_GC_STRESS) — под исключительной блокировкой, со временем начала.
+fn __gc_begin_cycle(self: int, why: int) {
+    let t0 = __gc_now_us()
+    __gc_st_why = why
+    __gc_st_inc = true
+    __gc_st_before = __heap_live
+    __gc_start(self)
+    let t1 = __gc_now_us()
+    let dt = t1 - t0
+    __gc_st_t1 = t1
+    __gc_st_start = dt
+    if dt > __gc_max_start {
+        __gc_max_start = dt
+    }
+}
+
 // Начало (§7.2): номер сборки и номер кэшей строк (их ключи могли бы указать на
-// освобождённую память, lib/text.kh), разметка включена, корни, записи. С
-// KHRIP_GC_VERIFY сначала — каждый контекст, который брал store в своей работе
-// и не держит его сейчас, опубликовал запись (кроме собирающего).
+// память, которую освободит уборка, lib/text.kh), разметка включена, корни,
+// записи. С KHRIP_GC_VERIFY сначала — каждый контекст, который брал store в
+// своей работе и не держит его сейчас, опубликовал запись (кроме собирающего).
+// Разметки здесь нет: корни только серятся, слова записей копируются.
 fn __gc_start(self: int) {
     if __gc_verify {
         __gc_verify_records(self, false)
@@ -1662,6 +1822,21 @@ fn __gc_start(self: int) {
     __gc_hwb = load64(__gc_ph + PH_HW) << GC_PAGE_SHIFT
     __gc_marked_bytes = 0
     __gc_marked_objs = 0
+    __gc_black_bytes = 0
+    __gc_black_objs = 0
+    __gc_term_tries = 0
+    __gc_npins = 0
+    __gc_pinpos = 0
+    __gc_nvw = 0
+    __gc_st_slices = 0
+    __gc_st_slice_max = 0
+    __gc_st_mark = 0
+    __gc_st_term = 0
+    __gc_st_fin = 0
+    __gc_st_handoffs = 0
+    if __gc_fr == 0 {
+        __gc_fr = __gc_scratch(GC_FRAMES * 24)
+    }
     let roots = __gc_roots()
     let n = load64(roots)
     for i in 0..n {
@@ -1670,11 +1845,13 @@ fn __gc_start(self: int) {
     __gc_capture()
 }
 
-// Записи (§6.3): слова каждой опубликованной записи разбираются сразу, арена —
-// в список захваченных (PENDING): её просмотрит разметка, а если контекст
-// продолжит раньше (шаг 6), — он сам при отзыве (__pin_withdraw).
+// Записи (§6.3): слова каждой опубликованной записи — в массив записей (их
+// разберёт разметка; сама запись может смениться, как только контекст
+// продолжит), арена — в список захваченных (PENDING): её просмотрит разметка, а
+// если контекст продолжит раньше, — он сам при отзыве (__pin_withdraw).
 fn __gc_capture() {
     __gc_ncap = 0
+    __gc_capdone = 0
     __gc_st_recs = 0
     __gc_st_words = 0
     __gc_st_arenas = 0
@@ -1691,11 +1868,7 @@ fn __gc_capture() {
         }
         while r != 0 {
             let rec: __Pin = __cast(r)
-            var j = 0
-            while j < rec.len {
-                __gc_resolve(load64(rec.buf + j * 8))
-                j += 1
-            }
+            __gc_pins_add(rec.buf, rec.len)
             __gc_st_recs += 1
             __gc_st_words += rec.len
             if rec.hi > rec.lo {
@@ -1716,6 +1889,33 @@ fn __gc_capture() {
             r = rec.next
         }
     }
+}
+
+// n слов с адреса p — в массив записей (растёт вдвое).
+fn __gc_pins_add(p: int, n: int) {
+    if n <= 0 {
+        return
+    }
+    if __gc_npins + n > __gc_pincap {
+        var nc = __gc_pincap * 2
+        if nc < 4096 {
+            nc = 4096
+        }
+        while nc < __gc_npins + n {
+            nc *= 2
+        }
+        let nb = __gc_scratch(nc * 8)
+        if __gc_npins > 0 {
+            __memcpy(nb, __gc_pins, __gc_npins * 8)
+        }
+        if __gc_pins != 0 {
+            syscall(SYS_MUNMAP, __gc_pins, __gc_pincap * 8)
+        }
+        __gc_pins = nb
+        __gc_pincap = nc
+    }
+    __memcpy(__gc_pins + __gc_npins * 8, p, n * 8)
+    __gc_npins += n
 }
 
 fn __gc_cap_push(r: int) {
@@ -1741,8 +1941,9 @@ fn __gc_cap_push(r: int) {
 // Слово w — возможная ссылка (§7.3): точная (поле, элемент) или нет (слово
 // записи), на начало объекта или внутрь (срез строки, вариант — начало + 8).
 // Объект, внутри которого оно лежит, помечается, а если в нём есть ссылки, —
-// в серый стек. Вне занятых страниц STORE, в хвосте спана и в свободном слоте
-// слово ничего не значит.
+// в серый стек. Вне занятых в начале сборки страниц STORE, в хвосте спана и в
+// свободном слоте слово ничего не значит; объект, выделенный во время
+// разметки, уже помечен.
 fn __gc_resolve(w: int) {
     let off = w - STORE_REGION
     if off < 0 || off >= __gc_hwb {
@@ -1808,11 +2009,11 @@ fn __gc_grey_grow() {
     __gc_gcap = nc
 }
 
-// Слова объекта slot (размер слота es) с битом PTRB — ссылки (у остальных слов
-// бита нет): их цели помечаются.
-fn __gc_scan(slot: int, es: int) {
-    var b = (slot - STORE_REGION) >> 3
-    let e = b + (es >> 3)
+// Слова [p, p + n) объекта с битом PTRB — ссылки (у остальных слов бита нет):
+// их цели помечаются.
+fn __gc_scan(p: int, n: int) {
+    var b = (p - STORE_REGION) >> 3
+    let e = b + (n >> 3)
     while b < e {
         let wi = b >> 6
         var hi = e - (wi << 6)
@@ -1829,50 +2030,116 @@ fn __gc_scan(slot: int, es: int) {
     }
 }
 
-// Разметка до конца (§7.4): сначала захваченные арены, затем серый стек.
-fn __gc_drain() {
-    var i = 0
-    while i < __gc_ncap {
-        __gc_arena(load64(__gc_capl + i * 8))
-        i += 1
+// Одна единица работы разметки в порядке §7.4: захваченные арены, слова
+// записей, серый стек, верхний кадр, отложенные. → сколько работы сделано
+// (единица — примерно объект) или −1: работы нет, кроме арен, которые смотрят
+// сами их контексты (SELF).
+fn __gc_mark_unit() -> int {
+    if __gc_capdone < __gc_ncap {
+        let w = __gc_cap_unit()
+        if w > 0 {
+            return w
+        }
     }
-    while __gc_gn > 0 {
+    if __gc_pinpos < __gc_npins {
+        let a = __gc_pinpos
+        var e = a + GC_PIN_BATCH
+        if e > __gc_npins {
+            e = __gc_npins
+        }
+        var j = a
+        while j < e {
+            __gc_resolve(load64(__gc_pins + j * 8))
+            j += 1
+        }
+        __gc_pinpos = e
+        return 1 + ((e - a) >> 2)
+    }
+    if __gc_gn > 0 {
         __gc_gn -= 1
-        let e = __gc_grey + (__gc_gn << 4)
-        __gc_scan(load64(e), load64(e + 8))
+        let g = __gc_grey + (__gc_gn << 4)
+        let o = load64(g)
+        let es = load64(g + 8)
+        if es > GC_FRAME_MIN {
+            __gc_frame_push(o, es)
+            return 1
+        }
+        __gc_scan(o, es)
+        return 1 + (es >> 7)
     }
+    if __gc_nfr > 0 {
+        return __gc_frame_unit()
+    }
+    if __gc_novf > 0 {
+        __gc_novf -= 1
+        let g = __gc_ovf + (__gc_novf << 4)
+        __gc_frame_push(load64(g), load64(g + 8))
+        return 1
+    }
+    return -1
 }
 
-// Захваченная арена записи r (§6.3): PENDING → GC, просмотреть остаток, DONE;
-// HANDED — разобрать слова, которые нашёл сам контекст, DONE; SELF — контекст
-// смотрит её сам, подождать. Пока сборка идёт под исключительной блокировкой,
-// контекст продолжить не может, и здесь всегда PENDING.
-fn __gc_arena(r: int) {
-    let rec: __Pin = __cast(r)
-    while true {
+// Одна захваченная арена (§6.3), первая, с которой есть что делать: PENDING —
+// кусок до GC_ACHUNK байт (на это время — GC: контекст, который продолжит,
+// подождёт его); HANDED — слова, которые нашёл сам контекст. Законченная
+// (DONE) уходит в начало списка. SELF пропускается: арену смотрит контекст.
+// → работа или 0, если делать нечего.
+fn __gc_cap_unit() -> int {
+    var i = __gc_capdone
+    while i < __gc_ncap {
+        let r = load64(__gc_capl + i * 8)
+        let rec: __Pin = __cast(r)
         let s = rec.ast
         let st = s & 7
         if st == PIN_PENDING {
+            // CAS не удался — контекст только что взял арену себе (SELF):
+            // смотреть ту же запись снова
             if __cas(r, s, (s & ~7) | PIN_GC) {
-                __gc_resolve_range(__pin_arena_from(rec), rec.hi)
-                rec.aoff = rec.hi - rec.lo
-                rec.ast = (s & ~7) | PIN_DONE
-                return
+                let from = __pin_arena_from(rec)
+                var to = from + GC_ACHUNK
+                if to > rec.hi {
+                    to = rec.hi
+                }
+                __gc_resolve_range(from, to)
+                rec.aoff = to - rec.lo
+                if to >= rec.hi {
+                    rec.ast = (s & ~7) | PIN_DONE
+                    __gc_cap_done(i)
+                } else {
+                    rec.ast = s
+                }
+                return 1 + ((to - from) >> 9)
             }
         } else if st == PIN_HANDED {
+            let n = rec.hlen
             var j = 0
-            while j < rec.hlen {
+            while j < n {
                 __gc_resolve(load64(rec.hbuf + j * 8))
                 j += 1
             }
+            // признак передачи в этой сборке: проверка конца разметки возьмёт
+            // слова арены из hbuf (новая сборка снова обнулит aoff)
+            rec.aoff = -1
             rec.ast = (s & ~7) | PIN_DONE
-            return
-        } else if st == PIN_SELF {
-            __cpu_pause()
+            __gc_cap_done(i)
+            __gc_st_handoffs += 1
+            __gc_total_handoffs += 1
+            return 1 + (n >> 2)
         } else {
-            return
+            i += 1
         }
     }
+    return 0
+}
+
+// Захваченная запись i закончена: в начало списка, к законченным.
+fn __gc_cap_done(i: int) {
+    let a = __gc_capl + i * 8
+    let b = __gc_capl + __gc_capdone * 8
+    let r = load64(a)
+    store64(a, load64(b))
+    store64(b, r)
+    __gc_capdone += 1
 }
 
 // Начало непросмотренной части арены записи. Кэш строк в начале арены
@@ -1893,33 +2160,220 @@ fn __gc_resolve_range(from: int, to: int) {
         let w = load64(p)
         if (w >> 38) == 0x40 {
             __gc_resolve(w)
+            if __gc_verify {
+                __gc_vnote(w)
+            }
         }
         p += 8
     }
 }
 
-// Конец разметки (§7.6): каждая захваченная арена просмотрена (DONE) и снова
-// IDLE (I9); с KHRIP_GC_VERIFY — независимая проверка разметки до уборки
-// (§8.7); помеченное — живые данные; номер уборки растёт, и каждый спан
-// становится неубранным; текущих спанов и частично занятых больше нет (I10):
-// выделение возьмёт только убранные спаны.
-fn __gc_terminate() {
+fn __gc_vnote(w: int) {
+    if __gc_nvw == __gc_vwcap {
+        var nc = __gc_vwcap * 2
+        if nc == 0 {
+            nc = 4096
+        }
+        let nb = __gc_scratch(nc * 8)
+        if __gc_nvw > 0 {
+            __memcpy(nb, __gc_vw, __gc_nvw * 8)
+        }
+        if __gc_vw != 0 {
+            syscall(SYS_MUNMAP, __gc_vw, __gc_vwcap * 8)
+        }
+        __gc_vw = nb
+        __gc_vwcap = nc
+    }
+    store64(__gc_vw + __gc_nvw * 8, w)
+    __gc_nvw += 1
+}
+
+// Кадры (§7.4): объект больше GC_FRAME_MIN байт смотрится кусками по GC_CHUNK
+// байт, после того как разобраны дети предыдущего куска (серое — раньше
+// кадров), поэтому серый стек не растёт на элемент длинного списка. Кадр —
+// (объект, байт просмотрено, размер слота); их стек не глубже GC_FRAMES
+// (смотрится верхний), остальные большие ждут в отложенных и становятся
+// кадром, когда кадр уходит. Пока объект — кадр, перестановки внутри него
+// соблюдают правило частичного массива (__gc_moved, __gc_permute).
+fn __gc_frame_push(o: int, es: int) {
+    if __gc_nfr == GC_FRAMES {
+        if __gc_novf == __gc_ovfcap {
+            var nc = __gc_ovfcap * 2
+            if nc == 0 {
+                nc = 256
+            }
+            let nb = __gc_scratch(nc * 16)
+            if __gc_novf > 0 {
+                __memcpy(nb, __gc_ovf, __gc_novf * 16)
+            }
+            if __gc_ovf != 0 {
+                syscall(SYS_MUNMAP, __gc_ovf, __gc_ovfcap * 16)
+            }
+            __gc_ovf = nb
+            __gc_ovfcap = nc
+        }
+        let g = __gc_ovf + (__gc_novf << 4)
+        store64(g, o)
+        store64(g + 8, es)
+        __gc_novf += 1
+        return
+    }
+    let f = __gc_fr + __gc_nfr * 24
+    store64(f, o)
+    store64(f + 8, 0)
+    store64(f + 16, es)
+    __gc_nfr += 1
+}
+
+// Следующий кусок верхнего кадра; кадр кончился — уходит, а его место
+// занимает отложенный.
+fn __gc_frame_unit() -> int {
+    let f = __gc_fr + (__gc_nfr - 1) * 24
+    let o = load64(f)
+    let pos = load64(f + 8)
+    let es = load64(f + 16)
+    var n = es - pos
+    if n > GC_CHUNK {
+        n = GC_CHUNK
+    }
+    if n > 0 {
+        __gc_scan(o + pos, n)
+        store64(f + 8, pos + n)
+    }
+    if pos + n >= es {
+        __gc_nfr -= 1
+        if __gc_novf > 0 {
+            __gc_novf -= 1
+            let g = __gc_ovf + (__gc_novf << 4)
+            __gc_frame_push(load64(g), load64(g + 8))
+        }
+    }
+    return 1 + (n >> 7)
+}
+
+// Кусок разметки (§7.4) под мьютексом писателей: не дольше us мкс (часы —
+// через каждые GC_CLOCK_WORK единиц) или, если work > 0, не больше work
+// единиц (шаги тестов и KHRIP_GC_STRESS в khc test). → true, если разметка
+// кончилась: осталось разве что арены, которые смотрят их контексты (SELF).
+fn __gc_mark_slice(us: int, work: int) -> bool {
+    var t0 = 0
+    if work == 0 {
+        t0 = __gc_now_us()
+    }
+    var done = 0
+    var since = 0
+    while true {
+        let w = __gc_mark_unit()
+        if w < 0 {
+            return true
+        }
+        done += w
+        since += w
+        if work > 0 {
+            if done >= work {
+                return false
+            }
+        } else if since >= GC_CLOCK_WORK {
+            since = 0
+            if __gc_now_us() - t0 >= us {
+                return false
+            }
+        }
+    }
+    return false
+}
+
+// Разметка до конца (конец разметки, сборка целиком): то же, что кусок, но
+// арены SELF дожидаются — контекст смотрит свою арену и от сборщика ничего не
+// ждёт (§6.3). us > 0 — не дольше us мкс: → false, если не успели.
+fn __gc_drain(us: int) -> bool {
+    var t0 = 0
+    if us > 0 {
+        t0 = __gc_now_us()
+    }
+    var since = 0
+    var spins = 0
+    while true {
+        var w = __gc_mark_unit()
+        if w < 0 {
+            if __gc_capdone >= __gc_ncap {
+                return true
+            }
+            __gc_spin(spins)
+            spins += 1
+            w = 1
+        }
+        since += w
+        if us > 0 && since >= GC_CLOCK_WORK {
+            since = 0
+            if __gc_now_us() - t0 >= us {
+                return false
+            }
+        }
+    }
+    return true
+}
+
+// Ожидание другого потока (арена, которую смотрит её контекст или сборщик):
+// пауза процессора, иногда — уступить ядро.
+fn __gc_spin(n: int) {
+    if (n & 1023) == 1023 {
+        syscall(GC_SYS_SCHED_YIELD)
+    } else {
+        __cpu_pause()
+    }
+}
+
+// Конец разметки (§7.6) под мьютексом писателей, сразу за куском, который её
+// закончил: доделать захваченные арены (SELF — дождаться) и серое не дольше
+// GC_TERM_US. Не успели — false: мьютекс отпускается, разметка идёт кусками
+// дальше; с GC_TERM_TRIES-й попытки — до конца.
+fn __gc_terminate_try() -> bool {
+    __gc_term_tries += 1
+    var us = GC_TERM_US
+    if __gc_term_tries >= GC_TERM_TRIES {
+        us = 0
+    }
+    if !__gc_drain(us) {
+        return false
+    }
+    __gc_mark_done()
+    return true
+}
+
+// Разметка кончилась (§7.6): серого, кадров и слов записей нет, каждая
+// захваченная арена просмотрена (DONE). С KHRIP_GC_VERIFY — независимая
+// проверка разметки до уборки (§8.7). Захваченные записи снова IDLE (I9);
+// разметка выключена; живое — помеченное разметкой и выделенное за время
+// разметки (чёрное); номер уборки растёт, и каждый спан становится неубранным;
+// текущих спанов и частично занятых больше нет (I10): выделение возьмёт только
+// убранные спаны.
+fn __gc_mark_done() {
     var i = 0
     while i < __gc_ncap {
         let rec: __Pin = __cast(load64(__gc_capl + i * 8))
         if (rec.ast & 7) != PIN_DONE {
             __gc_fatal("a captured arena was not marked by the end of marking (I9)")
         }
+        i += 1
+    }
+    if __gc_verify {
+        __gc_verify_marks()
+    }
+    i = 0
+    while i < __gc_ncap {
+        let rec: __Pin = __cast(load64(__gc_capl + i * 8))
         rec.ast = PIN_IDLE
         i += 1
     }
     __gc_ncap = 0
-    if __gc_verify {
-        __gc_verify_marks()
-    }
+    __gc_capdone = 0
+    __gc_npins = 0
+    __gc_pinpos = 0
+    __gc_nvw = 0
     __gc_set_marking(false)
     __gc_phase = GC_PH_SWEEP
-    __heap_marked = __gc_marked_bytes
+    __heap_marked = __gc_marked_bytes + __gc_black_bytes
     __heap_live = __heap_marked
     __gc_sweepgen += 1
     for j in 0..(GC_CLASSES + 1) * 2 {
@@ -1927,11 +2381,12 @@ fn __gc_terminate() {
         store64(__gc_partial + j * 16, 0)
         store64(__gc_partial + j * 16 + 8, 0)
     }
+    __gc_poked = false
 }
 
 // Уборка всех спанов по адресам (§7.7): спан без объектов — страницы кучке,
 // спан со свободными слотами — в конец списка частично занятых своего класса.
-// Серый стек больше 1 МБ — системе.
+// Память разметки больше 1 МБ — системе.
 fn __gc_sweep_all() {
     var kept = 0
     let hw = load64(__gc_ph + PH_HW)
@@ -1949,13 +2404,23 @@ fn __gc_sweep_all() {
         pg += np
     }
     if __gc_verify && kept != __heap_marked {
-        __gc_fatal("the sweep kept {kept} bytes, but marking counted {__heap_marked}")
+        __gc_fatal("the sweep kept {kept} bytes, but marking counted {__heap_marked} ({__gc_black_bytes} of them allocated black)")
     }
     __gc_phase = GC_PH_IDLE
     if __gc_gcap * 16 > GC_MB {
         syscall(SYS_MUNMAP, __gc_grey, __gc_gcap * 16)
         __gc_grey = 0
         __gc_gcap = 0
+    }
+    if __gc_pincap * 8 > GC_MB {
+        syscall(SYS_MUNMAP, __gc_pins, __gc_pincap * 8)
+        __gc_pins = 0
+        __gc_pincap = 0
+    }
+    if __gc_vwcap * 8 > GC_MB {
+        syscall(SYS_MUNMAP, __gc_vw, __gc_vwcap * 8)
+        __gc_vw = 0
+        __gc_vwcap = 0
     }
     if __gc_verify {
         __gc_verify_swept()
@@ -2082,13 +2547,209 @@ fn __popcount(x: int) -> int {
     return ((v * 0x0101010101010101) >> 56) & 0xFF
 }
 
-// ---- Темп и пределы (§8.2, §8.4; m = 1 до шага 6) ----
+// ---- Барьер SATB и правило частичного массива (§7.5) ----
+// Пока идёт разметка (__gc_marking != 0 проверяют вызывающие: без разметки
+// барьер — одна загрузка и переход), значение, которое затирают или убирают из
+// объекта store или из корня, сначала серится: разметка найдёт всё, что было
+// достижимо в начале сборки. Меняет store только тот, кто держит его
+// исключительно (__store_mut), — значит, и мьютекс писателей: метаданные
+// сборщика меняет только его владелец (I5). Списки и словари вне store
+// (временные значения, читающие запросы) не серят ничего.
+
+// Старое значение слова объекта store (барьеры компилятора, lib/api.kh;
+// вызывающий проверил, что объект в store и изменение под исключительной
+// блокировкой).
+fn __gc_shade(w: int) {
+    __gc_resolve(w)
+}
+
+// Значение w уходит из контейнера h (pop, remove_at, значение словаря, старый
+// массив при росте).
+fn __gc_shade_in(h: int, w: int) {
+    if __in_store(h) {
+        __gc_resolve(w)
+    }
+}
+
+// n слов с адреса p уходят из контейнера h (truncate, clear, clear словаря); у
+// массива без ссылок (NOSCAN) серить нечего.
+fn __gc_shade_words(h: int, p: int, n: int) {
+    if !__in_store(h) || n <= 0 || __gc_kind_of(p) == K_NOSCAN {
+        return
+    }
+    var i = 0
+    while i < n {
+        __gc_resolve(load64(p + i * 8))
+        i += 1
+    }
+}
+
+// Корень slot (глобальная store, var теста) получает новое значение
+// (__persist_root): старое серится. Менять корень может только тот, кто держит
+// store исключительно.
+fn __gc_shade_root(slot: int) {
+    if load64(__ctx() + CTX_STORE_HELD) != 1 {
+        __store_mut_slow()
+    }
+    __gc_resolve(load64(slot))
+}
+
+// Кадр, внутри которого лежит адрес p, или 0.
+fn __gc_frame_at(p: int) -> int {
+    var k = 0
+    while k < __gc_nfr {
+        let f = __gc_fr + k * 24
+        let o = load64(f)
+        if p >= o && p < o + load64(f + 16) {
+            return f
+        }
+        k += 1
+    }
+    return 0
+}
+
+// remove_at(i) списка h с массивом d из n элементов (до сдвига): элементы
+// (i, n) сдвигаются на слово вниз. Если массив — кадр и граница просмотренного
+// между ними, элемент на границе перешёл бы в просмотренную часть
+// непросмотренным — он серится (такой один; остальные остаются по свою
+// сторону границы).
+fn __gc_moved(h: int, d: int, i: int, n: int) {
+    if __gc_nfr == 0 || !__in_store(h) {
+        return
+    }
+    let f = __gc_frame_at(d)
+    if f == 0 {
+        return
+    }
+    let bound = load64(f) + load64(f + 8)
+    if bound > d + i * 8 && bound < d + n * 8 {
+        __gc_resolve(load64(bound))
+    }
+}
+
+// Перестановка элементов [0, n) массива d контейнера h (reverse, sort,
+// sort_by, сжатие при перестройке словаря): если массив — кадр, его
+// непросмотренная часть серится целиком, и кадр закончен (O(n), как и сама
+// перестановка).
+fn __gc_permute(h: int, d: int, n: int) {
+    if __gc_nfr == 0 || !__in_store(h) {
+        return
+    }
+    let f = __gc_frame_at(d)
+    if f == 0 {
+        return
+    }
+    var p = load64(f) + load64(f + 8)
+    if p < d {
+        p = d
+    }
+    let e = d + n * 8
+    while p < e {
+        __gc_resolve(load64(p))
+        p += 8
+    }
+    store64(f + 8, load64(f + 16))
+}
+
+// ---- Шаги сборки для тестов (tests/api/gc_*.kh) ----
+// Тест начинает сборку, делает разметку по шагам, меняет store между ними и
+// заканчивает её — так проверяется каждая строка таблицы SATB (§7.5). Тест
+// держит store исключительно или не держит (тогда блокировка сборщика — на
+// время шага).
+
+// Начать сборку: контекст публикует себя на время начала (его указатели — в
+// массиве записей; арену, когда продолжит, он передаст сам, __pin_withdraw).
+// Идущая разметка сначала доделывается.
+fn __gc_begin() {
+    let c = __ctx()
+    let held = load64(c + CTX_STORE_HELD)
+    if !__gc_ready || held == 2 || __gc_busy {
+        return
+    }
+    if held == 0 {
+        __store_lock_gc()
+    }
+    __gc_busy = true
+    if __gc_phase == GC_PH_MARK {
+        __gc_finish_stw(GC_WHY_CALL)
+    }
+    let r = load64(c + CTX_PINREC)
+    __pin_publish(r)
+    __gc_begin_cycle(r, GC_WHY_CALL)
+    if r != 0 {
+        __pin_withdraw(__cast(r))
+    }
+    __gc_busy = false
+    if held == 0 {
+        __store_unlock_gc()
+    }
+}
+
+// n единиц разметки. → true, если разметка кончилась (или её нет).
+fn __gc_step(n: int) -> bool {
+    let held = load64(__ctx() + CTX_STORE_HELD)
+    if __gc_phase != GC_PH_MARK || held == 2 {
+        return __gc_phase != GC_PH_MARK
+    }
+    if held == 0 {
+        __store_lock_gc()
+    }
+    let fin = __gc_mark_slice(0, n)
+    if held == 0 {
+        __store_unlock_gc()
+    }
+    return fin
+}
+
+// Доделать разметку, конец разметки и уборка.
+fn __gc_finish() {
+    let held = load64(__ctx() + CTX_STORE_HELD)
+    if __gc_phase != GC_PH_MARK || held == 2 || __gc_busy {
+        return
+    }
+    if held == 0 {
+        __store_lock_gc()
+    }
+    __gc_busy = true
+    __gc_finish_stw(GC_WHY_CALL)
+    __gc_busy = false
+    if held == 0 {
+        __store_unlock_gc()
+    }
+}
+
+// Сколько байт массива, где лежит p, просмотрено (p — кадр), или −1.
+fn __gc_frame_pos(p: int) -> int {
+    let f = __gc_frame_at(p)
+    if f == 0 {
+        return -1
+    }
+    return load64(f + 8)
+}
+
+// Помечен ли объект, в котором лежит p (0 — не объект store).
+fn __gc_is_marked(p: int) -> bool {
+    let o = __gc_obj_of(p)
+    return o != 0 && __gc_bit(GC_MARK, o)
+}
+
+// Выделен ли объект, в котором лежит p.
+fn __gc_is_allocated(p: int) -> bool {
+    return __gc_obj_of(p) != 0
+}
+
+// ---- Темп и пределы (§8.2, §8.4; m = 1 до шага 6b) ----
 
 // По помеченному после сборки: цель — помеченное · (1 + KHRIP_GC/100), не
 // меньше KHRIP_GC_MIN_MB; порог — 70% запаса; жёсткий предел — вдвое выше цели,
 // но не меньше цели + 64 МБ. KHRIP_GC=off — сборки нет. KHRIP_GC_STRESS — цель
-// и порог сборки внутри работы — помеченное + 64 КБ (у кучи больше 256 КБ —
-// плюс четверть помеченного).
+// — помеченное + шаг (64 КБ, а у кучи больше 256 КБ — четверть помеченного);
+// с потоком сборщика следующая сборка начинается с первого же выделения после
+// уборки, а порог сборки внутри работы — восемь шагов: разметка идёт почти всё
+// время, и почти каждый запрос встречает её (её доделывает поток, кусками); без
+// него (khc test) — четверть помеченного, но не меньше 8 КБ: с него начинаются
+// шаги сборки (__gc_stress_step), и маленький store тестов размечается, пока
+// тест его меняет.
 fn __gc_pace() {
     let m = __heap_marked
     if __gc_pct < 0 {
@@ -2120,7 +2781,14 @@ fn __gc_pace() {
     __gc_hard = hard
     __gc_limit = hard
     if __gc_stress {
-        __gc_limit = m + step
+        if __gc_has_thread {
+            __gc_trigger = m
+            __gc_limit = m + 8 * step
+        } else if m / 4 > GC_STRESS_TEST_STEP {
+            __gc_limit = m + m / 4
+        } else {
+            __gc_limit = m + GC_STRESS_TEST_STEP
+        }
     }
 }
 
@@ -2138,12 +2806,20 @@ fn __gc_poke() {
 // контейнера store (__salloc_for), до __pmode_on. Запрос или задача держит
 // store исключительно посреди работы, и поток сборщика его не дождётся:
 // контекст публикует себя (I7: всё, что живо через вызов, — в rbx, rbp, r12–r15
-// или в памяти), собирает и отзывает запись. С KHRIP_GC_STRESS — каждые 64 КБ.
+// или в памяти), собирает и отзывает запись. С KHRIP_GC_STRESS без потока
+// сборщика (khc test) — шаг сборки (__gc_stress_step): начало у порога, а
+// пока идёт разметка — в каждой точке.
 fn __gc_hard_check() {
     if __heap_live < __gc_limit {
-        return
+        if !__gc_stress || __gc_has_thread || __gc_phase != GC_PH_MARK {
+            return
+        }
     }
     if load64(__ctx() + CTX_STORE_HELD) != 1 || __gc_busy || __store_on() {
+        return
+    }
+    if __gc_stress && !__gc_has_thread {
+        __gc_stress_step(load64(__ctx() + CTX_PINREC))
         return
     }
     __gc_emergency(GC_WHY_EMERGENCY)
@@ -2162,6 +2838,33 @@ fn __gc_emergency(why: int) {
     __pin_withdraw(__cast(r))
     __gc_release_locked()
     __gc_report()
+}
+
+// KHRIP_GC_STRESS без потока сборщика (khc test): шаг сборки вместо сборки
+// целиком — в точке внутри работы (жёсткий предел; self — запись контекста,
+// он держит store исключительно) и в окне (self = 0: запись уже опубликована,
+// блокировку сборщика взял вызывающий). Нет разметки — начать (в точке внутри
+// работы контекст публикует себя на время начала и, отзывая запись, сам
+// передаёт свою арену); идёт — GC_STRESS_WORK единиц; кончилась — конец
+// разметки и уборка. Так разметка идёт, пока тесты меняют store: барьеры,
+// правило частичного массива и передача арен работают на всём наборе.
+fn __gc_stress_step(self: int) {
+    __gc_busy = true
+    if __gc_phase != GC_PH_MARK {
+        if self != 0 {
+            __pin_publish(self)
+        }
+        __gc_begin_cycle(self, GC_WHY_STRESS)
+        if self != 0 {
+            __pin_withdraw(__cast(self))
+        }
+    } else if __gc_mark_slice(0, GC_STRESS_WORK) {
+        __gc_finish_stw(GC_WHY_STRESS)
+        if !__gc_has_thread {
+            __gc_scavenge(false, true, __gc_runs)
+        }
+    }
+    __gc_busy = false
 }
 
 // Точка сборки khc test (§6.8): потока сборщика в тестах нет. После call
@@ -2190,18 +2893,17 @@ fn __gc_test_point(end: bool) {
 }
 
 // KHRIP_GC_STRESS без потока сборщика (khc test): окно (__store_release_keep,
-// блокировка уже отпущена) — тоже точка сборки, как будто в окно попала сборка
-// потока сборщика: контекст опубликовал себя и не держит store. Так и в тестах
-// сборка застаёт то, что запрос держит через ожидание.
+// блокировка уже отпущена) — тоже точка сборки, как будто в окно попал кусок
+// разметки потока сборщика: контекст опубликовал себя и не держит store. Шаг
+// сборки (__gc_stress_step); сборка, начатая здесь, захватывает арену окна, и
+// контекст, продолжив, передаёт её сам.
 fn __gc_window_point() {
     if !__gc_stress || __gc_has_thread || __gc_busy || __gc_pct < 0 || !__gc_ready {
         return
     }
     __store_lock_gc()
-    __gc_collect_now(0, GC_WHY_WINDOW)
-    __gc_release_locked()
+    __gc_stress_step(0)
     __store_unlock_gc()
-    __gc_report()
 }
 
 // Сборка из контекста, который держит указатели в store: если он держит store
@@ -2247,7 +2949,7 @@ type __GcStats {
     cycles: int
     // байт в выделенных объектах сейчас
     heap: int
-    // помечено последней сборкой: байт и объектов
+    // живое по последней сборке (помеченное и чёрное): байт и объектов
     live: int
     objects: int
     // цель и порог следующей сборки
@@ -2257,12 +2959,23 @@ type __GcStats {
     pages: int
     // байт возвращено системе за всё время
     released: int
-    // наибольшая пауза, мкс
+    // наибольшая пауза сборки целиком, мкс
     max_pause_us: int
+    // идёт разметка
+    marking: bool
+    // выделено чёрным в последней (или идущей) сборке: байт
+    black: int
+    // кусков разметки и арен, переданных самими контекстами, за всё время
+    slices: int
+    handoffs: int
+    // самый долгий кусок, начало и конец разметки, мкс
+    max_slice_us: int
+    max_start_us: int
+    max_term_us: int
 }
 
 fn __gc_stats() -> __GcStats {
-    return __GcStats { cycles: __gc_cycle_no, heap: __heap_live, live: __heap_marked, objects: __gc_marked_objs, goal: __gc_goal, trigger: __gc_trigger, pages: load64(__gc_ph + PH_HW), released: __gc_total_released, max_pause_us: __gc_max_pause }
+    return __GcStats { cycles: __gc_cycle_no, heap: __heap_live, live: __heap_marked, objects: __gc_marked_objs + __gc_black_objs, goal: __gc_goal, trigger: __gc_trigger, pages: load64(__gc_ph + PH_HW), released: __gc_total_released, max_pause_us: __gc_max_pause, marking: __gc_marking != 0, black: __gc_black_bytes, slices: __gc_total_slices, handoffs: __gc_total_handoffs, max_slice_us: __gc_max_slice, max_start_us: __gc_max_start, max_term_us: __gc_max_term }
 }
 
 // ---- Возврат памяти системе (§4.8) ----
@@ -2408,6 +3121,8 @@ fn __gc_spawn() {
         __panic(PANIC_MEMORY, "mmap")
     }
     __gc_has_thread = true
+    // с потоком сборщика другой порог сборки внутри работы (KHRIP_GC_STRESS)
+    __gc_pace()
     // загрузка — не запись после сборки: отсчёт простоя и двух минут — отсюда
     __gc_touches = __store_touches
     __gc_last_us = __gc_now_us()
@@ -2416,12 +3131,13 @@ fn __gc_spawn() {
 
 // Поток сборщика (lib/http.kh, __thread_main(-2)): ждёт, пока его разбудят
 // (куча дошла до порога или сборка под чужой блокировкой оставила ему возврат
-// памяти), но не дольше секунды; сборка — под исключительной блокировкой
-// сборщика, возврат памяти — без неё. Десять секунд без выделений в store —
-// простой (раз на период): сборка, если с прошлой выделено больше 1 МБ или
-// store брали на запись, и вся свободная память — системе. Store брали на
-// запись, а сборки не было две минуты — сборка. Строки журнала — в своей
-// арене потока.
+// памяти), но не дольше секунды; начало сборки — под исключительной
+// блокировкой сборщика, разметка, её конец и уборка — кусками под мьютексом
+// писателей, возврат памяти — без блокировки. Десять секунд без выделений в
+// store — простой (раз на период): сборка, если с прошлой выделено больше 1 МБ
+// или store брали на запись, и вся свободная память — системе. Store брали на
+// запись, а сборки не было две минуты — сборка. Строки журнала — в своей арене
+// потока.
 fn __gc_thread_main() {
     __arena_init()
     let ts = __alloc(16)
@@ -2466,29 +3182,101 @@ fn __gc_thread_main() {
     }
 }
 
+// Сборка потока сборщика: начало (если сборки нет и, по порогу, куча дошла до
+// него), разметка кусками, возврат памяти (и тот, что оставила сборка под
+// чужой блокировкой), строка журнала.
 fn __gc_thread_cycle(why: int, runs: int) {
     __store_lock_gc()
     store64(__gc_ctl, 0)
     var ran = false
-    if why != GC_WHY_PACE || __heap_live >= __gc_trigger {
-        __gc_collect_now(0, why)
+    if __gc_phase == GC_PH_IDLE && (why != GC_WHY_PACE || __heap_live >= __gc_trigger) {
+        __gc_begin_cycle(0, why)
         ran = true
     }
-    // и возврат памяти, который оставила сборка под чужой блокировкой
-    let scav = ran || __gc_scav_due
+    let scav = __gc_scav_due
     __gc_scav_due = false
-    __gc_poked = false
+    if !ran {
+        __gc_poked = false
+    }
     __store_unlock_gc()
-    if scav {
+    var done = false
+    if ran {
+        done = __gc_thread_mark()
+    }
+    if ran || scav {
         __gc_scavenge(why == GC_WHY_IDLE, false, runs)
     }
-    if ran {
-        if __gc_log {
-            __arena_begin()
-            eprint(__gc_line())
-            __arena_end()
+    if done && __gc_log {
+        __arena_begin()
+        __store_lock_marker()
+        let line = __gc_line()
+        __store_unlock_marker()
+        eprint(line)
+        __arena_end()
+    }
+}
+
+// Разметка кусками (§7.4, §8.1): кусок — не дольше KHRIP_GC_SLICE_US под
+// мьютексом писателей, между кусками — пауза в три куска (разметке — четверть
+// времени; подстройка под давление кучи — шаг 6b), чтобы писатели шли: мьютекс
+// не честный, и сразу взятый снова он им бы не достался. Кусок, который
+// закончил разметку, — тут же и конец разметки (§7.6) с уборкой. → true, если
+// сборку закончил поток; false — её доделал кто-то другой (сборка внутри
+// работы, __gc_collect).
+fn __gc_thread_mark() -> bool {
+    let k = __gc_cycle_no
+    while true {
+        __gc_sleep_us(__gc_slice_us * 3)
+        __store_lock_marker()
+        if __gc_phase != GC_PH_MARK || __gc_cycle_no != k {
+            __store_unlock_marker()
+            return false
+        }
+        __gc_busy = true
+        let t0 = __gc_now_us()
+        let fin = __gc_mark_slice(__gc_slice_us, 0)
+        var t1 = __gc_now_us()
+        var done = false
+        if fin {
+            let ok = __gc_terminate_try()
+            let t2 = __gc_now_us()
+            if ok {
+                __gc_sweep_all()
+                __gc_pace()
+                let t3 = __gc_now_us()
+                __gc_st_term = t2 - t1
+                __gc_st_wall = t2 - __gc_st_t1
+                __gc_st_sweep = t3 - t2
+                __gc_st_after = __heap_live
+                __gc_st_release = 0
+                __gc_st_relhanded = false
+                __gc_last_us = t3
+                if t2 - t1 > __gc_max_term {
+                    __gc_max_term = t2 - t1
+                }
+                done = true
+            } else {
+                // конец разметки не уложился в GC_TERM_US: это был ещё кусок
+                t1 = t2
+            }
+        }
+        let dt = t1 - t0
+        __gc_st_slices += 1
+        __gc_st_mark += dt
+        __gc_total_slices += 1
+        if dt > __gc_st_slice_max {
+            __gc_st_slice_max = dt
+        }
+        if dt > __gc_max_slice {
+            __gc_max_slice = dt
+        }
+        __gc_busy = false
+        __store_unlock_marker()
+        if done {
+            return true
         }
     }
+    return false
 }
 
 // ---- Журнал (KHRIP_GC_LOG=1, §8.6) ----
@@ -2500,29 +3288,60 @@ fn __gc_report() {
     }
 }
 
-fn __gc_line() -> str {
-    var why = "pace"
-    if __gc_st_why == GC_WHY_IDLE {
-        why = "idle"
-    } else if __gc_st_why == GC_WHY_EMERGENCY {
-        why = "in request"
-    } else if __gc_st_why == GC_WHY_RELEASE {
-        why = "at release"
-    } else if __gc_st_why == GC_WHY_TEST {
-        why = "test"
-    } else if __gc_st_why == GC_WHY_CALL {
-        why = "explicit"
-    } else if __gc_st_why == GC_WHY_WINDOW {
-        why = "window"
-    } else if __gc_st_why == GC_WHY_FORCED {
-        why = "forced"
+fn __gc_why(w: int) -> str {
+    if w == GC_WHY_IDLE {
+        return "idle"
+    } else if w == GC_WHY_EMERGENCY {
+        return "in request"
+    } else if w == GC_WHY_RELEASE {
+        return "at release"
+    } else if w == GC_WHY_TEST {
+        return "test"
+    } else if w == GC_WHY_CALL {
+        return "explicit"
+    } else if w == GC_WHY_WINDOW {
+        return "window"
+    } else if w == GC_WHY_FORCED {
+        return "forced"
+    } else if w == GC_WHY_STRESS {
+        return "stress"
     }
-    let pause = __gc_st_pause
-    var line = "gc {__gc_cycle_no} ({why}): heap {__gc_mbs(__gc_st_before)}->{__gc_mbs(__gc_st_after)} MB, live {__gc_mbs(__heap_marked)} MB ({__gc_marked_objs} obj), m 1, pins {__gc_st_recs} rec/{__gc_st_words} words, arenas {__gc_st_arenas} ({(__gc_st_abytes + 1023) / 1024} KB), pause {__gc_ms(pause)} ms (start {__gc_ms(__gc_st_start)}, mark {__gc_ms(__gc_st_mark)}, sweep {__gc_ms(__gc_st_sweep)}, release {__gc_ms(__gc_st_release)})"
-    if __gc_st_handed {
-        line += ", pages released by the GC thread"
+    return "pace"
+}
+
+// Инкрементальная сборка: начало (мкс), разметка — сумма кусков и самый
+// долгий, конец разметки (мкс), уборка; доделанная кем-то целиком — сколько
+// это заняло. Сборка целиком: пауза и её части.
+fn __gc_line() -> str {
+    var line = "gc {__gc_cycle_no} ({__gc_why(__gc_st_why)}"
+    if __gc_st_fin != 0 {
+        line += ", finished {__gc_why(__gc_st_fin)}"
+    }
+    line += "): heap {__gc_mbs(__gc_st_before)}->{__gc_mbs(__gc_st_after)} MB, live {__gc_mbs(__heap_marked)} MB ({__gc_marked_objs + __gc_black_objs} obj, {__gc_black_objs} black), m 1, pins {__gc_st_recs} rec/{__gc_st_words} words, arenas {__gc_st_arenas} ({(__gc_st_abytes + 1023) / 1024} KB"
+    if __gc_st_handoffs > 0 {
+        line += ", {__gc_st_handoffs} handed off"
+    }
+    line += ")"
+    if __gc_st_inc {
+        line += ", start {__gc_st_start} µs, mark {__gc_ms(__gc_st_mark)} ms in {__gc_st_slices} slices (max {__gc_st_slice_max} µs) over {__gc_ms(__gc_st_wall)} ms"
+        if __gc_st_fin != 0 {
+            line += ", finished in {__gc_ms(__gc_st_term)} ms"
+        } else {
+            line += ", term {__gc_st_term} µs"
+            if __gc_term_tries > 1 {
+                line += " ({__gc_term_tries} tries)"
+            }
+        }
+        line += ", sweep {__gc_ms(__gc_st_sweep)} ms"
     } else {
-        line += ", released {__gc_mbs(__gc_st_released)} MB, rss-store {__gc_mbs(__gc_st_rss)} MB"
+        line += ", pause {__gc_ms(__gc_st_pause)} ms (start {__gc_ms(__gc_st_start)}, mark {__gc_ms(__gc_st_mark)}, sweep {__gc_ms(__gc_st_sweep)}, release {__gc_ms(__gc_st_release)})"
+    }
+    if __gc_st_fin == 0 {
+        if __gc_st_relhanded {
+            line += ", pages released by the GC thread"
+        } else {
+            line += ", released {__gc_mbs(__gc_st_released)} MB, rss-store {__gc_mbs(__gc_st_rss)} MB"
+        }
     }
     if __gc_st_long > 0 {
         line += ", long holders {__gc_st_long} ({__gc_st_long_age} cycles, {__gc_st_long_words} words)"

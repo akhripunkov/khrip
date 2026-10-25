@@ -82,3 +82,23 @@ fn __gc_spawn() {
 
 fn __gc_thread_main() {
 }
+
+// Барьера SATB без store нет: разметки не бывает (__gc_marking всегда 0), и
+// хуки контейнеров (lib/core.kh) и барьеры (lib/api.kh) их не вызывают.
+fn __gc_shade(w: int) {
+}
+
+fn __gc_shade_in(h: int, w: int) {
+}
+
+fn __gc_shade_words(h: int, p: int, n: int) {
+}
+
+fn __gc_shade_root(slot: int) {
+}
+
+fn __gc_moved(h: int, d: int, i: int, n: int) {
+}
+
+fn __gc_permute(h: int, d: int, n: int) {
+}

@@ -764,7 +764,7 @@ fn assign_name(t: Token, op: int, at: Token) {
         compound_value(op, g.ty, at)
     }
     if persistent {
-        store_write(g.ty)
+        store_write(g.ty, g.addr)
     }
     emit_store_abs(g.addr, RAX)
 }
@@ -813,7 +813,7 @@ fn assign_field(t: int, f: Token, op: int, at: Token) {
         emit_push(RAX)
         compound_value(op, ft, at)
     }
-    emit_barrier(0, ft)
+    emit_field_barrier(fi * 8, ft)
     emit_pop(RCX)
     emit_store(RCX, fi * 8, RAX)
 }
@@ -910,7 +910,7 @@ fn assign_index(t: int) {
         emit_push(RAX)
         compound_value(op, et, opt)
     }
-    emit_barrier(8, et)
+    emit_index_barrier(et)
     emit_mov_rr(RDX, RAX)
     emit_pop(RCX)
     emit_pop(RAX)
@@ -2144,7 +2144,7 @@ fn init_global(g: Global, persistent: bool) {
         return
     }
     if persistent {
-        store_write(g.ty)
+        store_write(g.ty, g.addr)
     }
     emit_store_abs(g.addr, RAX)
 }

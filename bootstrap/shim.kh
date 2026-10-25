@@ -38,6 +38,22 @@ fn __salloc_for(h: int, n: int, kind: int, mask: int) -> int {
 fn __store_mut(h: int) {
 }
 
+// Барьер SATB (lib/gc.kh): разметки у загрузчика нет.
+fn __gc_shade(w: int) {
+}
+
+fn __gc_shade_in(h: int, w: int) {
+}
+
+fn __gc_shade_words(h: int, p: int, n: int) {
+}
+
+fn __gc_moved(h: int, d: int, i: int, n: int) {
+}
+
+fn __gc_permute(h: int, d: int, n: int) {
+}
+
 fn __store_panic() {
 }
 

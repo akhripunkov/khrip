@@ -131,9 +131,16 @@ fn __variant_entry(d: int, v: int) -> int {
 // варианты без полей). Арена освобождается после ответа, а обычная память
 // потока (строки из файла KHRIP_DATA, env) store не принадлежит. Поэтому
 // значение, которое кладут внутрь объекта вне арены, копируется, если оно не в
-// store и не в DATA. Барьеры для сборщика (__barrier_at, __barrier_idx,
-// __persist_root) — шаг 6 docs/design/v0.13-store-gc.md. __in_store — в
-// lib/core.kh.
+// store и не в DATA. __in_store — в lib/core.kh.
+//
+// Барьеры сборщика (docs/design/v0.13-store-gc.md §5.1, §7.5): поле x.f = v
+// (__barrier_at), элемент xs[i] = v (__barrier_idx) и глобальная store
+// (__persist_root) — пока идёт разметка, старое значение серится (SATB,
+// lib/gc.kh); без разметки это одна загрузка и переход. Объект store меняет
+// только тот, кто держит store исключительно (__store_mut): иначе маршрут,
+// который компилятор счёл читающим, писал бы одновременно с разметкой.
+// Значение словаря, ключ, push и insert идут через __barrier: старое значение
+// словаря серит __map_set, а push и insert ничего не затирают.
 
 // DATA — [DATA_BASE, __data_end()), DATA_BASE = 0x20000000 (src/emit.kh).
 fn __in_data(p: int) -> bool {
@@ -147,7 +154,54 @@ fn __barrier(obj: int, v: int, d: int) -> int {
     return __persist_copy(v, d)
 }
 
+// x.f = v: поле со смещением off объекта obj (src/stmt.kh, assign_field).
+fn __barrier_at(obj: int, off: int, v: int, d: int) -> int {
+    if __in_arena(obj) {
+        return v
+    }
+    if __in_store(obj) {
+        __store_mut(obj)
+        if __gc_marking != 0 {
+            __gc_shade(load64(obj + off))
+        }
+    }
+    if v == 0 || __in_store(v) || __in_data(v) {
+        return v
+    }
+    return __persist_copy(v, d)
+}
+
+// xs[i] = v (src/stmt.kh, assign_index); границы проверяются после барьера:
+// за границей старого значения нет.
+fn __barrier_idx(xs: int, i: int, v: int, d: int) -> int {
+    if __in_arena(xs) {
+        return v
+    }
+    if __in_store(xs) {
+        __store_mut(xs)
+        if __gc_marking != 0 && i >= 0 && i < load64(xs + 8) {
+            __gc_shade(load64(load64(xs) + i * 8))
+        }
+    }
+    if v == 0 || __in_store(v) || __in_data(v) {
+        return v
+    }
+    return __persist_copy(v, d)
+}
+
 fn __persist(v: int, d: int) -> int {
+    if __is_scalar(d) || v == 0 || __in_store(v) || __in_data(v) {
+        return v
+    }
+    return __persist_copy(v, d)
+}
+
+// Глобальная store или var теста (store_write): старое значение корня slot
+// серится, пока идёт разметка; новое копируется, как у __persist.
+fn __persist_root(v: int, d: int, slot: int) -> int {
+    if __gc_marking != 0 {
+        __gc_shade_root(slot)
+    }
     if __is_scalar(d) || v == 0 || __in_store(v) || __in_data(v) {
         return v
     }
