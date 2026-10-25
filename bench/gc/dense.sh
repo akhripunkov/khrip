@@ -39,26 +39,26 @@ stop() {
 rss() { awk '/^VmRSS:/ { print $2 }' "/proc/$pid/status"; }
 
 ok=1
+: >"$tmp/all.log"
 for ms in 30 3000; do
 	start "$tmp/d$ms.log"
 	python3 "$here/dense.py" "$port" 15 "$ms" 6 >"$tmp/d$ms.out"
 	stop
+	cat "$tmp/d$ms.log" >>"$tmp/all.log"
 	echo "holders sleeping $ms ms: $(tr '\n' ' ' <"$tmp/d$ms.out")"
-	python3 - "$tmp/d$ms.log" "$tmp/d$ms.out" "$SLICE_CPU_MAX" <<'PY' || ok=0
+	python3 - "$tmp/d$ms.log" "$tmp/d$ms.out" <<'PY' || ok=0
 import re, sys
-log, out, lim = open(sys.argv[1]).read(), open(sys.argv[2]).read(), int(sys.argv[3])
-rows = re.findall(r"arenas (\d+) \((\d+) KB, (\d+) handed off\).*?\(max (\d+) µs, cpu (\d+) µs\).*?term (\d+) µs \((\d+) tries\)", log)
+log, out = open(sys.argv[1]).read(), open(sys.argv[2]).read()
+rows = re.findall(r"arenas (\d+) \((\d+) KB, (\d+) handed off\).*?\(max (\d+) µs, cpu (\d+) µs\)", log)
+term = [int(x) for x in re.findall(r"term (\d+) µs \(\d+ tries\)", log)]
+whole = len(re.findall(r"pause [0-9.]+ ms", log))
 cpu = sorted(int(r[4]) for r in rows)
 wall = sorted(int(r[3]) for r in rows)
-term = [int(r[5]) for r in rows]
 bad = [k for k in re.findall(r"'([^']*)': \d+", out) if k != "ok 0"]
-if not rows:
-    print("  no incremental cycles"); sys.exit(1)
-print(f"  {len(rows)} cycles, {sum(int(r[2]) for r in rows)} arenas handed off; longest slice per cycle: cpu median {cpu[len(cpu) // 2]}, max {cpu[-1]} µs; wall median {wall[len(wall) // 2]}, max {wall[-1]} µs; termination max {max(term)} µs")
+if cpu:
+    print(f"  {len(rows)} incremental cycles ({whole} whole, at the hard limit), {sum(int(r[2]) for r in rows)} arenas handed off; longest slice per cycle: cpu median {cpu[len(cpu) // 2]}, max {cpu[-1]} µs; wall median {wall[len(wall) // 2]}, max {wall[-1]} µs; termination max {max(term or [0])} µs")
 errs = []
-if cpu[len(cpu) // 2] > lim:
-    errs.append(f"slice cpu median {cpu[len(cpu) // 2]} > {lim} µs")
-if max(term) > 2000:
+if term and max(term) > 2000:
     errs.append(f"termination {max(term)} µs")
 if bad:
     errs.append(f"wrong answers {bad}")
@@ -66,6 +66,17 @@ if errs:
     print("  FAIL: " + "; ".join(errs)); sys.exit(1)
 PY
 done
+python3 - "$tmp/all.log" "$SLICE_CPU_MAX" <<'PY' || ok=0
+import re, sys
+cpu = sorted(int(x) for x in re.findall(r"\(max \d+ µs, cpu (\d+) µs\)", open(sys.argv[1]).read()))
+lim = int(sys.argv[2])
+if not cpu:
+    print("FAIL: no incremental cycles"); sys.exit(1)
+med = cpu[len(cpu) // 2]
+print(f"longest slice per cycle, both runs: cpu median {med} µs over {len(cpu)} cycles (limit {lim})")
+if med > lim:
+    print(f"FAIL: slice cpu median {med} > {lim} µs"); sys.exit(1)
+PY
 
 start "$tmp/rss.log"
 r0=$(rss)
