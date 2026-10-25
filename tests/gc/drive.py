@@ -4,9 +4,14 @@
                                              ждут с ними; печатает итог JSON
     python3 drive.py check <файл KHRIP_DATA> — снимок цел: имена товаров с
                                              правильной проверкой, деньги на месте
+    python3 drive.py probe <порт> <путь> <раз> — один и тот же запрос держателя
+                                             подряд, пока писатели меняют товары:
+                                             сколько раз он продолжил посреди
+                                             разметки (JSON)
 
 Каждый поток — своё соединение keep-alive. Держатели проверяют ответ сервера
-("ok"), счётчик и переводы — по итогам в конце.
+("ok"; "ok~" — запрос продолжил посреди разметки сборки, начатой, пока он
+ждал; "ok+" — и передал арену сам), счётчик и переводы — по итогам в конце.
 """
 import http.client
 import json
@@ -43,12 +48,20 @@ def load(port, seconds):
 
     def note(route, ok, detail=""):
         with lock:
-            s = stats.setdefault(route, [0, 0])
+            s = stats.setdefault(route, [0, 0, 0, 0])
             s[0] += 1
             if not ok:
                 s[1] += 1
                 if len(bad) < 20:
                     bad.append(f"{route}: {detail}")
+
+    # держатель: ok, ok~ (посреди разметки), ok+ (и передал арену сам)
+    def held(route, st, b):
+        ok = st == 200 and b in ("ok", "ok~", "ok+")
+        note(route, ok, f"{st} {b}")
+        if ok and b != "ok":
+            with lock:
+                stats[route][2 if b == "ok~" else 3] += 1
 
     def connect():
         return http.client.HTTPConnection("127.0.0.1", port, timeout=120)
@@ -85,15 +98,15 @@ def load(port, seconds):
             s, b = req(c, "POST", f"/resurrect/{i}")
         else:
             s, b = req(c, "GET", f"/{kind}/{i}")
-        note(kind, s == 200 and b == "ok", f"{s} {b}")
+        held(kind, s, b)
 
     def poll(c, rnd):
         s, b = req(c, "GET", "/poll")
-        note("poll", s == 200 and b == "ok", f"{s} {b}")
+        held("poll", s, b)
 
     def login(c, rnd):
         s, b = req(c, "POST", "/login")
-        note("login", s == 200 and b == "ok", f"{s} {b}")
+        held("login", s, b)
 
     def rotate(c, rnd):
         s, b = req(c, "POST", "/rotate")
@@ -101,7 +114,7 @@ def load(port, seconds):
 
     def fx(c, rnd):
         s, b = req(c, "POST", "/fx")
-        note("fx", s == 200 and b == "ok", f"{s} {b}")
+        held("fx", s, b)
 
     def hdrs(c, rnd):
         s, b = req(c, "POST", f"/hdrs/{rnd.randrange(1000)}")
@@ -128,7 +141,14 @@ def load(port, seconds):
         s, b = req(c, "POST", f"/feed/{rnd.randrange(1, 30)}")
         note("feed", s == 200 and b == "ok", f"{s} {b}")
 
-    plan = [churn] * 6 + [holder] * 10 + [poll] * 3 + [login, rotate, fx, fx, hdrs, boom, bump, bump, transfer, transfer, feed]
+    # сборка у жёсткого предела посреди запроса (с KHRIP_GC_STRESS — посреди
+    # разметки потока сборщика)
+    def grow(c, rnd):
+        s, b = req(c, "POST", "/grow")
+        note("grow", s == 200 and b == "ok", f"{s} {b}")
+        time.sleep(0.5)
+
+    plan = [churn] * 6 + [holder] * 10 + [poll] * 3 + [login, rotate, fx, fx, hdrs, boom, bump, bump, transfer, transfer, feed, grow]
     threads = [threading.Thread(target=loop, args=(fn,)) for fn in plan]
     for t in threads:
         t.start()
@@ -141,8 +161,43 @@ def load(port, seconds):
     print(json.dumps(out))
 
 
+def probe(port, path, times):
+    """Запрос держателя path подряд times раз, пока поток писателей меняет
+    товары (сборки идут одна за другой): сколько ответов ok, ok~, ok+ и
+    неверных."""
+    stop = [False]
+    method = "POST" if path.startswith(("/login", "/fx", "/resurrect")) else "GET"
+
+    def churn():
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
+        rnd = random.Random(7)
+        while not stop[0]:
+            c.request("POST", f"/churn/{rnd.randrange(N)}/20")
+            c.getresponse().read()
+
+    t = threading.Thread(target=churn)
+    t.start()
+    counts = {"ok": 0, "ok~": 0, "ok+": 0, "bad": []}
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
+    try:
+        for i in range(times):
+            c.request(method, path.replace("{i}", str(i * 37 % N)))
+            r = c.getresponse()
+            b = r.read().decode("utf-8", "replace")
+            if r.status == 200 and b in counts:
+                counts[b] += 1
+            elif len(counts["bad"]) < 5:
+                counts["bad"].append(f"{r.status} {b}")
+    finally:
+        stop[0] = True
+        t.join()
+    print(json.dumps(counts))
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "check":
         check_file(sys.argv[2])
+    elif sys.argv[1] == "probe":
+        probe(int(sys.argv[2]), sys.argv[3], int(sys.argv[4]))
     else:
         load(int(sys.argv[2]), float(sys.argv[3]))

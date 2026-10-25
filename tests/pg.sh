@@ -173,11 +173,17 @@ else
 	bad=$(grep -cv '^20[04]$\|^409$' "$tmp/pg/race.moves")
 	labels=$(grep -c '^204$' "$tmp/pg/race.labels")
 	cycles=$(grep -c '^gc [0-9]* (' "$tmp/pg/race.log")
+	# с KHRIP_GC_STRESS=1 разметка идёт почти всё время: держатели /hit, /move и
+	# /sweep (их окна — только ожидания PostgreSQL) попадают в начало сборки
+	# (захвачена их арена) и продолжают посреди разметки
+	captured=1
+	[[ ${KHRIP_GC_STRESS:-} == 1 ]] && captured=$(grep -c '^gc [0-9]* (.*arenas [1-9]' "$tmp/pg/race.log")
 	# 400 попаданий по одной строке и 20 проходов по 80 строкам
-	if [[ $hits == 420 && $bad == 0 && $labels == 60 && $total == '{"n":2000,"balance":5000}' && $one == '{"id":1,"n":320}' ]] && ((cycles >= 2)); then
+	if [[ $hits == 420 && $bad == 0 && $labels == 60 && $total == '{"n":2000,"balance":5000}' && $one == '{"id":1,"n":320}' ]] && ((cycles >= 2 && captured >= 1)); then
+		[[ ${KHRIP_GC_STRESS:-} == 1 ]] && echo "pg race (KHRIP_GC_STRESS=1): $cycles collections, $captured with holders in PostgreSQL windows, arenas handed off $(grep -o '[0-9]* handed off' "$tmp/pg/race.log" | awk '{ s += $1 } END { print s + 0 }')"
 		pass=$((pass + 1))
 	else
-		failed "tests/pg/load/race.kh" "успешных /hit и /sweep: $hits из 420, других ответов на /move: $bad, /label: $labels из 60, сборок store: $cycles, итог: $total, строка 1: $one"$'\n'"$(sort "$tmp/pg/race.hits" "$tmp/pg/race.moves" | uniq -c)"$'\n'"$(grep -v '^gc [0-9]' "$tmp/pg/race.log" | tail -5)"
+		failed "tests/pg/load/race.kh" "успешных /hit и /sweep: $hits из 420, других ответов на /move: $bad, /label: $labels из 60, сборок store: $cycles (с держателями в окнах: $captured), итог: $total, строка 1: $one"$'\n'"$(sort "$tmp/pg/race.hits" "$tmp/pg/race.moves" | uniq -c)"$'\n'"$(grep -v '^gc [0-9]' "$tmp/pg/race.log" | tail -5)"
 	fi
 fi
 
