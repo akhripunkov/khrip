@@ -1,0 +1,17 @@
+ok    build the store
+ok    x.f = v shades the old value of the field
+ok    xs[i] = v shades the old element
+ok    a store global = v during marking keeps the old value
+ok    m[k] = v over a key shades the old value
+ok    m.remove(k) shades the removed key and value
+ok    m.clear() shades every key and value
+ok    push that grows the array shades the old array
+ok    pop shades the removed element
+ok    truncate shades the removed elements
+ok    clear shades every element
+ok    remove_at shades the removed element
+ok    insert during marking moves elements up and loses none
+ok    push during marking loses nothing
+ok    objects allocated during marking are black and counted
+ok    after the cycles everything kept is still there
+16 tests: 16 passed, 0 failed

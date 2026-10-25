@@ -1,0 +1,9 @@
+ok    build big arrays and a big map
+ok    remove_at across the scan position shades the element on the boundary
+ok    remove_at after the scan position moves nothing across it
+ok    sort of a partial array
+ok    reverse of a partial array
+ok    sort_by of a partial array
+ok    rehash compaction of a partial values array
+ok    after a full collection everything is still there
+8 tests: 8 passed, 0 failed

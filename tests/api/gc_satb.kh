@@ -1,0 +1,265 @@
+// Барьер SATB (docs/design/v0.13-store-gc.md §7.5), по тесту на строку
+// таблицы. Тест начинает сборку от корней (__gc_begin_from_roots: сам он
+// указателей в store не держит, и случайное слово на его стеке ничего не
+// пометит), достаёт объект, до которого разметка ещё не дошла, кладёт его в
+// корень keep (корни размечены в начале сборки, новое значение корня разметка
+// не увидит) и убирает прежний путь к объекту операцией строки. Без барьера
+// объект остался бы непомеченным, уборка освободила бы его, и keep указывал
+// бы в свободную память: с KHRIP_GC_VERIFY это ловит проверка конца разметки,
+// без неё — сам тест (__gc_is_allocated). С KHRIP_GC_STRESS шаги сборки идут
+// ещё и в точках внутри работы, поэтому «ещё не помечен» проверяется только
+// без неё. Строки без барьера (insert, push) — что во время разметки ничего не
+// теряется; новый объект — чёрный и в счёте живого.
+
+type Item { name: str, n: int }
+
+type Box { item: Item, other: Item? }
+
+store boxes: [Box]
+store items: [Item]
+store gl: Item = Item { name: "", n: 0 }
+store vals: map[int, Item]
+store named: map[str, Item]
+store cleared: map[str, Item]
+store grow: [Item]
+store popl: [Item]
+store trunc: [Item]
+store clr: [Item]
+store rem: [Item]
+store ins: [Item]
+store pushed: [Item]
+store fresh: [Item]
+store spare: Item = Item { name: "", n: 0 }
+store keep: Item?
+store keep2: Item?
+store keep_s: str
+
+// без KHRIP_GC_STRESS: шаги сборки — только те, что делает тест
+fn exact() -> bool {
+    return (env("KHRIP_GC_STRESS") ?? "") != "1"
+}
+
+// разметка до объекта ещё не дошла
+fn unmarked(x: Item) -> bool {
+    let a: int = __cast(x)
+    return !exact() || !__gc_is_marked(a)
+}
+
+fn key_unmarked(s: str) -> bool {
+    let a: int = __cast(s)
+    return !exact() || !__gc_is_marked(a)
+}
+
+// объект и его имя на месте (не освобождены; литерал — в DATA) и имя — то
+// самое
+fn alive(it: Item?, name: str) -> bool {
+    let x = it else {
+        return false
+    }
+    let a: int = __cast(x)
+    return __gc_is_allocated(a) && str_alive(x.name, name)
+}
+
+fn str_alive(s: str, want: str) -> bool {
+    let a: int = __cast(s)
+    return (__in_data(a) || __gc_is_allocated(a)) && s == want
+}
+
+fn cap_of(xs: [Item]) -> int {
+    let h: int = __cast(xs)
+    return load64(h + 16)
+}
+
+test "build the store" {
+    spare = Item { name: "spare", n: -1 }
+    gl = Item { name: "global", n: 0 }
+    for i in 0..4 {
+        boxes.push(Box { item: Item { name: "box {i}", n: i }, other: none })
+        items.push(Item { name: "item {i}", n: i })
+        vals[i] = Item { name: "val {i}", n: i }
+        named["key {i}"] = Item { name: "named {i}", n: i }
+        cleared["ckey {i}"] = Item { name: "cleared {i}", n: i }
+        grow.push(Item { name: "grow {i}", n: i })
+        popl.push(Item { name: "pop {i}", n: i })
+        rem.push(Item { name: "rem {i}", n: i })
+        ins.push(Item { name: "ins {i}", n: i })
+    }
+    for i in 0..8 {
+        trunc.push(Item { name: "trunc {i}", n: i })
+        clr.push(Item { name: "clr {i}", n: i })
+    }
+    __gc_collect()
+    expect grow.len() == 4 && cap_of(grow) == 4
+}
+
+test "x.f = v shades the old value of the field" {
+    __gc_begin_from_roots()
+    let b = boxes[1]
+    let o = b.item
+    expect unmarked(o)
+    keep = o
+    b.item = spare
+    __gc_finish()
+    expect alive(keep, "box 1") && boxes[1].item.name == "spare"
+}
+
+test "xs[i] = v shades the old element" {
+    __gc_begin_from_roots()
+    let o = items[2]
+    expect unmarked(o)
+    keep = o
+    items[2] = spare
+    __gc_finish()
+    expect alive(keep, "item 2") && items[2].name == "spare"
+}
+
+// Корни размечаются в начале сборки, поэтому старое значение глобальной уже
+// помечено; барьер __persist_root (старое значение серится) — про запас.
+test "a store global = v during marking keeps the old value" {
+    __gc_begin_from_roots()
+    let o = gl
+    keep = o
+    gl = spare
+    __gc_finish()
+    expect alive(keep, "global") && gl.name == "spare"
+}
+
+test "m[k] = v over a key shades the old value" {
+    __gc_begin_from_roots()
+    let o = vals[1] else {
+        expect false
+        return
+    }
+    expect unmarked(o)
+    keep = o
+    vals[1] = spare
+    __gc_finish()
+    expect alive(keep, "val 1")
+}
+
+test "m.remove(k) shades the removed key and value" {
+    __gc_begin_from_roots()
+    let ks = named.keys()
+    let k = ks[2]
+    let o = named[k] else {
+        expect false
+        return
+    }
+    expect unmarked(o) && key_unmarked(k)
+    keep = o
+    keep_s = k
+    named.remove(k)
+    __gc_finish()
+    expect alive(keep, "named 2") && str_alive(keep_s, "key 2") && named.len() == 3
+}
+
+test "m.clear() shades every key and value" {
+    __gc_begin_from_roots()
+    let ks = cleared.keys()
+    let k = ks[1]
+    let o = cleared[k] else {
+        expect false
+        return
+    }
+    expect unmarked(o) && key_unmarked(k)
+    keep = o
+    keep_s = k
+    cleared.clear()
+    __gc_finish()
+    expect alive(keep, "cleared 1") && str_alive(keep_s, "ckey 1") && cleared.len() == 0
+}
+
+// рост: новый массив чёрный, и разметка его не смотрит — элементы найдутся
+// только в старом, а на старый заголовок больше не ссылается
+test "push that grows the array shades the old array" {
+    __gc_begin_from_roots()
+    expect unmarked(grow[0])
+    grow.push(spare)
+    __gc_finish()
+    expect grow.len() == 5 && cap_of(grow) == 8
+    for i in 0..4 {
+        expect alive(grow[i], "grow {i}")
+    }
+}
+
+test "pop shades the removed element" {
+    __gc_begin_from_roots()
+    expect unmarked(popl[3])
+    let o = popl.pop()
+    keep = o
+    __gc_finish()
+    expect alive(keep, "pop 3") && popl.len() == 3
+}
+
+test "truncate shades the removed elements" {
+    __gc_begin_from_roots()
+    let o = trunc[5]
+    expect unmarked(o)
+    keep = o
+    trunc.truncate(2)
+    __gc_finish()
+    expect alive(keep, "trunc 5") && trunc.len() == 2
+}
+
+test "clear shades every element" {
+    __gc_begin_from_roots()
+    let o = clr[6]
+    expect unmarked(o)
+    keep = o
+    clr.clear()
+    __gc_finish()
+    expect alive(keep, "clr 6") && clr.len() == 0
+}
+
+test "remove_at shades the removed element" {
+    __gc_begin_from_roots()
+    expect unmarked(rem[1])
+    let o = rem.remove_at(1)
+    keep = o
+    __gc_finish()
+    expect alive(keep, "rem 1") && rem.len() == 3 && rem[1].name == "rem 2"
+}
+
+test "insert during marking moves elements up and loses none" {
+    __gc_begin_from_roots()
+    for i in 0..6 {
+        ins.insert(1, spare)
+    }
+    __gc_finish()
+    expect ins.len() == 10
+    expect alive(ins[0], "ins 0") && alive(ins[7], "ins 1") && alive(ins[8], "ins 2") && alive(ins[9], "ins 3")
+}
+
+test "push during marking loses nothing" {
+    __gc_begin_from_roots()
+    for i in 0..20 {
+        pushed.push(Item { name: "pushed {i}", n: i })
+    }
+    __gc_finish()
+    expect pushed.len() == 20 && alive(pushed[0], "pushed 0") && alive(pushed[19], "pushed 19")
+}
+
+// новый объект — чёрный: разметка его не смотрит, уборка оставляет; его байты
+// — в живом этой сборки, и куча после уборки — ровно живое
+test "objects allocated during marking are black and counted" {
+    __gc_begin_from_roots()
+    keep2 = Item { name: "born during marking", n: 7 }
+    for i in 0..100 {
+        fresh.push(Item { name: "fresh {i}", n: i })
+    }
+    let s = __gc_stats()
+    expect !exact() || (s.marking && s.black > 0)
+    __gc_finish()
+    let t = __gc_stats()
+    expect !t.marking
+    expect !exact() || (t.heap == t.live && t.black > 100 * 16 && t.live > t.black)
+    expect alive(keep2, "born during marking") && alive(fresh[0], "fresh 0") && alive(fresh[99], "fresh 99")
+    // куча: байты выделенных объектов — ровно __heap_live
+    __gc_verify_run("black", false)
+}
+
+test "after the cycles everything kept is still there" {
+    __gc_collect()
+    expect alive(keep, "rem 1") && alive(keep2, "born during marking") && str_alive(keep_s, "ckey 1")
+    expect boxes[0].item.name == "box 0" && items[3].name == "item 3" && grow[4].name == "spare"
+}
