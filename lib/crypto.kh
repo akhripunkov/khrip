@@ -215,16 +215,22 @@ fn __pbkdf2(pw: str, salt: int, slen: int, iter: int, out: int) {
 }
 
 // PBKDF2 считается без блокировки store, как fetch ждёт сеть: медленная
-// проверка пароля не задерживает остальные запросы.
+// проверка пароля не задерживает остальные запросы. Окно (docs/design/
+// v0.13-store-gc.md §6.5) читает пароль и соль, а пишет только в свою память
+// выше опубликованной границы арены; в out результат копируется под
+// блокировкой — окно ничего не пишет в арену ниже границы (W1). Ожидания
+// __co_yield внутри идут без блокировки и ничего не публикуют.
 fn __pbkdf2_unlocked(pw: str, salt: int, slen: int, iter: int, out: int) {
     let held = load64(__ctx() + CTX_STORE_HELD) != 0
     if held {
-        __store_unlock()
+        __store_release_keep()
     }
-    __pbkdf2(pw, salt, slen, iter, out)
+    let dk = __alloc(32)
+    __pbkdf2(pw, salt, slen, iter, dk)
     if held {
         __store_lock()
     }
+    __memcpy(out, dk, 32)
 }
 
 fn __unhex(s: str, out: int) -> int {

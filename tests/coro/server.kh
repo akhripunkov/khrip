@@ -131,3 +131,43 @@ route GET "/text" (seed: int) -> str {
     h = mix(h, s[n / 3..n / 2])
     return "{n} {h}"
 }
+
+// ---- Окна без блокировки store (lib/gc.kh, docs/design/v0.13-store-gc.md §6) ----
+// Пишущий запрос держит строку store и список в арене со ссылкой на неё через
+// fetch к себе: в окне блокировка отпущена, и запись контекста опубликована.
+// Пока он ждёт, читающий запрос (/marks) и пишущие (/log) на том же потоке
+// идут без задержки; после окна указатели те же.
+store marks: [str]
+
+route POST "/hold" (port: int, ms: int, tag: str) -> str {
+    marks.push("held-" + tag)
+    let mine = marks[marks.len() - 1]
+    let keep = [mine, "x"]
+    let r = fetch GET "http://127.0.0.1:{port}/sleep?ms={ms}&tag={tag}"
+    marks.push("after-" + tag)
+    if mine != "held-" + tag || keep[0] != mine {
+        return "lost"
+    }
+    return "{r.status} {r.body} {mine}"
+}
+
+route GET "/marks" () -> int {
+    return marks.len()
+}
+
+// Хеш пароля — тоже окно: PBKDF2 без блокировки, по частям между ожиданиями.
+route POST "/hash" (tag: str) -> str {
+    marks.push("hash-" + tag)
+    let mine = marks[marks.len() - 1]
+    let h = hash_password(mine)
+    if !check_password(mine, h) || check_password("other", h) {
+        return "wrong hash"
+    }
+    return mine
+}
+
+// Проверки сборщика (сервер собран с KHRIP_GC_VERIFY): сколько раз проверено
+// начало сборки и сколько опубликованных записей при этом встретилось.
+route GET "/gcv" () -> str {
+    return "{__gc_vstarts} {__gc_vlinked}"
+}

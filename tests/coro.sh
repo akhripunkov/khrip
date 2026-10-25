@@ -9,8 +9,9 @@ if ! "$KHC" -o "$tmp/coro" tests/coro/server.kh 2>"$tmp/coro.err"; then
 	return 0
 fi
 
+coro_bin=$tmp/coro
 coro_start() {
-	PORT=$CORO_PORT THREADS=1 "$@" "$tmp/coro" 2>"$tmp/coro.log" &
+	PORT=$CORO_PORT THREADS=1 "$@" "$coro_bin" 2>"$tmp/coro.log" &
 	coro_pid=$!
 	for _ in $(seq 100); do
 		curl -s -o /dev/null "http://127.0.0.1:$CORO_PORT/log" && break
@@ -112,6 +113,60 @@ else
 	failed "coro: кэш строк через ожидание" "$(diff "$tmp/walk.want" "$tmp/walk.got"; diff "$tmp/text.want" "$tmp/text.got" | head -5)"
 fi
 coro_stop
+
+# Окна без блокировки store (docs/design/v0.13-store-gc.md §6): пока пишущий
+# запрос ждёт fetch к себе (окно: блокировка отпущена, запись контекста
+# опубликована), читающий и пишущие запросы на том же единственном потоке идут
+# сразу — если бы окно держало блокировку, поток встал бы навсегда; строка
+# store и список в арене, которые держит ждущий, после окна те же. Хеш пароля
+# — тоже окно.
+coro_windows() {
+	local tag=$1 t0 t1 t2 t3 hold_pid r r2
+	t0=$(ms_now)
+	curl -s --max-time 10 -X POST "$url/hold?port=$CORO_PORT&ms=600&tag=$tag" >"$tmp/hold.out" &
+	hold_pid=$!
+	sleep 0.15
+	r=$(curl -s --max-time 5 "$url/marks")
+	t1=$(ms_now)
+	r2=$(curl_many 5 --max-time 5 -X POST "$url/log?text=w" | sort | uniq -c | tr -s ' ')
+	t2=$(ms_now)
+	wait "$hold_pid"
+	t3=$(ms_now)
+	if [[ "$r" =~ ^[0-9]+$ && "$r" -ge 1 && "$r2" == " 5 200" ]] && ((t1 - t0 < 500 && t2 - t0 < 600 && t3 - t0 >= 600)); then
+		http_ok
+	else
+		failed "coro: store читают и пишут, пока запрос ждёт fetch ($tag)" "marks: $r, log: $r2, чтение через $((t1 - t0)) мс, запись через $((t2 - t0)) мс, ждущий — $((t3 - t0)) мс"
+	fi
+	expect_count "запрос держит store через fetch ($tag)" "$(cat "$tmp/hold.out")" "^200 slept $tag held-$tag$" 1
+	r=$(curl_many 3 --max-time 10 -X POST "$url/hash?tag=$tag" | sort | uniq -c | tr -s ' ')
+	expect_count "хеш пароля без блокировки store ($tag)" "$r" "^ 3 200$" 1
+	r=$(curl -s --max-time 10 -X POST "$url/hash?tag=$tag")
+	expect_count "хеш пароля: строка store цела ($tag)" "$r" "^hash-$tag$" 1
+}
+
+coro_start env
+coro_windows plain
+coro_stop
+
+# То же с проверками сборщика (KHRIP_GC_VERIFY=1): каждое исключительное
+# взятие store проверяет, что каждый контекст, который брал store и отпустил
+# его посреди работы, опубликовал запись (их встретилось больше нуля), а при
+# отзыве — что окно не изменило ссылки в арене ниже границы записи (W1).
+if KHRIP_GC_VERIFY=1 "$KHC" -o "$tmp/coro_v" tests/coro/server.kh 2>"$tmp/coro.err"; then
+	coro_bin=$tmp/coro_v
+	coro_start env KHRIP_GC_VERIFY=1
+	coro_windows verify
+	r=$(curl -s "$url/gcv")
+	if [[ "$r" =~ ^[0-9]+\ [0-9]+$ && "${r#* }" -gt 0 ]] && ! grep -q 'gc verify:' "$tmp/coro.log"; then
+		http_ok
+	else
+		failed "coro: записи опубликованы при каждой проверке начала сборки" "проверок и записей: $r; журнал: $(cat "$tmp/coro.log")"
+	fi
+	coro_stop
+	coro_bin=$tmp/coro
+else
+	failed "coro" "сервер с проверками не скомпилировался: $(cat "$tmp/coro.err")"
+fi
 
 # две сопрограммы на поток: остальные запросы ждут в очереди
 coro_start env KHRIP_COROUTINES=2

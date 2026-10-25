@@ -1,0 +1,4 @@
+ok    a wait publishes what the test holds and the next lock withdraws it
+ok    the final release ends the work, the next touch starts it again
+ok    the collector's lock leaves no hold and counts no change
+3 tests: 3 passed, 0 failed

@@ -242,6 +242,28 @@ else
 	failed "раскладка ctx" "вне lib/core.kh: $ctx_other; повторы: $ctx_dup; в буферах системных вызовов: $ctx_scratch"
 fi
 
+# Окна без блокировки store (docs/design/v0.13-store-gc.md §6.5–6.6): store
+# посреди работы отпускает только __store_release_keep, и только в
+# проверенных местах — новое место должно пройти проверку правил окна W1–W3 и
+# попасть в этот список; __store_unlock_raw (отпускание без записи) — только в
+# lib/rt.kh и lib/gc.kh. Комментарии не в счёт.
+keep_sites="lib/rt.kh:__store_release_keep lib/rt.kh:__co_wait lib/fetch.kh:__fetch lib/crypto.kh:__pbkdf2_unlocked lib/mongo.kh:mongo_command lib/clickhouse.kh:__ch_run"
+kh_files=$(find lib src tests eval examples docs bench tools bootstrap -name '*.kh' 2>/dev/null | sort)
+# shellcheck disable=SC2086
+keep_found=$(awk 'FNR == 1 { f = "" }
+	/^fn [A-Za-z_0-9]+\(/ { f = $2; sub(/\(.*/, "", f) }
+	{ code = $0; sub(/\/\/.*/, "", code) }
+	code ~ /__store_release_keep\(/ { print FILENAME ":" f }' $kh_files | sort | tr '\n' ' ')
+keep_want=$(tr ' ' '\n' <<<"$keep_sites" | sort | tr '\n' ' ')
+# shellcheck disable=SC2086
+raw_bad=$(awk '{ code = $0; sub(/\/\/.*/, "", code) }
+	code ~ /__store_unlock_raw\(/ && FILENAME != "lib/rt.kh" && FILENAME != "lib/gc.kh" { print FILENAME ":" FNR }' $kh_files)
+if [[ "$keep_found" == "$keep_want" && -z "$raw_bad" ]]; then
+	pass=$((pass + 1))
+else
+	failed "места отпускания store" "__store_release_keep: $keep_found(ожидались: $keep_want); __store_unlock_raw вне lib/rt.kh и lib/gc.kh: $raw_bad"
+fi
+
 # Шаблоны регулярных выражений: проверка при компиляции (src/rx.kh) отвечает
 # на наборе tests/run/regex_grammar.kh то же, что разбор библиотеки
 # (tests/run/regex_grammar.out): шаблоны — литералами в s.matches, по 50 на

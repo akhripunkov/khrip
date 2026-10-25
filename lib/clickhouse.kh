@@ -270,10 +270,12 @@ fn __ch_run(c: ChConfig, query: str, payload: str, params: map[str, str], insert
         head += "&max_execution_time="
     }
     let rest = " HTTP/1.1\r\nHost: {u.host}:{u.port}\r\nAuthorization: Basic {auth}\r\nContent-Type: {ctype}\r\nAccept-Encoding: identity\r\nContent-Length: {sql.byte_len() + body.byte_len()}\r\n\r\n"
+    // Окно без блокировки store (docs/design/v0.13-store-gc.md §6.5): запись
+    // публикуется, в окне — только обмен; ответ — в арене выше границы записи
     let ctx = __ctx()
     let held = load64(ctx + CTX_STORE_HELD) != 0
     if held {
-        __store_unlock()
+        __store_release_keep()
     }
     let r = __dh_exchange(u, head, rest, budget, sql, body, deadline, max, inflight)
     if held {

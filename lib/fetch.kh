@@ -876,12 +876,12 @@ fn __fetch(method: str, url: str, body: int, d: int, headers: int) -> Response {
     buf_add(b, "\r\n")
     buf_add(b, text)
     let req = __str_new(b.data, b.len)
-    // окно без блокировки store — только обмен (выпуск с публикацией — шаг 4
-    // docs/design/v0.13-store-gc.md)
+    // окно без блокировки store — только обмен; запись контекста опубликована
+    // (docs/design/v0.13-store-gc.md §6.5)
     let c = __ctx()
     let held = load64(c + CTX_STORE_HELD) != 0
     if held {
-        __store_unlock()
+        __store_release_keep()
     }
     let r = __http_exchange(u, req, method)
     if held {

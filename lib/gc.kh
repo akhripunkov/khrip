@@ -1,7 +1,8 @@
 // Сборщик мусора store (docs/design/v0.13-store-gc.md). Пока здесь куча store
-// (§4: классы размеров, спаны, кучка страниц, битовые карты) и загрузка store
-// (§5.3). Записи и сама сборка — следующие шаги проекта (§14); пока память
-// store только выделяется.
+// (§4: классы размеров, спаны, кучка страниц, битовые карты), загрузка store
+// (§5.3) и записи контекстов (§3.4, §6: что держат запросы, задачи и тесты,
+// когда отпускают store посреди работы). Сама сборка — следующие шаги проекта
+// (§14); пока память store только выделяется.
 //
 // Программы без store вместо этого файла получают lib/nostore.kh; проверки
 // (KHRIP_GC_VERIFY) — в lib/gc_verify.kh или заглушки lib/gc_noverify.kh;
@@ -142,6 +143,7 @@ fn __store_init() {
     }
     __gc_ph = __mmap(128)
     __ph_init(__gc_ph, GC_PHEAP, GC_PHEAP + GC_PH_PART, GC_PHEAP + 2 * GC_PH_PART, GC_PHEAP + 3 * GC_PH_PART, 512, GC_MAX_PAGES, true)
+    __gc_reg = __mmap(16 + GC_MAX_THREADS * 8)
     __gc_ready = true
 }
 
@@ -941,6 +943,378 @@ fn __ph_free(ph: int, pg: int, np: int) {
     __ph_tick(ph)
 }
 
+// ---- Записи контекстов (§3.4, §6) ----
+// Запрос, задача или тест, который взял store и отпускает его посреди работы
+// (ожидание сети или времени, хеш пароля: __store_release_keep в lib/rt.kh),
+// публикует запись: слова со значением в STORE из своих регистров, стека,
+// слов контекста [8, CTX_CO_END), __Worker и буферов __setjmp, а арену —
+// только границами [lo, hi) (её сборщик просмотрит, только если сборка
+// придётся на окно). Следующее взятие store отзывает запись. Так сборщик
+// найдёт всё, что держит контекст без блокировки, и не будет его ждать.
+//
+// Запись одна на контекст: на сопрограмму (создаётся в __co_new) и на поток
+// вне сопрограмм (при первом взятии store). Опубликованные записи потока —
+// двусвязный список с головой в CTX_PINLIST; меняет его только контекст этого
+// потока, держа блокировку store (I4). Публикация и отзыв строго чередуются с
+// блокировкой: опубликована — только между __store_release_keep и следующим
+// __store_lock (или __store_release_final после паники в окне).
+
+// Запись контекста. Память — обычная память потока (__alloc_heap), не арена:
+// запись живёт, пока жив контекст. Поле ast — первое: его адрес — адрес
+// записи (__cas).
+type __Pin {
+    // передача арены сборщику: (номер сборки << 3) | состояние PIN_* (шаг 5)
+    ast: int
+    // соседи в списке опубликованных записей потока (0 — конец)
+    next: int
+    prev: int
+    // опубликована
+    linked: bool
+    // контекст брал store в этой работе (запрос, задача, тест)
+    touched: bool
+    // вершина стека контекста: стек копируется от регистра rsp до неё
+    top: int
+    // регистры при публикации (буфер __setjmp, 64 байта)
+    regs: int
+    // слова со значением в STORE (mmap, растёт вдвое): len из cap
+    buf: int
+    len: int
+    cap: int
+    // арена [lo, hi) при публикации; lo == hi — арены нет
+    lo: int
+    hi: int
+    // байт [lo, hi), которые сборщик уже просмотрел в этой сборке
+    aoff: int
+    // слова арены, которые просмотрел сам контекст при передаче (mmap)
+    hbuf: int
+    hlen: int
+    hcap: int
+    // __gc_cycle_no при публикации (отчёт о долгих держателях, §8.6)
+    pub_cycle: int
+    // KHRIP_GC_VERIFY: хеш слов со значением в STORE в [lo, hi) (W1)
+    whash: int
+    // следующая запись в реестре всех записей (__gc_reg)
+    all: int
+}
+
+// размер __Pin: 19 полей по 8 байт
+const PIN_BYTES = 152
+// полей в __Worker (lib/api.kh): запись копирует их
+const WORKER_WORDS = 9
+// начальный буфер слов записи (байт)
+const PIN_BUF0 = 4096
+// потоков, которые могут публиковать записи
+const GC_MAX_THREADS = 4096
+// Состояния передачи арены (ast & 7, §6.2–6.3): сборщик ещё не смотрел арену
+// (PENDING), смотрит кусок (GC), её смотрит сам контекст (SELF) и передал
+// найденное (HANDED), сборщик закончил (DONE). Вне сборки — IDLE. Пока
+// сборщика нет (шаг 5), состояние всегда IDLE.
+const PIN_IDLE = 0
+const PIN_PENDING = 1
+const PIN_GC = 2
+const PIN_SELF = 3
+const PIN_HANDED = 4
+const PIN_DONE = 5
+
+// Реестр (кусок mmap, __store_init): [0] — последняя созданная запись (по
+// полю all — все остальные), [8] — сколько потоков записано, [16 + 8·i] —
+// контекст потока i (CTX_PINLIST — его опубликованные записи).
+var __gc_reg: int
+// номер сборки (шаг 5)
+var __gc_cycle_no: int
+// KHRIP_GC_VERIFY: сколько раз проверено начало сборки (__gc_verify_start) и
+// сколько опубликованных записей при этом встретилось
+var __gc_vstarts: int
+var __gc_vlinked: int
+
+// Новая запись контекста с вершиной стека top (lib/http.kh, __co_new; для
+// потока — __pin_acquired). Память — обычная память потока; запись — в
+// реестр, без блокировки (CAS).
+fn __pin_new(top: int) -> int {
+    let r = __alloc_heap(PIN_BYTES)
+    let rec: __Pin = __cast(r)
+    rec.top = top
+    rec.regs = __alloc_heap(64)
+    while true {
+        let h = load64(__gc_reg)
+        rec.all = h
+        if __cas(__gc_reg, h, r) {
+            break
+        }
+    }
+    return r
+}
+
+// Взятие store (__store_lock, блокировка уже взята): контекст брал store в этой
+// работе; опубликованная запись отзывается. У потока вне сопрограмм запись
+// создаётся при первом взятии. Без кучи store (до __store_init) указателей в
+// store нет и запись не нужна.
+fn __pin_acquired(c: int) {
+    var r = load64(c + CTX_PINREC)
+    if r == 0 {
+        if !__gc_ready {
+            return
+        }
+        r = __pin_new(__pin_top(c))
+        store64(c + CTX_PINREC, r)
+    }
+    let rec: __Pin = __cast(r)
+    rec.touched = true
+    if rec.linked {
+        __pin_withdraw(rec)
+    }
+    if __gc_verify && load64(c + CTX_STORE_HELD) == 1 {
+        __gc_verify_start(r)
+    }
+}
+
+// Вершина стека контекста: у сопрограммы — стек запросов потока, иначе — стек
+// потока (CTX_STACK_TOP: __entry, __thread_main).
+fn __pin_top(c: int) -> int {
+    let cv = load64(c + CTX_CORO)
+    if cv != 0 {
+        let co: __Co = __cast(cv)
+        return co.sch.top
+    }
+    return load64(c + CTX_STACK_TOP)
+}
+
+// Публикация (__store_release_keep; блокировка ещё взята): регистры (__setjmp
+// здесь: то, что вызвавшие держат в rbx, rbp, r12–r15, либо ещё в регистрах,
+// либо сохранено в их кадрах, I7), весь стек от rsp до вершины, слова
+// контекста [8, CTX_CO_END) (текст паники, CTX_JNULLS, ...), __Worker и буферы
+// __setjmp запроса и CTX_CATCH — копируются слова со значением в STORE; арена
+// запоминается границами: [начало арены, CTX_PTR). Затем запись — в список
+// потока.
+fn __pin_publish(r: int) {
+    if r == 0 {
+        return
+    }
+    let rec: __Pin = __cast(r)
+    if __gc_verify {
+        __gc_check_slow()
+        if rec.linked {
+            __gc_fatal("a context record is published twice (I4)")
+        }
+    }
+    __setjmp(rec.regs)
+    let sp = load64(rec.regs + 8)
+    if sp >= rec.top {
+        // стек не был бы скопирован: лучше остановиться, чем потерять указатели
+        __oom_exit("khrip: internal: a store context record without its stack top\n")
+    }
+    rec.len = 0
+    __pin_take(rec, rec.regs, 8)
+    __pin_take(rec, sp, (rec.top - sp) >> 3)
+    let c = __ctx()
+    __pin_take(rec, c + 8, (CTX_CO_END - 8) >> 3)
+    let wv = load64(c + CTX_WORKER)
+    if wv != 0 {
+        let w: __Worker = __cast(wv)
+        __pin_take(rec, wv, WORKER_WORDS)
+        __pin_take(rec, w.jb, 8)
+    }
+    let cj = load64(c + CTX_CATCH)
+    if cj != 0 {
+        __pin_take(rec, cj, 8)
+    }
+    let p = load64(c + CTX_PTR)
+    if __in_arena(p) {
+        rec.lo = load64(c + CTX_ARENA)
+        rec.hi = p
+    } else {
+        rec.lo = 0
+        rec.hi = 0
+    }
+    if __gc_verify {
+        rec.whash = __pin_hash(rec.lo, rec.hi)
+    }
+    rec.pub_cycle = __gc_cycle_no
+    __gc_register_thread(c)
+    let h = load64(c + CTX_PINLIST)
+    rec.next = h
+    rec.prev = 0
+    if h != 0 {
+        let hr: __Pin = __cast(h)
+        hr.prev = r
+    }
+    store64(c + CTX_PINLIST, r)
+    rec.linked = true
+}
+
+// Слова [p, p + 8n) со значением в STORE — в буфер записи. Места в буфере —
+// на все n слов (__simd_pinscan): он растёт вдвое, новый кусок mmap — с копией
+// занятых слов, старый — системе.
+fn __pin_take(rec: __Pin, p: int, n: int) {
+    if n <= 0 {
+        return
+    }
+    if rec.len + n > rec.cap {
+        let nc = __pin_cap(rec.cap, rec.len + n)
+        let nb = __mmap(nc * 8)
+        if rec.len > 0 {
+            __memcpy(nb, rec.buf, rec.len * 8)
+        }
+        if rec.buf != 0 {
+            syscall(SYS_MUNMAP, rec.buf, rec.cap * 8)
+        }
+        rec.buf = nb
+        rec.cap = nc
+    }
+    rec.len += __simd_pinscan(p, n, rec.buf + rec.len * 8)
+}
+
+// Вместимость буфера слов на need слов: вдвое, начальная — PIN_BUF0 байт.
+fn __pin_cap(cap: int, need: int) -> int {
+    var nc = cap
+    if nc == 0 {
+        nc = PIN_BUF0 >> 3
+    }
+    while nc < need {
+        nc *= 2
+    }
+    return nc
+}
+
+// Отзыв (взятие store, блокировка уже взята): запись уходит из списка потока.
+// С KHRIP_GC_VERIFY арена ниже опубликованной границы должна быть той же
+// (W1). Если сборка, начатая в окне, ещё не просмотрела арену (PENDING),
+// контекст просматривает её сам и передаёт найденное (HANDED): после отзыва он
+// снова пишет в арену; если сборщик смотрит её кусок (GC) — подождать (кусок
+// не больше 256 КБ). Пока сборщика нет (шаг 5), состояние всегда IDLE.
+fn __pin_withdraw(rec: __Pin) {
+    let c = __ctx()
+    let r: int = __cast(rec)
+    if rec.prev == 0 {
+        if __gc_verify && load64(c + CTX_PINLIST) != r {
+            __gc_fatal("a published record is not in its thread's list (I4)")
+        }
+        store64(c + CTX_PINLIST, rec.next)
+    } else {
+        let pv: __Pin = __cast(rec.prev)
+        pv.next = rec.next
+    }
+    if rec.next != 0 {
+        let nx: __Pin = __cast(rec.next)
+        nx.prev = rec.prev
+    }
+    rec.next = 0
+    rec.prev = 0
+    rec.linked = false
+    if __gc_verify && __pin_hash(rec.lo, rec.hi) != rec.whash {
+        __gc_fatal("code in a store window changed a store pointer in the arena below the published bound (W1)")
+    }
+    while true {
+        let s = rec.ast
+        let st = s & 7
+        if st == PIN_PENDING {
+            if __cas(r, s, (s & ~7) | PIN_SELF) {
+                __pin_self_scan(rec)
+                rec.ast = (s & ~7) | PIN_HANDED
+                break
+            }
+        } else if st == PIN_GC {
+            __cpu_pause()
+        } else {
+            break
+        }
+    }
+}
+
+// Передача (PENDING → SELF): контекст сам просматривает непросмотренную часть
+// арены [lo + aoff, hi) в hbuf; сборщик разберёт найденное (§6.3).
+fn __pin_self_scan(rec: __Pin) {
+    let from = rec.lo + rec.aoff
+    let n = (rec.hi - from) >> 3
+    rec.hlen = 0
+    if n <= 0 {
+        return
+    }
+    if n > rec.hcap {
+        let nc = __pin_cap(rec.hcap, n)
+        let nb = __mmap(nc * 8)
+        if rec.hbuf != 0 {
+            syscall(SYS_MUNMAP, rec.hbuf, rec.hcap * 8)
+        }
+        rec.hbuf = nb
+        rec.hcap = nc
+    }
+    rec.hlen = __simd_pinscan(from, n, rec.hbuf)
+}
+
+// KHRIP_GC_VERIFY: хеш слов со значением в STORE в [lo, hi) вместе с их
+// адресами (W1). Кэш строк в начале арены (STRC_SIZE байт, lib/text.kh) не в
+// счёт: его ключи — адреса для сравнения, не ссылки (устаревшие ключи
+// снимает номер сборки __store_epoch).
+fn __pin_hash(lo: int, hi: int) -> int {
+    var p = lo
+    if hi - lo >= STRC_SIZE {
+        p = lo + STRC_SIZE
+    }
+    var h = 0
+    while p < hi {
+        let w = load64(p)
+        if (w >> 38) == 0x40 {
+            h = (h ^ w ^ (p << 1)) * 0x100000001B3
+        }
+        p += 8
+    }
+    return h
+}
+
+// Последнее отпускание без блокировки (__store_release_final): → true, если
+// запись опубликована (паника в окне) — тогда блокировка берётся снова, и
+// отзыв идёт под ней; иначе работа просто закончена.
+fn __pin_unfinished(c: int) -> bool {
+    let r = load64(c + CTX_PINREC)
+    if r == 0 {
+        return false
+    }
+    let rec: __Pin = __cast(r)
+    if rec.linked {
+        return true
+    }
+    rec.touched = false
+    return false
+}
+
+// Последнее отпускание под блокировкой (__store_release_final): хуки писателя
+// (помощь разметке и жёсткий предел — шаги 5 и 6), проверки сборщика (граф и
+// куча после работы под исключительной блокировкой), работа закончена.
+fn __pin_final(c: int) {
+    __gc_verify_release()
+    let r = load64(c + CTX_PINREC)
+    if r != 0 {
+        let rec: __Pin = __cast(r)
+        rec.touched = false
+    }
+}
+
+// KHRIP_GC_VERIFY (__co_put): сопрограмма закончила запрос последним
+// отпусканием, её запись не опубликована (W3).
+fn __pin_check_idle(r: int) {
+    if __gc_verify && r != 0 {
+        let rec: __Pin = __cast(r)
+        if rec.linked || rec.touched {
+            __gc_fatal("a finished request left its context record published (W3)")
+        }
+    }
+}
+
+// Поток — в реестр при первой публикации (флаг CTX_REGISTERED): сборщик
+// обходит списки записей записанных потоков.
+fn __gc_register_thread(c: int) {
+    if load64(c + CTX_REGISTERED) != 0 {
+        return
+    }
+    let i = __xadd(__gc_reg + 8, 1)
+    if i >= GC_MAX_THREADS {
+        __oom_exit("khrip: more than 4096 threads hold store pointers\n")
+    }
+    store64(__gc_reg + 16 + i * 8, c)
+    store64(c + CTX_REGISTERED, 1)
+}
+
 // ---- Загрузка ----
 
 // Начало программы со store (__serve, __run_timers — с load, __tests_init —
@@ -983,7 +1357,7 @@ fn __store_boot(load: bool) {
     if restored && __gc_verify {
         __gc_verify_graph("restore")
     }
-    __store_unlock()
+    __store_release_final()
     __store_saved = __store_touches
 }
 

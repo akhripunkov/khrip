@@ -1559,7 +1559,7 @@ fn parse_builtin(t: Token, w: int) -> int {
         }
         return ty_opt(inner)
     }
-    let lib_only = name == "__fsqrt" || name.starts_with("__simd_") || name == "__sha256_x64" || name == "__sha512_x64" || name == "__cpu_aes" || name == "__aes_ctr" || name == "__ghash" || name == "__chacha_block" || name == "__mp_add" || name == "__mp_sub" || name == "__mont_mul" || name == "__madd" || name == "__msub" || name == "__wmul" || name == "__cpu_avx2" || name == "__cpu_pdep" || name == "__cpu_sha" || name == "__spawn" || name == "__co_call" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset" || name == "__data_end" || name == "__data_hex" || name == "__gc_roots" || name == "__ctz" || name == "__clz"
+    let lib_only = name == "__fsqrt" || name.starts_with("__simd_") || name == "__sha256_x64" || name == "__sha512_x64" || name == "__cpu_aes" || name == "__aes_ctr" || name == "__ghash" || name == "__chacha_block" || name == "__mp_add" || name == "__mp_sub" || name == "__mont_mul" || name == "__madd" || name == "__msub" || name == "__wmul" || name == "__cpu_avx2" || name == "__cpu_pdep" || name == "__cpu_sha" || name == "__spawn" || name == "__co_call" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset" || name == "__data_end" || name == "__data_hex" || name == "__gc_roots" || name == "__ctz" || name == "__clz" || name == "__sp" || name == "__cpu_pause"
     if lib_only && !files[t.file].is_lib {
         return -1
     }
@@ -1624,6 +1624,13 @@ fn parse_builtin(t: Token, w: int) -> int {
         advance()
         builtin_regs(4, t, name, [RDI, RSI, RDX, RCX])
         emit_simd_case()
+        return ty_int
+    }
+    if name == "__simd_pinscan" {
+        // слова со значением в STORE (lib/gc.kh, записи сборщика)
+        advance()
+        builtin_regs(3, t, name, [RDI, RSI, RDX])
+        emit_simd_pinscan()
         return ty_int
     }
     if name == "__data_hex" {
@@ -1867,6 +1874,20 @@ fn parse_builtin(t: Token, w: int) -> int {
             emit_hex("B9 7F 00 00 00 48 0F BD C0 48 0F 44 C1 48 83 F0 3F")
         }
         return ty_int
+    }
+    if name == "__sp" {
+        // указатель стека здесь: mov rax, rsp (вершина стека потока, lib/rt.kh)
+        advance()
+        expect_tok(')')
+        emit_hex("48 89 E0")
+        return ty_int
+    }
+    if name == "__cpu_pause" {
+        // pause: подсказка процессору в цикле ожидания (lib/gc.kh)
+        advance()
+        expect_tok(')')
+        emit_hex("F3 90")
+        return ty_void
     }
     if name == "__xchg" || name == "__xadd" {
         advance()

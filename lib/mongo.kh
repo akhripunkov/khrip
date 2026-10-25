@@ -1336,11 +1336,11 @@ fn mongo_command(client: Mongo, database: str, command: Bson) -> MongoResult {
     if q.error != "" {
         return __mongo_failure(q.error)
     }
-    // окно без блокировки store — только обмен (выпуск с публикацией — шаг 4
-    // docs/design/v0.13-store-gc.md)
+    // окно без блокировки store — только обмен; запись контекста опубликована
+    // (docs/design/v0.13-store-gc.md §6.5)
     let held = load64(__ctx() + CTX_STORE_HELD) != 0
     if held {
-        __store_unlock()
+        __store_release_keep()
     }
     let result = __mongo_run(q)
     if held {

@@ -24,9 +24,6 @@ fn __panic_recover() {
 fn __store_lock() {
 }
 
-fn __store_unlock() {
-}
-
 // Куча store (lib/gc.kh): ядро ссылается на неё, но без store в неё не попадает.
 fn __salloc(n: int, kind: int, mask: int) -> int {
     exit(101)

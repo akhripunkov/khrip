@@ -1,0 +1,71 @@
+// Записи контекстов сборщика store (lib/gc.kh, docs/design/v0.13-store-gc.md
+// §3.4, §6): ожидание посреди работы публикует то, что держит тест (адрес
+// строки store среди найденных слов, границы арены), следующее взятие store
+// отзывает запись; последнее отпускание заканчивает работу; блокировка
+// сборщика — исключительная, но без следа в контексте и без счёта изменений.
+
+store items: [str]
+
+fn rec_of() -> __Pin {
+    return __cast(load64(__ctx() + CTX_PINREC))
+}
+
+test "a wait publishes what the test holds and the next lock withdraws it" {
+    // строка из арены (литерал остался бы в DATA): в store — её копия
+    let n = 1
+    items.push("first-{n}")
+    let mine = items[0]
+    let rec = rec_of()
+    expect rec.touched
+    expect !rec.linked
+    sleep(1)
+    expect load64(__ctx() + CTX_STORE_HELD) == 1
+    expect rec.touched
+    expect !rec.linked
+    // среди слов, найденных при публикации, — адрес строки, которую держит тест
+    let want: int = __cast(mine)
+    var seen = false
+    for i in 0..rec.len {
+        if load64(rec.buf + i * 8) == want {
+            seen = true
+        }
+    }
+    expect seen
+    // тест работает в арене: она опубликована границами
+    expect (rec.lo >> 45) == 1
+    expect rec.hi > rec.lo
+    expect mine == "first-1"
+}
+
+test "the final release ends the work, the next touch starts it again" {
+    expect items.len() == 1
+    let rec = rec_of()
+    expect rec.touched
+    __store_release_final()
+    expect load64(__ctx() + CTX_STORE_HELD) == 0
+    expect !rec.touched
+    expect !rec.linked
+    // отпускать второй раз нечего
+    __store_release_final()
+    expect !rec.touched
+    items.push("second")
+    expect rec.touched
+    expect load64(__ctx() + CTX_STORE_HELD) == 1
+}
+
+test "the collector's lock leaves no hold and counts no change" {
+    let t = __store_touches
+    __store_lock_gc()
+    let held = load64(__ctx() + CTX_STORE_HELD)
+    let writer = load64(__store_rw + 16)
+    __store_unlock_gc()
+    expect held == 0
+    expect writer == 1
+    expect load64(__store_rw + 16) == 0
+    expect __store_touches == t
+    __store_lock_marker()
+    let wm = load64(__store_rw + 16)
+    __store_unlock_marker()
+    expect wm == 0
+    expect items.len() == 2
+}

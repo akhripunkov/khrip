@@ -19,8 +19,8 @@ trap cleanup EXIT
 # Окно без блокировки store в __ch_run (docs/design/v0.13-store-gc.md §6.5):
 # срок, пределы и байты запроса — до него; в окне — только обмен
 # __dh_exchange по локальным значениям, а он не читает ChConfig.
-window=$(sed -n '/^fn __ch_run(/,/^}/p' lib/clickhouse.kh | sed -n '/__store_unlock()/,/__store_lock()/p' |
-    grep -v -e '__store_unlock()' -e '__store_lock()' -e '^ *} *$' -e '^ *if held {$')
+window=$(sed -n '/^fn __ch_run(/,/^}/p' lib/clickhouse.kh | sed -n '/__store_release_keep()/,/__store_lock()/p' |
+    grep -v -e '__store_release_keep()' -e '__store_lock()' -e '^ *} *$' -e '^ *if held {$')
 if [[ "$window" != "    let r = __dh_exchange(u, head, rest, budget, sql, body, deadline, max, inflight)" ]] ||
     sed -n '/^fn __dh_exchange(/,/^}/p' lib/db_http.kh | grep -q -e 'ChConfig' -e 'timeout_ms' -e 'max_response_bytes' -e 'max_inflight\.'; then
     echo "FAIL __ch_run: the store-lock window must hold only __dh_exchange over local values:"
