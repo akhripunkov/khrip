@@ -256,9 +256,19 @@ fn __gc_verify_marks() {
     __gcv_marks = false
 }
 
-// После уборки (§8.7): куча согласована — учёт байтов, свободные слоты без
-// битов PTRB, записи спанов, кучка страниц.
-fn __gc_verify_swept() {
+// После уборки (§8.7): уборка оставила ровно живое (помеченное разметкой и
+// выделенное чёрным за время разметки, kept — байт оставленных объектов); куча
+// согласована — учёт байтов, свободные слоты без битов PTRB, записи спанов,
+// кучка страниц. Слова арен, найденные разметкой, больше 1 МБ — системе.
+fn __gc_verify_swept(kept: int) {
+    if kept != __heap_marked {
+        __gc_fatal("the sweep kept {kept} bytes, but marking counted {__heap_marked} ({__gc_black_bytes} of them allocated black)")
+    }
+    if __gc_vwcap * 8 > GC_MB {
+        syscall(SYS_MUNMAP, __gc_vw, __gc_vwcap * 8)
+        __gc_vw = 0
+        __gc_vwcap = 0
+    }
     let st = syscall(SYS_MMAP, 0, 64, 3, 0x22, -1, 0)
     if st < 0 {
         return
@@ -778,4 +788,43 @@ fn __gcv_place(t: int, cap: int, p: int) {
         i = (i + 1) & (cap - 1)
     }
     store64(t + i * 8, p)
+}
+
+// Слово арены w, которое разметка нашла сама (__gc_resolve_range): его снова
+// проверит конец разметки (__gc_verify_pins).
+fn __gc_vnote(w: int) {
+    if __gc_nvw == __gc_vwcap {
+        __gc_vw = __gc_regrow(__gc_vw, __gc_nvw, __gc_vwcap, 8, 0)
+        __gc_vwcap = __gc_regrow_cap
+    }
+    store64(__gc_vw + __gc_nvw * 8, w)
+    __gc_nvw += 1
+}
+
+// KHRIP_GC_STRESS без потока сборщика (khc test): шаг сборки вместо сборки
+// целиком — в точке внутри работы (жёсткий предел; self — запись контекста,
+// он держит store исключительно) и в окне (self = 0: запись уже опубликована,
+// блокировку сборщика взял вызывающий). Нет разметки — начать (в точке внутри
+// работы контекст публикует себя на время начала и, отзывая запись, сам
+// передаёт свою арену); идёт — GC_STRESS_WORK единиц; кончилась — конец
+// разметки и уборка. Так разметка идёт, пока тесты меняют store: барьеры,
+// правило частичного массива и передача арен работают на всём наборе.
+fn __gc_stress_step(self: int) -> bool {
+    __gc_busy = true
+    if __gc_phase != GC_PH_MARK {
+        if self != 0 {
+            __pin_publish(self)
+        }
+        __gc_begin_cycle(self, GC_WHY_STRESS)
+        if self != 0 {
+            __pin_withdraw(__cast(self))
+        }
+    } else if __gc_mark(0, GC_STRESS_WORK, false) {
+        __gc_finish_stw(GC_WHY_STRESS)
+        if !__gc_has_thread {
+            __gc_scavenge(false, true, __gc_runs)
+        }
+    }
+    __gc_busy = false
+    return true
 }

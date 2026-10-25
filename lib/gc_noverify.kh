@@ -36,8 +36,18 @@ fn __gc_verify_records(self: int, acquiring: bool) {
 fn __gc_verify_marks() {
 }
 
-fn __gc_verify_swept() {
+fn __gc_verify_swept(kept: int) {
 }
 
 fn __gc_verify_graph(when: str) {
+}
+
+fn __gc_vnote(w: int) {
+}
+
+// Шаги сборки KHRIP_GC_STRESS (khc test, программы без потока сборщика) — с
+// проверками (lib/gc_verify.kh); без них у жёсткого предела — сборка целиком
+// (→ false), а окно — не точка сборки.
+fn __gc_stress_step(self: int) -> bool {
+    return false
 }

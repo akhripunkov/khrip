@@ -83,22 +83,40 @@ fn __gc_spawn() {
 fn __gc_thread_main() {
 }
 
-// Барьера SATB без store нет: разметки не бывает (__gc_marking всегда 0), и
-// хуки контейнеров (lib/core.kh) и барьеры (lib/api.kh) их не вызывают.
+// Барьера SATB без store нет: разметки не бывает. Хуки контейнеров
+// (lib/core.kh) и барьеров (lib/api.kh) пустые — встраиваются в ничто.
+fn __gc_field(obj: int, off: int) {
+}
+
+fn __gc_elem(xs: int, i: int) {
+}
+
+fn __gc_root(slot: int) {
+}
+
 fn __gc_shade(w: int) {
 }
 
-fn __gc_shade_in(h: int, w: int) {
+fn __gc_old_array(h: int) {
 }
 
-fn __gc_shade_words(h: int, p: int, n: int) {
+fn __gc_old_slots(m: int) {
 }
 
-fn __gc_shade_root(slot: int) {
+fn __gc_old_at(m: int, a: int) {
 }
 
-fn __gc_moved(h: int, d: int, i: int, n: int) {
+fn __gc_vacate(h: int, from: int) {
 }
 
-fn __gc_permute(h: int, d: int, n: int) {
+fn __gc_remove_at(h: int, v: int, i: int, n: int) {
+}
+
+fn __gc_permute(h: int) {
+}
+
+fn __gc_map_removed(m: int, idx: int, v: int) {
+}
+
+fn __gc_map_cleared(m: int, n: int) {
 }

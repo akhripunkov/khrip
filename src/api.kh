@@ -109,6 +109,10 @@ fn uses_api() -> bool {
 var user_tok_from: int = -1
 var user_tok_to: int
 
+// В программе куча store (lib/gc.kh: store или khc test). Без неё барьеры —
+// прежние __barrier и __persist: объектов store нет, и серить нечего.
+var store_heap: bool
+
 // Есть ли в программе store: ей нужна куча store (lib/gc.kh).
 fn uses_store() -> bool {
     var i = user_tok_from
@@ -1111,6 +1115,10 @@ fn store_write(t: int, addr: int) {
     }
     emit_mov_rr(RDI, RAX)
     emit_mov_imm(RSI, type_desc(t))
+    if !store_heap {
+        emit_call(rt_func("__persist"))
+        return
+    }
     emit_mov_imm(RDX, addr)
     emit_call(rt_func("__persist_root"))
 }
@@ -1138,6 +1146,10 @@ fn emit_field_barrier(field: int, t: int) {
     if !barrier_on(t) {
         return
     }
+    if !store_heap {
+        emit_barrier(0, t)
+        return
+    }
     emit_mov_rr(RDX, RAX)
     emit_load(RDI, RSP, 0)
     emit_mov_imm(RSI, field)
@@ -1148,6 +1160,10 @@ fn emit_field_barrier(field: int, t: int) {
 // Значение (rax) ложится в элемент [rsp] списка [rsp + 8] (__barrier_idx).
 fn emit_index_barrier(t: int) {
     if !barrier_on(t) {
+        return
+    }
+    if !store_heap {
+        emit_barrier(8, t)
         return
     }
     emit_mov_rr(RDX, RAX)

@@ -295,7 +295,8 @@ fn main() -> int {
     // которые собирают с KHRIP_GC_VERIFY в окружении, иначе их заглушки;
     // самопроверка кучки страниц (lib/gc_test.kh) — только тестам.
     var heap_libs: [str] = []
-    if test_mode || uses_store() {
+    store_heap = test_mode || uses_store()
+    if store_heap {
         heap_libs.push("gc.kh")
         if test_mode || gc_verify_wanted() {
             heap_libs.push("gc_verify.kh")
