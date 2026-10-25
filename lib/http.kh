@@ -495,7 +495,9 @@ fn __co_get(s: __Server) -> __Co? {
 
 fn __co_put(s: __Server, co: __Co) {
     // запрос закончен последним отпусканием store: запись не опубликована
-    __pin_check_idle(load64(co.ctx + CTX_PINREC))
+    if __gc_verify {
+        __pin_check_idle(load64(co.ctx + CTX_PINREC))
+    }
     co.started = false
     co.parked = false
     co.done = false
@@ -926,6 +928,9 @@ fn __env_int(name: str, default: int) -> int {
 const SYS_SCHED_SETAFFINITY = 203
 const SYS_SCHED_GETAFFINITY = 204
 const THREAD_STACK = 8388608
+// Рабочих потоков не больше: реестр потоков сборщика store (lib/gc.kh,
+// GC_MAX_THREADS) вмещает их, поток задач и поток сборщика.
+const THREADS_MAX = 4000
 
 // Ядра, на которых разрешено работать процессу (учитывает taskset).
 var __cpus: [int]
@@ -1139,13 +1144,18 @@ fn __run_timers() {
 fn __serve() {
     __http_port = __env_int("PORT", 8080)
     __ignore_sigpipe()
-    __store_boot(true)
-    __db_init()
     __read_cpus()
     var n = __env_int("THREADS", __cpus.len())
     if n < 1 {
         n = 1
     }
+    if n > THREADS_MAX {
+        // до загрузки store и подключения к базам
+        eprint("khrip: THREADS={n}: at most {THREADS_MAX} worker threads")
+        exit(1)
+    }
+    __store_boot(true)
+    __db_init()
     __threads = n
     let timers = __timers_wanted()
     if timers {

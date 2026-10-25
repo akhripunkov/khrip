@@ -8,9 +8,9 @@
 // (KHRIP_GC_VERIFY) — в lib/gc_verify.kh или заглушки lib/gc_noverify.kh;
 // самопроверка кучки страниц — lib/gc_test.kh (src/main.kh).
 
-// Проверки сборщика включены (KHRIP_GC_VERIFY, lib/gc_verify.kh)
-var __gc_verify: bool
-// проверки и при каждом выделении (KHRIP_GC_VERIFY=1): быстрого пути нет
+// Признак проверок сборщика __gc_verify — в lib/core.kh (его смотрит и код
+// рантайма, общий с программами без store).
+// Проверки и при каждом выделении (KHRIP_GC_VERIFY=1): быстрого пути нет
 var __gc_verify_slow: bool
 // Выделение — только общим путём (__salloc_slow): идут проверки при каждом
 // выделении или разметка. Признак пересчитывает __gc_slow_update; разметку
@@ -997,13 +997,14 @@ type __Pin {
     all: int
 }
 
-// размер __Pin: 19 полей по 8 байт
+// размер __Pin: 19 полей по 8 байт; полей в __Worker (lib/api.kh) — запись
+// копирует их. Обе цифры сверяет с типами tests/api/gc_records.kh.
 const PIN_BYTES = 152
-// полей в __Worker (lib/api.kh): запись копирует их
 const WORKER_WORDS = 9
 // начальный буфер слов записи (байт)
 const PIN_BUF0 = 4096
-// потоков, которые могут публиковать записи
+// потоков, которые могут публиковать записи: рабочие (не больше THREADS_MAX,
+// lib/http.kh), поток задач и поток сборщика
 const GC_MAX_THREADS = 4096
 // Состояния передачи арены (ast & 7, §6.2–6.3): сборщик ещё не смотрел арену
 // (PENDING), смотрит кусок (GC), её смотрит сам контекст (SELF) и передал
@@ -1264,7 +1265,11 @@ fn __pin_hash(lo: int, hi: int) -> int {
 
 // Последнее отпускание без блокировки (__store_release_final): → true, если
 // запись опубликована (паника в окне) — тогда блокировка берётся снова, и
-// отзыв идёт под ней; иначе работа просто закончена.
+// отзыв идёт под ней; иначе работа просто закончена. С KHRIP_GC_VERIFY
+// контекст, который брал store и не держит ни блокировки, ни опубликованной
+// записи, — нарушение I3 (отпускание мимо __store_release_keep): проверка
+// начала сборки видит только другие контексты, а единственный (khc test)
+// попадается здесь.
 fn __pin_unfinished(c: int) -> bool {
     let r = load64(c + CTX_PINREC)
     if r == 0 {
@@ -1273,6 +1278,11 @@ fn __pin_unfinished(c: int) -> bool {
     let rec: __Pin = __cast(r)
     if rec.linked {
         return true
+    }
+    if __gc_verify && rec.touched {
+        // брал store и отпустил его без записи, а теперь заканчивает работу:
+        // всё это время сборщик не видел, что он держит
+        __gc_fatal("a context released store in the middle of its work without publishing its record (I3)")
     }
     rec.touched = false
     return false
@@ -1293,7 +1303,7 @@ fn __pin_final(c: int) {
 // KHRIP_GC_VERIFY (__co_put): сопрограмма закончила запрос последним
 // отпусканием, её запись не опубликована (W3).
 fn __pin_check_idle(r: int) {
-    if __gc_verify && r != 0 {
+    if r != 0 {
         let rec: __Pin = __cast(r)
         if rec.linked || rec.touched {
             __gc_fatal("a finished request left its context record published (W3)")

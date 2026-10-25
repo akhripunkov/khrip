@@ -324,9 +324,9 @@ fn __mutex_unlock(m: int) {
 // (запрос, задача или тест ещё держит указатели в store): контекст публикует
 // свою запись (lib/gc.kh), и сборщик видит, что тот держит; и
 // __store_release_final — в конце работы. Каждое взятие отзывает
-// опубликованную запись. __store_unlock_raw — только здесь и в lib/gc.kh
-// (проверка в tests/run.sh), а места __store_release_keep перечислены там же:
-// новое место отпускания проверяется по правилам окна W1–W3 (§6.6).
+// опубликованную запись. __store_unlock_raw вызывают только эти две, а места
+// __store_release_keep перечислены в tests/store_windows.sh: новое место
+// отпускания проверяется по правилам окна W1–W3 (§6.6).
 var __store_rw: int
 // Сколько раз store брали на запись: по нему видно, что store могли изменить.
 var __store_touches: int
@@ -406,8 +406,8 @@ fn __store_lock() {
     __pin_acquired(c)
 }
 
-// Отпустить store без записи. Только здесь и в lib/gc.kh: каждое отпускание
-// посреди работы — __store_release_keep, в конце — __store_release_final.
+// Отпустить store без записи. Вызывают только __store_release_keep (посреди
+// работы) и __store_release_final (в конце; tests/store_windows.sh).
 fn __store_unlock_raw() {
     let c = __ctx()
     let held = load64(c + CTX_STORE_HELD)
@@ -429,9 +429,9 @@ fn __store_unlock_raw() {
 // сначала запись контекста публикует указатели в store, которые он держит
 // (регистры, стек, контекст; арену — границами), затем блокировка
 // отпускается. Окно кончается __store_lock. Места вызова перечислены в
-// tests/run.sh: код окна не пишет в арену ниже опубликованной границы (W1),
-// не читает изменяемых объектов store (W2), а паника в нём доходит до
-// __store_release_final (W3).
+// tests/store_windows.sh: код окна не пишет в арену ниже опубликованной
+// границы (W1), не читает изменяемых объектов store (W2), а паника в нём
+// доходит до __store_release_final (W3).
 fn __store_release_keep() {
     let c = __ctx()
     if load64(c + CTX_STORE_HELD) == 0 {
@@ -459,7 +459,8 @@ fn __store_release_final() {
 
 // Блокировка сборщика (lib/gc.kh, начало сборки): исключительная, но без
 // CTX_STORE_HELD, без __store_touches (KHRIP_DATA не видит изменения) и без
-// записи — у потока сборщика нет указателей в store.
+// записи — у потока сборщика нет указателей в store. Отпускают её и мьютекс
+// разметки только в lib/gc.kh (tests/store_windows.sh).
 fn __store_lock_gc() {
     __store_rw_init()
     __store_write_lock(__store_rw)

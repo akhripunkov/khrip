@@ -39,6 +39,16 @@ curl_many() {
 	wait "${pids[@]}"
 }
 
+# Рабочих потоков не больше 4000 (реестр потоков сборщика store, lib/gc.kh):
+# больше — отказ при старте, а не выход посреди работы.
+r=$(PORT=$CORO_PORT THREADS=5000 timeout 5 "$coro_bin" 2>&1)
+rc=$?
+if [[ $rc == 1 && "$r" == *"THREADS=5000: at most 4000 worker threads"* ]]; then
+	http_ok
+else
+	failed "coro: THREADS сверх предела" "код $rc: $r"
+fi
+
 coro_start env
 url="http://127.0.0.1:$CORO_PORT"
 

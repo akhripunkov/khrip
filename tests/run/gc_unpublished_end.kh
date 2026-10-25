@@ -1,0 +1,24 @@
+// exit: 101
+// build-env: KHRIP_GC_VERIFY=1
+// env: KHRIP_GC_VERIFY=1
+// Записи контекстов (lib/gc.kh, docs/design/v0.13-store-gc.md I3): с
+// KHRIP_GC_VERIFY последнее отпускание store замечает и сам контекст, который
+// брал store, а потом отпустил его мимо __store_release_keep (здесь — забыл,
+// что держит: так выглядит отпускание без записи) — даже если других
+// контекстов, чью проверку начала сборки он бы не прошёл, нет (khc test).
+
+store hits: int
+
+fn main() {
+    __store_boot(false)
+    __store_lock()
+    hits += 1
+    __store_release_final()
+    print("final release: ok, {hits}")
+    __store_lock()
+    hits += 1
+    // блокировка отпущена без записи
+    store64(__ctx() + CTX_STORE_HELD, 0)
+    __store_release_final()
+    print("not reached")
+}

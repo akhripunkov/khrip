@@ -242,27 +242,49 @@ else
 	failed "раскладка ctx" "вне lib/core.kh: $ctx_other; повторы: $ctx_dup; в буферах системных вызовов: $ctx_scratch"
 fi
 
-# Окна без блокировки store (docs/design/v0.13-store-gc.md §6.5–6.6): store
-# посреди работы отпускает только __store_release_keep, и только в
-# проверенных местах — новое место должно пройти проверку правил окна W1–W3 и
-# попасть в этот список; __store_unlock_raw (отпускание без записи) — только в
-# lib/rt.kh и lib/gc.kh. Комментарии не в счёт.
-keep_sites="lib/rt.kh:__store_release_keep lib/rt.kh:__co_wait lib/fetch.kh:__fetch lib/crypto.kh:__pbkdf2_unlocked lib/mongo.kh:mongo_command lib/clickhouse.kh:__ch_run"
-kh_files=$(find lib src tests eval examples docs bench tools bootstrap -name '*.kh' 2>/dev/null | sort)
-# shellcheck disable=SC2086
-keep_found=$(awk 'FNR == 1 { f = "" }
-	/^fn [A-Za-z_0-9]+\(/ { f = $2; sub(/\(.*/, "", f) }
-	{ code = $0; sub(/\/\/.*/, "", code) }
-	code ~ /__store_release_keep\(/ { print FILENAME ":" f }' $kh_files | sort | tr '\n' ' ')
-keep_want=$(tr ' ' '\n' <<<"$keep_sites" | sort | tr '\n' ' ')
-# shellcheck disable=SC2086
-raw_bad=$(awk '{ code = $0; sub(/\/\/.*/, "", code) }
-	code ~ /__store_unlock_raw\(/ && FILENAME != "lib/rt.kh" && FILENAME != "lib/gc.kh" { print FILENAME ":" FNR }' $kh_files)
-if [[ "$keep_found" == "$keep_want" && -z "$raw_bad" ]]; then
+# Места отпускания блокировки store (docs/design/v0.13-store-gc.md §6.5–6.6):
+# tests/store_windows.sh — посреди работы только __store_release_keep и только
+# в проверенных местах, отпускание без записи — только в API блокировки. И
+# проверка самой проверки: на копиях библиотеки с подложенным нарушением она
+# должна упасть, а на безвредных строках и комментариях — пройти.
+if win_out=$(bash tests/store_windows.sh .); then
 	pass=$((pass + 1))
 else
-	failed "места отпускания store" "__store_release_keep: $keep_found(ожидались: $keep_want); __store_unlock_raw вне lib/rt.kh и lib/gc.kh: $raw_bad"
+	failed "места отпускания store" "$win_out"
 fi
+# случай: ожидание (pass/fail), файл, функция для вставки внутрь ("" — новая
+# функция в конце файла), текст
+win_cases=(
+	'fail|lib/rt.kh|__slot_take|    __store_unlock_raw()'
+	'fail|lib/gc.kh||fn __plant() {\n    __store_unlock_raw()\n    sleep(10)\n    __store_lock()\n}'
+	'fail|lib/pg.kh||fn __plant() {\n    __store_write_unlock(__store_rw)\n}'
+	'fail|lib/mongo.kh||fn __plant() {\n    __store_unlock_gc()\n}'
+	'fail|lib/mongo.kh||fn __plant() {\n    __store_unlock_marker()\n}'
+	'fail|lib/rt.kh||fn __plant_unlock() {\n    __store_unlock_raw()\n}'
+	'fail|lib/pg.kh||fn __plant() {\n    __mutex_unlock(__store_rw)\n}'
+	'fail|lib/fetch.kh||fn __plant() {\n    let u = "http://x"; __store_release_keep()\n}'
+	'fail|lib/fetch.kh||fn __plant(c: int) {\n    if c == \x27"\x27 { __store_release_keep() }\n}'
+	'fail|lib/fetch.kh||fn __plant() {\n    print("{__store_unlock_raw()}")\n}'
+	'pass|lib/fetch.kh||fn __plant() {\n    print("__store_release_keep( and __store_unlock_raw(")\n    // __store_unlock_raw()\n    let s = `\n__store_release_keep()\n`\n}'
+)
+win_ok=1
+for c in "${win_cases[@]}"; do
+	IFS='|' read -r want file fn text <<<"$c"
+	rm -rf "$tmp/winlib"
+	mkdir -p "$tmp/winlib"
+	cp -r lib "$tmp/winlib/"
+	if [[ -n "$fn" ]]; then
+		awk -v f="$fn" -v t="$(printf '%b' "$text")" '{ print } index($0, "fn " f "(") == 1 { print t }' "$file" >"$tmp/winlib/$file"
+	else
+		printf '\n%b\n' "$text" >>"$tmp/winlib/$file"
+	fi
+	if bash tests/store_windows.sh "$tmp/winlib" >"$tmp/win.txt"; then got=pass; else got=fail; fi
+	if [[ "$got" != "$want" ]]; then
+		win_ok=0
+		failed "проверка мест отпускания store" "ожидалось $want, вышло $got: $file ${fn:-(новая функция)}: $(printf '%b' "$text"); $(cat "$tmp/win.txt")"
+	fi
+done
+[[ $win_ok -eq 1 ]] && pass=$((pass + 1))
 
 # Шаблоны регулярных выражений: проверка при компиляции (src/rx.kh) отвечает
 # на наборе tests/run/regex_grammar.kh то же, что разбор библиотеки

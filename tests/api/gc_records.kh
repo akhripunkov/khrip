@@ -69,3 +69,42 @@ test "the collector's lock leaves no hold and counts no change" {
     expect wm == 0
     expect items.len() == 2
 }
+
+// Ключи верхнего уровня объекта JSON: по одному на поле.
+fn json_fields(j: str) -> int {
+    var depth = 0
+    var in_str = false
+    var n = 0
+    var i = 0
+    while i < j.byte_len() {
+        let c = j.byte(i)
+        if in_str {
+            if c == '\\' {
+                i += 1
+            } else if c == '"' {
+                in_str = false
+            }
+        } else if c == '"' {
+            in_str = true
+        } else if c == '{' || c == '[' {
+            depth += 1
+        } else if c == '}' || c == ']' {
+            depth -= 1
+        } else if c == ':' && depth == 1 {
+            n += 1
+        }
+        i += 1
+    }
+    return n
+}
+
+// lib/gc.kh выделяет запись по PIN_BYTES и копирует WORKER_WORDS слов
+// __Worker: новое поле записи вышло бы за выделенную память, а новое поле
+// __Worker (со ссылкой в store) публикация бы не увидела.
+test "the record and worker sizes in lib/gc.kh match their types" {
+    items.push("x")
+    let rec = rec_of()
+    expect json_fields(to_json(rec)) * 8 == PIN_BYTES
+    let w: __Worker = __cast(load64(__ctx() + CTX_WORKER))
+    expect json_fields(to_json(w)) == WORKER_WORDS
+}
