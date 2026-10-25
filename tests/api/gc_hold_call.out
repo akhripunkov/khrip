@@ -1,0 +1,4 @@
+ok    the test holds a value across a call that replaces it
+ok    the resurrected value survives later collections
+ok    a route that waits inside call keeps its store values
+3 tests: 3 passed, 0 failed

@@ -1,0 +1,41 @@
+// var программы с одними тестами живёт в store (docs/design/v0.13-store-gc.md
+// §5.4) и она — корень сборщика: список растёт от теста к тесту, между ними
+// идут сборки, а сам тест держит в арене только временное.
+
+type Rec { name: str, parts: [str] }
+
+var log: [Rec] = []
+var total: map[str, int] = {}
+
+test "the var list grows" {
+    for i in 0..3000 {
+        log.push(Rec { name: "rec {i}", parts: ["p{i}", "q"] })
+        total["k{i % 100}"] = (total["k{i % 100}"] ?? 0) + i
+    }
+    __gc_collect()
+    expect log.len() == 3000
+}
+
+test "it grows again after a collection" {
+    __gc_collect()
+    for i in 3000..6000 {
+        log.push(Rec { name: "rec {i}", parts: ["p{i}", "q"] })
+    }
+    // замены — мусор
+    for i in 0..3000 {
+        log[i] = Rec { name: "new {i}", parts: [] }
+    }
+    __gc_collect()
+    expect log.len() == 6000
+}
+
+test "every element is intact after the collections" {
+    __gc_collect()
+    expect log[0].name == "new 0" && log[0].parts.len() == 0
+    expect log[2999].name == "new 2999"
+    expect log[3000].name == "rec 3000" && log[3000].parts[0] == "p3000"
+    expect log[5999].parts[1] == "q"
+    expect (total["k7"] ?? 0) == 7 * 30 + 100 * 435
+    // 6000 записей, у половины по три строки и список: не больше мегабайта
+    expect __gc_stats().live < 1048576
+}

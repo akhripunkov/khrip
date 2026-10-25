@@ -1,0 +1,256 @@
+// Оракул сборщика store (docs/design/v0.13-store-gc.md §15.1): 10 тысяч
+// случайных операций (зерно постоянное) над словарями, списками, структурами,
+// вариантами, общими объектами и циклами; после каждых 100 операций JSON всего
+// store до сборки и после неё совпадают, а кольца (циклы, их JSON не
+// записать) обходятся до начала и дают те же имена. Операции идут кусками по
+// 1000 в отдельных тестах: между ними — конец теста, тоже точка сборки.
+
+type Tag { name: str, weight: int? }
+
+type Shape = Circle { r: float } | Box { w: int, h: int } | Point
+
+type Rec {
+    id: int
+    name: str
+    tags: [Tag]
+    props: map[str, str]
+    shape: Shape?
+    score: int?
+    nums: [int]
+}
+
+type Node { name: str, next: Node? }
+
+var recs: map[int, Rec] = {}
+var order: [Rec] = []
+var rings: map[int, Node] = {}
+var seed: int = 88172645463325252
+var ops: int = 0
+var checks: int = 0
+
+fn rnd() -> int {
+    var x = seed
+    x = x ^ (x << 13)
+    x = x ^ ((x >> 7) & 0x1FFFFFFFFFFFFFF)
+    x = x ^ (x << 17)
+    seed = x
+    return (x >> 8) & 0xFFFFFFFFFFFF
+}
+
+fn new_rec(id: int, r: int) -> Rec {
+    var tags: [Tag] = []
+    for i in 0..r % 4 {
+        var w: int? = none
+        if i % 2 == 0 {
+            w = r % 1000 + i
+        }
+        tags.push(Tag { name: "tag {r % 97} {i}", weight: w })
+    }
+    var shape: Shape? = none
+    if r % 4 == 1 {
+        shape = Circle { r: (r % 100).to_float() / 4.0 }
+    } else if r % 4 == 2 {
+        shape = Box { w: r % 50, h: r % 30 }
+    } else if r % 4 == 3 {
+        shape = Point
+    }
+    var score: int? = none
+    if r % 3 != 0 {
+        score = r % 10000
+    }
+    return Rec { id: id, name: "rec {id}/{r % 1000}", tags: tags, props: { "a": "{r}" }, shape: shape, score: score, nums: [r % 7, r % 11] }
+}
+
+fn ring(n: int, r: int) -> Node {
+    let first = Node { name: "ring {r} 0", next: none }
+    var x = first
+    for i in 1..n {
+        let y = Node { name: "ring {r} {i}", next: none }
+        x.next = y
+        x = y
+    }
+    x.next = first
+    return first
+}
+
+fn step() {
+    let r = rnd()
+    let k = r % 150
+    let op = (r >> 20) % 18
+    ops += 1
+    if op <= 2 {
+        recs[k] = new_rec(k, r)
+        return
+    }
+    if op == 3 {
+        recs.remove(k)
+        return
+    }
+    if op == 9 {
+        if order.len() > 0 {
+            order.remove_at((r >> 30) % order.len())
+        }
+        return
+    }
+    if op == 14 {
+        let at = (r >> 30) % 5
+        if (r >> 40) % 3 == 0 {
+            rings.remove(at)
+        } else {
+            rings[at] = ring(1 + (r >> 33) % 40, r % 1000)
+        }
+        return
+    }
+    if op == 16 {
+        if order.len() > 20 {
+            order.truncate(order.len() / 2)
+        }
+        return
+    }
+    if op == 17 {
+        if (r >> 30) % 20 == 0 {
+            order.clear()
+        }
+        return
+    }
+    let x = recs[k] else {
+        return
+    }
+    if op == 4 {
+        x.name = "renamed {ops}"
+    } else if op == 5 {
+        x.tags.push(Tag { name: "pushed {ops}", weight: ops })
+    } else if op == 6 {
+        if x.tags.len() > 0 {
+            if r % 2 == 0 {
+                x.tags.pop()
+            } else {
+                x.tags.remove_at((r >> 30) % x.tags.len())
+            }
+        }
+    } else if op == 7 {
+        x.props["p{r % 10}"] = "v{ops}"
+    } else if op == 8 {
+        x.props.remove("p{r % 10}")
+    } else if op == 10 {
+        order.push(x)
+    } else if op == 11 {
+        // общий объект: тег другой записи
+        if let y = recs[(r >> 30) % 150] {
+            if y.tags.len() > 0 {
+                x.tags.push(y.tags[0])
+            }
+        }
+    } else if op == 12 {
+        if r % 4 == 0 {
+            x.shape = none
+        } else if r % 4 == 1 {
+            x.shape = Box { w: ops % 77, h: 1 }
+        } else {
+            x.shape = Circle { r: 0.5 }
+        }
+    } else if op == 13 {
+        if r % 2 == 0 {
+            x.tags.sort_by(t => t.name)
+        } else {
+            x.tags.reverse()
+        }
+    } else {
+        x.score = ops
+        x.nums.push(ops)
+        if x.nums.len() > 6 {
+            x.nums.insert(0, -ops)
+            x.nums.truncate(3)
+        }
+    }
+}
+
+// кольца: от начала до начала, имена подряд
+fn walk_rings() -> str {
+    var out = ""
+    for i in 0..5 {
+        if let start = rings[i] {
+            out += "[{i}]"
+            var at = start
+            var n = 0
+            while n < 100 {
+                out += at.name + ";"
+                let nx = at.next else {
+                    out += "broken"
+                    break
+                }
+                let a: int = __cast(nx)
+                let b: int = __cast(start)
+                if a == b {
+                    break
+                }
+                at = nx
+                n += 1
+            }
+        }
+    }
+    return out
+}
+
+fn snapshot() -> str {
+    return to_json(recs) + "|" + to_json(order) + "|" + walk_rings()
+}
+
+fn run(n: int) -> bool {
+    var ok = true
+    for i in 0..n {
+        step()
+        if ops % 100 == 0 {
+            let before = snapshot()
+            __gc_collect()
+            let after = snapshot()
+            checks += 1
+            if after != before {
+                ok = false
+            }
+        }
+    }
+    return ok
+}
+
+test "operations 1-1000" {
+    expect run(1000)
+}
+
+test "operations 1001-2000" {
+    expect run(1000)
+}
+
+test "operations 2001-3000" {
+    expect run(1000)
+}
+
+test "operations 3001-4000" {
+    expect run(1000)
+}
+
+test "operations 4001-5000" {
+    expect run(1000)
+}
+
+test "operations 5001-6000" {
+    expect run(1000)
+}
+
+test "operations 6001-7000" {
+    expect run(1000)
+}
+
+test "operations 7001-8000" {
+    expect run(1000)
+}
+
+test "operations 8001-9000" {
+    expect run(1000)
+}
+
+test "operations 9001-10000" {
+    expect run(1000)
+    expect checks == 100
+    expect recs.len() > 50 && order.len() > 0
+}

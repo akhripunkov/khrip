@@ -439,6 +439,7 @@ fn __store_release_keep() {
     }
     __pin_publish(load64(c + CTX_PINREC))
     __store_unlock_raw()
+    __gc_window_point()
 }
 
 // Конец работы со store (запрос, задача, тест, сохранение, загрузка), в том

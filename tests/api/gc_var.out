@@ -1,0 +1,4 @@
+ok    the var list grows
+ok    it grows again after a collection
+ok    every element is intact after the collections
+3 tests: 3 passed, 0 failed

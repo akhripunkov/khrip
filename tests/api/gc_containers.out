@@ -1,0 +1,11 @@
+ok    build 100k-element lists and a 50k map
+ok    pop and truncate
+ok    pop and truncate freed half of the strings
+ok    remove_at and insert shift elements, collections between
+ok    reverse, sort and sort_by keep every element
+ok    clear frees the strings
+ok    after clear the strings are gone
+ok    map remove, re-insert and rehash
+ok    removed keys were freed
+ok    map clear frees every key
+10 tests: 10 passed, 0 failed

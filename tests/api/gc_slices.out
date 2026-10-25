@@ -1,0 +1,3 @@
+ok    slices of store strings in other store fields
+ok    a slice held by the test keeps the whole string alive
+2 tests: 2 passed, 0 failed

@@ -1,0 +1,91 @@
+// Сборщик store не перемещает объекты (docs/design/v0.13-store-gc.md §0,
+// §15.1): псевдонимы остаются псевдонимами и после сборок — изменение через
+// одно имя видно через другое; список tags, общий у старого и нового значения
+// после {...old, ...patch}, остаётся одним списком; общий список в
+// сохранённом значении — тоже.
+
+type User { name: str, tags: [str] }
+
+type Product { id: int, name: str, price: int, tags: [str] }
+
+type ProductPatch { name: str?, price: int? }
+
+type Pair { a: [int], b: [int] }
+
+store users: map[int, User]
+store products: map[int, Product]
+store pairs: [Pair]
+
+fn addr(x: [str]) -> int {
+    let a: int = __cast(x)
+    return a
+}
+
+test "users[2] = users[1]: one object under two keys" {
+    users[1] = User { name: "one", tags: ["x"] }
+    let u = users[1] else {
+        expect false
+        return
+    }
+    users[2] = u
+    __gc_collect()
+    let two = users[2] else {
+        expect false
+        return
+    }
+    two.name = "changed"
+    two.tags.push("y")
+    __gc_collect()
+    let one = users[1] else {
+        expect false
+        return
+    }
+    expect one.name == "changed"
+    expect one.tags.len() == 2 && one.tags[1] == "y"
+}
+
+test "the alias survives removing the first key" {
+    users.remove(1)
+    __gc_collect()
+    let two = users[2] else {
+        expect false
+        return
+    }
+    expect two.name == "changed"
+    expect two.tags[0] == "x" && two.tags[1] == "y"
+}
+
+test "{...old, ...patch} keeps the tags list shared" {
+    products[1] = Product { id: 1, name: "lamp", price: 10, tags: ["home", "light"] }
+    let old = products[1] else {
+        expect false
+        return
+    }
+    let tags_before = addr(old.tags)
+    let patch: ProductPatch? = from_json("\{\"name\":\"desk lamp\"}")
+    let pt = patch else {
+        expect false
+        return
+    }
+    let p = Product { ...old, name: pt.name ?? old.name, price: pt.price ?? old.price }
+    products[1] = p
+    __gc_collect()
+    let now = products[1] else {
+        expect false
+        return
+    }
+    expect now.name == "desk lamp"
+    expect addr(now.tags) == tags_before
+    old.tags.push("sale")
+    __gc_collect()
+    expect now.tags.len() == 3 && now.tags[2] == "sale"
+}
+
+test "a persisted Pair{a: xs, b: xs} is one list" {
+    let xs = [1, 2]
+    pairs.push(Pair { a: xs, b: xs })
+    __gc_collect()
+    pairs[0].a.push(3)
+    __gc_collect()
+    expect pairs[0].b.len() == 3 && pairs[0].b[2] == 3
+}

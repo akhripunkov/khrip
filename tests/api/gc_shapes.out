@@ -1,0 +1,9 @@
+ok    variants keep their identity and match after a collection
+ok    nested maps of lists of optional variants
+ok    [bool], [float?], int? cells, empty structs, empty and literal strings
+ok    a list of a million links
+ok    the million links survive collections
+ok    ten million numbers
+ok    the numbers survive collections and replacement frees them
+ok    after both are gone the heap is small again
+8 tests: 8 passed, 0 failed

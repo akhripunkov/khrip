@@ -1,0 +1,3 @@
+ok    100k replacements keep the heap within the goal
+ok    after the collections every value is intact
+2 tests: 2 passed, 0 failed

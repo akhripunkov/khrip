@@ -1,0 +1,83 @@
+// Тест держит значение store через call (docs/design/v0.13-store-gc.md §6.8,
+// §15.1): call PUT заменяет его в store, а сборки идут в точке сборки после
+// call (тест публикует себя) — значение, которое держит тест, цело. Положить
+// его обратно в store — воскресить, и следующие сборки его оставят. Маршрут,
+// который ждёт внутри call (sleep, хеш пароля, fetch), держит свои значения
+// store через окна без блокировки.
+
+type User { name: str, tags: [str], hash: str }
+
+store users: map[int, User]
+store kept: [str]
+
+route PUT "/users/{id}" (id: int, name: str) -> 204 {
+    users[id] = User { name: name, tags: ["{name} tag"], hash: "" }
+    return 204
+}
+
+// каждый вызов оставляет мусор: поэтому сборки идут и в обычном режиме
+route POST "/garbage/{n}" (n: int) -> 204 {
+    for i in 0..n {
+        kept.push("garbage {i} " + "y".repeat(i % 100))
+        kept.pop()
+    }
+    return 204
+}
+
+route GET "/wait/{id}" (id: int) -> str | 404 {
+    let u = users[id] else {
+        return 404
+    }
+    let name = u.name
+    sleep(2)
+    let ok = check_password("pw", u.hash)
+    let r = fetch GET "http://127.0.0.1:1/nothing"
+    sleep(1)
+    return "{name} {u.tags[0]} {ok} {r.status} {u.name}"
+}
+
+test "the test holds a value across a call that replaces it" {
+    users[1] = User { name: "first", tags: ["a", "b"], hash: hash_password("pw") }
+    let u = users[1] else {
+        expect false
+        return
+    }
+    let before = __gc_stats().cycles
+    for i in 0..30 {
+        expect (call PUT "/users/1?name=second-{i}").status == 204
+        expect (call POST "/garbage/2000").status == 204
+    }
+    expect __gc_stats().cycles > before
+    expect u.name == "first" && u.tags.len() == 2 && u.tags[1] == "b"
+    let now = users[1] else {
+        expect false
+        return
+    }
+    expect now.name == "second-29"
+    // воскресить: тот же объект снова в store
+    users[3] = u
+}
+
+test "the resurrected value survives later collections" {
+    for i in 0..10 {
+        expect (call POST "/garbage/3000").status == 204
+    }
+    __gc_collect()
+    let u = users[3] else {
+        expect false
+        return
+    }
+    expect u.name == "first" && u.tags[0] == "a"
+    u.tags.push("c")
+    __gc_collect()
+    expect (users[3] ?? u).tags.len() == 3
+}
+
+test "a route that waits inside call keeps its store values" {
+    let r = call GET "/wait/3"
+    expect r.status == 200
+    expect r.body == "first a true 0 first"
+    expect (call PUT "/users/3?name=other").status == 204
+    __gc_collect()
+    expect (call GET "/wait/3").body == "other other tag false 0 other"
+}

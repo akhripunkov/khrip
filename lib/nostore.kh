@@ -66,3 +66,19 @@ fn __pin_final(c: int) {
 
 fn __pin_check_idle(r: int) {
 }
+
+// Сборщика без store нет: собирать нечего, потока сборщика нет.
+fn __gc_hard_check() {
+}
+
+fn __gc_test_point(end: bool) {
+}
+
+fn __gc_window_point() {
+}
+
+fn __gc_spawn() {
+}
+
+fn __gc_thread_main() {
+}
