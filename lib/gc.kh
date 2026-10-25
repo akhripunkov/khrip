@@ -1539,12 +1539,16 @@ const GC_SYS_MADVISE = 28
 const GC_DONTNEED = 4
 const GC_SYS_SCHED_YIELD = 24
 // Разметка (§7.4): объект больше GC_FRAME_MIN байт смотрится кусками по
-// GC_CHUNK байт (2048 слов) — кадр; кадров не больше GC_FRAMES, остальные
-// большие ждут в отложенных. Арена — кусками по GC_ACHUNK байт, слова записей
-// — по GC_PIN_BATCH. Часы — через каждые GC_CLOCK_WORK единиц работы (единица
-// — примерно объект).
-const GC_FRAME_MIN = 16384
-const GC_CHUNK = 16384
+// GC_CHUNK байт — кадр; кадров не больше GC_FRAMES, остальные большие ждут в
+// отложенных. Порог и кусок — 4 КБ (512 слов), а не 16 КБ (2048 слов), как в
+// проекте: 2048 ссылок на холодные разбросанные объекты — 160–200 мкс, почти
+// весь кусок разметки, и куски выходили за 0,3 мс. Арена —
+// кусками по GC_ACHUNK байт, слова записей — по GC_PIN_BATCH. Часы — через
+// каждые GC_CLOCK_WORK единиц работы: единица — маленький объект или 8 слов
+// объекта больше; кусок кадра, кусок арены и пачка слов записей — не меньше
+// GC_CLOCK_WORK, так что после каждого из них часы смотрятся сразу.
+const GC_FRAME_MIN = 4096
+const GC_CHUNK = 4096
 const GC_FRAMES = 8
 const GC_ACHUNK = 262144
 const GC_PIN_BATCH = 1024
@@ -2040,7 +2044,7 @@ fn __gc_mark_unit() -> int {
             return 1
         }
         __gc_scan(o, es)
-        return 1 + (es >> 7)
+        return 1 + (es >> 6)
     }
     if __gc_nfr > 0 {
         return __gc_frame_unit()
@@ -2190,7 +2194,7 @@ fn __gc_frame_unit() -> int {
             __gc_frame_push(load64(g), load64(g + 8))
         }
     }
-    return 1 + (n >> 7)
+    return 1 + (n >> 4)
 }
 
 // Разметка (§7.4): единицы работы по порядку, пока она не кончится, — не
@@ -2772,6 +2776,11 @@ fn __gc_handed_off() -> bool {
     let s = rec.ast
     let st = s & 7
     return (s >> 3) == __gc_cycle_no && (st == PIN_HANDED || st == PIN_SELF || (st == PIN_DONE && rec.aoff < 0))
+}
+
+// Сколько больших объектов ждут в отложенных (кадров уже GC_FRAMES).
+fn __gc_overflow() -> int {
+    return __gc_novf
 }
 
 // Сколько байт массива, где лежит p, просмотрено (p — кадр), или −1.

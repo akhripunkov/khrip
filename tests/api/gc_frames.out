@@ -5,5 +5,7 @@ ok    sort of a partial array
 ok    reverse of a partial array
 ok    sort_by of a partial array
 ok    rehash compaction of a partial values array
+ok    build a tree of big arrays nested twelve deep
+ok    arrays nested deeper than eight frames wait in the overflow list
 ok    after a full collection everything is still there
-8 tests: 8 passed, 0 failed
+10 tests: 10 passed, 0 failed
