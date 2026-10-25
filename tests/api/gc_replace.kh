@@ -1,0 +1,52 @@
+// Сборщик store (lib/gc.kh, docs/design/v0.13-store-gc.md §15.1): 100 тысяч
+// замен значений словаря — память не растёт. Замены идут маршрутом через call:
+// после каждого call — точка сборки теста (__gc_test_point), и куча остаётся в
+// пределах цели — вдвое больше живого, но не меньше 4 МБ (KHRIP_GC=100,
+// KHRIP_GC_MIN_MB=4), плюс выделенное одним запросом.
+
+type Item { name: str, tags: [str], n: int }
+
+store items: map[int, Item]
+
+route PUT "/items/{id}/{n}" (id: int, n: int) -> 204 {
+    for i in 0..1000 {
+        items[id] = Item { name: "item {id} #{n}.{i}", tags: ["t{i}", "u"], n: i }
+    }
+    return 204
+}
+
+test "100k replacements keep the heap within the goal" {
+    var worst = 0
+    for n in 0..100 {
+        expect (call PUT "/items/{n % 10}/{n}").status == 204
+        let s = __gc_stats()
+        if s.heap - 2 * s.live > worst {
+            worst = s.heap - 2 * s.live
+        }
+    }
+    let s = __gc_stats()
+    expect s.cycles >= 3
+    // цель — 4 МБ; один запрос выделяет около 150 КБ
+    expect worst < 4 * 1048576 + 512 * 1024
+    let it = items[3] else {
+        expect false
+        return
+    }
+    expect it.name == "item 3 #93.999"
+    expect it.tags[0] == "t999"
+    expect it.n == 999
+}
+
+test "after the collections every value is intact" {
+    __gc_collect()
+    for id in 0..10 {
+        let it = items[id] else {
+            expect false
+            return
+        }
+        expect it.name == "item {id} #{90 + id}.999"
+        expect it.tags.len() == 2 && it.tags[1] == "u"
+    }
+    // живое — десять значений и словарь: несколько килобайт
+    expect __gc_stats().live < 64 * 1024
+}

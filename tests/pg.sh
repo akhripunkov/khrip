@@ -134,13 +134,15 @@ done
 
 # Очередь повторов tx под одновременными запросами: горячая строка и переводы
 # «прочитал — записал». Ни одного 503, счётчик равен числу ответов, деньги не
-# теряются и не появляются.
+# теряются и не появляются. Тем временем /label заменяет метки store и
+# оставляет мусор: /hit держит метку через тело tx с повторами, пока идут
+# сборки store (docs/design/v0.13-store-gc.md §15.2).
 race_port=$((PG_PORT + 1))
 "${as_pg[@]}" "$pg_bin/psql" -q -h "$pg_dir" -p "$PG_PORT" -U postgres -d postgres -c "create database t_race" >/dev/null 2>&1
 if ! "$KHC" -o "$tmp/pg/race" tests/pg/load/race.kh >"$tmp/pg/race.err" 2>&1; then
 	failed "tests/pg/load/race.kh" "не скомпилировалось:"$'\n'"$(cat "$tmp/pg/race.err")"
 else
-	DATABASE_URL="postgres://u_scram:pw-u_scram@127.0.0.1:$PG_PORT/t_race?sslmode=disable" PORT=$race_port THREADS=2 \
+	DATABASE_URL="postgres://u_scram:pw-u_scram@127.0.0.1:$PG_PORT/t_race?sslmode=disable" PORT=$race_port THREADS=2 KHRIP_GC_LOG=1 \
 		"$tmp/pg/race" 2>"$tmp/pg/race.log" &
 	race_pid=$!
 	for _ in $(seq 100); do
@@ -150,11 +152,14 @@ else
 	url=http://127.0.0.1:$race_port
 	# горячая строка 1 и строка 75 (за пределами 63 ключей очереди) вместе с
 	# транзакциями на все 80 строк; затем переводы «прочитал — записал»
+	seq 60 | xargs -P 4 -I{} curl -s -o /dev/null -w '%{http_code}\n' -X POST "$url/label/{}" >"$tmp/pg/race.labels" &
+	race_lb=$!
 	{
 		seq 300 | sed "s|.*|$url/hit/1|"
 		seq 100 | sed "s|.*|$url/hit/75|"
 		seq 20 | sed "s|.*|$url/sweep|"
 	} | shuf | xargs -P 32 -I{} curl -s -o /dev/null -w '%{http_code}\n' -X POST {} >"$tmp/pg/race.hits"
+	wait "$race_lb"
 	for i in $(seq 300); do
 		a=$((RANDOM % 5 + 1)) b=$((RANDOM % 4 + 1))
 		((b >= a)) && b=$((b + 1))
@@ -166,11 +171,13 @@ else
 	wait "$race_pid" 2>/dev/null
 	hits=$(grep -c '^20[04]$' "$tmp/pg/race.hits")
 	bad=$(grep -cv '^20[04]$\|^409$' "$tmp/pg/race.moves")
+	labels=$(grep -c '^204$' "$tmp/pg/race.labels")
+	cycles=$(grep -c '^gc [0-9]* (' "$tmp/pg/race.log")
 	# 400 попаданий по одной строке и 20 проходов по 80 строкам
-	if [[ $hits == 420 && $bad == 0 && $total == '{"n":2000,"balance":5000}' && $one == '{"id":1,"n":320}' ]]; then
+	if [[ $hits == 420 && $bad == 0 && $labels == 60 && $total == '{"n":2000,"balance":5000}' && $one == '{"id":1,"n":320}' ]] && ((cycles >= 2)); then
 		pass=$((pass + 1))
 	else
-		failed "tests/pg/load/race.kh" "успешных /hit и /sweep: $hits из 420, других ответов на /move: $bad, итог: $total, строка 1: $one"$'\n'"$(sort "$tmp/pg/race.hits" "$tmp/pg/race.moves" | uniq -c)"$'\n'"$(tail -5 "$tmp/pg/race.log")"
+		failed "tests/pg/load/race.kh" "успешных /hit и /sweep: $hits из 420, других ответов на /move: $bad, /label: $labels из 60, сборок store: $cycles, итог: $total, строка 1: $one"$'\n'"$(sort "$tmp/pg/race.hits" "$tmp/pg/race.moves" | uniq -c)"$'\n'"$(grep -v '^gc [0-9]' "$tmp/pg/race.log" | tail -5)"
 	fi
 fi
 

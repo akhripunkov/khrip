@@ -1,0 +1,70 @@
+// Сборщик store и срезы строк (docs/design/v0.13-store-gc.md §15.1): строка
+// store — один объект (заголовок, байты, NUL), срез указывает внутрь него и
+// держит его целиком. Срезы и части split строк store кладутся в другие поля
+// store (там — копии) и держатся тестом, пока исходные значения заменяют и
+// собирают.
+
+type Doc { title: str, words: [str], first: str, tail: str }
+
+store docs: map[int, Doc]
+
+test "slices of store strings in other store fields" {
+    for i in 0..50 {
+        docs[i] = Doc { title: "document number {i} of fifty", words: [], first: "", tail: "" }
+    }
+    for i in 0..50 {
+        let d = docs[i] else {
+            expect false
+            return
+        }
+        let parts = d.title.split(" ")
+        d.words = parts
+        d.first = d.title[0..8]
+        d.tail = d.title[9..]
+    }
+    __gc_collect()
+    for i in 0..50 {
+        let d = docs[i] else {
+            expect false
+            return
+        }
+        d.title = "replaced {i}"
+    }
+    __gc_collect()
+    let d = docs[7] else {
+        expect false
+        return
+    }
+    expect d.words.len() == 5 && d.words[2] == "7" && d.words[4] == "fifty"
+    expect d.first == "document"
+    expect d.tail == "number 7 of fifty"
+    expect d.title == "replaced 7"
+}
+
+test "a slice held by the test keeps the whole string alive" {
+    docs[100] = Doc { title: "a long title that will be replaced while a slice of it is held", words: [], first: "", tail: "" }
+    let d = docs[100] else {
+        expect false
+        return
+    }
+    let mid = d.title[7..12]
+    let end = d.title[d.title.len()..]
+    let parts = d.title.split(" ")
+    docs[100] = Doc { title: "new", words: [], first: "", tail: "" }
+    __gc_collect()
+    // и арена теста, и мусор вокруг: сборки с выделениями между ними
+    for i in 0..2000 {
+        docs[200 + i % 10] = Doc { title: "filler {i} " + "x".repeat(i % 50), words: [], first: "", tail: "" }
+    }
+    __gc_collect()
+    expect mid == "title"
+    expect end == ""
+    expect parts.len() == 14 && parts[13] == "held"
+    docs[101] = Doc { title: mid, words: parts, first: end, tail: "" }
+    __gc_collect()
+    let k = docs[101] else {
+        expect false
+        return
+    }
+    expect k.title == "title" && k.words[1] == "long"
+}

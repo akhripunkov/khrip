@@ -121,10 +121,11 @@ fn uses_store() -> bool {
     return false
 }
 
-// Проверки сборщика в программе: KHRIP_GC_VERIFY=1 или fast при сборке.
+// Проверки сборщика в программе: KHRIP_GC_VERIFY=1 или fast при сборке, или
+// KHRIP_GC_STRESS=1 (частая сборка идёт с проверками).
 fn gc_verify_wanted() -> bool {
     let v = env("KHRIP_GC_VERIFY") ?? ""
-    return v == "1" || v == "fast"
+    return v == "1" || v == "fast" || (env("KHRIP_GC_STRESS") ?? "") == "1"
 }
 
 // Программа сама зовёт fetch: тогда в конце запроса нужен хук TLS.

@@ -1,0 +1,37 @@
+// Удаление большей части store (bench/gc/gate.sh, docs/design/v0.13-store-gc.md
+// §16 «delete-heavy»): 200 тысяч товаров, затем удаляются 90% — старые подряд
+// (oldest) или вразнобой (random), затем простой. Сборщик не перемещает
+// объекты: спан с выжившими остаётся, пустые возвращаются системе. GET /stats
+// — живое по последней сборке и куча, байт.
+
+type Product { id: int, name: str, category: str, price: float, tags: [str] }
+
+store products: map[int, Product]
+
+route POST "/fill/{n}" (n: int) -> int {
+    let start = products.len()
+    for i in start..start + n {
+        products[i] = Product { id: i, name: "Product number {i} with a name", category: "category {i % 40}", price: i.to_float() / 7.0, tags: ["t{i % 13}", "all"] }
+    }
+    return products.len()
+}
+
+// удалить 90%: oldest — первые 90% по номеру, random — каждый, кроме каждого
+// десятого по перемешанному номеру
+route POST "/delete/{how}/{n}" (how: str, n: int) -> int {
+    for i in 0..n {
+        if how == "oldest" {
+            if i < n * 9 / 10 {
+                products.remove(i)
+            }
+        } else if (i * 7919) % 10 != 0 {
+            products.remove(i)
+        }
+    }
+    return products.len()
+}
+
+route GET "/stats" -> str {
+    let s = __gc_stats()
+    return "{products.len()} {s.live} {s.heap} {s.cycles}"
+}

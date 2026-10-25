@@ -1,0 +1,5 @@
+ok    users[2] = users[1]: one object under two keys
+ok    the alias survives removing the first key
+ok    {...old, ...patch} keeps the tags list shared
+ok    a persisted Pair{a: xs, b: xs} is one list
+4 tests: 4 passed, 0 failed

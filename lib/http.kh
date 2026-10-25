@@ -959,10 +959,15 @@ fn __pin(cpu: int) {
     syscall(SYS_SCHED_SETAFFINITY, 0, 128, mask)
 }
 
-// Начало рабочего потока (__spawn); id < 0 — поток фоновых задач.
+// Начало рабочего потока (__spawn); id −1 — поток фоновых задач, −2 — поток
+// сборщика store (lib/gc.kh).
 fn __thread_main(id: int) {
     __thread_init()
     store64(__ctx() + CTX_STACK_TOP, __sp())
+    if id == -2 {
+        __gc_thread_main()
+        return
+    }
     if id < 0 {
         __timer_loop()
         return
@@ -1135,6 +1140,7 @@ fn __run_timers() {
     __store_boot(true)
     __db_init()
     __block_signals()
+    __gc_spawn()
     eprint("khrip: running {__every_count()} background task(s)")
     __timer_loop()
 }
@@ -1161,6 +1167,8 @@ fn __serve() {
     if timers {
         __block_signals()
     }
+    // поток сборщика store (с сигналами, как у остальных потоков)
+    __gc_spawn()
     eprint("khrip: listening on http://0.0.0.0:{__http_port} ({n} threads)")
     for id in 1..n {
         let stack = syscall(SYS_MMAP, 0, THREAD_STACK, 3, 0x22 | 0x4000, -1, 0)

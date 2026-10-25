@@ -4,7 +4,8 @@
 // пустой спан отдаёт страницы кучке, сняв свои биты и записи карты страниц
 // (__span_free); разметку включает только __gc_set_marking — вместе с общим
 // путём выделения, который ставит бит MARK. Уборку здесь изображает тест: он
-// снимает биты START и PTRB освобождённого слота, как снимет их уборка.
+// снимает биты START и PTRB освобождённого слота и заливает его ядом 0xDE, как
+// уборка (с KHRIP_GC_VERIFY выделение проверяет яд).
 
 store keep: [int]
 
@@ -27,6 +28,7 @@ test "a rewound span reuses a freed slot and zeroes it" {
     let w = GC_START + (g >> 6) * 8
     store64(w, load64(w) & ~(1 << (g & 63)))
     __bits_put(GC_PTRB, (a - STORE_REGION) >> 3, ((a - STORE_REGION) >> 3) + es / 8, false)
+    __memset(a, 0xDE, es)
     __heap_live -= es
     __span_rewind(s)
     let c = __salloc(6900, K_PTRS, 0)
@@ -45,6 +47,7 @@ test "an empty span gives its pages back to the page heap" {
     store64(big, 5)
     let s = __gc_span_of(big)
     __heap_live -= __gc_obj_size(big)
+    __memset(big, 0xDE, __gc_obj_size(big))
     __span_free(s)
     expect __gc_obj_of(big) == 0
     expect !ptrb(big)
@@ -61,6 +64,9 @@ test "allocation during marking is marked" {
     let m = __salloc(48, K_NOSCAN, 0)
     expect __gc_bit(GC_MARK, m)
     __gc_set_marking(false)
+    // вне сборки битов MARK нет: снять, как сняла бы уборка
+    let g = (m - STORE_REGION) >> 4
+    __bits_put(GC_MARK, g, g + 1, false)
     let f = __salloc(48, K_NOSCAN, 0)
     expect !__gc_bit(GC_MARK, f)
 }

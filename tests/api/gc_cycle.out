@@ -1,0 +1,6 @@
+ok    t.next = t survives collections
+ok    a ring in store
+ok    the ring is live, then removed and freed
+ok    after removal the ring's memory is free
+ok    JSON of a cycle is an error, not a crash
+5 tests: 5 passed, 0 failed

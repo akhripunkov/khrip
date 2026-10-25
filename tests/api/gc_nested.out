@@ -1,0 +1,4 @@
+ok    a request in call outgrows the hard limit: its release leaves the collection to the test point
+ok    a small request in call (stress: past the 64 KB step at its release)
+ok    a collection inside the nested request publishes the test's frames
+3 tests: 3 passed, 0 failed

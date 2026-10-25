@@ -1,0 +1,84 @@
+// Сборщик store и циклы (docs/design/v0.13-store-gc.md §15.1): цикл в store
+// переживает сборки (t.next.next — тот же t), удалённый цикл освобождается
+// (живое уменьшается), а JSON цикла — ошибка «cycle», а не переполнение стека.
+
+type Node { name: str, next: Node? }
+
+store nodes: map[int, Node]
+
+fn same(a: Node, b: Node) -> bool {
+    let x: int = __cast(a)
+    let y: int = __cast(b)
+    return x == y
+}
+
+test "t.next = t survives collections" {
+    let t = Node { name: "t", next: none }
+    t.next = t
+    nodes[1] = t
+    __gc_collect()
+    __gc_collect()
+    let s = nodes[1] else {
+        expect false
+        return
+    }
+    let n = s.next else {
+        expect false
+        return
+    }
+    let nn = n.next else {
+        expect false
+        return
+    }
+    expect same(nn, s)
+    expect nn.name == "t"
+}
+
+// кольцо из 2000 узлов со строками: строится в арене, в store — копия
+fn ring(n: int) -> Node {
+    let first = Node { name: "node 0", next: none }
+    var x = first
+    for i in 1..n {
+        let y = Node { name: "node {i}", next: none }
+        x.next = y
+        x = y
+    }
+    x.next = first
+    return first
+}
+
+test "a ring in store" {
+    nodes[2] = ring(2000)
+}
+
+store with_ring: int
+
+test "the ring is live, then removed and freed" {
+    __gc_collect()
+    with_ring = __gc_stats().live
+    nodes.remove(2)
+}
+
+test "after removal the ring's memory is free" {
+    __gc_collect()
+    let s = __gc_stats()
+    // 2000 узлов и 2000 строк — около 100 КБ
+    expect with_ring - s.live > 90 * 1024
+    expect nodes.len() == 1
+}
+
+route GET "/node/{id}" (id: int) -> Node | 404 {
+    return nodes[id] ?? 404
+}
+
+test "JSON of a cycle is an error, not a crash" {
+    let r = call GET "/node/1"
+    expect r.status == 500
+    expect r.body.contains("cycle")
+    __gc_collect()
+    let s = nodes[1] else {
+        expect false
+        return
+    }
+    expect (s.next ?? s).name == "t"
+}

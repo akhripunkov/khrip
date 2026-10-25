@@ -1,0 +1,431 @@
+// Сервер матрицы держателей сборщика store (tests/gc.sh, docs/design/
+// v0.13-store-gc.md §15.2): запросы держат значения store через ожидания (sleep,
+// хеш пароля, fetch), а их тем временем заменяют писатели и собирает сборщик.
+// Имя товара несёт свою проверку (name_of): освобождённая и снова занятая
+// память дала бы чужие или испорченные байты. Ответ маршрута держателя — "ok"
+// или что не так.
+
+type Product { id: int, name: str, tags: [str], price: int }
+
+type User { name: str, hash: str }
+
+type Account { id: int, balance: int }
+
+type Pair { a: str, b: str }
+
+store products: map[int, Product]
+store resurrected: map[int, Product]
+store users: map[str, User]
+store accounts: map[int, Account]
+store feed: [str]
+store every_ok: int
+store every_bad: int
+store every_runs: int
+store counter: int
+store seen: map[int, int]
+store hdrs: map[str, str]
+store target: str
+store big: [int]
+
+const N = 2000
+
+// имя версии v товара id: "p{id}:{v}:{проверка}"
+fn name_of(id: int, v: int) -> str {
+    return "p{id}:{v}:{(id * 7919 + v * 104729) % 1000003}"
+}
+
+// версия имени товара id или −1, если имя не такое, каким его сделал name_of
+fn version(id: int, s: str) -> int {
+    let parts = s.split(":")
+    if parts.len() != 3 || parts[0] != "p{id}" {
+        return -1
+    }
+    let v = parts[1].to_int() ?? -1
+    if v < 0 || parts[2] != "{(id * 7919 + v * 104729) % 1000003}" {
+        return -1
+    }
+    return v
+}
+
+fn check(p: Product) -> str {
+    if version(p.id, p.name) < 0 {
+        return "bad name {p.name}"
+    }
+    if p.tags.len() < 2 || p.tags[0] != "t{p.id}" || p.tags[1] != "all" {
+        return "bad tags of {p.id}"
+    }
+    if p.price != p.id * 3 {
+        return "bad price of {p.id}"
+    }
+    return "ok"
+}
+
+fn fresh(id: int, v: int) -> Product {
+    var tags = ["t{id}", "all"]
+    for i in 0..v % 6 {
+        tags.push("extra {i} of version {v}")
+    }
+    return Product { id: id, name: name_of(id, v), tags: tags, price: id * 3 }
+}
+
+route POST "/seed" -> int {
+    for id in 0..N {
+        products[id] = fresh(id, 0)
+    }
+    for i in 0..100 {
+        accounts[i] = Account { id: i, balance: 1000 }
+    }
+    users["alice"] = User { name: "alice", hash: hash_password("pw-alice") }
+    target = "http://127.0.0.1:{(env("UPSTREAM_PORT") ?? "1")}/len"
+    hdrs = { "X-Probe": "probe 0" }
+    return products.len()
+}
+
+// писатель: новая версия товара (старая — мусор, если её никто не держит)
+route PATCH "/p/{id}" (id: int) -> str | 404 {
+    let old = products[id] else {
+        return 404
+    }
+    let v = version(id, old.name)
+    if v < 0 {
+        return "bad name {old.name}"
+    }
+    products[id] = fresh(id, v + 1)
+    return "ok"
+}
+
+// много версий за один запрос: мусор быстрее
+route POST "/churn/{id}/{n}" (id: int, n: int) -> str | 404 {
+    for i in 0..n {
+        let k = (id + i * 37) % N
+        let old = products[k] else {
+            return 404
+        }
+        let v = version(k, old.name)
+        if v < 0 {
+            return "bad name {old.name}"
+        }
+        products[k] = fresh(k, v + 1)
+    }
+    return "ok"
+}
+
+// держит товар через ожидание: его заменяют, а он цел байт в байт
+route GET "/hold/{id}" (id: int, ms: int = 200) -> str | 404 {
+    let p = products[id] else {
+        return 404
+    }
+    let name = p.name
+    let tags = p.tags
+    sleep(ms)
+    if name != p.name || tags.len() != p.tags.len() {
+        return "changed under the request"
+    }
+    return check(p)
+}
+
+// срез строки store держит всю строку
+route GET "/slice/{id}" (id: int, ms: int = 50) -> str | 404 {
+    let p = products[id] else {
+        return 404
+    }
+    let s = p.name[1..]
+    sleep(ms)
+    if version(id, "p" + s) < 0 {
+        return "bad slice {s}"
+    }
+    return "ok"
+}
+
+// держит, ждёт, меняет и кладёт обратно в store под другим ключом
+route POST "/resurrect/{id}" (id: int, ms: int = 20) -> str | 404 {
+    let p = products[id] else {
+        return 404
+    }
+    sleep(ms)
+    p.tags.push("x")
+    resurrected[id] = p
+    return check(p)
+}
+
+route GET "/resurrected" -> str {
+    for id, p in resurrected {
+        let c = check(p)
+        if c != "ok" {
+            return c
+        }
+        if p.tags[p.tags.len() - 1] != "x" {
+            return "lost x of {id}"
+        }
+    }
+    return "ok {resurrected.len()}"
+}
+
+// цикл по списку store с ожиданием на каждом шаге
+route GET "/loop/{id}" (id: int) -> str | 404 {
+    let p = products[id] else {
+        return 404
+    }
+    var n = 0
+    for t in p.tags {
+        sleep(1)
+        // "x" дописывает /resurrect — тому же объекту
+        if t != "t{id}" && t != "all" && t != "x" && !t.starts_with("extra ") {
+            return "bad tag {t}"
+        }
+        n += 1
+    }
+    return check(p)
+}
+
+fn slow_name(id: int) -> str {
+    sleep(2)
+    let p = products[id] else {
+        return ""
+    }
+    return p.name
+}
+
+fn pair(a: str, b: str) -> str {
+    return a + "|" + b
+}
+
+// временные значения через ожидание: аргументы, литералы, интерполяция
+route GET "/temps/{id}" (id: int) -> str | 404 {
+    let u = products[id] else {
+        return 404
+    }
+    var xs: [str] = []
+    xs.push(slow_name((id + 1) % N))
+    let both = pair(u.name, slow_name((id + 2) % N))
+    let box = Pair { a: u.name, b: slow_name((id + 3) % N) }
+    let msg = "{u.name} {slow_name((id + 4) % N)} {u.tags[0]}"
+    if version((id + 1) % N, xs[0]) < 0 {
+        return "bad push"
+    }
+    let halves = both.split("|")
+    if version(id, halves[0]) < 0 || version((id + 2) % N, halves[1]) < 0 {
+        return "bad argument"
+    }
+    if version(id, box.a) < 0 || version((id + 3) % N, box.b) < 0 {
+        return "bad literal"
+    }
+    let words = msg.split(" ")
+    if words.len() != 3 || version(id, words[0]) < 0 || version((id + 4) % N, words[1]) < 0 || words[2] != "t{id}" {
+        return "bad interpolation {msg}"
+    }
+    return check(u)
+}
+
+// map и filter по store держатся через ожидание
+route GET "/map/{id}" (id: int) -> str {
+    var ids: [int] = []
+    for i in 0..20 {
+        ids.push((id + i * 11) % N)
+    }
+    let ps = ids.map(k => products[k]).filter(p => p != none)
+    sleep(20)
+    for p in ps {
+        if let q = p {
+            let c = check(q)
+            if c != "ok" {
+                return c
+            }
+        }
+    }
+    return "ok"
+}
+
+// долгий опрос: все значения разом, ожидание 60 раз
+route GET "/poll" (ms: int = 50) -> str {
+    let all = products.values()
+    for i in 0..60 {
+        sleep(ms)
+    }
+    for p in all {
+        let c = check(p)
+        if c != "ok" {
+            return c
+        }
+    }
+    return "ok"
+}
+
+// хеш пароля ждёт в своём окне; пользователя тем временем заменяют
+route POST "/login" -> str | 404 {
+    let u = users["alice"] else {
+        return 404
+    }
+    if !check_password("pw-alice", u.hash) {
+        return "wrong password"
+    }
+    if u.name != "alice" {
+        return "bad name"
+    }
+    return "ok"
+}
+
+route POST "/rotate" -> str {
+    users["alice"] = User { name: "alice", hash: hash_password("pw-alice") }
+    return "ok"
+}
+
+// fetch по адресу и заголовкам из store, пока их заменяют
+route POST "/fx" -> str {
+    let r = fetch GET target headers hdrs
+    if r.status != 200 || r.body != "abc" {
+        return "fetch {r.status} {r.body}"
+    }
+    return "ok"
+}
+
+route POST "/hdrs/{n}" (n: int) -> str {
+    hdrs = { "X-Probe": "probe {n}", "X-More": "more {n}" }
+    target = "http://127.0.0.1:{(env("UPSTREAM_PORT") ?? "1")}/len"
+    return "ok"
+}
+
+// читающий маршрут ждёт, пока идёт сборка
+route GET "/search/{id}" (id: int) -> str | 404 {
+    let p = products[id] else {
+        return 404
+    }
+    sleep(30)
+    return check(p)
+}
+
+// паника после ожидания (в том числе после fetch): 500, запись отозвана
+route GET "/boom/{id}" (id: int) -> int | 404 {
+    let p = products[id] else {
+        return 404
+    }
+    sleep(3)
+    let xs: [int] = []
+    return xs[p.price]
+}
+
+route GET "/boom-fetch/{id}" (id: int) -> int | 404 {
+    let p = products[id] else {
+        return 404
+    }
+    let r = fetch GET "http://127.0.0.1:1/none"
+    let xs: [int] = []
+    return xs[p.price + r.status]
+}
+
+// счётчик из встроенной функции: ни одной потери
+fn bump(k: int) {
+    counter += 1
+    seen[k % 100] = (seen[k % 100] ?? 0) + 1
+}
+
+route POST "/bump/{k}" (k: int) -> 204 {
+    bump(k)
+    return 204
+}
+
+route GET "/count" -> str {
+    var sum = 0
+    for v in seen.values() {
+        sum += v
+    }
+    return "{counter} {sum}"
+}
+
+// переводы: деньги не появляются и не пропадают
+route POST "/transfer/{a}/{b}/{amt}" (a: int, b: int, amt: int) -> str | 404 {
+    sleep(1)
+    let x = accounts[a % 100] else {
+        return 404
+    }
+    let y = accounts[b % 100] else {
+        return 404
+    }
+    if x.balance < amt || a % 100 == b % 100 {
+        return "ok"
+    }
+    accounts[a % 100] = Account { id: x.id, balance: x.balance - amt }
+    accounts[b % 100] = Account { id: y.id, balance: y.balance + amt }
+    return "ok"
+}
+
+route GET "/sum" -> int {
+    var s = 0
+    for _, a in accounts {
+        s += a.balance
+    }
+    return s
+}
+
+route POST "/feed/{n}" (n: int) -> str {
+    for i in 0..n {
+        feed.push(name_of(i, n))
+    }
+    if feed.len() > 400 {
+        feed = feed[200..]
+    }
+    return "ok"
+}
+
+// простой (tests/gc.sh): большой список, сборка, замена пустым — мусор без
+// новых выделений; сборку после этого делает простой потока сборщика
+route POST "/big/{n}" (n: int) -> str {
+    for i in 0..n {
+        big.push(i)
+    }
+    __gc_collect()
+    return "{big.len()}"
+}
+
+route POST "/big-drop" -> str {
+    big = []
+    return "ok"
+}
+
+route GET "/gcstats" -> str {
+    let s = __gc_stats()
+    return "{s.cycles} {s.heap} {s.live}"
+}
+
+route GET "/every" -> str {
+    return "{every_runs} {every_ok} {every_bad}"
+}
+
+// фоновая задача держит список store через ожидание, маршруты меняют его
+every 100 ms {
+    let snapshot = feed
+    let n = snapshot.len()
+    sleep(30)
+    var ok = true
+    for i in 0..n {
+        let parts = snapshot[i].split(":")
+        if parts.len() != 3 || !parts[0].starts_with("p") {
+            ok = false
+        }
+    }
+    every_runs += 1
+    if ok {
+        every_ok += 1
+    } else {
+        every_bad += 1
+    }
+}
+
+// call в тестах: тест держит товар, маршрут его заменяет и ждёт
+test "a test holds a product across calls that replace it" {
+    expect (call POST "/seed").status == 200
+    let p = products[5] else {
+        expect false
+        return
+    }
+    for i in 0..20 {
+        expect (call PATCH "/p/5").body == "ok"
+        expect (call POST "/churn/{i}/50").body == "ok"
+        expect (call GET "/hold/5?ms=1").body == "ok"
+    }
+    expect check(p) == "ok" && version(5, p.name) == 0
+    expect (call GET "/temps/7").body == "ok"
+    expect (call GET "/boom/3").status == 500
+    expect (call POST "/resurrect/9?ms=1").body == "ok"
+    expect (call GET "/resurrected").body == "ok 1"
+}

@@ -1,0 +1,173 @@
+// Сборщик store и все виды значений (docs/design/v0.13-store-gc.md §15.1):
+// варианты (в том числе без полей — их адреса в DATA, сравнение по адресу) и
+// match после сборки; вложенные словари со списками необязательных вариантов;
+// [bool], [float?], ячейки int?; структуры без полей; пустые строки и строки в
+// DATA; список в миллион звеньев (ни разметка, ни проверка не рекурсивны) и
+// список из десяти миллионов чисел.
+
+type Shape = Circle { r: float } | Rect { w: int, h: int } | Dot
+
+type Color = Red | Green | Blue
+
+type Empty {}
+
+type Mixed {
+    flags: [bool]
+    ratios: [float?]
+    count: int?
+    nothing: Empty
+    label: str
+    blank: str
+}
+
+type Link { v: int, next: Link? }
+
+store shapes: [Shape]
+store colors: map[str, Color]
+store nested: map[str, map[int, [Shape?]]]
+store mixed: [Mixed]
+store chain: Link?
+store numbers: [int]
+
+fn is_dot(s: Shape) -> bool {
+    match s {
+        Dot => return true
+        _ => return false
+    }
+}
+
+fn area(s: Shape) -> int {
+    match s {
+        Circle c => return (c.r * c.r * 3.0).to_int()
+        Rect r => return r.w * r.h
+        Dot => return 0
+    }
+}
+
+test "variants keep their identity and match after a collection" {
+    shapes.push(Circle { r: 2.0 })
+    shapes.push(Rect { w: 3, h: 4 })
+    shapes.push(Dot)
+    __gc_collect()
+    expect area(shapes[0]) == 12
+    expect area(shapes[1]) == 12
+    expect area(shapes[2]) == 0
+    expect is_dot(shapes[2])
+    shapes[0] = Rect { w: 1, h: 1 }
+    colors["a"] = Green
+    colors["b"] = Blue
+    __gc_collect()
+    expect area(shapes[0]) == 1
+    expect (colors["a"] ?? Red) == Green
+    expect (colors["b"] ?? Red) != Green
+}
+
+test "nested maps of lists of optional variants" {
+    for k in 0..20 {
+        var inner: map[int, [Shape?]] = {}
+        for i in 0..10 {
+            var xs: [Shape?] = []
+            xs.push(Circle { r: i.to_float() })
+            xs.push(none)
+            xs.push(Dot)
+            inner[i] = xs
+        }
+        nested["k{k}"] = inner
+    }
+    __gc_collect()
+    nested.remove("k3")
+    nested["k5"] = {}
+    __gc_collect()
+    let inner = nested["k7"] else {
+        expect false
+        return
+    }
+    let xs = inner[9] else {
+        expect false
+        return
+    }
+    expect xs.len() == 3 && xs[1] == none
+    if let d = xs[2] {
+        expect is_dot(d)
+    } else {
+        expect false
+    }
+    if let s = xs[0] {
+        expect area(s) == 243
+    } else {
+        expect false
+    }
+    expect nested.len() == 19
+}
+
+test "[bool], [float?], int? cells, empty structs, empty and literal strings" {
+    for i in 0..100 {
+        var c: int? = none
+        if i % 2 == 0 {
+            c = i
+        }
+        mixed.push(Mixed { flags: [i % 2 == 0, true, false], ratios: [i.to_float() / 2.0, none], count: c, nothing: Empty {}, label: "literal", blank: "" })
+    }
+    __gc_collect()
+    mixed.remove_at(0)
+    __gc_collect()
+    // после remove_at(0) mixed[49] — значение 50, mixed[50] — значение 51
+    let m = mixed[49]
+    expect m.flags[0] && m.flags[1] && !m.flags[2]
+    expect (m.ratios[0] ?? 0.0) == 25.0 && m.ratios[1] == none
+    expect (m.count ?? 0) == 50
+    expect mixed[50].count == none
+    expect m.label == "literal" && m.blank == ""
+    let a: int = __cast(mixed[1].nothing)
+    let b: int = __cast(mixed[2].nothing)
+    expect a != b
+}
+
+fn build_chain(n: int) -> Link {
+    var x = Link { v: 0, next: none }
+    for i in 1..n {
+        x = Link { v: i, next: x }
+    }
+    return x
+}
+
+test "a list of a million links" {
+    chain = build_chain(1000000)
+}
+
+test "the million links survive collections" {
+    __gc_collect()
+    var n = 0
+    var sum = 0
+    var at = chain
+    while true {
+        let x = at else {
+            break
+        }
+        n += 1
+        sum += x.v
+        at = x.next
+    }
+    expect n == 1000000
+    expect sum == 499999500000
+}
+
+test "ten million numbers" {
+    var xs: [int] = []
+    for i in 0..10000000 {
+        xs.push(i)
+    }
+    numbers = xs
+}
+
+test "the numbers survive collections and replacement frees them" {
+    __gc_collect()
+    expect numbers.len() == 10000000 && numbers[9999999] == 9999999
+    chain = none
+    numbers = []
+}
+
+test "after both are gone the heap is small again" {
+    __gc_collect()
+    expect __gc_stats().live < 4 * 1048576
+}

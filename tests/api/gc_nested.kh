@@ -1,0 +1,79 @@
+// Запрос внутри call теста (docs/design/v0.13-store-gc.md §6.8, §8.4): его
+// последнее отпускание — не конец работы теста, кадры и арена теста над ним
+// держат значения store. Сборку у жёсткого предела (с KHRIP_GC_STRESS — каждые
+// 64 КБ) оно не делает: собирает точка сборки теста сразу после запроса,
+// опубликовав тест. А сборка внутри вложенного запроса (рост store посреди
+// работы) публикует весь стек — и кадры теста. Значение, которое держит тест,
+// после сборки и повторного занятия освобождённых слотов — то же.
+
+type User { name: str, tags: [str] }
+
+store users: map[int, User]
+store junk: [str]
+
+route PUT "/users/{id}" (id: int, n: int) -> 204 {
+    users[id] = User { name: "x".repeat(n), tags: ["t"] }
+    return 204
+}
+
+// много копий в store посреди запроса: куча проходит жёсткий предел внутри
+// него, и сборка идёт посреди работы
+route POST "/grow/{id}/{n}" (id: int, n: int) -> 204 {
+    users[id] = User { name: "replaced", tags: [] }
+    for i in 0..n {
+        junk.push("y".repeat(1000000))
+    }
+    junk = []
+    return 204
+}
+
+fn reuse() {
+    for i in 2..200 {
+        users[i] = User { name: "bob-{i}-" + "b".repeat(40), tags: ["c", "d"] }
+    }
+}
+
+test "a request in call outgrows the hard limit: its release leaves the collection to the test point" {
+    users[1] = User { name: "alice-" + "a".repeat(40), tags: ["a", "b"] }
+    let u = users[1] else {
+        expect false
+        return
+    }
+    let before = __gc_stats().cycles
+    // 72 МБ одной копией — больше жёсткого предела (цель + 64 МБ)
+    expect (call PUT "/users/1?n=72000000").status == 204
+    expect __gc_stats().cycles > before
+    reuse()
+    expect u.name == "alice-" + "a".repeat(40)
+    expect u.tags.len() == 2 && u.tags[1] == "b"
+}
+
+test "a small request in call (stress: past the 64 KB step at its release)" {
+    users[1] = User { name: "carol-" + "c".repeat(40), tags: ["e", "f"] }
+    let u = users[1] else {
+        expect false
+        return
+    }
+    expect (call PUT "/users/1?n=200000").status == 204
+    reuse()
+    expect u.name == "carol-" + "c".repeat(40)
+    expect u.tags.len() == 2 && u.tags[1] == "f"
+}
+
+test "a collection inside the nested request publishes the test's frames" {
+    users[1] = User { name: "dave-" + "d".repeat(40), tags: ["g", "h"] }
+    let u = users[1] else {
+        expect false
+        return
+    }
+    // большое значение первого теста ушло: темп — от малой кучи, жёсткий
+    // предел — 68 МБ, и 90 МБ внутри запроса его проходят (без
+    // KHRIP_GC_STRESS это единственная сборка после before)
+    __gc_collect()
+    let before = __gc_stats().cycles
+    expect (call POST "/grow/1/90").status == 204
+    expect __gc_stats().cycles > before
+    reuse()
+    expect u.name == "dave-" + "d".repeat(40)
+    expect u.tags.len() == 2 && u.tags[1] == "h"
+}

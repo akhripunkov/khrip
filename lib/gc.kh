@@ -1,8 +1,10 @@
-// Сборщик мусора store (docs/design/v0.13-store-gc.md). Пока здесь куча store
-// (§4: классы размеров, спаны, кучка страниц, битовые карты), загрузка store
-// (§5.3) и записи контекстов (§3.4, §6: что держат запросы, задачи и тесты,
-// когда отпускают store посреди работы). Сама сборка — следующие шаги проекта
-// (§14); пока память store только выделяется.
+// Сборщик мусора store (docs/design/v0.13-store-gc.md): куча store (§4:
+// классы размеров, спаны, кучка страниц, битовые карты), загрузка store (§5.3),
+// записи контекстов (§3.4, §6: что держат запросы, задачи и тесты, когда
+// отпускают store посреди работы) и сама сборка (§7, §8). Сборка пока целиком
+// под исключительной блокировкой (шаг 5 проекта, «остановка мира»): разметка
+// от корней и опубликованных записей, уборка всех спанов, возврат страниц
+// системе. Инкрементальная разметка кусками — шаг 6.
 //
 // Программы без store вместо этого файла получают lib/nostore.kh; проверки
 // (KHRIP_GC_VERIFY) — в lib/gc_verify.kh или заглушки lib/gc_noverify.kh;
@@ -17,8 +19,47 @@ var __gc_verify_slow: bool
 // включает и выключает только __gc_set_marking.
 var __gc_slow: bool
 
+// ---- Настройки (§8.6) ----
+// KHRIP_GC — запас кучи над живыми данными в процентах (100) или off: сборки
+// нет (выделение — те же классы размеров); KHRIP_GC_MIN_MB — наименьшая цель
+// (4 МБ); KHRIP_GC_LOG=1 — строка о каждой сборке в stderr; KHRIP_GC_STRESS=1
+// — сборка очень часто: цель — помеченное + 64 КБ (у большой кучи — плюс
+// четверть помеченного), а запрос или тест, который выделил столько, собирает
+// сам (с проверками, если они есть в программе).
+var __gc_pct: int
+var __gc_min: int
+var __gc_log: bool
+var __gc_stress: bool
+const GC_MB = 1048576
+const GC_STRESS_STEP = 65536
+const GC_MAX = 0x7FFFFFFFFFFFFFFF
+
 // Настройки сборщика из окружения.
 fn __gc_init() {
+    __gc_pct = 100
+    __gc_min = 4 * GC_MB
+    if let v = env("KHRIP_GC") {
+        if v == "off" {
+            __gc_pct = -1
+        } else if let n = v.to_int() {
+            if n > 0 && n <= 100000 {
+                __gc_pct = n
+            }
+        }
+    }
+    if let v = env("KHRIP_GC_MIN_MB") {
+        if let n = v.to_int() {
+            if n >= 1 && n <= 1000000 {
+                __gc_min = n * GC_MB
+            }
+        }
+    }
+    __gc_log = (env("KHRIP_GC_LOG") ?? "") == "1"
+    __gc_stress = (env("KHRIP_GC_STRESS") ?? "") == "1"
+    __gc_goal = GC_MAX
+    __gc_trigger = GC_MAX
+    __gc_hard = GC_MAX
+    __gc_limit = GC_MAX
     __gc_verify_init()
 }
 
@@ -26,7 +67,7 @@ fn __gc_slow_update() {
     __gc_slow = __gc_verify_slow || __gc_marking != 0
 }
 
-// Разметка (шаг 6): пока она идёт, каждый новый объект помечен, а быстрый путь
+// Разметка: пока она идёт, каждый новый объект помечен, а быстрый путь
 // __salloc бит MARK не ставит, — поэтому вместе с __gc_marking меняется и
 // __gc_slow. Другого способа менять __gc_marking нет.
 fn __gc_set_marking(on: bool) {
@@ -85,11 +126,13 @@ const GC_CLASSES = 65
 //   [16] размер слота (у большого спана — все его байты);
 //   [24] freeindex — адрес, с которого искать свободный слот (до него свободных
 //        нет до следующей уборки);
-//   [32] sweepgen (шаг 5);
+//   [32] sweepgen — номер уборки, которая прошла спан (или при которой он
+//        создан): спан с другим номером ещё не убран;
 //   [40] magic (32) | объектов в спане (32); magic = ⌈2^32 / размер⌉: номер слота
 //        смещения off — (off · magic) >> 32, точно для смещений спана (меньше
 //        80 КБ); у большого — 0 | 1;
-//   [48] следующий спан списка частично занятых (шаг 5);
+//   [48] следующий спан списка частично занятых (первая страница + 1, 0 —
+//        конец) | свободных слотов при последней уборке << 32;
 //   [56] конец слотов для быстрого пути __salloc или 0, если слоты надо
 //        обнулять (NEEDZERO): тогда каждое выделение идёт общим путём.
 // Класс спана sc = класс · 2 + 1, если в объектах нет ссылок (NOSCAN).
@@ -122,8 +165,12 @@ var __gc_committed: int
 var __gc_took_dirty: bool
 // байт в выделенных объектах (по размерам классов и целым страницам)
 var __heap_live: int
-// номер уборки (шаг 5)
+// номер уборки: разметка его увеличивает, и все спаны становятся неубранными
 var __gc_sweepgen: int
+// списки частично занятых спанов (кусок mmap, по 16 байт на класс спана):
+// первая и последняя страница + 1 (0 — пусто); уборка дописывает спаны в
+// конец по адресам, выделение берёт с головы — самый низкий адрес (§4.2)
+var __gc_partial: int
 
 // Резерв адресов STORE и GCMETA, таблицы классов, кучка страниц. Повторный
 // вызов ничего не делает.
@@ -144,6 +191,9 @@ fn __store_init() {
     __gc_ph = __mmap(128)
     __ph_init(__gc_ph, GC_PHEAP, GC_PHEAP + GC_PH_PART, GC_PHEAP + 2 * GC_PH_PART, GC_PHEAP + 3 * GC_PH_PART, 512, GC_MAX_PAGES, true)
     __gc_reg = __mmap(16 + GC_MAX_THREADS * 8)
+    __gc_partial = __mmap((GC_CLASSES + 1) * 32)
+    __gc_ctl = __mmap(64)
+    __gc_runs = __mmap(GC_SCAV_RUNS * 16)
     __gc_ready = true
 }
 
@@ -257,7 +307,7 @@ fn __salloc_slow(n: int, kind: int, mask: int) -> int {
     var s = load64(cur)
     var p = __span_take(s)
     if p == 0 {
-        s = __span_new(sc)
+        s = __gc_refill(sc)
         store64(cur, s)
         p = __span_take(s)
     }
@@ -266,6 +316,9 @@ fn __salloc_slow(n: int, kind: int, mask: int) -> int {
         __gc_bit_set(GC_MARK, p)
     }
     if ((load64(s + S_INFO) >> 48) & F_NEEDZERO) != 0 {
+        if __gc_verify {
+            __gc_check_poison(p, es)
+        }
         __memset(p, 0, es)
     } else if __gc_verify {
         __gc_check_zero(p, es)
@@ -274,7 +327,28 @@ fn __salloc_slow(n: int, kind: int, mask: int) -> int {
         __gc_ptrbits(p, n, kind, mask)
     }
     __heap_live += es
+    if __heap_live >= __gc_trigger && !__gc_poked {
+        __gc_poke()
+    }
     return p
+}
+
+// Спан для класса спана sc, когда в текущем места нет: голова списка частично
+// занятых (убранный спан с самым низким адресом), иначе новый спан.
+fn __gc_refill(sc: int) -> int {
+    let h = __gc_partial + sc * 16
+    let head = load64(h)
+    if head == 0 {
+        return __span_new(sc)
+    }
+    let s = GC_SPANS + ((head - 1) << 6)
+    let nx = load64(s + S_NEXT) & 0xFFFFFFFF
+    store64(h, nx)
+    if nx == 0 {
+        store64(h + 8, 0)
+    }
+    store64(s + S_NEXT, load64(s + S_NEXT) & ~0xFFFFFFFF)
+    return s
 }
 
 // Память для объекта h (рост контейнера store) или любая память в режиме
@@ -288,6 +362,8 @@ fn __salloc_for(h: int, n: int, kind: int, mask: int) -> int {
     if __store_on() {
         return __salloc(n, k, mask)
     }
+    // рост контейнера store вне копии: здесь можно собрать (§8.4)
+    __gc_hard_check()
     __pmode_on()
     let p = __salloc(n, k, mask)
     __pmode_off()
@@ -405,7 +481,7 @@ fn __span_new(sc: int) -> int {
     return s
 }
 
-// Спан после уборки (шаг 5), где остались объекты: свободные слоты ищутся
+// Спан после уборки, где остались объекты: свободные слоты ищутся
 // снова с начала (freeindex — адрес первого слота), а быстрый путь закрыт
 // (S_FAST = 0) — освобождённые слоты надо обнулять при выделении (NEEDZERO).
 // Биты START и PTRB освобождённых слотов уборка уже сняла.
@@ -415,7 +491,7 @@ fn __span_rewind(s: int) {
     store64(s + S_INFO, load64(s + S_INFO) | (F_NEEDZERO << 48))
 }
 
-// Спан, где не осталось объектов, — страницы кучке (шаг 5): биты START, MARK и
+// Спан, где не осталось объектов, — страницы кучке: биты START, MARK и
 // PTRB его памяти снимаются (у свободной памяти они нули), записи карты
 // страниц — нули, запись спана — не INUSE; страницы — свободны и грязны (их
 // следующий спан обнулит). Байты объектов из __heap_live вычитает вызывающий.
@@ -459,6 +535,9 @@ fn __salloc_large(n: int, kind: int, mask: int) -> int {
         __gc_bit_set(GC_MARK, base)
     }
     if __gc_took_dirty {
+        if __gc_verify {
+            __gc_check_poison(base, bytes)
+        }
         __memset(base, 0, bytes)
     } else if __gc_verify {
         __gc_check_zero(base, bytes)
@@ -467,6 +546,9 @@ fn __salloc_large(n: int, kind: int, mask: int) -> int {
         __gc_ptrbits(base, n, kind, mask)
     }
     __heap_live += bytes
+    if __heap_live >= __gc_trigger && !__gc_poked {
+        __gc_poke()
+    }
     return base
 }
 
@@ -686,7 +768,10 @@ const PH_CAP = 0
 // одна за самой верхней занятой страницей
 const PH_HW = 8
 // карты: бит на страницу; free — свободна, dirty — на ней были объекты с тех
-// пор, как её память вернули системе, released — память возвращена (шаг 5)
+// пор, как её память вернули системе (свободная грязная страница, скорее
+// всего, занимает память), released — память возвращена системе. Свободная
+// страница с released — чистая; занятая с released — её память сейчас
+// возвращает сборщик (__gc_scavenge): спана на ней нет, и взять её нельзя.
 const PH_FREE = 16
 const PH_DIRTY = 24
 const PH_REL = 32
@@ -906,6 +991,7 @@ fn __ph_take(ph: int, pg: int, np: int) -> bool {
     }
     let dirty = __bits_any(load64(ph + PH_DIRTY), pg, pg + np, true)
     __bits_put(fr, pg, pg + np, false)
+    __bits_put(load64(ph + PH_REL), pg, pg + np, false)
     __ph_update(ph, pg, pg + np)
     if pg + np > load64(ph + PH_HW) {
         store64(ph + PH_HW, pg + np)
@@ -924,22 +1010,56 @@ fn __ph_free(ph: int, pg: int, np: int) {
     __bits_put(fr, pg, pg + np, true)
     __bits_put(load64(ph + PH_DIRTY), pg, pg + np, true)
     __ph_update(ph, pg, pg + np)
+    __ph_lower_hw(ph, pg, np)
+    __ph_tick(ph)
+}
+
+// Страницы [pg, pg + np) только что стали свободными: если они были верхними
+// занятыми, граница занятых опускается за свободные страницы под ними.
+fn __ph_lower_hw(ph: int, pg: int, np: int) {
+    let fr = load64(ph + PH_FREE)
     var hw = load64(ph + PH_HW)
-    if pg + np == hw {
-        hw = pg
-        while hw > 0 {
-            let top = (hw - 1) & 63
-            let w = load64(fr + (((hw - 1) >> 6) << 3))
-            if top == 63 && w == -1 {
-                hw -= 64
-            } else if ((w >> top) & 1) != 0 {
-                hw -= 1
-            } else {
-                break
-            }
-        }
-        store64(ph + PH_HW, hw)
+    if pg + np != hw {
+        return
     }
+    hw = pg
+    while hw > 0 {
+        let top = (hw - 1) & 63
+        let w = load64(fr + (((hw - 1) >> 6) << 3))
+        if top == 63 && w == -1 {
+            hw -= 64
+        } else if ((w >> top) & 1) != 0 {
+            hw -= 1
+        } else {
+            break
+        }
+    }
+    store64(ph + PH_HW, hw)
+}
+
+// Сборщик возвращает память свободных страниц [pg, pg + np) системе
+// (__gc_scavenge): пока она возвращается без блокировки, страницы заняты (их
+// не возьмёт спан), а released отмечает, что спана на них нет. Граница занятых
+// не меняется.
+fn __ph_scav_take(ph: int, pg: int, np: int) {
+    let fr = load64(ph + PH_FREE)
+    if __gc_verify && __bits_any(fr, pg, pg + np, false) {
+        __gc_fatal("page heap: a page to release is not free")
+    }
+    __bits_put(fr, pg, pg + np, false)
+    __bits_put(load64(ph + PH_REL), pg, pg + np, true)
+    __ph_update(ph, pg, pg + np)
+    __ph_tick(ph)
+}
+
+// Память страниц [pg, pg + np) возвращена: страницы снова свободны, чистые
+// (released, не dirty) — спан на них обнулять не нужно.
+fn __ph_scav_done(ph: int, pg: int, np: int) {
+    let fr = load64(ph + PH_FREE)
+    __bits_put(fr, pg, pg + np, true)
+    __bits_put(load64(ph + PH_DIRTY), pg, pg + np, false)
+    __ph_update(ph, pg, pg + np)
+    __ph_lower_hw(ph, pg, np)
     __ph_tick(ph)
 }
 
@@ -963,7 +1083,7 @@ fn __ph_free(ph: int, pg: int, np: int) {
 // запись живёт, пока жив контекст. Поле ast — первое: его адрес — адрес
 // записи (__cas).
 type __Pin {
-    // передача арены сборщику: (номер сборки << 3) | состояние PIN_* (шаг 5)
+    // передача арены сборщику: (номер сборки << 3) | состояние PIN_*
     ast: int
     // соседи в списке опубликованных записей потока (0 — конец)
     next: int
@@ -1008,8 +1128,7 @@ const PIN_BUF0 = 4096
 const GC_MAX_THREADS = 4096
 // Состояния передачи арены (ast & 7, §6.2–6.3): сборщик ещё не смотрел арену
 // (PENDING), смотрит кусок (GC), её смотрит сам контекст (SELF) и передал
-// найденное (HANDED), сборщик закончил (DONE). Вне сборки — IDLE. Пока
-// сборщика нет (шаг 5), состояние всегда IDLE.
+// найденное (HANDED), сборщик закончил (DONE). Вне разметки — IDLE.
 const PIN_IDLE = 0
 const PIN_PENDING = 1
 const PIN_GC = 2
@@ -1021,7 +1140,7 @@ const PIN_DONE = 5
 // полю all — все остальные), [8] — сколько потоков записано, [16 + 8·i] —
 // контекст потока i (CTX_PINLIST — его опубликованные записи).
 var __gc_reg: int
-// номер сборки (шаг 5)
+// номер сборки
 var __gc_cycle_no: int
 // KHRIP_GC_VERIFY: сколько раз проверено начало сборки (__gc_verify_start) и
 // сколько опубликованных записей при этом встретилось
@@ -1182,7 +1301,9 @@ fn __pin_cap(cap: int, need: int) -> int {
 // (W1). Если сборка, начатая в окне, ещё не просмотрела арену (PENDING),
 // контекст просматривает её сам и передаёт найденное (HANDED): после отзыва он
 // снова пишет в арену; если сборщик смотрит её кусок (GC) — подождать (кусок
-// не больше 256 КБ). Пока сборщика нет (шаг 5), состояние всегда IDLE.
+// не больше 256 КБ). Пока сборка идёт целиком под исключительной блокировкой
+// (шаг 5), контекст не может взять store посреди неё, и здесь состояние —
+// IDLE: конец разметки возвращает все записи в IDLE.
 fn __pin_withdraw(rec: __Pin) {
     let c = __ctx()
     let r: int = __cast(rec)
@@ -1225,7 +1346,7 @@ fn __pin_withdraw(rec: __Pin) {
 // Передача (PENDING → SELF): контекст сам просматривает непросмотренную часть
 // арены [lo + aoff, hi) в hbuf; сборщик разберёт найденное (§6.3).
 fn __pin_self_scan(rec: __Pin) {
-    let from = rec.lo + rec.aoff
+    let from = __pin_arena_from(rec)
     let n = (rec.hi - from) >> 3
     rec.hlen = 0
     if n <= 0 {
@@ -1288,16 +1409,35 @@ fn __pin_unfinished(c: int) -> bool {
     return false
 }
 
-// Последнее отпускание под блокировкой (__store_release_final): хуки писателя
-// (помощь разметке и жёсткий предел — шаги 5 и 6), проверки сборщика (граф и
-// куча после работы под исключительной блокировкой), работа закончена.
+// Последнее отпускание под блокировкой (__store_release_final): проверки
+// сборщика (граф и куча после работы под исключительной блокировкой), хук
+// писателя — сборка, если куча дошла до жёсткого предела (§8.4; с
+// KHRIP_GC_STRESS — каждые 64 КБ): публиковать ничего не нужно, контекст со
+// store закончил (I8). Кроме запроса внутри call теста (__gc_nested): его
+// последнее отпускание — не конец работы теста, кадры и арена теста над ним
+// ещё держат указатели в store; собирать — точке сборки теста сразу после
+// запроса, которая публикует тест. Помощь разметке — шаг 6. Работа
+// закончена.
 fn __pin_final(c: int) {
     __gc_verify_release()
     let r = load64(c + CTX_PINREC)
+    if __heap_live >= __gc_limit && load64(c + CTX_STORE_HELD) == 1 && !__gc_busy && !__store_on() && !__gc_nested(c) {
+        __gc_collect_now(r, GC_WHY_RELEASE)
+        __gc_release_locked()
+        __gc_report()
+    }
     if r != 0 {
         let rec: __Pin = __cast(r)
         rec.touched = false
     }
+}
+
+// Запрос вложен в call теста (lib/api.kh, __call): __serve_one вернул в
+// CTX_CATCH буфер теста (у запроса сервера, задачи, сохранения, загрузки и в
+// конце теста там 0; так же их различает __mongo_request_end). Его последнее
+// отпускание — не конец работы контекста: тест над ним держит свои значения.
+fn __gc_nested(c: int) -> bool {
+    return load64(c + CTX_CATCH) != 0
 }
 
 // KHRIP_GC_VERIFY (__co_put): сопрограмма закончила запрос последним
@@ -1323,6 +1463,1089 @@ fn __gc_register_thread(c: int) {
     }
     store64(__gc_reg + 16 + i * 8, c)
     store64(c + CTX_REGISTERED, 1)
+}
+
+// ---- Сборка (§7; шаг 5 — цикл целиком под исключительной блокировкой) ----
+// Цикл: начало (корни, опубликованные записи), разметка до пустого серого
+// стека, конец разметки, уборка всех спанов. Собирает тот, кто держит store
+// исключительно: поток сборщика (__store_lock_gc), запрос или задача у
+// жёсткого предела (опубликовав себя), последнее отпускание у жёсткого
+// предела, тест (после call и в конце теста). Никто другой в это время store
+// не держит, а каждый контекст, который держит указатели в store без
+// блокировки, опубликовал запись (I3) и, чтобы продолжить, возьмёт store —
+// уже после сборки.
+
+// Фазы (§7.1)
+const GC_PH_IDLE = 0
+const GC_PH_MARK = 1
+const GC_PH_SWEEP = 2
+// Кто собирает (журнал): поток сборщика — по порогу и после простоя; запрос
+// или задача посреди работы у жёсткого предела; последнее отпускание у
+// жёсткого предела; khc test; __gc_collect(); окно в khc test с
+// KHRIP_GC_STRESS
+const GC_WHY_PACE = 1
+const GC_WHY_IDLE = 2
+const GC_WHY_EMERGENCY = 3
+const GC_WHY_RELEASE = 4
+const GC_WHY_TEST = 5
+const GC_WHY_CALL = 6
+const GC_WHY_WINDOW = 7
+const GC_WHY_FORCED = 8
+// запись опубликована столько сборок назад — долгий держатель (§8.6)
+const GC_LONG = 10
+// тиков (по секунде) без выделений — простой: всё свободное — системе
+const GC_IDLE_TICKS = 10
+// store брали на запись, а сборки не было две минуты — сборка (мкс)
+const GC_FORCE_US = 120000000
+// серий страниц за один возврат памяти системе
+const GC_SCAV_RUNS = 256
+// стек потока сборщика
+const GC_STACK = 1048576
+// madvise(MADV_DONTNEED): страницы — системе, при следующем касании — нули
+const GC_SYS_MADVISE = 28
+const GC_DONTNEED = 4
+
+var __gc_phase: int
+// идёт сборка: повторно не входить
+var __gc_busy: bool
+// байт помеченных объектов: после последней сборки — живые данные
+var __heap_marked: int
+// Темп (§8.2): цель, порог, жёсткий предел. __gc_limit — порог сборки внутри
+// работы (__gc_hard_check, последнее отпускание): жёсткий предел, а с
+// KHRIP_GC_STRESS — помеченное + 64 КБ.
+var __gc_goal: int
+var __gc_trigger: int
+var __gc_hard: int
+var __gc_limit: int
+// поток сборщика уже разбужен в этом цикле
+var __gc_poked: bool
+// сборка под блокировкой контекста оставила возврат памяти потоку сборщика
+var __gc_scav_due: bool
+// __store_touches в начале последней сборки и её конец (мкс): простой и
+// сборка раз в две минуты смотрят, брали ли store на запись с тех пор
+var __gc_touches: int
+var __gc_last_us: int
+// поток сборщика запущен (__gc_spawn)
+var __gc_has_thread: bool
+// слово futex потока сборщика (кусок mmap): 1 — его будят
+var __gc_ctl: int
+// серии страниц возврата памяти для сборок под блокировкой (у потока
+// сборщика — свои: он возвращает память без блокировки)
+var __gc_runs: int
+// граница занятых страниц в начале сборки, байт от STORE_REGION
+var __gc_hwb: int
+// серый стек: пары (слот, размер слота), кусок mmap
+var __gc_grey: int
+var __gc_gn: int
+var __gc_gcap: int
+// захваченные арены: записи, чью арену просмотрит разметка (кусок mmap)
+var __gc_capl: int
+var __gc_ncap: int
+var __gc_capcap: int
+// помечено в этой сборке: байт и объектов
+var __gc_marked_bytes: int
+var __gc_marked_objs: int
+// последняя сборка (журнал, __gc_stats): кто, куча до неё, записи и слова,
+// арены и их байты, долгие держатели, времена (мкс), возвращено системе,
+// память страниц store после неё
+var __gc_st_why: int
+var __gc_st_before: int
+var __gc_st_after: int
+var __gc_st_recs: int
+var __gc_st_words: int
+var __gc_st_arenas: int
+var __gc_st_abytes: int
+var __gc_st_long: int
+var __gc_st_long_age: int
+var __gc_st_long_words: int
+var __gc_st_start: int
+var __gc_st_mark: int
+var __gc_st_sweep: int
+var __gc_st_release: int
+var __gc_st_pause: int
+// возврат памяти этой сборки отдан потоку сборщика
+var __gc_st_handed: bool
+var __gc_st_released: int
+var __gc_st_rss: int
+// за всё время: паузы (мкс), наибольшая пауза, байт возвращено системе
+var __gc_total_pause: int
+var __gc_max_pause: int
+var __gc_total_released: int
+
+// Память сборщика — только куски mmap: если система откажет, продолжать нельзя
+// (метаданные полуразмечены), и сообщение — без выделений.
+fn __gc_scratch(n: int) -> int {
+    let p = syscall(SYS_MMAP, 0, n, 3, 0x22, -1, 0)
+    if p < 0 {
+        __oom_exit("khrip: out of memory in the store collector\n")
+    }
+    return p
+}
+
+// Микросекунды монотонных часов (слова 192–207 контекста — временный буфер
+// системного вызова, как у now_ms).
+fn __gc_now_us() -> int {
+    let ts = __ctx() + 192
+    syscall(228, 1, ts)
+    return load64(ts) * 1000000 + load64(ts + 8) / 1000
+}
+
+// Цикл сборки целиком. Вызывающий держит store исключительно (мьютекс
+// писателей, читателей нет). self — запись собирающего контекста или 0 (поток
+// сборщика): она опубликована (запрос посреди работы, тест после call) или
+// контекст со store уже закончил (последнее отпускание, конец теста, I8).
+fn __gc_collect_now(self: int, why: int) {
+    __gc_busy = true
+    let t0 = __gc_now_us()
+    __gc_st_why = why
+    __gc_st_before = __heap_live
+    __gc_start(self)
+    let t1 = __gc_now_us()
+    __gc_drain()
+    __gc_terminate()
+    let t2 = __gc_now_us()
+    __gc_sweep_all()
+    __gc_pace()
+    let t3 = __gc_now_us()
+    __gc_st_after = __heap_live
+    __gc_st_start = t1 - t0
+    __gc_st_mark = t2 - t1
+    __gc_st_sweep = t3 - t2
+    __gc_st_release = 0
+    __gc_st_handed = false
+    __gc_st_pause = t3 - t0
+    __gc_total_pause += t3 - t0
+    if t3 - t0 > __gc_max_pause {
+        __gc_max_pause = t3 - t0
+    }
+    __gc_last_us = t3
+    __gc_poked = false
+    __gc_busy = false
+}
+
+// Возврат памяти после сборки, которую контекст сделал под своей
+// исключительной блокировкой (запрос, задача, тест). Есть поток сборщика —
+// возврат ему: он вернёт память без блокировки, а не в паузе запроса. Нет
+// (khc test) — здесь, и его время — часть паузы (журнал, __gc_stats).
+fn __gc_release_locked() {
+    if __gc_has_thread {
+        __gc_scav_due = true
+        __gc_st_handed = true
+        store64(__gc_ctl, 1)
+        syscall(SYS_FUTEX, __gc_ctl, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0)
+        return
+    }
+    let t0 = __gc_now_us()
+    __gc_scavenge(false, true, __gc_runs)
+    let dt = __gc_now_us() - t0
+    __gc_st_release = dt
+    __gc_st_pause += dt
+    __gc_total_pause += dt
+    if __gc_st_pause > __gc_max_pause {
+        __gc_max_pause = __gc_st_pause
+    }
+}
+
+// Начало (§7.2): номер сборки и номер кэшей строк (их ключи могли бы указать на
+// освобождённую память, lib/text.kh), разметка включена, корни, записи. С
+// KHRIP_GC_VERIFY сначала — каждый контекст, который брал store в своей работе
+// и не держит его сейчас, опубликовал запись (кроме собирающего).
+fn __gc_start(self: int) {
+    if __gc_verify {
+        __gc_verify_records(self, false)
+    }
+    __gc_cycle_no += 1
+    __store_epoch += 1
+    __gc_touches = __store_touches
+    __gc_set_marking(true)
+    __gc_phase = GC_PH_MARK
+    __gc_hwb = load64(__gc_ph + PH_HW) << GC_PAGE_SHIFT
+    __gc_marked_bytes = 0
+    __gc_marked_objs = 0
+    let roots = __gc_roots()
+    let n = load64(roots)
+    for i in 0..n {
+        __gc_resolve(load64(load64(roots + 8 + i * 16)))
+    }
+    __gc_capture()
+}
+
+// Записи (§6.3): слова каждой опубликованной записи разбираются сразу, арена —
+// в список захваченных (PENDING): её просмотрит разметка, а если контекст
+// продолжит раньше (шаг 6), — он сам при отзыве (__pin_withdraw).
+fn __gc_capture() {
+    __gc_ncap = 0
+    __gc_st_recs = 0
+    __gc_st_words = 0
+    __gc_st_arenas = 0
+    __gc_st_abytes = 0
+    __gc_st_long = 0
+    __gc_st_long_age = 0
+    __gc_st_long_words = 0
+    let nt = load64(__gc_reg + 8)
+    for i in 0..nt {
+        let c = load64(__gc_reg + 16 + i * 8)
+        var r = 0
+        if c != 0 {
+            r = load64(c + CTX_PINLIST)
+        }
+        while r != 0 {
+            let rec: __Pin = __cast(r)
+            var j = 0
+            while j < rec.len {
+                __gc_resolve(load64(rec.buf + j * 8))
+                j += 1
+            }
+            __gc_st_recs += 1
+            __gc_st_words += rec.len
+            if rec.hi > rec.lo {
+                rec.aoff = 0
+                rec.ast = (__gc_cycle_no << 3) | PIN_PENDING
+                __gc_cap_push(r)
+                __gc_st_arenas += 1
+                __gc_st_abytes += rec.hi - rec.lo
+            }
+            let age = __gc_cycle_no - rec.pub_cycle
+            if age >= GC_LONG {
+                __gc_st_long += 1
+                __gc_st_long_words += rec.len
+                if age > __gc_st_long_age {
+                    __gc_st_long_age = age
+                }
+            }
+            r = rec.next
+        }
+    }
+}
+
+fn __gc_cap_push(r: int) {
+    if __gc_ncap == __gc_capcap {
+        var nc = __gc_capcap * 2
+        if nc == 0 {
+            nc = 512
+        }
+        let nb = __gc_scratch(nc * 8)
+        if __gc_ncap > 0 {
+            __memcpy(nb, __gc_capl, __gc_ncap * 8)
+        }
+        if __gc_capl != 0 {
+            syscall(SYS_MUNMAP, __gc_capl, __gc_capcap * 8)
+        }
+        __gc_capl = nb
+        __gc_capcap = nc
+    }
+    store64(__gc_capl + __gc_ncap * 8, r)
+    __gc_ncap += 1
+}
+
+// Слово w — возможная ссылка (§7.3): точная (поле, элемент) или нет (слово
+// записи), на начало объекта или внутрь (срез строки, вариант — начало + 8).
+// Объект, внутри которого оно лежит, помечается, а если в нём есть ссылки, —
+// в серый стек. Вне занятых страниц STORE, в хвосте спана и в свободном слоте
+// слово ничего не значит.
+fn __gc_resolve(w: int) {
+    let off = w - STORE_REGION
+    if off < 0 || off >= __gc_hwb {
+        return
+    }
+    let sb = load32(GC_PAGEMAP + ((off >> GC_PAGE_SHIFT) << 2))
+    if sb == 0 {
+        return
+    }
+    let s = GC_SPANS + ((sb - 1) << 6)
+    let fl = load64(s + S_INFO) >> 48
+    if (fl & F_INUSE) == 0 {
+        return
+    }
+    let base = load64(s + S_BASE)
+    let es = load64(s + S_SIZE)
+    var slot = base
+    if (fl & F_LARGE) == 0 {
+        let mg = load64(s + S_MAGIC)
+        let i = ((w - base) * (mg & 0xFFFFFFFF)) >> 32
+        if i >= mg >> 32 {
+            return
+        }
+        slot = base + i * es
+    }
+    let a = ((slot >> 10) << 3) + GC_START_P
+    let b = 1 << ((slot >> 4) & 63)
+    if (load64(a) & b) == 0 {
+        return
+    }
+    let am = a + (GC_MARK - GC_START)
+    let m = load64(am)
+    if (m & b) != 0 {
+        return
+    }
+    store64(am, m | b)
+    __gc_marked_bytes += es
+    __gc_marked_objs += 1
+    if (fl & F_NOSCAN) == 0 {
+        if __gc_gn == __gc_gcap {
+            __gc_grey_grow()
+        }
+        let e = __gc_grey + (__gc_gn << 4)
+        store64(e, slot)
+        store64(e + 8, es)
+        __gc_gn += 1
+    }
+}
+
+fn __gc_grey_grow() {
+    var nc = __gc_gcap * 2
+    if nc == 0 {
+        nc = 4096
+    }
+    let nb = __gc_scratch(nc * 16)
+    if __gc_gn > 0 {
+        __memcpy(nb, __gc_grey, __gc_gn * 16)
+    }
+    if __gc_grey != 0 {
+        syscall(SYS_MUNMAP, __gc_grey, __gc_gcap * 16)
+    }
+    __gc_grey = nb
+    __gc_gcap = nc
+}
+
+// Слова объекта slot (размер слота es) с битом PTRB — ссылки (у остальных слов
+// бита нет): их цели помечаются.
+fn __gc_scan(slot: int, es: int) {
+    var b = (slot - STORE_REGION) >> 3
+    let e = b + (es >> 3)
+    while b < e {
+        let wi = b >> 6
+        var hi = e - (wi << 6)
+        if hi > 64 {
+            hi = 64
+        }
+        var m = load64(GC_PTRB + (wi << 3)) & __bits_mask(b & 63, hi)
+        let at = STORE_REGION + (wi << 9)
+        while m != 0 {
+            __gc_resolve(load64(at + (__ctz(m) << 3)))
+            m = m & (m - 1)
+        }
+        b = (wi << 6) + hi
+    }
+}
+
+// Разметка до конца (§7.4): сначала захваченные арены, затем серый стек.
+fn __gc_drain() {
+    var i = 0
+    while i < __gc_ncap {
+        __gc_arena(load64(__gc_capl + i * 8))
+        i += 1
+    }
+    while __gc_gn > 0 {
+        __gc_gn -= 1
+        let e = __gc_grey + (__gc_gn << 4)
+        __gc_scan(load64(e), load64(e + 8))
+    }
+}
+
+// Захваченная арена записи r (§6.3): PENDING → GC, просмотреть остаток, DONE;
+// HANDED — разобрать слова, которые нашёл сам контекст, DONE; SELF — контекст
+// смотрит её сам, подождать. Пока сборка идёт под исключительной блокировкой,
+// контекст продолжить не может, и здесь всегда PENDING.
+fn __gc_arena(r: int) {
+    let rec: __Pin = __cast(r)
+    while true {
+        let s = rec.ast
+        let st = s & 7
+        if st == PIN_PENDING {
+            if __cas(r, s, (s & ~7) | PIN_GC) {
+                __gc_resolve_range(__pin_arena_from(rec), rec.hi)
+                rec.aoff = rec.hi - rec.lo
+                rec.ast = (s & ~7) | PIN_DONE
+                return
+            }
+        } else if st == PIN_HANDED {
+            var j = 0
+            while j < rec.hlen {
+                __gc_resolve(load64(rec.hbuf + j * 8))
+                j += 1
+            }
+            rec.ast = (s & ~7) | PIN_DONE
+            return
+        } else if st == PIN_SELF {
+            __cpu_pause()
+        } else {
+            return
+        }
+    }
+}
+
+// Начало непросмотренной части арены записи. Кэш строк в начале арены
+// (STRC_SIZE байт, lib/text.kh) — ключи для сравнения, а не ссылки: их не
+// смотрят ни разметка, ни хеш W1 (__pin_hash).
+fn __pin_arena_from(rec: __Pin) -> int {
+    var p = rec.lo + rec.aoff
+    if rec.hi - rec.lo >= STRC_SIZE && p < rec.lo + STRC_SIZE {
+        p = rec.lo + STRC_SIZE
+    }
+    return p
+}
+
+// Слова [from, to) со значением в STORE — возможные ссылки.
+fn __gc_resolve_range(from: int, to: int) {
+    var p = from
+    while p < to {
+        let w = load64(p)
+        if (w >> 38) == 0x40 {
+            __gc_resolve(w)
+        }
+        p += 8
+    }
+}
+
+// Конец разметки (§7.6): каждая захваченная арена просмотрена (DONE) и снова
+// IDLE (I9); с KHRIP_GC_VERIFY — независимая проверка разметки до уборки
+// (§8.7); помеченное — живые данные; номер уборки растёт, и каждый спан
+// становится неубранным; текущих спанов и частично занятых больше нет (I10):
+// выделение возьмёт только убранные спаны.
+fn __gc_terminate() {
+    var i = 0
+    while i < __gc_ncap {
+        let rec: __Pin = __cast(load64(__gc_capl + i * 8))
+        if (rec.ast & 7) != PIN_DONE {
+            __gc_fatal("a captured arena was not marked by the end of marking (I9)")
+        }
+        rec.ast = PIN_IDLE
+        i += 1
+    }
+    __gc_ncap = 0
+    if __gc_verify {
+        __gc_verify_marks()
+    }
+    __gc_set_marking(false)
+    __gc_phase = GC_PH_SWEEP
+    __heap_marked = __gc_marked_bytes
+    __heap_live = __heap_marked
+    __gc_sweepgen += 1
+    for j in 0..(GC_CLASSES + 1) * 2 {
+        store64(__gc_cur + j * 8, __gc_none)
+        store64(__gc_partial + j * 16, 0)
+        store64(__gc_partial + j * 16 + 8, 0)
+    }
+}
+
+// Уборка всех спанов по адресам (§7.7): спан без объектов — страницы кучке,
+// спан со свободными слотами — в конец списка частично занятых своего класса.
+// Серый стек больше 1 МБ — системе.
+fn __gc_sweep_all() {
+    var kept = 0
+    let hw = load64(__gc_ph + PH_HW)
+    var pg = 0
+    while pg < hw {
+        if load32(GC_PAGEMAP + (pg << 2)) != pg + 1 {
+            pg += 1
+            continue
+        }
+        let s = GC_SPANS + (pg << 6)
+        let np = load64(s + S_INFO) & 0xFFFFFFFF
+        if load64(s + S_SWEEPGEN) != __gc_sweepgen {
+            kept += __gc_sweep_span(s)
+        }
+        pg += np
+    }
+    if __gc_verify && kept != __heap_marked {
+        __gc_fatal("the sweep kept {kept} bytes, but marking counted {__heap_marked}")
+    }
+    __gc_phase = GC_PH_IDLE
+    if __gc_gcap * 16 > GC_MB {
+        syscall(SYS_MUNMAP, __gc_grey, __gc_gcap * 16)
+        __gc_grey = 0
+        __gc_gcap = 0
+    }
+    if __gc_verify {
+        __gc_verify_swept()
+    }
+}
+
+// Уборка спана s → байт в оставшихся объектах. Освобождённый слот (START без
+// MARK) теряет START и биты PTRB (у свободной памяти их нет, §4.2), с
+// KHRIP_GC_VERIFY — заполняется 0xDE (выделение проверит, что в него не
+// писали); MARK снимается у всех.
+fn __gc_sweep_span(s: int) -> int {
+    let info = load64(s + S_INFO)
+    let np = info & 0xFFFFFFFF
+    let fl = info >> 48
+    let base = load64(s + S_BASE)
+    let es = load64(s + S_SIZE)
+    store64(s + S_SWEEPGEN, __gc_sweepgen)
+    if (fl & F_LARGE) != 0 {
+        let am = ((base >> 10) << 3) + GC_START_P + (GC_MARK - GC_START)
+        let b = 1 << ((base >> 4) & 63)
+        if (load64(am) & b) != 0 {
+            store64(am, load64(am) & ~b)
+            return es
+        }
+        if __gc_verify {
+            __memset(base, 0xDE, es)
+        }
+        __span_free(s)
+        return 0
+    }
+    let noscan = (fl & F_NOSCAN) != 0
+    let w0 = (base - STORE_REGION) >> 10
+    let sa = GC_START + (w0 << 3)
+    let ma = GC_MARK + (w0 << 3)
+    let nw = np << 3
+    // сначала — сколько объектов останется: спан без них уходит целиком
+    // (__span_free снимает все его биты), и по слотам идти не нужно
+    var alloc = 0
+    for j in 0..nw {
+        let sw = load64(sa + j * 8)
+        if sw != 0 {
+            alloc += __popcount(sw & load64(ma + j * 8))
+        }
+    }
+    if alloc == 0 {
+        if __gc_verify {
+            for j in 0..nw {
+                var sw = load64(sa + j * 8)
+                while sw != 0 {
+                    __memset(STORE_REGION + ((w0 + j) << 10) + (__ctz(sw) << 4), 0xDE, es)
+                    sw = sw & (sw - 1)
+                }
+            }
+        }
+        __span_free(s)
+        return 0
+    }
+    for j in 0..nw {
+        var sw = load64(sa + j * 8)
+        let mw = load64(ma + j * 8)
+        var freed = sw & ~mw
+        if freed != 0 {
+            sw = sw & mw
+            store64(sa + j * 8, sw)
+            let at = STORE_REGION + ((w0 + j) << 10)
+            while freed != 0 {
+                let p = at + (__ctz(freed) << 4)
+                if __gc_verify {
+                    __memset(p, 0xDE, es)
+                }
+                if !noscan {
+                    __gc_ptrb_clear(p, es)
+                }
+                freed = freed & (freed - 1)
+            }
+        }
+        if mw != 0 {
+            store64(ma + j * 8, 0)
+        }
+    }
+    let nfree = (load64(s + S_MAGIC) >> 32) - alloc
+    store64(s + S_NEXT, nfree << 32)
+    if nfree > 0 {
+        __span_rewind(s)
+        let h = __gc_partial + ((info >> 32) & 0xFFFF) * 16
+        let pg1 = ((base - STORE_REGION) >> GC_PAGE_SHIFT) + 1
+        if load64(h) == 0 {
+            store64(h, pg1)
+        } else {
+            let t = GC_SPANS + ((load64(h + 8) - 1) << 6)
+            store64(t + S_NEXT, (load64(t + S_NEXT) & ~0xFFFFFFFF) | pg1)
+        }
+        store64(h + 8, pg1)
+    }
+    return alloc * es
+}
+
+// Биты PTRB слота p из es байт — нули (свободная память, §4.2). Слот до 64
+// слов задевает одно или два слова карты.
+fn __gc_ptrb_clear(p: int, es: int) {
+    let k = es >> 3
+    if k > 64 {
+        let pb = (p - STORE_REGION) >> 3
+        __bits_put(GC_PTRB, pb, pb + k, false)
+        return
+    }
+    var m = -1
+    if k < 64 {
+        m = (1 << k) - 1
+    }
+    let pa = ((p >> 9) << 3) + GC_PTRB_P
+    let sh = (p >> 3) & 63
+    store64(pa, load64(pa) & ~(m << sh))
+    if sh != 0 && sh + k > 64 {
+        store64(pa + 8, load64(pa + 8) & ~((m >> (64 - sh)) & ((1 << sh) - 1)))
+    }
+}
+
+// Число единиц в слове (SWAR).
+fn __popcount(x: int) -> int {
+    var v = x - ((x >> 1) & 0x5555555555555555)
+    v = (v & 0x3333333333333333) + ((v >> 2) & 0x3333333333333333)
+    v = (v + (v >> 4)) & 0x0F0F0F0F0F0F0F0F
+    return ((v * 0x0101010101010101) >> 56) & 0xFF
+}
+
+// ---- Темп и пределы (§8.2, §8.4; m = 1 до шага 6) ----
+
+// По помеченному после сборки: цель — помеченное · (1 + KHRIP_GC/100), не
+// меньше KHRIP_GC_MIN_MB; порог — 70% запаса; жёсткий предел — вдвое выше цели,
+// но не меньше цели + 64 МБ. KHRIP_GC=off — сборки нет. KHRIP_GC_STRESS — цель
+// и порог сборки внутри работы — помеченное + 64 КБ (у кучи больше 256 КБ —
+// плюс четверть помеченного).
+fn __gc_pace() {
+    let m = __heap_marked
+    if __gc_pct < 0 {
+        __gc_goal = GC_MAX
+        __gc_trigger = GC_MAX
+        __gc_hard = GC_MAX
+        __gc_limit = GC_MAX
+        return
+    }
+    var goal = m + (m / 100) * __gc_pct + (m % 100) * __gc_pct / 100
+    if goal < __gc_min {
+        goal = __gc_min
+    }
+    // KHRIP_GC_STRESS: шаг — 64 КБ, а у большой кучи — четверть помеченного,
+    // иначе работа сборок росла бы как квадрат кучи
+    var step = m / 4
+    if step < GC_STRESS_STEP {
+        step = GC_STRESS_STEP
+    }
+    if __gc_stress {
+        goal = m + step
+    }
+    __gc_goal = goal
+    __gc_trigger = m + (goal - m) / 10 * 7
+    var hard = goal * 2
+    if hard < goal + 64 * GC_MB {
+        hard = goal + 64 * GC_MB
+    }
+    __gc_hard = hard
+    __gc_limit = hard
+    if __gc_stress {
+        __gc_limit = m + step
+    }
+}
+
+// Разбудить поток сборщика (из __salloc_slow: куча дошла до порога) — раз за
+// цикл. Без потока (khc test) сборку запустит точка сборки теста.
+fn __gc_poke() {
+    __gc_poked = true
+    if __gc_has_thread {
+        store64(__gc_ctl, 1)
+        syscall(SYS_FUTEX, __gc_ctl, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0)
+    }
+}
+
+// Жёсткий предел (§8.4) — перед копированием в store (__persist_copy) и ростом
+// контейнера store (__salloc_for), до __pmode_on. Запрос или задача держит
+// store исключительно посреди работы, и поток сборщика его не дождётся:
+// контекст публикует себя (I7: всё, что живо через вызов, — в rbx, rbp, r12–r15
+// или в памяти), собирает и отзывает запись. С KHRIP_GC_STRESS — каждые 64 КБ.
+fn __gc_hard_check() {
+    if __heap_live < __gc_limit {
+        return
+    }
+    if load64(__ctx() + CTX_STORE_HELD) != 1 || __gc_busy || __store_on() {
+        return
+    }
+    __gc_emergency(GC_WHY_EMERGENCY)
+}
+
+// Сборка посреди работы под исключительной блокировкой: запись опубликована
+// на время сборки (единственный случай, когда она опубликована при взятой
+// блокировке), затем отозвана.
+fn __gc_emergency(why: int) {
+    let r = load64(__ctx() + CTX_PINREC)
+    if r == 0 {
+        return
+    }
+    __pin_publish(r)
+    __gc_collect_now(r, why)
+    __pin_withdraw(__cast(r))
+    __gc_release_locked()
+    __gc_report()
+}
+
+// Точка сборки khc test (§6.8): потока сборщика в тестах нет. После call
+// (end = false) тест держит указатели в store и публикует себя; в конце теста
+// (end) со store он закончил. Собирает, если куча дошла до порога, а с
+// KHRIP_GC_STRESS — всегда.
+fn __gc_test_point(end: bool) {
+    if !__gc_ready || __gc_pct < 0 || __gc_busy {
+        return
+    }
+    if !__gc_stress && __heap_live < __gc_trigger {
+        return
+    }
+    if !end {
+        __gc_collect_self(GC_WHY_TEST)
+        return
+    }
+    if load64(__ctx() + CTX_STORE_HELD) != 0 {
+        return
+    }
+    __store_lock_gc()
+    __gc_collect_now(load64(__ctx() + CTX_PINREC), GC_WHY_TEST)
+    __gc_release_locked()
+    __store_unlock_gc()
+    __gc_report()
+}
+
+// KHRIP_GC_STRESS без потока сборщика (khc test): окно (__store_release_keep,
+// блокировка уже отпущена) — тоже точка сборки, как будто в окно попала сборка
+// потока сборщика: контекст опубликовал себя и не держит store. Так и в тестах
+// сборка застаёт то, что запрос держит через ожидание.
+fn __gc_window_point() {
+    if !__gc_stress || __gc_has_thread || __gc_busy || __gc_pct < 0 || !__gc_ready {
+        return
+    }
+    __store_lock_gc()
+    __gc_collect_now(0, GC_WHY_WINDOW)
+    __gc_release_locked()
+    __store_unlock_gc()
+    __gc_report()
+}
+
+// Сборка из контекста, который держит указатели в store: если он держит store
+// исключительно — как у жёсткого предела; если не держит — блокировка
+// сборщика и запись, опубликованная на время сборки (тест после call,
+// __gc_collect). Разделяемая блокировка — собрать нельзя.
+fn __gc_collect_self(why: int) {
+    let c = __ctx()
+    let held = load64(c + CTX_STORE_HELD)
+    if held == 1 {
+        if !__store_on() {
+            __gc_emergency(why)
+        }
+        return
+    }
+    if held != 0 {
+        return
+    }
+    __store_lock_gc()
+    let r = load64(c + CTX_PINREC)
+    __pin_publish(r)
+    __gc_collect_now(r, why)
+    if r != 0 {
+        __pin_withdraw(__cast(r))
+    }
+    __gc_release_locked()
+    __store_unlock_gc()
+    __gc_report()
+}
+
+// Сборка сейчас (тесты, замеры): контекст публикует себя на время сборки.
+// Работает и с KHRIP_GC=off.
+fn __gc_collect() {
+    if !__gc_ready || __gc_busy {
+        return
+    }
+    __gc_collect_self(GC_WHY_CALL)
+}
+
+// Состояние сборщика для тестов и замеров.
+type __GcStats {
+    // сборок
+    cycles: int
+    // байт в выделенных объектах сейчас
+    heap: int
+    // помечено последней сборкой: байт и объектов
+    live: int
+    objects: int
+    // цель и порог следующей сборки
+    goal: int
+    trigger: int
+    // страниц до границы занятых
+    pages: int
+    // байт возвращено системе за всё время
+    released: int
+    // наибольшая пауза, мкс
+    max_pause_us: int
+}
+
+fn __gc_stats() -> __GcStats {
+    return __GcStats { cycles: __gc_cycle_no, heap: __heap_live, live: __heap_marked, objects: __gc_marked_objs, goal: __gc_goal, trigger: __gc_trigger, pages: load64(__gc_ph + PH_HW), released: __gc_total_released, max_pause_us: __gc_max_pause }
+}
+
+// ---- Возврат памяти системе (§4.8) ----
+
+// Свободные грязные страницы (на них были объекты, их память, скорее всего,
+// занята) — системе, сверху вниз, пока их не останется на retain байт:
+// max(1 МБ, 1,1 · цель − занятое), а после простоя (idle) — ни одной. С ними
+// — целые страницы метаданных (START, MARK, PTRB, карта страниц, записи
+// спанов), которые описывают только эти страницы. locked — вызывающий держит
+// store исключительно и не отпускает (сборка внутри работы, тест): всё под
+// блокировкой; иначе (поток сборщика) кучка меняется под мьютексом писателей
+// (__store_lock_marker), а madvise идёт без блокировки — страницы тем
+// временем заняты (__ph_scav_take). runs — место на GC_SCAV_RUNS серий. →
+// байт возвращено.
+fn __gc_scavenge(idle: bool, locked: bool, runs: int) -> int {
+    if !locked {
+        __store_lock_marker()
+    }
+    let ph = __gc_ph
+    let fr = load64(ph + PH_FREE)
+    let dt = load64(ph + PH_DIRTY)
+    var top = __gc_committed >> GC_PAGE_SHIFT
+    if top > load64(ph + PH_CAP) {
+        top = load64(ph + PH_CAP)
+    }
+    var fd = 0
+    var used = 0
+    var wi = 0
+    while (wi << 6) < top {
+        var valid = -1
+        if (wi << 6) + 64 > top {
+            valid = (1 << (top - (wi << 6))) - 1
+        }
+        let f = load64(fr + (wi << 3))
+        fd += __popcount(f & load64(dt + (wi << 3)) & valid)
+        used += __popcount(~f & valid)
+        wi += 1
+    }
+    var retain = 0
+    if !idle {
+        retain = __gc_goal + __gc_goal / 10 - (used << GC_PAGE_SHIFT)
+        if retain < GC_MB {
+            retain = GC_MB
+        }
+    }
+    var need = (fd << GC_PAGE_SHIFT) - retain
+    var n = 0
+    var pg = top
+    while need > 0 && n < GC_SCAV_RUNS {
+        let e = __gc_scav_prev(fr, dt, pg) + 1
+        if e <= 0 {
+            break
+        }
+        var a = e - 1
+        while a > 0 && __gc_scav_page(fr, dt, a - 1) {
+            a -= 1
+        }
+        let most = (need + GC_PAGE - 1) >> GC_PAGE_SHIFT
+        if e - a > most {
+            a = e - most
+        }
+        __ph_scav_take(ph, a, e - a)
+        store64(runs + n * 16, a)
+        store64(runs + n * 16 + 8, e - a)
+        n += 1
+        need -= (e - a) << GC_PAGE_SHIFT
+        pg = a
+    }
+    if !locked {
+        __store_unlock_marker()
+    }
+    var bytes = 0
+    for i in 0..n {
+        let a = load64(runs + i * 16) << GC_PAGE_SHIFT
+        let b = a + (load64(runs + i * 16 + 8) << GC_PAGE_SHIFT)
+        syscall(GC_SYS_MADVISE, STORE_REGION + a, b - a, GC_DONTNEED)
+        __gc_meta_drop(GC_START, a >> 7, b >> 7)
+        __gc_meta_drop(GC_MARK, a >> 7, b >> 7)
+        __gc_meta_drop(GC_PTRB, a >> 6, b >> 6)
+        __gc_meta_drop(GC_SPANS, a >> 7, b >> 7)
+        __gc_meta_drop(GC_PAGEMAP, a >> 11, b >> 11)
+        bytes += b - a
+    }
+    if !locked {
+        __store_lock_marker()
+    }
+    for i in 0..n {
+        __ph_scav_done(ph, load64(runs + i * 16), load64(runs + i * 16 + 8))
+    }
+    if !locked {
+        __store_unlock_marker()
+    }
+    __gc_st_released = bytes
+    __gc_total_released += bytes
+    __gc_st_rss = ((used + fd) << GC_PAGE_SHIFT) - bytes
+    return bytes
+}
+
+// Свободна и грязна ли страница pg.
+fn __gc_scav_page(fr: int, dt: int, pg: int) -> bool {
+    let wi = pg >> 6
+    return (((load64(fr + (wi << 3)) & load64(dt + (wi << 3))) >> (pg & 63)) & 1) != 0
+}
+
+// Самая верхняя свободная грязная страница ниже pg или −1.
+fn __gc_scav_prev(fr: int, dt: int, pg: int) -> int {
+    var p = pg
+    while p > 0 {
+        let wi = (p - 1) >> 6
+        let nb = p - (wi << 6)
+        var x = load64(fr + (wi << 3)) & load64(dt + (wi << 3))
+        if nb < 64 {
+            x = x & ((1 << nb) - 1)
+        }
+        if x != 0 {
+            return (wi << 6) + 63 - __clz(x)
+        }
+        p = wi << 6
+    }
+    return -1
+}
+
+// Метаданные [base + lo, base + hi) — системе целыми страницами внутри
+// диапазона (соседние страницы описывают и другие страницы STORE).
+fn __gc_meta_drop(base: int, lo: int, hi: int) {
+    let l = (lo + 4095) & ~4095
+    let h = hi & ~4095
+    if h > l {
+        syscall(GC_SYS_MADVISE, base + l, h - l, GC_DONTNEED)
+    }
+}
+
+// ---- Поток сборщика (§8.1) ----
+
+// Запустить поток сборщика: сервер и программа с одними every — после
+// загрузки, если в программе есть корни store и сборка не выключена.
+fn __gc_spawn() {
+    if __gc_pct < 0 || __gc_has_thread || load64(__gc_roots()) == 0 {
+        return
+    }
+    let stack = syscall(SYS_MMAP, 0, GC_STACK, 3, 0x22 | 0x4000, -1, 0)
+    if stack < 0 {
+        __panic(PANIC_MEMORY, "mmap")
+    }
+    __gc_has_thread = true
+    // загрузка — не запись после сборки: отсчёт простоя и двух минут — отсюда
+    __gc_touches = __store_touches
+    __gc_last_us = __gc_now_us()
+    __spawn(stack + GC_STACK, -2)
+}
+
+// Поток сборщика (lib/http.kh, __thread_main(-2)): ждёт, пока его разбудят
+// (куча дошла до порога или сборка под чужой блокировкой оставила ему возврат
+// памяти), но не дольше секунды; сборка — под исключительной блокировкой
+// сборщика, возврат памяти — без неё. Десять секунд без выделений в store —
+// простой (раз на период): сборка, если с прошлой выделено больше 1 МБ или
+// store брали на запись, и вся свободная память — системе. Store брали на
+// запись, а сборки не было две минуты — сборка. Строки журнала — в своей
+// арене потока.
+fn __gc_thread_main() {
+    __arena_init()
+    let ts = __alloc(16)
+    let runs = __gc_scratch(GC_SCAV_RUNS * 16)
+    var idle = 0
+    var last_live = -1
+    var last_cycle = -1
+    var idle_done = false
+    while true {
+        store64(ts, 1)
+        store64(ts + 8, 0)
+        syscall(SYS_FUTEX, __gc_ctl, FUTEX_WAIT_PRIVATE, 0, ts, 0, 0)
+        if load64(__gc_ctl) != 0 || __heap_live >= __gc_trigger {
+            __gc_thread_cycle(GC_WHY_PACE, runs)
+            idle = 0
+            idle_done = false
+            continue
+        }
+        if __heap_live == last_live && __gc_cycle_no == last_cycle {
+            idle += 1
+        } else {
+            idle = 0
+            idle_done = false
+        }
+        if idle >= GC_IDLE_TICKS && !idle_done {
+            // простой — раз на период без выделений: сборка, если с прошлой
+            // выделено больше 1 МБ или store брали на запись (удаления и
+            // замены освобождают, не выделяя), и всё свободное — системе
+            idle_done = true
+            if __heap_live > __heap_marked + GC_MB || __store_touches != __gc_touches {
+                __gc_thread_cycle(GC_WHY_IDLE, runs)
+            } else {
+                __gc_scavenge(true, false, runs)
+            }
+        } else if __store_touches != __gc_touches && __gc_now_us() - __gc_last_us >= GC_FORCE_US {
+            // store меняют, а куча не растёт (одни удаления): сборка раз в
+            // две минуты, как у Go
+            __gc_thread_cycle(GC_WHY_FORCED, runs)
+        }
+        last_live = __heap_live
+        last_cycle = __gc_cycle_no
+    }
+}
+
+fn __gc_thread_cycle(why: int, runs: int) {
+    __store_lock_gc()
+    store64(__gc_ctl, 0)
+    var ran = false
+    if why != GC_WHY_PACE || __heap_live >= __gc_trigger {
+        __gc_collect_now(0, why)
+        ran = true
+    }
+    // и возврат памяти, который оставила сборка под чужой блокировкой
+    let scav = ran || __gc_scav_due
+    __gc_scav_due = false
+    __gc_poked = false
+    __store_unlock_gc()
+    if scav {
+        __gc_scavenge(why == GC_WHY_IDLE, false, runs)
+    }
+    if ran {
+        if __gc_log {
+            __arena_begin()
+            eprint(__gc_line())
+            __arena_end()
+        }
+    }
+}
+
+// ---- Журнал (KHRIP_GC_LOG=1, §8.6) ----
+
+// Строка о последней сборке — в stderr (сборка внутри работы и в тестах).
+fn __gc_report() {
+    if __gc_log {
+        eprint(__gc_line())
+    }
+}
+
+fn __gc_line() -> str {
+    var why = "pace"
+    if __gc_st_why == GC_WHY_IDLE {
+        why = "idle"
+    } else if __gc_st_why == GC_WHY_EMERGENCY {
+        why = "in request"
+    } else if __gc_st_why == GC_WHY_RELEASE {
+        why = "at release"
+    } else if __gc_st_why == GC_WHY_TEST {
+        why = "test"
+    } else if __gc_st_why == GC_WHY_CALL {
+        why = "explicit"
+    } else if __gc_st_why == GC_WHY_WINDOW {
+        why = "window"
+    } else if __gc_st_why == GC_WHY_FORCED {
+        why = "forced"
+    }
+    let pause = __gc_st_pause
+    var line = "gc {__gc_cycle_no} ({why}): heap {__gc_mbs(__gc_st_before)}->{__gc_mbs(__gc_st_after)} MB, live {__gc_mbs(__heap_marked)} MB ({__gc_marked_objs} obj), m 1, pins {__gc_st_recs} rec/{__gc_st_words} words, arenas {__gc_st_arenas} ({(__gc_st_abytes + 1023) / 1024} KB), pause {__gc_ms(pause)} ms (start {__gc_ms(__gc_st_start)}, mark {__gc_ms(__gc_st_mark)}, sweep {__gc_ms(__gc_st_sweep)}, release {__gc_ms(__gc_st_release)})"
+    if __gc_st_handed {
+        line += ", pages released by the GC thread"
+    } else {
+        line += ", released {__gc_mbs(__gc_st_released)} MB, rss-store {__gc_mbs(__gc_st_rss)} MB"
+    }
+    if __gc_st_long > 0 {
+        line += ", long holders {__gc_st_long} ({__gc_st_long_age} cycles, {__gc_st_long_words} words)"
+    }
+    return line + ", next at {__gc_mbs(__gc_trigger)} MB"
+}
+
+// Байты в мегабайтах с одним знаком.
+fn __gc_mbs(b: int) -> str {
+    if b == GC_MAX {
+        return "-"
+    }
+    let t = (b * 10 + GC_MB / 2) / GC_MB
+    return "{t / 10}.{t % 10}"
+}
+
+// Микросекунды в миллисекундах с двумя знаками.
+fn __gc_ms(us: int) -> str {
+    let f = (us % 1000) / 10
+    if f < 10 {
+        return "{us / 1000}.0{f}"
+    }
+    return "{us / 1000}.{f}"
 }
 
 // ---- Загрузка ----
@@ -1367,6 +2590,9 @@ fn __store_boot(load: bool) {
     if restored && __gc_verify {
         __gc_verify_graph("restore")
     }
+    // всё, что построено при загрузке, живо: от этого — темп сборок (§5.3)
+    __heap_marked = __heap_live
+    __gc_pace()
     __store_release_final()
     __store_saved = __store_touches
 }

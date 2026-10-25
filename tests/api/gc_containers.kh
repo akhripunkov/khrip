@@ -1,0 +1,149 @@
+// Сборщик store и операции контейнеров (docs/design/v0.13-store-gc.md §15.1,
+// §4.7): pop, truncate, clear, remove_at, insert, reverse, sort и sort_by на
+// списках store из 100 тысяч элементов, со сборками между шагами; remove,
+// повторная вставка, clear и перестройка словаря. Освобождённые места
+// обнуляются, поэтому удалённое уходит в следующую же сборку (живое
+// уменьшается), а оставшееся цело. Живое сравнивается в следующем тесте:
+// тест держит указатели на стеке и в арене, и сборка внутри него может
+// оставить то, на что они ещё смотрят. clear и remove оставляют массивы
+// контейнеров прежней вместимости, поэтому после них считаются объекты.
+
+type Entry { key: str, n: int }
+
+store words: [str]
+store nums: [int]
+store entries: [Entry]
+store idx: map[str, int]
+store live_before: int
+store objs_before: int
+
+fn live() -> int {
+    __gc_collect()
+    return __gc_stats().live
+}
+
+fn objects() -> int {
+    __gc_collect()
+    return __gc_stats().objects
+}
+
+test "build 100k-element lists and a 50k map" {
+    for i in 0..100000 {
+        words.push("word {i}")
+        nums.push(i * 7 % 100003)
+    }
+    for i in 0..20000 {
+        entries.push(Entry { key: "k{(i * 7919) % 20000}", n: i })
+    }
+    for i in 0..50000 {
+        idx["key {i}"] = i
+    }
+}
+
+test "pop and truncate" {
+    live_before = live()
+    for i in 0..10000 {
+        words.pop()
+    }
+    __gc_collect()
+    expect words.len() == 90000 && words[89999] == "word 89999"
+    words.truncate(50000)
+    __gc_collect()
+    expect words.len() == 50000 && words[49999] == "word 49999"
+    nums.truncate(60000)
+}
+
+test "pop and truncate freed half of the strings" {
+    let now = live()
+    // 50 тысяч строк по 32 байта
+    expect live_before - now > 50000 * 32 * 9 / 10
+    expect words[0] == "word 0" && nums.len() == 60000
+}
+
+test "remove_at and insert shift elements, collections between" {
+    for i in 0..500 {
+        words.remove_at(i * 50)
+    }
+    __gc_collect()
+    expect words.len() == 49500
+    expect words[0] == "word 1" && words[1] == "word 2"
+    for i in 0..300 {
+        words.insert(i * 100, "inserted {i}")
+    }
+    __gc_collect()
+    expect words.len() == 49800
+    expect words[0] == "inserted 0" && words[100] == "inserted 1"
+    for i in 0..1000 {
+        nums.remove_at(0)
+        nums.insert(nums.len() / 2, i)
+    }
+    __gc_collect()
+    expect nums.len() == 60000
+}
+
+test "reverse, sort and sort_by keep every element" {
+    words.reverse()
+    __gc_collect()
+    expect words[words.len() - 1] == "inserted 0"
+    words.sort()
+    __gc_collect()
+    expect words[0] < words[1] && words[words.len() - 2] < words[words.len() - 1]
+    nums.sort()
+    __gc_collect()
+    expect nums[0] <= nums[1] && nums[59998] <= nums[59999]
+    entries.sort_by(e => e.key)
+    __gc_collect()
+    expect entries[0].key == "k0" && entries[19999].key == "k9999"
+    entries.sort_by(e => e.n)
+    __gc_collect()
+    expect entries[12345].n == 12345 && entries[12345].key == "k{(12345 * 7919) % 20000}"
+}
+
+test "clear frees the strings" {
+    live_before = live()
+    words.clear()
+    entries.clear()
+}
+
+test "after clear the strings are gone" {
+    let now = live()
+    expect live_before - now >= 49800 * 32 + 20000 * 48
+    expect words.len() == 0 && entries.len() == 0
+    words.push("again")
+    expect words[0] == "again"
+}
+
+test "map remove, re-insert and rehash" {
+    objs_before = objects()
+    for i in 0..50000 {
+        if i % 2 == 0 {
+            idx.remove("key {i}")
+        }
+    }
+    __gc_collect()
+    expect idx.len() == 25000
+    expect idx["key 1"] == 1 && idx["key 2"] == none
+    // вставки после удалений перестраивают словарь (уплотнение)
+    for i in 0..20000 {
+        idx["new {i}"] = -i
+    }
+    __gc_collect()
+    expect idx.len() == 45000
+    expect idx["new 19999"] == -19999 && idx["key 49999"] == 49999
+}
+
+test "removed keys were freed" {
+    // 25 тысяч ключей ушли, 20 тысяч пришли
+    let now = objects()
+    expect now <= objs_before - 5000 + 16
+    idx.clear()
+}
+
+test "map clear frees every key" {
+    let now = objects()
+    // остались контейнеры и одна строка "again"
+    expect now < 40
+    expect idx.len() == 0
+    idx["x"] = 1
+    expect idx["x"] == 1
+}

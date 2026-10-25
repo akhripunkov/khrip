@@ -160,6 +160,8 @@ fn __persist_copy(v: int, d: int) -> int {
         // всё живёт в обычной памяти, копировать некуда
         return v
     }
+    // жёсткий предел кучи: собрать до копии (lib/gc.kh, §8.4)
+    __gc_hard_check()
     let on = __pmode_on()
     let r = __deep_copy(v, d)
     if on {
@@ -1831,6 +1833,8 @@ fn __test_end(name: str) {
     store64(c + CTX_CATCH, 0)
     __db_end()
     __store_release_final()
+    // со store тест закончил: точка сборки без публикации (lib/gc.kh)
+    __gc_test_point(true)
     if __test_bad {
         __tests_failed += 1
         write("FAIL  " + name + "\n" + __test_log)
@@ -1915,10 +1919,12 @@ fn __call(method: str, target: str, body: int, d: int, headers: int) -> Response
     let th = load64(c + CTX_STORE_HELD)
     __serve_one(w, req)
     store64(c + CTX_PGHELD, held)
+    // точка сборки теста (lib/gc.kh, docs/design/v0.13-store-gc.md §6.8): тест
+    // держит указатели в store и публикует себя на время сборки
+    __gc_test_point(false)
     if th != 0 {
         // тест держал блокировку — снова держит (CTX_STORE_MODE сброшен в 0:
-        // монопольно); точка сборки для тестов (__gc_test_point) — шаг 5
-        // docs/design/v0.13-store-gc.md
+        // монопольно)
         __store_lock()
     }
     let used = load64(c + CTX_PTR) - mark

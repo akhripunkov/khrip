@@ -30,6 +30,8 @@
 #   docs/tutorial/    — примеры учебника выполняются, их тесты проходят;
 #   tests/http.sh     — HTTP-сервер на Khrip отвечает правильно;
 #   tests/coro.sh     — запросы, которые ждут (sleep, fetch), не держат поток;
+#   tests/gc.sh       — сборщик store: запросы держат значения через ожидания,
+#                       пока писатели их заменяют, а сборщик собирает;
 #   tests/tls.sh      — свой TLS 1.3: криптография, сертификаты, рукопожатия;
 #   tests/pg.sh       — клиент PostgreSQL на временном сервере;
 #   tests/mongo.sh, tests/clickhouse.sh, tests/databases/runtime.sh —
@@ -42,7 +44,10 @@
 # Компилятор берётся из $KHC (по умолчанию build/khc). С KHRIP_GC_VERIFY=1 в
 # окружении проверки сборщика идут во всех программах набора (tests/api без
 # них — только первый проход); с KHRIP_GC_VERIFY=fast — те же проверки, но
-# выделение из store идёт и быстрым путём.
+# выделение из store идёт и быстрым путём. С KHRIP_GC_STRESS=1 сборка идёт
+# очень часто (каждые 64 КБ выделений в store) и с проверками во всех
+# программах набора, кроме первого прохода tests/api; tests/api/gc_*.kh и без
+# неё проходят третий раз — с KHRIP_GC_STRESS=1.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -164,7 +169,7 @@ fi
 
 for src in tests/api/*.kh; do
 	name=$(basename "$src" .kh)
-	env -u KHRIP_GC_VERIFY "$KHC" test "$src" >"$tmp/$name.out" 2>&1
+	env -u KHRIP_GC_VERIFY -u KHRIP_GC_STRESS "$KHC" test "$src" >"$tmp/$name.out" 2>&1
 	if ! diff -u "tests/api/$name.out" "$tmp/$name.out" >"$tmp/$name.diff"; then
 		failed "$src" "вывод тестов отличается от ожидаемого"
 		cat "$tmp/$name.diff"
@@ -193,6 +198,22 @@ for src in tests/api/*.kh; do
 	pass=$((pass + 1))
 done
 
+# Тесты сборщика (tests/api/gc_*.kh) — ещё и с KHRIP_GC_STRESS=1 (если набор
+# идёт без неё): сборка в каждой точке сборки теста и каждые 64 КБ выделений,
+# с проверками; вывод тот же.
+if [[ "${KHRIP_GC_STRESS:-}" != 1 ]]; then
+	for src in tests/api/gc_*.kh; do
+		name=$(basename "$src" .kh)
+		KHRIP_GC_STRESS=1 "$KHC" test "$src" 2>&1 | grep -v '^khrip: gc verify (boot): ' >"$tmp/$name.sout"
+		if ! diff -u "tests/api/$name.out" "$tmp/$name.sout" >"$tmp/$name.diff"; then
+			failed "$src (KHRIP_GC_STRESS=1)" "вывод тестов отличается от ожидаемого"
+			cat "$tmp/$name.diff"
+			continue
+		fi
+		pass=$((pass + 1))
+	done
+fi
+
 # Примеры учебника (docs/TUTORIAL.md) и ответы к заданиям: программы
 # выполняются, API проходят свои блоки test.
 for src in docs/tutorial/*.kh docs/tutorial/answers/*.kh; do
@@ -212,7 +233,7 @@ done
 # --all-lib проверяет все функции библиотеки, а не только вызванные программой:
 # с API (crud.kh; с проверками сборщика и без) и без него — вместе с исходниками
 # компилятора в режиме --system.
-if env -u KHRIP_GC_VERIFY "$KHC" check --all-lib tests/api/crud.kh >"$tmp/alllib.txt" 2>&1; then
+if env -u KHRIP_GC_VERIFY -u KHRIP_GC_STRESS "$KHC" check --all-lib tests/api/crud.kh >"$tmp/alllib.txt" 2>&1; then
 	pass=$((pass + 1))
 else
 	failed "khc check --all-lib tests/api/crud.kh" "$(cat "$tmp/alllib.txt")"
@@ -336,14 +357,14 @@ fi
 # программа со store — кода проверок сборщика (lib/gc_noverify.kh вместо
 # lib/gc_verify.kh).
 for src in tests/run/arith.kh tests/run/net_sigpipe.kh tests/run/ch_lex.kh tests/chdb/api.kh; do
-	env -u KHRIP_GC_VERIFY "$KHC" --sizes -o "$tmp/nostore" "$src" >"$tmp/nostore.txt" 2>&1
+	env -u KHRIP_GC_VERIFY -u KHRIP_GC_STRESS "$KHC" --sizes -o "$tmp/nostore" "$src" >"$tmp/nostore.txt" 2>&1
 	if grep -E ' (__salloc|__pmode_|__gc_|__span_|__ph_|__store_mut)' "$tmp/nostore.txt" >"$tmp/nostore.bad"; then
 		failed "$src" "код store в программе без store:"$'\n'"$(cat "$tmp/nostore.bad")"
 	else
 		pass=$((pass + 1))
 	fi
 done
-env -u KHRIP_GC_VERIFY "$KHC" --sizes -o "$tmp/store" tests/api/crud.kh >"$tmp/store.txt" 2>&1
+env -u KHRIP_GC_VERIFY -u KHRIP_GC_STRESS "$KHC" --sizes -o "$tmp/store" tests/api/crud.kh >"$tmp/store.txt" 2>&1
 if grep -E ' (__gcv_|__gc_verify_graph|__gc_verify_heap|__ph_check|__ph_selftest)' "$tmp/store.txt" >"$tmp/store.bad"; then
 	failed "tests/api/crud.kh" "проверки сборщика без KHRIP_GC_VERIFY:"$'\n'"$(cat "$tmp/store.bad")"
 else
@@ -470,6 +491,11 @@ fi
 if [[ -f tests/coro.sh ]] && command -v curl >/dev/null; then
 	# shellcheck source=tests/coro.sh
 	source tests/coro.sh
+fi
+
+if [[ -f tests/gc.sh ]] && command -v curl >/dev/null && command -v python3 >/dev/null; then
+	# shellcheck source=tests/gc.sh
+	source tests/gc.sh
 fi
 
 if [[ -f tests/tls.sh ]] && command -v curl >/dev/null; then
