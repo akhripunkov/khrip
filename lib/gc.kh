@@ -1935,8 +1935,30 @@ fn __gc_sweep_span(s: int) -> int {
     let w0 = (base - STORE_REGION) >> 10
     let sa = GC_START + (w0 << 3)
     let ma = GC_MARK + (w0 << 3)
+    let nw = np << 3
+    // сначала — сколько объектов останется: спан без них уходит целиком
+    // (__span_free снимает все его биты), и по слотам идти не нужно
     var alloc = 0
-    for j in 0..np << 3 {
+    for j in 0..nw {
+        let sw = load64(sa + j * 8)
+        if sw != 0 {
+            alloc += __popcount(sw & load64(ma + j * 8))
+        }
+    }
+    if alloc == 0 {
+        if __gc_verify {
+            for j in 0..nw {
+                var sw = load64(sa + j * 8)
+                while sw != 0 {
+                    __memset(STORE_REGION + ((w0 + j) << 10) + (__ctz(sw) << 4), 0xDE, es)
+                    sw = sw & (sw - 1)
+                }
+            }
+        }
+        __span_free(s)
+        return 0
+    }
+    for j in 0..nw {
         var sw = load64(sa + j * 8)
         let mw = load64(ma + j * 8)
         var freed = sw & ~mw
@@ -1950,8 +1972,7 @@ fn __gc_sweep_span(s: int) -> int {
                     __memset(p, 0xDE, es)
                 }
                 if !noscan {
-                    let pb = (p - STORE_REGION) >> 3
-                    __bits_put(GC_PTRB, pb, pb + (es >> 3), false)
+                    __gc_ptrb_clear(p, es)
                 }
                 freed = freed & (freed - 1)
             }
@@ -1959,13 +1980,6 @@ fn __gc_sweep_span(s: int) -> int {
         if mw != 0 {
             store64(ma + j * 8, 0)
         }
-        if sw != 0 {
-            alloc += __popcount(sw)
-        }
-    }
-    if alloc == 0 {
-        __span_free(s)
-        return 0
     }
     let nfree = (load64(s + S_MAGIC) >> 32) - alloc
     store64(s + S_NEXT, nfree << 32)
@@ -1982,6 +1996,27 @@ fn __gc_sweep_span(s: int) -> int {
         store64(h + 8, pg1)
     }
     return alloc * es
+}
+
+// Биты PTRB слота p из es байт — нули (свободная память, §4.2). Слот до 64
+// слов задевает одно или два слова карты.
+fn __gc_ptrb_clear(p: int, es: int) {
+    let k = es >> 3
+    if k > 64 {
+        let pb = (p - STORE_REGION) >> 3
+        __bits_put(GC_PTRB, pb, pb + k, false)
+        return
+    }
+    var m = -1
+    if k < 64 {
+        m = (1 << k) - 1
+    }
+    let pa = ((p >> 9) << 3) + GC_PTRB_P
+    let sh = (p >> 3) & 63
+    store64(pa, load64(pa) & ~(m << sh))
+    if sh != 0 && sh + k > 64 {
+        store64(pa + 8, load64(pa + 8) & ~((m >> (64 - sh)) & ((1 << sh) - 1)))
+    }
 }
 
 // Число единиц в слове (SWAR).

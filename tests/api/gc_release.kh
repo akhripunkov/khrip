@@ -1,0 +1,54 @@
+// Возврат памяти store системе (docs/design/v0.13-store-gc.md §4.8): после
+// сборки свободные страницы сверх запаса (1,1 · цель − занятое, не меньше 1 МБ)
+// уходят системе (MADV_DONTNEED) вместе с их метаданными; RSS процесса падает,
+// а страницы снова годятся для новых объектов (они нулевые, их не обнуляют).
+
+store big: [str]
+store keep: [str]
+store rss_full: int
+store released_before: int
+
+fn rss_kb() -> int {
+    let text = read_file("/proc/self/status") ?? ""
+    for line in text.split("\n") {
+        if line.starts_with("VmRSS:") {
+            let parts = line.split(" ").filter(p => p != "" && p != "kB")
+            return parts[parts.len() - 1].to_int() ?? 0
+        }
+    }
+    return 0
+}
+
+test "fill 20 MB of store strings" {
+    for i in 0..200000 {
+        big.push("string number {i} " + "z".repeat(60))
+    }
+    keep.push("kept")
+}
+
+test "drop them" {
+    __gc_collect()
+    rss_full = rss_kb()
+    released_before = __gc_stats().released
+    big = []
+}
+
+test "the collection gives the pages back" {
+    __gc_collect()
+    let s = __gc_stats()
+    // 200 тысяч строк по 96 байт и массив — около 20 МБ, запас — около 4 МБ
+    // (с KHRIP_GC_STRESS память уходит уже в сборке в конце прошлого теста)
+    expect s.released - released_before > 12 * 1048576
+    expect rss_full - rss_kb() > 12 * 1024
+    expect s.live < 1048576
+    expect keep[0] == "kept"
+}
+
+test "released pages are reused" {
+    for i in 0..100000 {
+        big.push("again {i} " + "q".repeat(60))
+    }
+    __gc_collect()
+    expect big.len() == 100000 && big[99999] == "again 99999 " + "q".repeat(60)
+    expect keep[0] == "kept"
+}

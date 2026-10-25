@@ -30,6 +30,8 @@
 #   docs/tutorial/    — примеры учебника выполняются, их тесты проходят;
 #   tests/http.sh     — HTTP-сервер на Khrip отвечает правильно;
 #   tests/coro.sh     — запросы, которые ждут (sleep, fetch), не держат поток;
+#   tests/gc.sh       — сборщик store: запросы держат значения через ожидания,
+#                       пока писатели их заменяют, а сборщик собирает;
 #   tests/tls.sh      — свой TLS 1.3: криптография, сертификаты, рукопожатия;
 #   tests/pg.sh       — клиент PostgreSQL на временном сервере;
 #   tests/mongo.sh, tests/clickhouse.sh, tests/databases/runtime.sh —
@@ -489,6 +491,11 @@ fi
 if [[ -f tests/coro.sh ]] && command -v curl >/dev/null; then
 	# shellcheck source=tests/coro.sh
 	source tests/coro.sh
+fi
+
+if [[ -f tests/gc.sh ]] && command -v curl >/dev/null && command -v python3 >/dev/null; then
+	# shellcheck source=tests/gc.sh
+	source tests/gc.sh
 fi
 
 if [[ -f tests/tls.sh ]] && command -v curl >/dev/null; then

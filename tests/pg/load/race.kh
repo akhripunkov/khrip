@@ -8,6 +8,38 @@ CREATE TABLE accounts (id bigint PRIMARY KEY, balance bigint NOT NULL CHECK (bal
 INSERT INTO accounts SELECT g, 1000 FROM generate_series(1, 5) g;
 `
 type Counter { id: int, n: int }
+
+// Метка из store держится через тело tx (ожидания sql, повторы при
+// конфликте), пока /label заменяет метки и оставляет мусор для сборщика store.
+store labels: map[int, str]
+
+fn label_of(k: int, v: int) -> str {
+    return "label {k} {v} {(k * 31 + v * 17) % 1009}"
+}
+
+fn label_ok(s: str) -> bool {
+    let p = s.split(" ")
+    if p.len() != 4 || p[0] != "label" {
+        return false
+    }
+    let k = p[1].to_int() ?? -1
+    let v = p[2].to_int() ?? -1
+    return k >= 0 && v >= 0 && p[3] == "{(k * 31 + v * 17) % 1009}"
+}
+
+route POST "/label/{k}" (k: int) -> 204 | 500 str {
+    for i in 0..2000 {
+        let key = (k + i) % 10
+        let old = labels[key] ?? label_of(key, 0)
+        if !label_ok(old) {
+            return 500 "bad label {old}"
+        }
+        let v = (old.split(" ")[2].to_int() ?? 0) + 1
+        labels[key] = label_of(key, v) + " "
+        labels[key] = label_of(key, v)
+    }
+    return 204
+}
 type Account { id: int, balance: int }
 type Total { n: int, balance: int }
 
@@ -17,8 +49,12 @@ fn counter(id: int) -> Counter {
 }
 
 route POST "/hit/{id}" (id: int) -> Counter | 404 {
+    let lb = labels[id % 10] ?? label_of(id % 10, 0)
     return tx {
         let c = counter(id)
+        if !label_ok(lb) {
+            fail(500, "bad label {lb}")
+        }
         sql "UPDATE counters SET n = {c.n + 1} WHERE id = {id} RETURNING *"
     }
 }

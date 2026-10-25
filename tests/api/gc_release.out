@@ -1,0 +1,5 @@
+ok    fill 20 MB of store strings
+ok    drop them
+ok    the collection gives the pages back
+ok    released pages are reused
+4 tests: 4 passed, 0 failed
