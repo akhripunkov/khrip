@@ -18,7 +18,13 @@ fn __gc_check_owner() {
 fn __gc_check_zero(p: int, n: int) {
 }
 
+fn __gc_check_slow() {
+}
+
 fn __gc_verify_release() {
+}
+
+fn __gc_verify_start(self: int) {
 }
 
 fn __gc_verify_graph(when: str) {

@@ -804,6 +804,61 @@ fn emit_simd_find_json_hi() {
     emit_hex("45 85 C9 74 05 48 0F BA E8 3E")
 }
 
+// ---- Сборщик store: слова со значением в STORE ----
+
+// __simd_pinscan(адрес, n, out): слова [p, p + 8n) со значением в области STORE
+// ((w >> 38) == 0x40) — подряд в out; → их число. В out — место на n слов:
+// найденный блок пишет все свои слова и сдвигает конец только на совпавшие
+// (без переходов по каждому слову), поэтому лишнее слово может лечь за концом,
+// но не дальше n. Запись сборщика копирует так регистры, стек и контекст
+// (lib/gc.kh, __pin_take); совпадений обычно нет, и блок без них — несколько
+// инструкций. AVX2 — 4 слова за шаг (vpsrlq 38, vpcmpeqq, vmovmskpd), SSE2 — 2
+// (pcmpeqq в SSE2 нет: после сдвига на 38 старшая половина слова — нуль, и
+// сравниваются половины, pcmpeqd; совпадение — младшие, биты 0 и 2
+// movmskps), остаток и уровень 0 — по слову. Байты — nasm от текста в
+// комментариях; кроме аргументов затираются rax rcx r8–r11 и ymm0–ymm2.
+fn emit_simd_pinscan() {
+    // xor eax, eax (найдено); xor r8d, r8d (номер слова)
+    emit_hex("31 C0 45 31 C0")
+    // cmp byte [__simd_level], 1; jb .scalar; cmp byte [__simd_level], 2; jb .sse
+    emit_level_cmp(1)
+    emit_hex("0F 82 F8 00 00 00")
+    emit_level_cmp(2)
+    emit_hex("0F 82 8C 00 00 00")
+    // AVX2: ymm2 = 0x40 в каждом слове: mov r9d, 0x40; vmovq xmm2, r9; vpbroadcastq ymm2, xmm2
+    emit_hex("41 B9 40 00 00 00 C4 C1 F9 6E D1 C4 E2 7D 59 D2")
+    // .avx: lea r9, [r8 + 4]; cmp r9, rsi; ja .avx_end; vmovdqu ymm0, [rdi + r8*8];
+    // vpsrlq ymm1, ymm0, 38; vpcmpeqq ymm1, ymm1, ymm2; vmovmskpd ecx, ymm1;
+    // test ecx, ecx; jnz .avx_hit; .avx_next: add r8, 4; jmp .avx
+    emit_hex("4D 8D 48 04 49 39 F1 77 6E C4 A1 7E 6F 04 C7 C5 F5 73 D0 26")
+    emit_hex("C4 E2 75 29 CA C5 FD 50 C9 85 C9 75 06 49 83 C0 04 EB D9")
+    // .avx_hit: слово k блока: mov r10, [rdi + r8*8 + 8k]; mov [rdx + rax*8], r10;
+    // rax += бит k маски (mov r11d, ecx; shr r11d, k; and r11d, 1; add rax, r11);
+    // после слова 3 — shr ecx, 3; add rax, rcx; jmp .avx_next
+    emit_hex("4E 8B 14 C7 4C 89 14 C2 41 89 CB 41 83 E3 01 4C 01 D8")
+    emit_hex("4E 8B 54 C7 08 4C 89 14 C2 41 89 CB 41 D1 EB 41 83 E3 01 4C 01 D8")
+    emit_hex("4E 8B 54 C7 10 4C 89 14 C2 41 89 CB 41 C1 EB 02 41 83 E3 01 4C 01 D8")
+    emit_hex("4E 8B 54 C7 18 4C 89 14 C2 C1 E9 03 48 01 C8 EB AA")
+    // .avx_end: vzeroupper; jmp .scalar (остаток)
+    emit_hex("C5 F8 77 EB 5E")
+    // .sse: xmm2 = [0x40, 0, 0x40, 0] (по 32 бита): mov r9d, 0x40; movq xmm2, r9;
+    // punpcklqdq xmm2, xmm2
+    emit_hex("41 B9 40 00 00 00 66 49 0F 6E D1 66 0F 6C D2")
+    // .sse_loop: lea r9, [r8 + 2]; cmp r9, rsi; ja .scalar; movdqu xmm1, [rdi + r8*8];
+    // psrlq xmm1, 38; pcmpeqd xmm1, xmm2; movmskps ecx, xmm1; test ecx, 5;
+    // jnz .sse_hit; .sse_next: add r8, 2; jmp .sse_loop
+    emit_hex("4D 8D 48 02 49 39 F1 77 46 F3 42 0F 6F 0C C7 66 0F 73 D1 26")
+    emit_hex("66 0F 76 CA 0F 50 C9 F7 C1 05 00 00 00 75 06 49 83 C0 02 EB D7")
+    // .sse_hit: слово 0 и rax += бит 0; слово 1 и rax += бит 2; jmp .sse_next
+    emit_hex("4E 8B 14 C7 4C 89 14 C2 41 89 CB 41 83 E3 01 4C 01 D8")
+    emit_hex("4E 8B 54 C7 08 4C 89 14 C2 C1 E9 02 83 E1 01 48 01 C8 EB D4")
+    // .scalar: cmp r8, rsi; jae .done; mov r10, [rdi + r8*8]; mov r11, r10;
+    // shr r11, 38; cmp r11, 0x40; jne .s_next; mov [rdx + rax*8], r10; inc rax;
+    // .s_next: inc r8; jmp .scalar; .done
+    emit_hex("49 39 F0 73 1D 4E 8B 14 C7 4D 89 D3 49 C1 EB 26 49 83 FB 40 75 07")
+    emit_hex("4C 89 14 C2 48 FF C0 49 FF C0 EB DE")
+}
+
 // __cpu_avx2(): есть ли AVX2 и включено ли сохранение ymm операционной системой.
 fn emit_cpu_avx2() {
     var no: [int] = []

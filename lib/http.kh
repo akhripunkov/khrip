@@ -469,6 +469,9 @@ fn __co_new(s: __Server) -> __Co? {
     store64(x + CTX_WORKER, co.w)
     store64(x + CTX_SERVER, __cast(s))
     store64(x + CTX_CORO, __cast(co))
+    // запись для сборщика store (в программе без store — 0): стек сопрограммы —
+    // стек запросов потока до его вершины
+    store64(x + CTX_PINREC, __pin_new(s.sch.top))
     __arena_attach(x, base)
     return co
 }
@@ -491,6 +494,10 @@ fn __co_get(s: __Server) -> __Co? {
 }
 
 fn __co_put(s: __Server, co: __Co) {
+    // запрос закончен последним отпусканием store: запись не опубликована
+    if __gc_verify {
+        __pin_check_idle(load64(co.ctx + CTX_PINREC))
+    }
     co.started = false
     co.parked = false
     co.done = false
@@ -921,6 +928,9 @@ fn __env_int(name: str, default: int) -> int {
 const SYS_SCHED_SETAFFINITY = 203
 const SYS_SCHED_GETAFFINITY = 204
 const THREAD_STACK = 8388608
+// Рабочих потоков не больше: реестр потоков сборщика store (lib/gc.kh,
+// GC_MAX_THREADS) вмещает их, поток задач и поток сборщика.
+const THREADS_MAX = 4000
 
 // Ядра, на которых разрешено работать процессу (учитывает taskset).
 var __cpus: [int]
@@ -952,6 +962,7 @@ fn __pin(cpu: int) {
 // Начало рабочего потока (__spawn); id < 0 — поток фоновых задач.
 fn __thread_main(id: int) {
     __thread_init()
+    store64(__ctx() + CTX_STACK_TOP, __sp())
     if id < 0 {
         __timer_loop()
         return
@@ -1032,7 +1043,7 @@ fn __save_store(w: __Worker) {
         store64(c + CTX_CATCH, w.jb)
         let text = __store_snapshot()
         store64(c + CTX_CATCH, 0)
-        __store_unlock()
+        __store_release_final()
         let tmp = path + ".tmp"
         if write_file(tmp, text, false) {
             syscall(SYS_RENAME_STORE, __cstr(tmp), __cstr(path))
@@ -1041,7 +1052,7 @@ fn __save_store(w: __Worker) {
         }
     } else {
         __pmode_reset()
-        __store_unlock()
+        __store_release_final()
         var msg: str = __cast(load64(c + CTX_PANIC))
         if msg.starts_with("panic: ") {
             msg = msg.byte_slice(7, msg.byte_len())
@@ -1065,8 +1076,8 @@ fn __run_task(w: __Worker, i: int) {
     }
     store64(c + CTX_CATCH, 0)
     __db_end()
-    __gc_verify_release()
-    __store_unlock()
+    // и после паники в окне (W3): запись отзывается под блокировкой
+    __store_release_final()
     __arena_end()
 }
 
@@ -1133,13 +1144,18 @@ fn __run_timers() {
 fn __serve() {
     __http_port = __env_int("PORT", 8080)
     __ignore_sigpipe()
-    __store_boot(true)
-    __db_init()
     __read_cpus()
     var n = __env_int("THREADS", __cpus.len())
     if n < 1 {
         n = 1
     }
+    if n > THREADS_MAX {
+        // до загрузки store и подключения к базам
+        eprint("khrip: THREADS={n}: at most {THREADS_MAX} worker threads")
+        exit(1)
+    }
+    __store_boot(true)
+    __db_init()
     __threads = n
     let timers = __timers_wanted()
     if timers {

@@ -144,7 +144,7 @@ test "objects of every kind and size live in the store heap" {
 test "a change of store under the shared lock is an error, not a race" {
     // так работает маршрут, который компилятор счёл читающим (src/rw.kh):
     // блокировка разделяемая, и изменение контейнера store — паника
-    __store_unlock()
+    __store_release_final()
     store64(__ctx() + CTX_STORE_MODE, 1)
     __store_lock()
     nums.push(1)

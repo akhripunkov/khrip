@@ -10,6 +10,7 @@ const FUTEX_WAKE_PRIVATE = 129
 // Компилятор начинает программу с «mov rdi, rsp; call __entry».
 fn __entry(sp: int) {
     __thread_init()
+    store64(__ctx() + CTX_STACK_TOP, sp)
     __argc = load64(sp)
     __argv = sp + 8
     __simd_init()
@@ -317,6 +318,15 @@ fn __mutex_unlock(m: int) {
 // src/rw.kh), идут параллельно; остальные — по одному и без читателей.
 // Слова в __store_rw: [0] — мьютекс писателей, [8] — число читателей,
 // [16] — писатель ждёт или работает, [24] — сколько читателей спит.
+//
+// Блокировку берёт только __store_lock, а отпускают две функции
+// (docs/design/v0.13-store-gc.md §6): __store_release_keep — посреди работы
+// (запрос, задача или тест ещё держит указатели в store): контекст публикует
+// свою запись (lib/gc.kh), и сборщик видит, что тот держит; и
+// __store_release_final — в конце работы. Каждое взятие отзывает
+// опубликованную запись. __store_unlock_raw вызывают только эти две, а места
+// __store_release_keep перечислены в tests/store_windows.sh: новое место
+// отпускания проверяется по правилам окна W1–W3 (§6.6).
 var __store_rw: int
 // Сколько раз store брали на запись: по нему видно, что store могли изменить.
 var __store_touches: int
@@ -352,6 +362,32 @@ fn __store_read_lock(rw: int) {
     }
 }
 
+// Исключительная блокировка: мьютекс писателей, затем «писатель ждёт» и
+// ожидание, пока уйдут читатели.
+fn __store_write_lock(rw: int) {
+    __mutex_lock(rw)
+    __xchg(rw + 16, 1)
+    while true {
+        let r = load64(rw + 8)
+        if r == 0 {
+            break
+        }
+        syscall(SYS_FUTEX, rw + 8, FUTEX_WAIT_PRIVATE, r, 0, 0, 0)
+    }
+}
+
+fn __store_write_unlock(rw: int) {
+    __xchg(rw + 16, 0)
+    if load64(rw + 24) != 0 {
+        syscall(SYS_FUTEX, rw + 16, FUTEX_WAKE_PRIVATE, 0x7FFFFFFF, 0, 0, 0)
+    }
+    __mutex_unlock(rw)
+}
+
+// Взять store (store_touch, __pmode_on, каждое повторное взятие после окна):
+// разделяемо, если запрос только читает, иначе исключительно. Запись
+// контекста (lib/gc.kh) отмечается: он брал store в этой работе; если она
+// опубликована (окно кончилось), — отзывается.
 fn __store_lock() {
     let c = __ctx()
     if load64(c + CTX_STORE_HELD) != 0 {
@@ -362,22 +398,17 @@ fn __store_lock() {
     if load64(c + CTX_STORE_MODE) == 1 {
         __store_read_lock(rw)
         store64(c + CTX_STORE_HELD, 2)
-        return
+    } else {
+        __store_write_lock(rw)
+        store64(c + CTX_STORE_HELD, 1)
+        __store_touches += 1
     }
-    __mutex_lock(rw)
-    __xchg(rw + 16, 1)
-    while true {
-        let r = load64(rw + 8)
-        if r == 0 {
-            break
-        }
-        syscall(SYS_FUTEX, rw + 8, FUTEX_WAIT_PRIVATE, r, 0, 0, 0)
-    }
-    store64(c + CTX_STORE_HELD, 1)
-    __store_touches += 1
+    __pin_acquired(c)
 }
 
-fn __store_unlock() {
+// Отпустить store без записи. Вызывают только __store_release_keep (посреди
+// работы) и __store_release_final (в конце; tests/store_windows.sh).
+fn __store_unlock_raw() {
     let c = __ctx()
     let held = load64(c + CTX_STORE_HELD)
     if held == 0 {
@@ -391,11 +422,63 @@ fn __store_unlock() {
         }
         return
     }
-    __xchg(rw + 16, 0)
-    if load64(rw + 24) != 0 {
-        syscall(SYS_FUTEX, rw + 16, FUTEX_WAKE_PRIVATE, 0x7FFFFFFF, 0, 0, 0)
+    __store_write_unlock(rw)
+}
+
+// Отпустить store посреди работы (окно: ожидание сети, времени, хеш пароля):
+// сначала запись контекста публикует указатели в store, которые он держит
+// (регистры, стек, контекст; арену — границами), затем блокировка
+// отпускается. Окно кончается __store_lock. Места вызова перечислены в
+// tests/store_windows.sh: код окна не пишет в арену ниже опубликованной
+// границы (W1), не читает изменяемых объектов store (W2), а паника в нём
+// доходит до __store_release_final (W3).
+fn __store_release_keep() {
+    let c = __ctx()
+    if load64(c + CTX_STORE_HELD) == 0 {
+        return
     }
-    __mutex_unlock(rw)
+    __pin_publish(load64(c + CTX_PINREC))
+    __store_unlock_raw()
+}
+
+// Конец работы со store (запрос, задача, тест, сохранение, загрузка), в том
+// числе после паники. Если блокировки нет, а запись опубликована (паника в
+// окне), блокировка берётся снова: отзыв записи — только под ней. Перед
+// отпусканием — хуки писателя и проверки сборщика (lib/gc.kh).
+fn __store_release_final() {
+    let c = __ctx()
+    if load64(c + CTX_STORE_HELD) == 0 {
+        if !__pin_unfinished(c) {
+            return
+        }
+        __store_lock()
+    }
+    __pin_final(c)
+    __store_unlock_raw()
+}
+
+// Блокировка сборщика (lib/gc.kh, начало сборки): исключительная, но без
+// CTX_STORE_HELD, без __store_touches (KHRIP_DATA не видит изменения) и без
+// записи — у потока сборщика нет указателей в store. Отпускают её и мьютекс
+// разметки только в lib/gc.kh (tests/store_windows.sh).
+fn __store_lock_gc() {
+    __store_rw_init()
+    __store_write_lock(__store_rw)
+}
+
+fn __store_unlock_gc() {
+    __store_write_unlock(__store_rw)
+}
+
+// Только мьютекс писателей (куски разметки и уборки): читатели смотрят лишь
+// на слово [16] и продолжают работать.
+fn __store_lock_marker() {
+    __store_rw_init()
+    __mutex_lock(__store_rw)
+}
+
+fn __store_unlock_marker() {
+    __mutex_unlock(__store_rw)
 }
 
 // ---- Постоянная память ----
@@ -626,9 +709,11 @@ fn __co_wait(fd: int, events: int, ms: int) -> int {
     if load64(c + CTX_PSAVE_PTR) != 0 {
         __panic_msg("internal: waiting while copying into store")
     }
+    // между публикацией и остановкой — только куча сроков и epoll: в арену
+    // ниже опубликованной границы окно не пишет (W1)
     let held = load64(c + CTX_STORE_HELD)
     if held != 0 {
-        __store_unlock()
+        __store_release_keep()
     }
     var r = 0
     let cv = load64(c + CTX_CORO)

@@ -1,0 +1,105 @@
+// Запись контекста сборщика (lib/gc.kh, __pin_take) копирует из памяти слова
+// со значением в STORE ((w >> 38) == 0x40) примитивом __simd_pinscan
+// (src/simd.kh): ответ — тот же, что у простой проверки по слову, на каждом
+// пути (tests/run.sh запускает тест при каждом KHRIP_SIMD ниже, вывод один), с
+// любого слова буфера, любой длины, со значениями у самых границ области. За
+// n-м словом буфер записи не меняется (примитив пишет блок целиком и сдвигает
+// конец только на совпавшие слова).
+// env: KHRIP_SIMD=0
+// env: KHRIP_SIMD=1
+// env: KHRIP_SIMD=2
+// env:
+
+store hits: int
+
+var seed: int = 88172645463325252
+
+fn rnd() -> int {
+    var x = seed
+    x = x ^ (x << 13)
+    x = x ^ ((x >> 7) & 0x1FFFFFFFFFFFFFF)
+    x = x ^ (x << 17)
+    seed = x
+    return x
+}
+
+// Значение слова: в STORE, у самых её границ, около них или любое.
+fn word() -> int {
+    let k = (rnd() & 0xFF) % 8
+    if k == 0 || k == 1 {
+        return STORE_REGION + ((rnd() & 0x3FFFFFFFF) << 3)
+    }
+    if k == 2 {
+        return STORE_REGION
+    }
+    if k == 3 {
+        return STORE_REGION + 0x3FFFFFFFFF
+    }
+    if k == 4 {
+        return STORE_REGION - 8
+    }
+    if k == 5 {
+        return STORE_REGION + 0x4000000000
+    }
+    if k == 6 {
+        return STORE_REGION | (1 << 63)
+    }
+    return rnd()
+}
+
+fn in_store(w: int) -> bool {
+    return w >= STORE_REGION && w < STORE_REGION + 0x4000000000
+}
+
+fn main() {
+    __store_init()
+    let r = __pin_new(0)
+    let rec: __Pin = __cast(r)
+    let src = __alloc(8 * 80)
+    let sentinel = 0x5A5A5A5A5A5A5A5A
+    var cases = 0
+    var found = 0
+    var bad = 0
+    for t in 0..3000 {
+        let off = (rnd() & 0xFF) % 8
+        let n = (rnd() & 0xFF) % 70
+        for i in 0..80 {
+            store64(src + i * 8, word())
+        }
+        if (t % 7) == 0 {
+            // ни одного совпадения
+            for i in 0..80 {
+                store64(src + i * 8, rnd() & 0xFFFFFFFFFF)
+            }
+        }
+        rec.len = 0
+        __pin_take(rec, src, 70)
+        for i in 0..rec.cap {
+            store64(rec.buf + i * 8, sentinel)
+        }
+        rec.len = 0
+        __pin_take(rec, src + off * 8, n)
+        var k = 0
+        for i in 0..n {
+            let w = load64(src + (off + i) * 8)
+            if in_store(w) {
+                if k >= rec.len || load64(rec.buf + k * 8) != w {
+                    bad += 1
+                }
+                k += 1
+            }
+        }
+        if k != rec.len {
+            bad += 1
+        }
+        for i in n..rec.cap {
+            if load64(rec.buf + i * 8) != sentinel {
+                bad += 1
+            }
+        }
+        cases += 1
+        found += k
+    }
+    print("cases: {cases}, wrong: {bad}")
+    print("found some: {found > 10000}")
+}

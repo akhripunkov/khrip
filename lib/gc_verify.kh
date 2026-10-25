@@ -140,6 +140,62 @@ fn __gc_verify_release() {
     }
 }
 
+// Начало сборки (§7.2 п. 5, §8.7 п. 1) — пока сборщика нет (шаг 4), на каждом
+// исключительном взятии store: никто другой store сейчас не держит, и каждый
+// контекст, который брал store в своей работе, держит указатели в store
+// только через опубликованную запись (I3); self — запись взявшего, она уже
+// отозвана. Опубликованная запись — у контекста, который брал store, и она в
+// списке своего потока (списки записанных потоков содержат ровно
+// опубликованные записи); передачи арены вне сборки нет (I9).
+fn __gc_verify_start(self: int) {
+    __gc_vstarts += 1
+    var linked = 0
+    var r = load64(__gc_reg)
+    while r != 0 {
+        let rec: __Pin = __cast(r)
+        if r == self {
+            if rec.linked {
+                __gc_fatal("the record of the context that took store is still published (I4)")
+            }
+        } else if rec.touched && !rec.linked {
+            __gc_fatal("a context released store in the middle of its work without publishing its record (I3)")
+        }
+        if rec.linked {
+            if !rec.touched {
+                __gc_fatal("a published record of a context that did not take store (I4)")
+            }
+            linked += 1
+        }
+        if (rec.ast & 7) != PIN_IDLE {
+            __gc_fatal("an arena hand-off outside a collection (I9)")
+        }
+        r = rec.all
+    }
+    var listed = 0
+    let nt = load64(__gc_reg + 8)
+    for i in 0..nt {
+        let c = load64(__gc_reg + 16 + i * 8)
+        var p = 0
+        if c != 0 {
+            p = load64(c + CTX_PINLIST)
+        }
+        var prev = 0
+        while p != 0 {
+            let rec: __Pin = __cast(p)
+            if !rec.linked || rec.prev != prev {
+                __gc_fatal("a thread's list of published records is broken (I4)")
+            }
+            listed += 1
+            prev = p
+            p = rec.next
+        }
+    }
+    if listed != linked {
+        __gc_fatal("{linked} records are published, but {listed} are in the threads' lists (I4)")
+    }
+    __gc_vlinked += linked
+}
+
 // Проверка графа и кучи со строкой об итоге.
 fn __gc_verify_graph(when: str) {
     __gc_verify_run(when, true)

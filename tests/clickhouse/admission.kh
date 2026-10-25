@@ -41,3 +41,22 @@ route POST "/fault/{mode}" (mode: int) -> int | 409 str {
     let values = [1]
     return values[mode]
 }
+
+// Окно __ch_run без блокировки store (docs/design/v0.13-store-gc.md §6.5):
+// пишущий запрос держит строку store, пока ждёт ClickHouse (mock /hold —
+// 0,4 с); тем временем на том же единственном потоке читают store (/marks).
+store marks: [str]
+
+route POST "/stored/{tag}" (tag: str) -> AdmissionResult {
+    marks.push("held-" + tag)
+    let mine = marks[marks.len() - 1]
+    let config = ChConfig { url: (env("CH_MOCK_URL") ?? "http://127.0.0.1:18371") + "/hold", timeout_ms: 5000, max_inflight: 2 }
+    let r = ch_query(config, "SELECT 1")
+    marks.push("after-" + tag)
+    if mine != "held-" + tag {
+        return AdmissionResult { ok: false, unknown: false, error: "store string changed across the window" }
+    }
+    return AdmissionResult { ok: r.ok, unknown: r.unknown_outcome, error: r.error }
+}
+
+route GET "/marks" -> int { return marks.len() }

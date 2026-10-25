@@ -45,5 +45,24 @@ fn __store_boot(load: bool) {
     __store_rw_init()
 }
 
-fn __gc_verify_release() {
+// Записей контекстов (lib/gc.kh) без store нет: указателей в store никто не
+// держит, публиковать и отзывать нечего.
+fn __pin_new(top: int) -> int {
+    return 0
+}
+
+fn __pin_acquired(c: int) {
+}
+
+fn __pin_publish(r: int) {
+}
+
+fn __pin_unfinished(c: int) -> bool {
+    return false
+}
+
+fn __pin_final(c: int) {
+}
+
+fn __pin_check_idle(r: int) {
 }

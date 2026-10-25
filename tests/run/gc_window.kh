@@ -1,0 +1,32 @@
+// exit: 101
+// build-env: KHRIP_GC_VERIFY=1
+// env: KHRIP_GC_VERIFY=1
+// Окно без блокировки store (lib/gc.kh, docs/design/v0.13-store-gc.md §6.6,
+// W1): код окна не меняет ссылки в store в арене ниже границы, которую
+// опубликовала запись контекста. С KHRIP_GC_VERIFY отзыв записи сверяет хеш
+// этих слов: запись выше границы (новая память окна) — можно, ссылка в store,
+// записанная ниже неё, останавливает программу.
+
+store hits: int
+
+fn main() {
+    __store_boot(false)
+    __arena_init()
+    __arena_begin()
+    let cell = __alloc(16)
+    __store_lock()
+    let s = __salloc(32, K_NOSCAN, 0)
+    let r = load64(__ctx() + CTX_PINREC)
+    let rec: __Pin = __cast(r)
+    // окно: память, выделенная в нём, — выше границы
+    __pin_publish(r)
+    let fresh = __alloc(16)
+    store64(fresh, s)
+    __pin_withdraw(rec)
+    print("above the bound: ok")
+    // ссылка в store ниже границы
+    __pin_publish(r)
+    store64(cell, s)
+    __pin_withdraw(rec)
+    print("not reached")
+}

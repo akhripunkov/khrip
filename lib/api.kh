@@ -1784,8 +1784,9 @@ fn __serve_one(w: __Worker, req: __Req) {
     store64(c + CTX_CATCH, prev)
     store64(c + CTX_JNULLS, 0)
     __db_end()
-    __gc_verify_release()
-    __store_unlock()
+    // конец запроса — и после паники, в том числе в окне без блокировки (W3):
+    // опубликованная запись отзывается под блокировкой, затем она отпускается
+    __store_release_final()
     store64(c + CTX_STORE_MODE, 0)
     w.cur = 0
 }
@@ -1829,8 +1830,7 @@ fn __test_end(name: str) {
     }
     store64(c + CTX_CATCH, 0)
     __db_end()
-    __gc_verify_release()
-    __store_unlock()
+    __store_release_final()
     if __test_bad {
         __tests_failed += 1
         write("FAIL  " + name + "\n" + __test_log)

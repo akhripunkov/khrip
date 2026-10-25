@@ -1,0 +1,35 @@
+// exit: 101
+// build-env: KHRIP_GC_VERIFY=1
+// env: KHRIP_GC_VERIFY=1
+// Записи контекстов (lib/gc.kh, docs/design/v0.13-store-gc.md §7.2 п. 5,
+// §8.7): пока сборщика нет, каждое исключительное взятие store с
+// KHRIP_GC_VERIFY проверяет начало сборки — контекст, который брал store и
+// отпустил его посреди работы, опубликовал запись (I3). Здесь другой контекст
+// — запись с отметкой «брал store»: опубликованная проходит проверку,
+// неопубликованная останавливает программу.
+
+store hits: int
+
+fn main() {
+    __store_boot(false)
+    let o = __pin_new(0)
+    let other: __Pin = __cast(o)
+    __store_lock()
+    hits += 1
+    // другой контекст брал store и опубликовал запись (стек — этого потока)
+    other.top = __ctx_top()
+    other.touched = true
+    __pin_publish(o)
+    __store_release_final()
+    __store_lock()
+    print("published: ok, {hits}")
+    // а теперь отпустил без публикации
+    __pin_withdraw(other)
+    __store_release_final()
+    __store_lock()
+    print("not reached")
+}
+
+fn __ctx_top() -> int {
+    return load64(__ctx() + CTX_STACK_TOP)
+}

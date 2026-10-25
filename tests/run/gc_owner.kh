@@ -11,7 +11,7 @@ fn main() {
     __store_boot(false)
     __store_lock()
     let p = __salloc(40, K_PTRS, 0)
-    __store_unlock()
+    __store_release_final()
     print("under the lock: {(p >> 40) == 0x10}")
     __salloc(16, K_PTRS, 0)
     print("not reached")
