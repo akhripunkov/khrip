@@ -2588,6 +2588,7 @@ fn __gc_mark_done() {
 // возвращает память, отпустив его (__gc_hbuf_free). Без потока (khc test) —
 // сразу.
 fn __gc_hbuf_drop(p: int, n: int) {
+    __noinline()
     if __gc_has_thread && __gc_nhfree < GC_HFREE {
         let e = __gc_fr + GC_HFREE_AT + __gc_nhfree * 16
         store64(e, p)
@@ -3831,9 +3832,7 @@ fn __gc_thread_work(runs: int) -> bool {
         }
         __gc_busy = false
         let nh = __gc_hbuf_take(runs)
-        // писатель ждёт мьютекс (слово 2, lib/rt.kh)
-        waiting = load64(__store_rw) == 2
-        __store_unlock_marker()
+        waiting = __store_unlock_marker()
         __gc_hbuf_free(runs, nh)
         if done {
             return true
