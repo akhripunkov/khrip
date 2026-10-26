@@ -1,0 +1,6 @@
+variant	variant	items	live_after_fill_mb	m_after_fill	rss_after_fill_mb	peak_churn_mb	rss_end_mb	live_end_mb	cycles_in_churn	churn_items_per_s
+item 1	khrip	2000000	354.5	-	405.4	550.8	550.8	362.0	9	50000
+item 1	go	2000000	293	-	354.6	628.7	628.7	301.0	4	50000
+78ef036 (7/8)	khrip	2000000	434.5	-	396.6	572.8	572.4	442.2	7	50000
+3495ef8 (no hold)	khrip	2000000	354.5	-	364.3	510.8	510.4	361.8	9	50000
+final	khrip	2000000	354.5	-	364.3	508.9	508.6	360.7	9	50000
