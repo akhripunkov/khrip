@@ -1,0 +1,4 @@
+bench/mem/out/wrk2-fixed-r2/khrip: probe answers 70 slow (≥ 20 ms), episodes ≥ 100 ms: 2; run 57963040..58263089
+  wrk2 send gaps ≥ 100 ms: 0
+  steal-server    +23.0 s    112 ms; probe max 112 ms; busiest thread 64 ms; steal server 80 / client 100 ms; probe
+  lock           +154.6 s    114 ms; probe max 114 ms; busiest thread 146 ms; steal server 0 / client 0 ms; probe

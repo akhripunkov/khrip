@@ -1,0 +1,9 @@
+Running 3m test @ http://127.0.0.1:8080
+  1 threads and 4 connections
+  Thread calibration: mean lat.: 2.426ms, rate sampling interval: 10ms
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.48ms    0.87ms  19.09ms   87.65%
+    Req/Sec    52.72     83.57   444.00     81.62%
+  9001 requests in 3.00m, 1.11MB read
+Requests/sec:     50.00
+Transfer/sec:      6.30KB

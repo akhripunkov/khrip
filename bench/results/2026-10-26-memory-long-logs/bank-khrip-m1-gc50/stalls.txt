@@ -1,0 +1,2 @@
+bench/mem/out/long/bank/khrip-m1-gc50: probe answers 42 slow (≥ 20 ms), episodes ≥ 100 ms: 0; run 43820475..44420510
+  wrk2 send gaps ≥ 100 ms: 0

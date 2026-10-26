@@ -1,0 +1,4 @@
+bench/mem/out/long/inventory/go: probe answers 903 slow (≥ 20 ms), episodes ≥ 100 ms: 3; run 47400354..48000404
+  wrk2 send gaps ≥ 100 ms: 4
+  steal-server   +247.2 s    237 ms; probe max 0 ms; busiest thread 83 ms; steal server 240 / client 20 ms; gap
+  steal-server   +301.6 s    146 ms; probe max 146 ms; busiest thread 214 ms; steal server 200 / client 80 ms; gap+probe

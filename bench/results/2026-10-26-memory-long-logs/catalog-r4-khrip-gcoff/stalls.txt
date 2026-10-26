@@ -1,0 +1,3 @@
+bench/mem/out/catalog-r4/khrip-gcoff: probe answers 33 slow (≥ 20 ms), episodes ≥ 100 ms: 1; run 57040691..57100741
+  wrk2 send gaps ≥ 100 ms: 0
+  steal-server    +35.0 s    116 ms; probe max 116 ms; busiest thread 71 ms; steal server 90 / client 120 ms; probe

@@ -1,0 +1,32 @@
+// Смена фазы (этап памяти, часть 1b; bench/gc/phase.sh): store сначала только
+// растёт — выживает всё, и адаптивный m сборщика удваивается до 8 (цель —
+// 9 × живого), — затем те же записи заменяются новыми: мусор без роста
+// живого. Сколько памяти наберётся, пока цель 9× не опустится до 2×?
+// GET /stats — «записей живое куча сборок» (байт).
+
+type Item { id: int, name: str, payload: str }
+
+store items: map[int, Item]
+
+route POST "/fill/{n}" (n: int) -> int {
+    let start = items.len()
+    for i in start..start + n {
+        items[i] = Item { id: i, name: "item number {i}", payload: "payload of the item number {i}" }
+    }
+    return items.len()
+}
+
+// заменить n записей, начиная с from (по кругу): старые — мусор
+route POST "/churn/{from}/{n}" (from: int, n: int) -> int {
+    let total = items.len()
+    for k in 0..n {
+        let i = (from + k) % total
+        items[i] = Item { id: i, name: "item number {i}", payload: "replaced payload of the item {from}" }
+    }
+    return total
+}
+
+route GET "/stats" -> str {
+    let s = __gc_stats()
+    return "{items.len()} {s.live} {s.heap} {s.cycles}"
+}

@@ -1,0 +1,2 @@
+bench/mem/out/catalog-r1/khrip-gcoff: probe answers 37 slow (≥ 20 ms), episodes ≥ 100 ms: 0; run 41823423..41883462
+  wrk2 send gaps ≥ 100 ms: 0

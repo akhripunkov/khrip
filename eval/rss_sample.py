@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """RSS процесса во времени (eval/perf.sh, RATE_MODE=1).
 
-    rss_sample.py <pid> <файл> <фаза> [интервал, мс = 100]
+    rss_sample.py <pid> <файл> <фаза> [интервал, мс = 100] [abs]
         каждые «интервал» мс дописывает в файл строку «фаза<TAB>мс от начала
         фазы<TAB>VmRSS, КБ» (из /proc/<pid>/status), пока процесс жив и пока не
-        придёт SIGTERM или SIGINT
+        придёт SIGTERM или SIGINT; с abs вместо мс от начала фазы — мс
+        CLOCK_MONOTONIC (их можно сопоставить с другими журналами)
 
     rss_sample.py --stats <файл> <фаза> [окно, с = 30]
         печатает по строкам фазы: «пик среднее последнее наклон пик_окна
@@ -16,7 +17,7 @@ import sys
 import time
 
 
-def sample(pid, path, phase, interval_ms):
+def sample(pid, path, phase, interval_ms, absolute=False):
     stop = False
 
     def on_signal(_sig, _frame):
@@ -38,7 +39,8 @@ def sample(pid, path, phase, interval_ms):
                 break
             if rss is None:
                 break
-            out.write(f"{phase}\t{int((time.monotonic() - t0) * 1000)}\t{rss}\n")
+            t = time.monotonic()
+            out.write(f"{phase}\t{int((t if absolute else t - t0) * 1000)}\t{rss}\n")
             k += 1
             delay = t0 + k * step - time.monotonic()
             if delay > 0:
@@ -74,4 +76,4 @@ if __name__ == "__main__":
     if a and a[0] == "--stats":
         stats(a[1], a[2], float(a[3]) if len(a) > 3 else 30.0)
     else:
-        sample(int(a[0]), a[1], a[2], int(a[3]) if len(a) > 3 else 100)
+        sample(int(a[0]), a[1], a[2], int(a[3]) if len(a) > 3 else 100, len(a) > 4 and a[4] == "abs")

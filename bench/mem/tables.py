@@ -8,6 +8,8 @@
                                                и Go (MemStats) по сценариям
     tables.py attr-tsv <папка bench/mem/out> — то же построчно (TSV): сценарий,
                                                снимок, часть, МБ
+    tables.py long <long.tsv>                — долгие прогоны (bench/mem/long.sh)
+    tables.py timeline <папка long>          — RSS по минутам: сценарий × вариант
 Печатает Markdown (или TSV) в stdout.
 """
 import csv
@@ -222,6 +224,64 @@ def attr_tsv(root):
                     print(f"{sc}\tgo-{when}\theap_objects (count)\t{g[when]['heap_objects']}")
 
 
+VARIANTS = [("khrip", "Khrip"), ("khrip-m1", "Khrip, m = 1"), ("khrip-m1-gc50", "Khrip, m = 1, KHRIP_GC=50"), ("go", "Go")]
+
+
+def long_table(path):
+    rs = rows(path)
+    data = {(r["scenario"], r["variant"]): r for r in rs}
+    scen = []
+    for r in rs:
+        if r["scenario"] not in scen:
+            scen.append(r["scenario"])
+    print("| Сценарий | Вариант | Пик, МБ | Среднее за последние 5 мин, МБ | Наклон за 5 мин, МБ/с | Живое в конце, МБ | Сборок (за замер) | мкс процессора на запрос | p99, мс | max, мс |")
+    print("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for sc in scen:
+        go = data.get((sc, "go"))
+        for v, name in VARIANTS:
+            r = data.get((sc, v))
+            if not r:
+                continue
+            peak = r["rss_peak_mb"]
+            if go and v != "go":
+                ratio = num(r["rss_peak_mb"]) / num(go["rss_peak_mb"])
+                peak += f" ({ratio:.2f})" if ratio <= 1 else f" (**{ratio:.2f}**)"
+            behind = " ⚠" if r["behind"] != "ok" else ""
+            print(f"| {sc} | {name}{behind} | {peak} | {r['rss_mean_last300_mb']} | {num(r['rss_slope_last300_mb_s']):+.3f} | {r['live_end_mb']} | "
+                  f"{r['gc_total']} ({r['gc_in_run']}) | {r['cpu_us_per_req']} | {r['p99_ms']} | {r['max_ms']} |")
+
+
+def timeline(root, step_s=60):
+    """RSS в конце каждой минуты от начала прогрева (из rss.tsv, мс CLOCK_MONOTONIC)."""
+    out = []
+    for sc in sorted(os.listdir(root)):
+        for v, name in VARIANTS:
+            p = os.path.join(root, sc, v, "rss.tsv")
+            if not os.path.exists(p):
+                continue
+            pts = [(int(r[1]), int(r[2])) for r in (l.split("\t") for l in open(p)) if len(r) == 3]
+            if not pts:
+                continue
+            t0 = pts[0][0]
+            marks = []
+            k = 1
+            j = 0
+            best = 0
+            for t, kb in pts:
+                while t - t0 >= k * step_s * 1000:
+                    marks.append(best)
+                    k += 1
+                best = kb
+            marks.append(pts[-1][1])
+            out.append((sc, name, [m / 1024 for m in marks]))
+    n = max(len(m) for _, _, m in out) if out else 0
+    print("| Сценарий | Вариант | " + " | ".join(f"{i + 1}" for i in range(n)) + " |")
+    print("|---|---|" + "---:|" * n)
+    for sc, name, m in out:
+        print(f"| {sc} | {name} | " + " | ".join(f"{x:.0f}" for x in m) + " |" + " — |" * (n - len(m)))
+
+
 if __name__ == "__main__":
     kind, path = sys.argv[1], sys.argv[2]
-    {"rate": rate_table, "conn": conn_table, "attr": attr_table, "attr-tsv": attr_tsv}[kind](path)
+    {"rate": rate_table, "conn": conn_table, "attr": attr_table, "attr-tsv": attr_tsv, "long": long_table,
+     "timeline": timeline}[kind](path)

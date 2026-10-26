@@ -1,0 +1,11 @@
+bench/mem/out/long/polls/khrip-m1-gc50: probe answers 121 slow (≥ 20 ms), episodes ≥ 100 ms: 8; run 54841005..55441050
+  wrk2 send gaps ≥ 100 ms: 14
+  lock             +5.3 s    378 ms; probe max 378 ms; busiest thread 379 ms; steal server 10 / client 0 ms; gap+probe
+  wrk2-timer      +18.5 s   1002 ms; probe max 0 ms; busiest thread 238 ms; steal server 0 / client 30 ms; gap
+  lock            +70.1 s    567 ms; probe max 566 ms; busiest thread 572 ms; steal server 10 / client 10 ms; gap+probe
+  wrk2-timer     +102.2 s   1001 ms; probe max 0 ms; busiest thread 277 ms; steal server 40 / client 40 ms; gap
+  steal-server   +105.1 s    118 ms; probe max 115 ms; busiest thread 68 ms; steal server 80 / client 60 ms; probe
+  lock           +199.6 s   1310 ms; probe max 1308 ms; busiest thread 1227 ms; steal server 50 / client 20 ms; gap+probe
+  lock           +458.5 s   2724 ms; probe max 2722 ms; busiest thread 2685 ms; steal server 90 / client 60 ms; gap+probe
+  steal-server   +539.2 s    160 ms; probe max 160 ms; busiest thread 29 ms; steal server 90 / client 90 ms; gap+probe
+  steal-server   +539.4 s    156 ms; probe max 138 ms; busiest thread 79 ms; steal server 160 / client 160 ms; gap+probe

@@ -1,0 +1,5 @@
+bench/mem/out/long/notes/go: probe answers 2342 slow (≥ 20 ms), episodes ≥ 100 ms: 3; run 52833684..53433730
+  wrk2 send gaps ≥ 100 ms: 4
+  steal-server   +357.1 s    103 ms; probe max 100 ms; busiest thread 88 ms; steal server 210 / client 120 ms; gap+probe
+  steal-client   +411.0 s    300 ms; probe max 0 ms; busiest thread 157 ms; steal server 20 / client 300 ms; gap
+  steal-server   +527.6 s    161 ms; probe max 98 ms; busiest thread 75 ms; steal server 230 / client 130 ms; gap

@@ -1,0 +1,13 @@
+scenario	source	wrk2	run	rate	achieved_rps	p50_ms	p99_ms	p999_ms	max_ms	ae_overdue_1s_waits	wrk2_gaps_ge_300ms
+notes	perf.sh 60 s (part 1 main run)	orig	main	33000	32957	1.22	660.48	952.83	1000.00	-	-
+catalog	perf.sh 60 s (part 1 main run)	orig	main	2800	2797	1.42	136.57	345.34	425.98	-	-
+polls	perf.sh 60 s (part 1 main run)	orig	main	27000	26964	1.30	477.18	771.58	891.90	-	-
+notes	perf.sh 60 s	fixed	r1	33000	32956	1.25	43.01	99.71	125.44	0	-
+polls	perf.sh 60 s	fixed	r1	27000	26964	1.25	6.15	16.40	33.69	0	-
+catalog	perf.sh 60 s	fixed	r1	2800	2797	1.45	5.65	49.82	87.04	0	-
+notes	perf.sh 60 s	fixed	r2	33000	32956	1.26	7.62	42.30	62.24	0	-
+polls	perf.sh 60 s	fixed	r2	27000	26965	1.28	6.88	20.94	35.42	0	-
+catalog	perf.sh 60 s	fixed	r2	2800	2797	1.48	5.10	45.63	87.29	0	-
+shortener	long.sh 20+300 s	debug	debug	30000	29992	1.32	27.89	123.65	236.16	8 (1 warm-up, 7 run)	0
+shortener	long.sh 20+300 s	fixed	r1	30000	29992	1.32	29.55	355.33	435.97	0	0
+shortener	long.sh 20+300 s	fixed	r2	30000	29992	1.28	22.96	91.65	176.38	0	0
