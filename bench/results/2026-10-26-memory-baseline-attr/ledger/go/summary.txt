@@ -1,0 +1,8 @@
+== ledger / go: 1300 запросов/с, seeded 12804 KB
+load snapshot: RSS 18484 KB, HWM 18560 KB
+after run: RSS 18228 KB, HWM 18560 KB; Requests/sec:   1298.76
+memstats before heap_alloc=2274912 heap_inuse=3702784 heap_idle=4063232 heap_released=2031616 heap_sys=7766016 heap_objects=12638 stack_inuse=622592 stack_sys=622592 mspan_inuse=92000 mcache_inuse=2416 gc_sys=2861328 other_sys=634112 buck_hash_sys=3688 sys=12017680 num_gc=512 next_gc=4194304
+memstats after-gc heap_alloc=1561248 heap_inuse=3235840 heap_idle=4530176 heap_released=2031616 heap_sys=7766016 heap_objects=3732 stack_inuse=622592 stack_sys=622592 mspan_inuse=87680 mcache_inuse=2416 gc_sys=2861328 other_sys=634112 buck_hash_sys=3688 sys=12017680 num_gc=513 next_gc=4194304
+after GC: RSS 16572 KB
+idle 15s: RSS 16572 KB
+invariant: ok

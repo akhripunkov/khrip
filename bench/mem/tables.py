@@ -6,7 +6,9 @@
     tables.py conn <perf_conn.tsv>           — RSS от числа соединений и наклон, КБ на соединение
     tables.py attr <папка bench/mem/out>     — раскладка RSS Khrip (снимки khrip_rss.py)
                                                и Go (MemStats) по сценариям
-Печатает Markdown в stdout.
+    tables.py attr-tsv <папка bench/mem/out> — то же построчно (TSV): сценарий,
+                                               снимок, часть, МБ
+Печатает Markdown (или TSV) в stdout.
 """
 import csv
 import json
@@ -146,7 +148,9 @@ def go_stats(d):
 
 
 def attr_table(root):
-    scen = sorted(d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d, "khrip")))
+    first = ["inventory", "bank", "polls", "notes", "shortener", "ratelimit", "shop", "shop-1500", "ledger"]
+    scen = sorted((d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d, "khrip"))),
+                  key=lambda d: (first.index(d) if d in first else len(first), d))
     cols = []
     for sc in scen:
         p = os.path.join(root, sc, "khrip", "load.json")
@@ -186,6 +190,38 @@ def attr_table(root):
         f"{c[3] / (c[4]['after-gc']['heap_alloc'] / MB):.2f}" if c[3] and c[4] and "after-gc" in c[4] else "—" for c in cols) + " |")
 
 
+def attr_tsv(root):
+    print("scenario\tsnapshot\tpart\tmb")
+    for sc in sorted(os.listdir(root)):
+        for snap in ("load", "idle"):
+            p = os.path.join(root, sc, "khrip", snap + ".json")
+            if not os.path.exists(p):
+                continue
+            j = json.load(open(p))
+            print(f"{sc}\tkhrip-{snap}\tvmrss\t{j['vmrss'] / MB:.2f}")
+            for k in ORDER:
+                print(f"{sc}\tkhrip-{snap}\t{k}\t{j['categories'].get(k, 0) / MB:.2f}")
+            st = j.get("store") or {}
+            for k in ("committed", "resident", "inuse_resident", "alloc_bytes", "alloc_resident", "free_slot_bytes", "tail_bytes", "free_resident"):
+                if k in st:
+                    print(f"{sc}\tkhrip-{snap}\tstore {k}\t{st[k] / MB:.2f}")
+            if j.get("arenas"):
+                print(f"{sc}\tkhrip-{snap}\tarenas with memory (count)\t{len(j['arenas'])}")
+        live = idle_live(os.path.join(root, sc))
+        if live is not None:
+            print(f"{sc}\tkhrip-idle\tlive by GC log\t{live:.2f}")
+        g = go_stats(os.path.join(root, sc))
+        if g:
+            if g.get("rss_load"):
+                print(f"{sc}\tgo-load\tvmrss\t{g['rss_load'] / 1024:.2f}")
+            for when in ("before", "after-gc"):
+                for k, v in sorted(g.get(when, {}).items()):
+                    if k.endswith(("_alloc", "_inuse", "_idle", "_released", "_sys")):
+                        print(f"{sc}\tgo-{when}\t{k}\t{v / MB:.2f}")
+                if when in g:
+                    print(f"{sc}\tgo-{when}\theap_objects (count)\t{g[when]['heap_objects']}")
+
+
 if __name__ == "__main__":
     kind, path = sys.argv[1], sys.argv[2]
-    {"rate": rate_table, "conn": conn_table, "attr": attr_table}[kind](path)
+    {"rate": rate_table, "conn": conn_table, "attr": attr_table, "attr-tsv": attr_tsv}[kind](path)
