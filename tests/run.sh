@@ -266,8 +266,8 @@ done
 # KHRIP_GC_LIMIT_MB=3 (первый тест сверяет цель с ним) — тот же вывод; на
 # копиях библиотеки без сброса текущих спанов в конце разметки, без номера
 # уборки у нового спана, без доуборки в начале сборки (tests/api/gc_sweep.kh),
-# без удвоения и сброса m, с удвоением m после сборки без выделений, без
-# мягкого предела, без помощи писателя и без помощи по счёту
+# с запасом 100 % вместо 50 % по умолчанию, без мягкого предела, без помощи
+# писателя и без помощи по счёту
 # (tests/api/gc_pace.kh), с записью, которая не копирует место сохранения
 # регистров __pin_publish (tests/api/gc_regs.kh: значение только в r14 —
 # если кодогенерация уведёт его оттуда, тест перестанет что-то проверять, и
@@ -278,7 +278,7 @@ if ! diff -u tests/api/gc_pace.out "$tmp/pace.txt" >"$tmp/pace.diff"; then
 	pace_ok=0
 	failed "tests/api/gc_pace.kh (KHRIP_GC_LIMIT_MB=3)" "$(cat "$tmp/pace.diff")"
 fi
-for cut in "gc_sweep cur" "gc_sweep newgen" "gc_sweep finish" "gc_pace mup" "gc_pace mdown" "gc_pace mhold" "gc_pace soft" "gc_pace assist" "gc_pace credit" "gc_regs savearea"; do
+for cut in "gc_sweep cur" "gc_sweep newgen" "gc_sweep finish" "gc_pace pct" "gc_pace soft" "gc_pace assist" "gc_pace credit" "gc_regs savearea"; do
 	read -r name mut <<<"$cut"
 	rm -rf "${tmp:?}/pacelib"
 	mkdir -p "$tmp/pacelib"
@@ -290,9 +290,7 @@ cuts = {
     "cur": ("        store64(__gc_cur + j * 8, __gc_none)\n        store64(__gc_partial + j * 16, 0)\n", "        store64(__gc_partial + j * 16, 0)\n"),
     "newgen": ("    store64(s + S_SWEEPGEN, __gc_sweepgen)\n    store64(s + S_MAGIC, ((", "    store64(s + S_SWEEPGEN, __gc_sweepgen - 1)\n    store64(s + S_MAGIC, (("),
     "finish": ("    if __gc_phase == GC_PH_SWEEP {\n        __gc_sweep_finish(why)\n    }\n", ""),
-    "mup": ("        if __gc_m < 8 {\n            __gc_m *= 2\n        }\n", ""),
-    "mdown": ("    } else if mb * 2 < b {\n        __gc_m = 1\n    }\n", "    }\n"),
-    "mhold": ("    __gc_m_hold = __heap_live == __gc_swept_heap\n", "    __gc_m_hold = false\n"),
+    "pct": ("    __gc_pct = 50\n", "    __gc_pct = 100\n"),
     "savearea": ("    let sp = load64(rec.regs + 16) - __save_area()\n", "    let sp = load64(rec.regs + 16) + 16\n"),
     "soft": ("        if goal > __gc_soft {\n            goal = __gc_soft\n        }\n", ""),
     "assist": ("        } else if __gc_phase == GC_PH_MARK && __heap_live > __gc_cgoal {\n            __gc_assist()\n        }\n", "        }\n"),

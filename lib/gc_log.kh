@@ -58,7 +58,7 @@ fn __gc_line() -> str {
     if __gc_st_fin != 0 {
         line += ", finished {__gc_why(__gc_st_fin)}"
     }
-    line += "): heap {__gc_mbs(__gc_st_before)}->{__gc_mbs(__gc_st_after)} MB, live {__gc_mbs(__heap_marked)} MB ({__gc_marked_objs + __gc_black_objs} obj, {__gc_black_objs} black), m {__gc_m}, pins {__gc_st_recs} rec/{__gc_st_words} words, arenas {__gc_st_arenas} ({(__gc_st_abytes + 1023) / 1024} KB, {__gc_st_handoffs} handed off), "
+    line += "): heap {__gc_mbs(__gc_st_before)}->{__gc_mbs(__gc_st_after)} MB, live {__gc_mbs(__heap_marked)} MB ({__gc_marked_objs + __gc_black_objs} obj, {__gc_black_objs} black), pins {__gc_st_recs} rec/{__gc_st_words} words, arenas {__gc_st_arenas} ({(__gc_st_abytes + 1023) / 1024} KB, {__gc_st_handoffs} handed off), "
     if !__gc_st_inc {
         line += "pause {__gc_ms(__gc_st_pause)} ms (start {__gc_ms(__gc_st_start)}, mark {__gc_ms(__gc_st_term)})"
     } else {
