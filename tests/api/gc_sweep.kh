@@ -1,0 +1,150 @@
+// Уборка кусками (docs/design/v0.13-store-gc.md §7.7, I10): пока она идёт,
+// выделение берёт только спаны, которые она уже прошла, и новые (новый спан —
+// с номером этой уборки), и всё выделенное переживает её конец; мёртвый
+// объект спана, до которого она ещё не дошла, — не объект (слово на него
+// ничего не значит); начало новой сборки сначала доубирает остаток, и слово
+// на такой объект не воскрешает его; куски уборки вперемешку с изменениями
+// store оставляют ровно живое. Сборку тест ведёт сам (__gc_begin_from_roots:
+// его стек и арена в начало не попадают, всё нужное — от корней),
+// __gc_finish_mark заканчивает разметку и оставляет уборку, __gc_sweep_step
+// убирает по кусочку. tests/run.sh проверяет, что без сброса текущих спанов
+// и списков частично занятых в конце разметки, без номера уборки у нового
+// спана и без доуборки в начале сборки эти тесты падают.
+
+type Item { name: str, n: int }
+
+store items: [Item]
+store fresh: [Item]
+store box: map[str, Item]
+
+fn exact() -> bool {
+    return (env("KHRIP_GC_STRESS") ?? "") != "1"
+}
+
+fn addr(x: Item) -> int {
+    let a: int = __cast(x)
+    return a
+}
+
+// объект и его имя на месте и имя — то самое
+fn alive(x: Item, name: str) -> bool {
+    let s: int = __cast(x.name)
+    return __gc_is_allocated(addr(x)) && __gc_is_allocated(s) && x.name == name
+}
+
+test "build: half of every span becomes garbage" {
+    for i in 0..6000 {
+        items.push(Item { name: "item {i}", n: i })
+    }
+    __gc_collect()
+    // каждый второй — мусор: спаны после уборки частично заняты
+    for i in 0..3000 {
+        items[i * 2] = Item { name: "new {i * 2}", n: -i }
+    }
+    __gc_collect()
+    expect items.len() == 6000 && items[1].name == "item 1" && items[2].name == "new 2"
+}
+
+test "allocation during the sweep takes only swept and new spans" {
+    // снова мусор в тех же спанах: заменённые в прошлом тесте уходят
+    for i in 0..3000 {
+        items[i * 2] = Item { name: "again {i * 2}", n: i }
+    }
+    __gc_begin_from_roots()
+    __gc_finish_mark()
+    expect __gc_stats().sweeping
+    // уборка прошла пару страниц, остальные спаны ещё не убраны
+    __gc_sweep_step(16)
+    var bad = 0
+    var unswept = 0
+    for i in 0..3000 {
+        fresh.push(Item { name: "fresh {i}", n: i })
+        if __gc_unswept(addr(fresh[i])) {
+            bad += 1
+        }
+        if __gc_unswept(addr(items[i * 2 + 1])) {
+            unswept += 1
+        }
+    }
+    expect bad == 0
+    // проверка что-то проверяла: часть спанов уборка правда ещё не прошла
+    expect !exact() || unswept > 0
+    __gc_finish()
+    expect !__gc_stats().sweeping
+    var lost = 0
+    for i in 0..3000 {
+        if !alive(fresh[i], "fresh {i}") || !alive(items[i * 2 + 1], "item {i * 2 + 1}") || !alive(items[i * 2], "again {i * 2}") {
+            lost += 1
+        }
+    }
+    expect lost == 0
+}
+
+test "a stale word into a span the sweep has not reached is ignored, and a new cycle sweeps it first" {
+    box["x"] = Item { name: "stale", n: 1 }
+    // слово на объект — на стеке и в арене теста (keep), а сам объект — мусор
+    let x = box["x"] else {
+        return
+    }
+    let keep = [addr(x)]
+    box.remove("x")
+    __gc_begin_from_roots()
+    __gc_finish_mark()
+    let xa = keep[0]
+    // спан объекта ещё не убран, но объект мёртв: бит START у него ещё
+    // есть, пометки нет
+    expect __gc_unswept(xa)
+    expect !__gc_is_allocated(xa)
+    // новая сборка публикует тест — с этим словом; её начало сначала
+    // доубирает прошлую сборку, и слово попадает в свободный слот
+    __gc_begin()
+    expect !__gc_stats().sweeping && __gc_stats().marking
+    expect !__gc_is_allocated(xa) && !__gc_is_marked(xa)
+    __gc_finish()
+    expect !__gc_is_allocated(xa) && keep[0] == xa
+    expect alive(items[1], "item 1") && alive(fresh[7], "fresh 7")
+}
+
+test "a collection while the sweep is unfinished finishes it first" {
+    for i in 0..1000 {
+        fresh[i] = Item { name: "fresher {i}", n: i }
+    }
+    __gc_begin_from_roots()
+    __gc_finish_mark()
+    __gc_sweep_step(8)
+    let before = __gc_stats().cycles
+    __gc_collect()
+    let s = __gc_stats()
+    expect !s.sweeping && !s.marking && s.cycles > before && s.heap == s.live
+    expect alive(fresh[999], "fresher 999") && alive(fresh[1500], "fresh 1500")
+}
+
+test "sweep steps between store changes keep exactly what lives" {
+    for i in 0..2000 {
+        items[i] = Item { name: "step {i}", n: i }
+    }
+    __gc_begin_from_roots()
+    __gc_finish_mark()
+    var k = 0
+    while !__gc_sweep_step(8) && k < 100000 {
+        // замены, рост и удаления посреди уборки
+        items[k % 6000] = Item { name: "mid {k}", n: k }
+        fresh.push(Item { name: "more {k}", n: k })
+        if k % 3 == 0 {
+            fresh.pop()
+        }
+        k += 1
+    }
+    expect !__gc_stats().sweeping && k > 0
+    var bad = 0
+    for i in 0..6000 {
+        let x = items[i]
+        if !alive(x, x.name) || !(x.name.starts_with("mid ") || x.name.starts_with("step ") || x.name.starts_with("item ") || x.name.starts_with("again ")) {
+            bad += 1
+        }
+    }
+    expect bad == 0
+    __gc_collect()
+    let s = __gc_stats()
+    expect s.heap == s.live
+}

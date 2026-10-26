@@ -1,0 +1,9 @@
+ok    KHRIP_GC_LIMIT_MB caps the goal from the start
+ok    m doubles while nearly everything survives, up to 8
+ok    m falls back to 1 when less than half survives
+ok    the soft limit caps the goal, but not below 1.1 x live
+ok    a writer's final release assists marking above 1.5 x goal
+ok    a reader does not assist, a window does not assist
+ok    an assist that finishes marking also ends it
+ok    between the goal and 1.5 x goal a writer pays for what it allocated
+8 tests: 8 passed, 0 failed

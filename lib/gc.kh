@@ -1567,6 +1567,7 @@ fn __gc_assist() {
         let t0 = __gc_now_us()
         __gc_terminate_try()
         __gc_term_stats(t0)
+        __gc_assist_ends += 1
     }
     if units == 0 || __gc_work - w0 >= units {
         __gc_paid += debt
@@ -1668,6 +1669,7 @@ const GC_STACK = 1048576
 const GC_SYS_MADVISE = 28
 const GC_DONTNEED = 4
 const GC_SYS_SCHED_YIELD = 24
+const GC_SYS_SETPRIORITY = 141
 const GC_SYS_MREMAP = 25
 // Разметка (§7.4): объект больше GC_FRAME_MIN байт смотрится кусками по
 // GC_CHUNK байт — кадр; кадров не больше GC_FRAMES, остальные большие ждут в
@@ -1707,8 +1709,10 @@ const GC_STRESS_TEST_STEP = 8192
 var __gc_phase: int
 // идёт сборка или кусок разметки: повторно не входить
 var __gc_busy: bool
-// байт помеченных объектов: после последней сборки — живые данные
+// байт помеченных объектов: после последней сборки — живые данные (с чёрными);
+// __gc_base — оценка живого, от которой темп (§8.2, __gc_mark_done)
 var __heap_marked: int
+var __gc_base: int
 // Темп (§8.2): цель, порог, жёсткий предел. __gc_limit — порог сборки внутри
 // работы (__gc_hard_check, последнее отпускание): жёсткий предел, а с
 // KHRIP_GC_STRESS — помеченное + шаг.
@@ -1809,7 +1813,9 @@ var __gc_st_fin: int
 // помощи писателей в этой сборке; куски уборки: число, самый долгий по
 // часам и по времени процессора (мкс); кто доубрал её сам (0 — никто)
 var __gc_st_assists: int
+// помощей писателей и концов разметки, сделанных ими, за всё время
 var __gc_assists: int
+var __gc_assist_ends: int
 var __gc_st_sweeps: int
 var __gc_st_sw_max: int
 var __gc_st_sw_cpu: int
@@ -2312,9 +2318,15 @@ fn __gc_cap_unit() -> int {
                 return 1 + ((n - a) >> 1)
             }
             // признак передачи в этой сборке (__gc_handed_off; новая сборка
-            // снова обнулит aoff)
+            // снова обнулит aoff); hbuf больше 1 МБ — системе уже сейчас, а не
+            // в конце разметки: контекст его в этой сборке больше не трогает
             rec.aoff = -1
             __gc_st_handoffs += 1
+            if rec.hcap * 8 > GC_MB {
+                __gc_hbuf_drop(rec.hbuf, rec.hcap * 8)
+                rec.hbuf = 0
+                rec.hcap = 0
+            }
             return __gc_cap_done(r, i, 1 + (n >> 1))
         } else {
             i += 1
@@ -2502,8 +2514,13 @@ fn __gc_terminate_try() -> bool {
 // убранные спаны и новые. Затем m и темп следующей сборки (§8.2): выжило
 // больше 0,85 кучи начала сборки — m вдвое (не больше 8), меньше половины —
 // m = 1. Выжившее — помеченное разметкой без чёрного: новые объекты в кучу
-// начала не входят (и в основном это ещё не убранный мусор). Уборка — с
-// первой страницы, кусками (__gc_sweep).
+// начала не входят. Чёрное уборка оставит целиком, но живо из него, скорее
+// всего, столько же, сколько из кучи начала (у писателя, который мусорит
+// быстрее разметки, это почти всё мусор, и считать его живым — раздуть цель
+// следующей сборки вдвое от мусора): темп — от помеченного и такой же доли
+// чёрного (__gc_base; с KHRIP_GC_STRESS — от всего оставленного). Если это
+// меньше, следующая сборка просто начнётся раньше и отметит живое из него.
+// Уборка — с первой страницы, кусками (__gc_sweep).
 fn __gc_mark_done() {
     var i = 0
     while i < __gc_ncap {
@@ -2541,12 +2558,17 @@ fn __gc_mark_done() {
     __gc_kept = 0
     __gc_poked = false
     let b = __gc_st_before
-    if __gc_marked_bytes * 20 > b * 17 {
+    let mb = __gc_marked_bytes
+    if mb * 20 > b * 17 {
         if __gc_m < 8 {
             __gc_m *= 2
         }
-    } else if __gc_marked_bytes * 2 < b {
+    } else if mb * 2 < b {
         __gc_m = 1
+    }
+    __gc_base = __heap_marked
+    if b > mb && !__gc_stress {
+        __gc_base = mb + __gc_black_bytes / 1024 * (mb * 1024 / b)
     }
     __gc_work_est = __gc_work
     __gc_pace()
@@ -3199,10 +3221,15 @@ fn __gc_sweep_step(n: int) -> bool {
     return fin
 }
 
-// Идёт уборка, и спан, где лежит p, она ещё не прошла.
+// Идёт уборка, и спан, где лежит p (в нём может и не быть объекта), она ещё
+// не прошла.
 fn __gc_unswept(p: int) -> bool {
-    let o = __gc_obj_of(p)
-    return __gc_phase == GC_PH_SWEEP && o != 0 && load64(__gc_span_of(o) + S_SWEEPGEN) != __gc_sweepgen
+    let off = p - STORE_REGION
+    if __gc_phase != GC_PH_SWEEP || off < 0 || off >= (load64(__gc_ph + PH_HW) << GC_PAGE_SHIFT) {
+        return false
+    }
+    let e = load32(GC_PAGEMAP + ((off >> GC_PAGE_SHIFT) << 2))
+    return e != 0 && load64(GC_SPANS + ((e - 1) << 6) + S_SWEEPGEN) != __gc_sweepgen
 }
 
 // Мягкий предел, как KHRIP_GC_LIMIT_MB (0 — нет), и темп по нему.
@@ -3253,10 +3280,11 @@ fn __gc_is_allocated(p: int) -> bool {
 
 // ---- Темп и пределы (§8.2, §8.4) ----
 
-// По помеченному после сборки: цель — помеченное · (1 + m · KHRIP_GC/100), не
-// меньше KHRIP_GC_MIN_MB; с KHRIP_GC_LIMIT_MB — не выше него, но не ниже
-// 1,1 · помеченного; порог — 70% запаса; жёсткий предел — вдвое выше цели, но
-// не меньше цели + 64 МБ. KHRIP_GC=off — сборки нет. KHRIP_GC_STRESS — цель
+// По живому после сборки (__gc_base: помеченное и живая доля чёрного, см.
+// __gc_mark_done): цель — живое · (1 + m · KHRIP_GC/100), не меньше
+// KHRIP_GC_MIN_MB; с KHRIP_GC_LIMIT_MB — не выше него, но не ниже 1,1 ·
+// живого; порог — 70% запаса; жёсткий предел — вдвое выше цели, но не меньше
+// цели + 64 МБ. KHRIP_GC=off — сборки нет. KHRIP_GC_STRESS — цель
 // — помеченное + шаг (64 КБ, а у кучи больше 256 КБ — четверть помеченного);
 // с потоком сборщика следующая сборка начинается, как только выделено 8 КБ
 // после уборки (под нагрузкой разметка идёт почти всё время, и почти каждый
@@ -3268,7 +3296,7 @@ fn __gc_is_allocated(p: int) -> bool {
 // шаги сборки (__gc_stress_step), и маленький store тестов размечается, пока
 // тест его меняет.
 fn __gc_pace() {
-    let m = __heap_marked
+    let m = __gc_base
     if __gc_pct < 0 {
         __gc_goal = GC_MAX
         __gc_trigger = GC_MAX
@@ -3459,14 +3487,16 @@ type __GcStats {
     marking: bool
     // выделено чёрным в последней (или идущей) сборке: байт
     black: int
-    // идёт уборка; множитель запаса m; помощей писателей за всё время
+    // идёт уборка; множитель запаса m; помощей писателей за всё время и
+    // концов разметки, которые сделали они
     sweeping: bool
     m: int
     assists: int
+    assist_ends: int
 }
 
 fn __gc_stats() -> __GcStats {
-    return __GcStats { cycles: __gc_cycle_no, heap: __heap_live, live: __heap_marked, objects: __gc_marked_objs + __gc_black_objs, goal: __gc_goal, trigger: __gc_trigger, pages: load64(__gc_ph + PH_HW), released: __gc_total_released, max_pause_us: __gc_max_pause, marking: __gc_marking != 0, black: __gc_black_bytes, sweeping: __gc_phase == GC_PH_SWEEP, m: __gc_m, assists: __gc_assists }
+    return __GcStats { cycles: __gc_cycle_no, heap: __heap_live, live: __heap_marked, objects: __gc_marked_objs + __gc_black_objs, goal: __gc_goal, trigger: __gc_trigger, pages: load64(__gc_ph + PH_HW), released: __gc_total_released, max_pause_us: __gc_max_pause, marking: __gc_marking != 0, black: __gc_black_bytes, sweeping: __gc_phase == GC_PH_SWEEP, m: __gc_m, assists: __gc_assists, assist_ends: __gc_assist_ends }
 }
 
 // ---- Возврат памяти системе (§4.8) ----
@@ -3630,6 +3660,10 @@ fn __gc_spawn() {
 // запись, а сборки не было две минуты — сборка. Строки журнала — в своей арене
 // потока.
 fn __gc_thread_main() {
+    // приоритет выше рабочих потоков (nice −10, если система позволяет): кусок
+    // держит мьютекс писателей, и вытесненный посреди куска поток держал бы
+    // его, пока снова не получит процессор
+    syscall(GC_SYS_SETPRIORITY, 0, 0, -10)
     __arena_init()
     let ts = __alloc(16)
     let runs = __gc_scratch(GC_SCAV_RUNS * 16)
@@ -3845,6 +3879,7 @@ fn __store_boot(load: bool) {
     }
     // всё, что построено при загрузке, живо: от этого — темп сборок (§5.3)
     __heap_marked = __heap_live
+    __gc_base = __heap_live
     __gc_pace()
     __store_release_final()
     __store_saved = __store_touches
