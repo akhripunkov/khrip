@@ -1,6 +1,6 @@
 // Рост словаря по частям (docs/design/v0.13-store-gc.md §14, «As built», этап
 // памяти, часть 2; lib/core.kh): вставка нового ключа в словарь store,
-// заполненный до 7/8 ёмкости, начинает рост, каждая следующая вставка
+// заполненный до 31/32 ёмкости, начинает рост, каждая следующая вставка
 // переносит часть записей в новые массивы и таблицу, последняя —
 // переключает словарь на них. Всё это время поиск, обход, JSON и читатели
 // видят старые массивы, полные и верные; изменение и удаление уже
@@ -190,10 +190,10 @@ test "large new arrays from reused memory are prepared before entries move" {
     __map_grow_budget(0, 0)
 }
 
-// шаг — 16 записей: столько нужно, чтобы рост кончился раньше, чем старые
-// массивы заполнятся (место — восьмая часть ёмкости, обычный шаг — 64)
+// шаг — 48 записей: меньше нельзя, иначе рост не кончится раньше, чем старые
+// массивы заполнятся (место — 1/32 ёмкости, обычный шаг — 64)
 test "between growth steps a store map answers from the old arrays" {
-    __map_grow_budget(16, 0)
+    __map_grow_budget(48, 0)
     var keys: [int] = []
     var names: [str] = []
     var k = 0
@@ -204,7 +204,7 @@ test "between growth steps a store map answers from the old arrays" {
         k += 1
     }
     // вставка, которая начала рост, сделала и первый шаг
-    expect __map_grow_moved(mi(byid)) == 16
+    expect __map_grow_moved(mi(byid)) == 48
     expect same_int(byid, keys, names)
     // удаление перенесённой записи и ещё не перенесённой
     expect (byid.remove(0) ?? item(-1, "x")).n == 0
@@ -220,7 +220,7 @@ test "between growth steps a store map answers from the old arrays" {
     names[index_of(keys, 1)] = "b 1"
     byid[k - 3] = item(k - 3, "b")
     names[index_of(keys, k - 3)] = "b {k - 3}"
-    expect __map_grow_moved(mi(byid)) == 16
+    expect __map_grow_moved(mi(byid)) == 48
     expect same_int(byid, keys, names)
     // вставки — шаги; между ними всё на месте
     var steps = 0
@@ -259,7 +259,7 @@ test "between growth steps a store map answers from the old arrays" {
 
 test "a reader finds every key during growth and changes nothing" {
     byid.clear()
-    __map_grow_budget(16, 0)
+    __map_grow_budget(48, 0)
     var k = 0
     while __map_cap(mi(byid)) < 1024 || !__map_growing(mi(byid)) {
         byid[k] = item(k, "r")
@@ -268,7 +268,7 @@ test "a reader finds every key during growth and changes nothing" {
     byid[k] = item(k, "r")
     k += 1
     let moved = __map_grow_moved(mi(byid))
-    expect moved == 32
+    expect moved == 96
     // перенесённые, ещё не перенесённые, вставленные во время роста
     for j in [0, 1, moved - 1, moved, k - 3, k - 1] {
         expect (call GET "/byid/{j}").body == "r {j}"
@@ -279,7 +279,7 @@ test "a reader finds every key during growth and changes nothing" {
 }
 
 test "string keys, JSON and to_json during growth keep the insertion order" {
-    __map_grow_budget(16, 0)
+    __map_grow_budget(48, 0)
     var keys: [str] = []
     var names: [str] = []
     var k = 0
@@ -317,7 +317,7 @@ test "string keys, JSON and to_json during growth keep the insertion order" {
 }
 
 test "clear during growth drops it" {
-    __map_grow_budget(16, 0)
+    __map_grow_budget(48, 0)
     var k = 0
     while __map_cap(mi(cleared)) < 64 || !__map_growing(mi(cleared)) {
         cleared[k] = item(k, "c")
@@ -361,7 +361,7 @@ test "a map outside store grows in the same insert" {
 // просмотренную часть новых массивов, держат только старые
 test "growth that started before marking ends during it" {
     byid.clear()
-    __map_grow_budget(16, 0)
+    __map_grow_budget(48, 0)
     var k = 0
     while __map_cap(mi(byid)) < 1024 || !__map_growing(mi(byid)) {
         byid[k] = item(k, "m")
@@ -388,7 +388,7 @@ test "growth that started before marking ends during it" {
 // не смотрит — записи в них живы только через серые старые массивы
 test "growth that starts and ends during marking" {
     byid.clear()
-    __map_grow_budget(16, 0)
+    __map_grow_budget(48, 0)
     var k = 0
     while k < 100 {
         byid[k] = item(k, "w")
@@ -426,7 +426,7 @@ test "growth of a string-keyed map during marking" {
         bystr["m{k}"] = item(k, "y")
         k += 1
     }
-    __map_grow_budget(16, 0)
+    __map_grow_budget(48, 0)
     __gc_begin_from_roots()
     var grew = false
     while !grew || __map_growing(ms(bystr)) {
@@ -450,14 +450,15 @@ test "growth of a string-keyed map during marking" {
 
 test "clear during growth during marking" {
     cleared.clear()
-    __map_grow_budget(16, 0)
+    __map_grow_budget(48, 0)
     var k = 0
-    while __map_cap(mi(cleared)) < 64 || !__map_growing(mi(cleared)) {
+    while __map_cap(mi(cleared)) < 1024 || !__map_growing(mi(cleared)) {
         cleared[k] = item(k, "q")
         k += 1
     }
     __gc_begin_from_roots()
     cleared[k] = item(k, "q")
+    expect __map_growing(mi(cleared))
     cleared.clear()
     cleared[1] = item(1, "q")
     __gc_finish()

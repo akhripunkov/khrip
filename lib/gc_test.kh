@@ -188,8 +188,8 @@ fn __map_cap(m: int) -> int {
 // store (lib/core.kh, __map_set).
 fn __map_grow_at(m: int) -> int {
     let cap = __map_limit(m)
-    if cap >= 16 {
-        return cap - (cap >> 3)
+    if cap >= 64 {
+        return cap - (cap >> 5)
     }
     return cap - 1
 }

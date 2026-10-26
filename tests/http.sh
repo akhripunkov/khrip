@@ -429,8 +429,8 @@ gs_stop() {
 if "$KHC" -o "$tmp/grow_store" tests/load/grow_store.kh >"$tmp/grow_store.err" 2>&1; then
 	rm -f "$tmp/grow.json"
 	gs_start
-	# 1024 записей на 2048: рост начинается с 1792-й и идёт 64 записи за вставку
-	r1=$(curl -s -X POST "$gs_url/fill/0/1800")
+	# массивы на 2048 записей: рост начинается с 1984-й и идёт 64 записи за вставку
+	r1=$(curl -s -X POST "$gs_url/fill/0/1990")
 	curl -s -o /dev/null -X DELETE "$gs_url/k/3"
 	curl -s -o /dev/null -X DELETE "$gs_url/k/1700"
 	curl -s -o /dev/null -X POST "$gs_url/set/5/-5"
@@ -439,17 +439,17 @@ if "$KHC" -o "$tmp/grow_store" tests/load/grow_store.kh >"$tmp/grow_store.err" 2
 	gs_stop
 	gs_start
 	d2=$(curl -s "$gs_url/dump")
-	r2=$(curl -s -X POST "$gs_url/fill/1800/5000")
+	r2=$(curl -s -X POST "$gs_url/fill/1990/5000")
 	d3=$(curl -s "$gs_url/dump")
 	gs_stop
 	want=$(python3 -c '
-order = [i for i in range(1800) if i not in (3, 1700)]
+order = [i for i in range(1990) if i not in (3, 1700)]
 val = {i: i for i in order}
 val[5] = -5
 val[1750] = -1750
 print("".join(f"k{i}={val[i]}," for i in order))')
-	more=$(python3 -c 'print("".join(f"k{i}={i}," for i in range(1800, 5000)))')
-	if [[ "$r1" == "1800 true" && "$d1" == "1798 true:$want" && "$d2" == "1798 false:$want" && "${r2% *}" == "4998" && "${d3#* }" == "${r2#* }:$want$more" ]]; then
+	more=$(python3 -c 'print("".join(f"k{i}={i}," for i in range(1990, 5000)))')
+	if [[ "$r1" == "1990 true" && "$d1" == "1988 true:$want" && "$d2" == "1988 false:$want" && "${r2% *}" == "4998" && "${d3#* }" == "${r2#* }:$want$more" ]]; then
 		http_ok
 	else
 		failed "http: KHRIP_DATA посреди роста словаря" "вставки «$r1», «$r2»; до: ${d1:0:80}…; после: ${d2:0:80}…; журнал: $(cat "$tmp/grow_store.log")"
