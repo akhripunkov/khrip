@@ -1,0 +1,24 @@
+// Цена вставки нового строкового ключа в большой словарь store (как voters в polls).
+store voters: map[str, bool]
+store ids: map[int, int]
+
+route POST "/str/{a}/{b}" (a: int, b: int) -> str {
+    let c0 = __gc_clock_us(3)
+    var dup = 0
+    for i in a..b {
+        let key = "{i % 100}/v123456789-{i}"
+        if voters.has(key) {
+            dup += 1
+        }
+        voters[key] = true
+    }
+    return "{voters.len()} {__gc_clock_us(3) - c0} {dup}"
+}
+
+route POST "/int/{a}/{b}" (a: int, b: int) -> str {
+    let c0 = __gc_clock_us(3)
+    for i in a..b {
+        ids[i * 7919] = i
+    }
+    return "{ids.len()} {__gc_clock_us(3) - c0} 0"
+}
