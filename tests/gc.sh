@@ -160,13 +160,14 @@ if KHRIP_GC_LOG=1 "$KHC" -o "$tmp/gcsrv" tests/gc/server.kh 2>"$tmp/gcsrv.err" &
 	# ожидания). /hold-many держит каждый товар одним звеном в начале большой
 	# арены, писатели товары заменяют: потерянное найденное слово — неверный
 	# ответ или строка проверки. Сервер не падает, значения целы, проверки
-	# молчат
+	# молчат. fetch — 32 раза: из 16 его окно иногда ни разу не попадало на
+	# разметку
 	for fault in hbuf hbuf2; do
 		gc_start "$tmp/gcsrv_s" KHRIP_GC=20 KHRIP_GC_MIN_MB=1 KHRIP_GC_STRESS=1 KHRIP_GC_FAULT=$fault
 		curl -s -o /dev/null -X POST "$gc_url/seed"
 		gc_probes=""
 		gc_probe_bad=""
-		for probe in "many /hold-many?ms=30 16" "sleep /hold/{i}?ms=20 16" "reader /search/{i} 16" "fetch /fx?n=10 16"; do
+		for probe in "many /hold-many?ms=30 16" "sleep /hold/{i}?ms=20 16" "reader /search/{i} 16" "fetch /fx?n=10 32"; do
 			read -r kind path times <<<"$probe"
 			res=$(python3 tests/gc/drive.py probe "$GC_PORT" "$path" "$times" 2>&1)
 			gc_probes+="$kind $res; "
