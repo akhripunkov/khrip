@@ -289,7 +289,7 @@ cuts = {
     "mup": ("        if __gc_m < 8 {\n            __gc_m *= 2\n        }\n", ""),
     "mdown": ("    } else if mb * 2 < b {\n        __gc_m = 1\n    }\n", "    }\n"),
     "soft": ("        if goal > __gc_soft {\n            goal = __gc_soft\n        }\n", ""),
-    "assist": ("        } else if __gc_phase == GC_PH_MARK && __heap_live > __gc_goal {\n            __gc_assist()\n        }\n", "        }\n"),
+    "assist": ("        } else if __gc_phase == GC_PH_MARK && __heap_live > __gc_cgoal {\n            __gc_assist()\n        }\n", "        }\n"),
     "credit": ("        if debt <= 0 || rem <= 0 {\n            return\n        }\n", "        if true {\n            return\n        }\n"),
 }
 old, new = cuts[m]

@@ -111,13 +111,14 @@ test "a writer's final release assists marking above 1.5 x goal" {
 
 test "a reader does not assist, a window does not assist" {
     // мусор до начала сборки (порог высокий: точка сборки после call не
-    // собирает), затем цель ниже 2/3 кучи; тест store не держит
+    // собирает), затем, уже посреди разметки, цель ниже 2/3 кучи; тест store
+    // не держит
     __gc_set_limit_mb(64)
     __gc_collect()
     expect (call POST "/blob/20000000").status == 204
-    __gc_set_limit_mb(1)
     let a0 = __gc_stats().assists
     __gc_begin_from_roots()
+    __gc_set_limit_mb(1)
     expect (call GET "/count").body == "60000"
     expect !exact() || __gc_stats().assists == a0
     __gc_begin_from_roots()
