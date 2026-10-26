@@ -1676,7 +1676,6 @@ const GC_STACK = 1048576
 const GC_SYS_MADVISE = 28
 const GC_DONTNEED = 4
 const GC_SYS_SCHED_YIELD = 24
-const GC_SYS_SETPRIORITY = 141
 const GC_SYS_MREMAP = 25
 // Разметка (§7.4): объект больше GC_FRAME_MIN байт смотрится кусками по
 // GC_CHUNK байт — кадр; кадров не больше GC_FRAMES, остальные большие ждут в
@@ -3668,10 +3667,6 @@ fn __gc_spawn() {
 // запись, а сборки не было две минуты — сборка. Строки журнала — в своей арене
 // потока.
 fn __gc_thread_main() {
-    // приоритет выше рабочих потоков (nice −10, если система позволяет): кусок
-    // держит мьютекс писателей, и вытесненный посреди куска поток держал бы
-    // его, пока снова не получит процессор
-    syscall(GC_SYS_SETPRIORITY, 0, 0, -10)
     __arena_init()
     let ts = __alloc(16)
     let runs = __gc_scratch(GC_SCAV_RUNS * 16)

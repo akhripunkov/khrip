@@ -269,7 +269,7 @@ done
 # без удвоения и сброса m, без мягкого предела, без помощи писателя и без
 # помощи по счёту (tests/api/gc_pace.kh) тесты падают.
 pace_ok=1
-KHRIP_GC_LIMIT_MB=3 "$KHC" test tests/api/gc_pace.kh >"$tmp/pace.txt" 2>&1
+KHRIP_GC_LIMIT_MB=3 "$KHC" test tests/api/gc_pace.kh 2>&1 | grep -v '^khrip: gc verify (boot): ' >"$tmp/pace.txt"
 if ! diff -u tests/api/gc_pace.out "$tmp/pace.txt" >"$tmp/pace.diff"; then
 	pace_ok=0
 	failed "tests/api/gc_pace.kh (KHRIP_GC_LIMIT_MB=3)" "$(cat "$tmp/pace.diff")"
