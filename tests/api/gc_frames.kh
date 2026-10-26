@@ -1,0 +1,271 @@
+// Правило частичного массива (docs/design/v0.13-store-gc.md §7.4, §7.5):
+// массив больше 16 КБ разметка смотрит кусками по 2048 слов (кадр), и пока он
+// просмотрен до середины, сдвиг или перестановка внутри него могли бы
+// перенести непросмотренный элемент в просмотренную часть. Тест начинает
+// сборку от корней (__gc_begin_from_roots), делает шаги разметки, пока массив
+// не станет кадром с границей посередине (__gc_frame_pos), меняет массив и
+// заканчивает сборку: каждый элемент на месте. Без правила элементы,
+// перешедшие границу, остались бы непомеченными и ушли бы в уборку: с
+// KHRIP_GC_VERIFY это ловит проверка конца разметки, без неё — сам тест
+// (__gc_is_allocated). remove_at серит один элемент на границе; reverse,
+// sort, sort_by и сжатие словаря при перестройке серят всю непросмотренную
+// часть и заканчивают кадр. Кадров не больше восьми: большие массивы,
+// вложенные глубже, ждут в отложенных и тоже размечаются целиком.
+
+type Item { name: str, n: int }
+
+// дерево: у каждого узла 600 детей (массив больше 4 КБ — кадр), дальше
+// ветвится только первый, глубина 12
+type Node { name: str, kids: [Node] }
+
+store big: [Item]
+store byn: [Item]
+store words: [str]
+store rwords: [str]
+store table: map[int, Item]
+store spare: Item = Item { name: "", n: 0 }
+store tree: [Node]
+
+const N = 5000
+
+fn exact() -> bool {
+    return (env("KHRIP_GC_STRESS") ?? "") != "1"
+}
+
+fn wname(i: int) -> str {
+    var s = "{i}"
+    while s.byte_len() < 4 {
+        s = "0" + s
+    }
+    return "w" + s
+}
+
+fn data_items(xs: [Item]) -> int {
+    let h: int = __cast(xs)
+    return load64(h)
+}
+
+fn data_words(xs: [str]) -> int {
+    let h: int = __cast(xs)
+    return load64(h)
+}
+
+// значения словаря: массив списка vals (слово 2 заголовка словаря)
+fn data_vals(m: map[int, Item]) -> int {
+    let h: int = __cast(m)
+    return load64(load64(h + 16))
+}
+
+// шаги разметки, пока массив d из n слов не станет кадром с границей
+// посередине → номер первого непросмотренного элемента, или −1
+fn frame_mid(d: int, n: int) -> int {
+    var k = 0
+    while k < 1000000 {
+        let p = __gc_frame_pos(d)
+        if p > 0 && p < n * 8 {
+            return p / 8
+        }
+        if __gc_step(1) {
+            return -1
+        }
+        k += 1
+    }
+    return -1
+}
+
+fn item_ok(x: Item, name: str) -> bool {
+    let a: int = __cast(x)
+    let s: int = __cast(x.name)
+    return __gc_is_allocated(a) && __gc_is_allocated(s) && x.name == name
+}
+
+fn word_ok(s: str, want: str) -> bool {
+    let a: int = __cast(s)
+    return __gc_is_allocated(a) && s == want
+}
+
+// сколько элементов не на месте
+fn bad_items(xs: [Item], off: int) -> int {
+    var bad = 0
+    for i in 0..xs.len() {
+        if !item_ok(xs[i], "big {i + off}") {
+            bad += 1
+        }
+    }
+    return bad
+}
+
+// сколько элементов освобождено (имена не важны)
+fn freed_items(xs: [Item]) -> int {
+    var bad = 0
+    for x in xs {
+        let a: int = __cast(x)
+        let s: int = __cast(x.name)
+        if !__gc_is_allocated(a) || !__gc_is_allocated(s) {
+            bad += 1
+        }
+    }
+    return bad
+}
+
+fn bad_words(xs: [str]) -> int {
+    var bad = 0
+    for i in 0..xs.len() {
+        if !word_ok(xs[i], wname(i)) {
+            bad += 1
+        }
+    }
+    return bad
+}
+
+test "build big arrays and a big map" {
+    for i in 0..N {
+        big.push(Item { name: "big {i}", n: i })
+        byn.push(Item { name: "big {N - 1 - i}", n: N - 1 - i })
+        words.push(wname(N - 1 - i))
+        rwords.push(wname(N - 1 - i))
+    }
+    // словарь: 3000 записей, первые 1000 удалены (мёртвые записи в начале
+    // массивов), затем записи до самой перестройки: следующая вставка сожмёт
+    // массивы — каждая живая запись сдвинется на 1000 вниз
+    for i in 0..3000 {
+        table[i] = Item { name: "t {i}", n: i }
+    }
+    for i in 0..1000 {
+        table.remove(i)
+    }
+    var k = 3000
+    while true {
+        let h: int = __cast(table)
+        if (load64(load64(h) + 8) + 1) * 2 > load64(h + 40) {
+            break
+        }
+        table[k] = Item { name: "t {k}", n: k }
+        k += 1
+    }
+    __gc_collect()
+    expect table.len() == k - 1000
+}
+
+test "remove_at across the scan position shades the element on the boundary" {
+    __gc_begin_from_roots()
+    let p = frame_mid(data_items(big), big.len())
+    expect p > 0
+    let a: int = __cast(big[p])
+    expect !exact() || !__gc_is_marked(a)
+    big.remove_at(0)
+    __gc_finish()
+    expect big.len() == N - 1 && item_ok(big[p - 1], "big {p}")
+    expect bad_items(big, 1) == 0
+}
+
+test "remove_at after the scan position moves nothing across it" {
+    __gc_begin_from_roots()
+    let p = frame_mid(data_items(big), big.len())
+    expect p > 0
+    big.remove_at(p + 10)
+    __gc_finish()
+    expect big.len() == N - 2 && item_ok(big[p + 10], "big {p + 12}")
+}
+
+test "sort of a partial array" {
+    __gc_begin_from_roots()
+    let p = frame_mid(data_words(words), words.len())
+    expect p > 0
+    words.sort()
+    __gc_finish()
+    expect words.len() == N && bad_words(words) == 0
+}
+
+test "reverse of a partial array" {
+    __gc_begin_from_roots()
+    let p = frame_mid(data_words(rwords), rwords.len())
+    expect p > 0
+    rwords.reverse()
+    __gc_finish()
+    expect rwords.len() == N && bad_words(rwords) == 0
+}
+
+test "sort_by of a partial array" {
+    __gc_begin_from_roots()
+    let p = frame_mid(data_items(byn), byn.len())
+    expect p > 0
+    byn.sort_by(x => x.n)
+    __gc_finish()
+    expect byn.len() == N && bad_items(byn, 0) == 0
+}
+
+test "rehash compaction of a partial values array" {
+    __gc_begin_from_roots()
+    let p = frame_mid(data_vals(table), 4096)
+    expect p > 0
+    let before = table.len()
+    let h: int = __cast(table)
+    let mask = load64(h + 40)
+    table[1000000] = spare
+    // перестройка была: таблица слотов стала больше
+    expect load64(h + 40) > mask
+    __gc_finish()
+    var bad = 0
+    for k, v in table {
+        if k != 1000000 && !item_ok(v, "t {k}") {
+            bad += 1
+        }
+    }
+    expect table.len() == before + 1 && bad == 0
+}
+
+fn grow_tree(depth: int, path: str) -> Node {
+    var kids: [Node] = []
+    if depth > 0 {
+        kids.push(grow_tree(depth - 1, path + ".0"))
+        for i in 1..600 {
+            kids.push(Node { name: "{path}.{i}", kids: [] })
+        }
+    }
+    return Node { name: path, kids: kids }
+}
+
+// узлы дерева с правильными именами, все на месте
+fn tree_ok(n: Node, path: str) -> int {
+    let a: int = __cast(n)
+    if !__gc_is_allocated(a) || n.name != path {
+        return 1000000
+    }
+    var count = 1
+    for k in n.kids {
+        if !k.name.starts_with(path + ".") {
+            return 1000000
+        }
+        count += tree_ok(k, k.name)
+    }
+    return count
+}
+
+test "build a tree of big arrays nested twelve deep" {
+    tree.push(grow_tree(12, "t"))
+    __gc_collect()
+    expect tree_ok(tree[0], "t") == 1 + 12 * 600
+}
+
+test "arrays nested deeper than eight frames wait in the overflow list" {
+    __gc_begin_from_roots()
+    var k = 0
+    while __gc_overflow() == 0 && !__gc_step(1) && k < 1000000 {
+        k += 1
+    }
+    expect !exact() || __gc_overflow() > 0
+    // перестановки в массивах, которые ждут (их разметка ещё не начиналась)
+    var n = tree[0]
+    for d in 0..12 {
+        n.kids.reverse()
+        n = n.kids[n.kids.len() - 1]
+    }
+    __gc_finish()
+    expect tree_ok(tree[0], "t") == 1 + 12 * 600
+}
+
+test "after a full collection everything is still there" {
+    __gc_collect()
+    expect freed_items(big) == 0 && bad_words(words) == 0 && bad_words(rwords) == 0 && bad_items(byn, 0) == 0
+}

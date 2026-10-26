@@ -1,0 +1,7 @@
+ok    build
+ok    call while marking: windows, replacement, test point
+ok    __gc_collect() while marking finishes the cycle and collects again
+ok    a request that passes the hard limit while marking finishes the cycle
+ok    the test end while marking
+ok    after the test end everything is still there
+6 tests: 6 passed, 0 failed

@@ -7,10 +7,12 @@
 """
 import http.client
 import json
+import os
 import random
 import sys
 
-conn = http.client.HTTPConnection("127.0.0.1", 8080)
+# порт сервера: SEED_PORT (по умолчанию 8080, как в eval/perf.sh)
+conn = http.client.HTTPConnection("127.0.0.1", int(os.environ.get("SEED_PORT", "8080")))
 
 
 def req(method, path, body=None, headers=None):

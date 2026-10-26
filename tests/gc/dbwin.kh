@@ -1,0 +1,132 @@
+// Окна драйверов MongoDB и ClickHouse под сборщиком store (tests/gc.sh,
+// docs/design/v0.13-store-gc.md §6.5): читатель держит товар store через
+// команду MongoDB или запрос ClickHouse (окно: блокировка отпущена, запись
+// опубликована), а писатели тем временем заменяют товары, и сборки с
+// KHRIP_GC_STRESS=1 идут одна за другой. Ответ — "ok", "ok~" (продолжил
+// посреди разметки сборки, начатой, пока он ждал) или "ok+" (и передал арену
+// сам), иначе — что не так. Имя товара несёт свою проверку, как в
+// tests/gc/server.kh. Адреса серверов — MONGODB_URI и CLICKHOUSE_URL
+// (CLICKHOUSE_USER, CLICKHOUSE_PASSWORD).
+
+type Product { id: int, name: str, tags: [str] }
+
+store products: map[int, Product]
+
+const N = 2000
+
+fn name_of(id: int, v: int) -> str {
+    return "p{id}:{v}:{(id * 7919 + v * 104729) % 1000003}"
+}
+
+fn version(id: int, s: str) -> int {
+    let parts = s.split(":")
+    if parts.len() != 3 || parts[0] != "p{id}" {
+        return -1
+    }
+    let v = parts[1].to_int() ?? -1
+    if v < 0 || parts[2] != "{(id * 7919 + v * 104729) % 1000003}" {
+        return -1
+    }
+    return v
+}
+
+fn check(p: Product) -> str {
+    if version(p.id, p.name) < 0 {
+        return "bad name {p.name}"
+    }
+    if p.tags.len() < 1 || p.tags[0] != "t{p.id}" {
+        return "bad tags of {p.id}"
+    }
+    return "ok"
+}
+
+fn fresh(id: int, v: int) -> Product {
+    var tags = ["t{id}"]
+    for i in 0..v % 4 {
+        tags.push("extra {i} of {v}")
+    }
+    return Product { id: id, name: name_of(id, v), tags: tags }
+}
+
+fn mongo() -> Mongo {
+    return Mongo { uri: env("MONGODB_URI") ?? "" }
+}
+
+fn ch() -> ChConfig {
+    return ChConfig { url: env("CLICKHOUSE_URL") ?? "", database: "default", user: env("CLICKHOUSE_USER") ?? "default", password: env("CLICKHOUSE_PASSWORD") ?? "" }
+}
+
+// итог держателя: c0 — номер сборки перед ожиданием
+fn mark_ok(c0: int, r: str) -> str {
+    if r != "ok" {
+        return r
+    }
+    if __gc_handed_off() {
+        return "ok+"
+    }
+    let s = __gc_stats()
+    if s.marking && s.cycles > c0 {
+        return "ok~"
+    }
+    return "ok"
+}
+
+route POST "/seed" -> int {
+    for id in 0..N {
+        products[id] = fresh(id, 0)
+    }
+    return products.len()
+}
+
+route POST "/churn/{id}/{n}" (id: int, n: int) -> str | 404 {
+    for i in 0..n {
+        let k = (id + i * 37) % N
+        let old = products[k] else {
+            return 404
+        }
+        let v = version(k, old.name)
+        if v < 0 {
+            return "bad name {old.name}"
+        }
+        products[k] = fresh(k, v + 1)
+    }
+    return "ok"
+}
+
+// товар через несколько команд MongoDB (у каждой — своё окно)
+route GET "/mongo/{id}" (id: int) -> str | 404 {
+    let p = products[id] else {
+        return 404
+    }
+    var res = "ok"
+    for i in 0..8 {
+        let c0 = __gc_stats().cycles
+        let cmd = bson_new()
+        bson_int(cmd, "ping", 1)
+        let r = mongo_command(mongo(), "admin", bson_finish(cmd))
+        if r.error != "" {
+            return "mongo: " + r.error
+        }
+        let m = mark_ok(c0, check(p))
+        if m != "ok" && res != "ok+" {
+            res = m
+        }
+        if m != "ok" && m != "ok~" && m != "ok+" {
+            return m
+        }
+    }
+    return res
+}
+
+// товар через запрос ClickHouse, который сам ждёт на сервере
+route GET "/ch/{id}" (id: int) -> str | 404 {
+    let p = products[id] else {
+        return 404
+    }
+    let c0 = __gc_stats().cycles
+    let r = ch_query(ch(), "SELECT sleepEachRow(0.01) FROM numbers(2) FORMAT TabSeparated")
+    if !r.ok {
+        return "clickhouse: {r.status} {r.error}"
+    }
+    return mark_ok(c0, check(p))
+}

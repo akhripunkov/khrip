@@ -1,0 +1,123 @@
+// Разметка, которая идёт, пока тест работает (docs/design/v0.13-store-gc.md
+// §6.8, §8.4): тест начинает сборку, публикуя себя (свою арену он при отзыве
+// передаёт сам), и посреди разметки делает call — запрос ждёт (его окно
+// публикует и отзывает ту же запись), меняет store, точка сборки теста после
+// него может собрать; __gc_collect() и сборка у жёсткого предела внутри
+// запроса доделывают идущую разметку с того, что есть, и собирают заново.
+// Значения, которые тест держит с начала сборки, остаются целы, и всё
+// достижимое — на месте.
+
+type Item { name: str, n: int }
+
+store items: [Item]
+store junk: [str]
+store blob: str = ""
+
+fn exact() -> bool {
+    return (env("KHRIP_GC_STRESS") ?? "") != "1"
+}
+
+fn ok_item(x: Item, name: str) -> bool {
+    let a: int = __cast(x)
+    return __gc_is_allocated(a) && x.name == name
+}
+
+route POST "/add/{n}" (n: int) -> str {
+    sleep(1)
+    items.push(Item { name: "item {n}", n: n })
+    return "ok"
+}
+
+// держит старый элемент через ожидание и заменяет его
+route PUT "/replace/{i}" (i: int) -> str {
+    let old = items[i]
+    sleep(1)
+    items[i] = Item { name: "new {i}", n: -i }
+    return old.name
+}
+
+// куча проходит жёсткий предел (цель + 64 МБ) посреди запроса
+route POST "/grow/{n}" (n: int) -> 204 {
+    for i in 0..n {
+        junk.push("y".repeat(1000000))
+    }
+    junk = []
+    return 204
+}
+
+route POST "/blob/{n}" (n: int) -> 204 {
+    blob = "z".repeat(n)
+    return 204
+}
+
+test "build" {
+    for i in 0..300 {
+        items.push(Item { name: "item {i}", n: i })
+    }
+    __gc_collect()
+}
+
+test "call while marking: windows, replacement, test point" {
+    let held = items[3]
+    let held2 = items[250]
+    __gc_begin()
+    expect !exact() || __gc_stats().marking
+    __gc_step(20)
+    expect (call POST "/add/1000").body == "ok"
+    __gc_step(20)
+    expect (call PUT "/replace/3").body == "item 3"
+    __gc_step(20)
+    expect (call PUT "/replace/250").body == "item 250"
+    __gc_finish()
+    expect !__gc_stats().marking
+    expect ok_item(held, "item 3") && ok_item(held2, "item 250")
+    expect ok_item(items[3], "new 3") && ok_item(items[300], "item 1000")
+    __gc_collect()
+    expect ok_item(held, "item 3") && ok_item(items[299], "item 299")
+}
+
+test "__gc_collect() while marking finishes the cycle and collects again" {
+    let held = items[5]
+    __gc_begin()
+    __gc_step(5)
+    items[5] = Item { name: "new 5", n: -5 }
+    let before = __gc_stats().cycles
+    __gc_collect()
+    let s = __gc_stats()
+    expect !s.marking && s.cycles >= before + 1 && s.heap == s.live
+    expect ok_item(held, "item 5") && ok_item(items[5], "new 5")
+}
+
+test "a request that passes the hard limit while marking finishes the cycle" {
+    let held = items[7]
+    __gc_collect()
+    let before = __gc_stats().cycles
+    __gc_begin()
+    __gc_step(5)
+    // 90 МБ внутри запроса: жёсткий предел — цель + 64 МБ
+    expect (call POST "/grow/90").status == 204
+    let s = __gc_stats()
+    expect s.cycles > before + 1 && !s.marking
+    expect ok_item(held, "item 7") && items.len() == 301
+}
+
+test "the test end while marking" {
+    __gc_begin()
+    __gc_step(5)
+    expect (call POST "/blob/100000").status == 204
+    expect blob.byte_len() == 100000
+}
+
+test "after the test end everything is still there" {
+    __gc_finish()
+    __gc_collect()
+    var bad = 0
+    for i in 0..items.len() {
+        let x = items[i]
+        let a: int = __cast(x)
+        if !__gc_is_allocated(a) {
+            bad += 1
+        }
+    }
+    expect bad == 0 && items[3].name == "new 3" && blob.byte_len() == 100000
+}

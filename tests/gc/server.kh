@@ -3,7 +3,9 @@
 // хеш пароля, fetch), а их тем временем заменяют писатели и собирает сборщик.
 // Имя товара несёт свою проверку (name_of): освобождённая и снова занятая
 // память дала бы чужие или испорченные байты. Ответ маршрута держателя — "ok"
-// или что не так.
+// или что не так; "ok~" — запрос продолжил посреди разметки сборки, которая
+// началась, пока он ждал (его запись захвачена), "ok+" — и арену он передал
+// сам (сборщик до неё ещё не дошёл; docs/design/v0.13-store-gc.md §6.3).
 
 type Product { id: int, name: str, tags: [str], price: int }
 
@@ -13,6 +15,10 @@ type Account { id: int, balance: int }
 
 type Pair { a: str, b: str }
 
+type PNode { p: Product, next: PNode? }
+
+type ANode { a: Account, next: ANode? }
+
 store products: map[int, Product]
 store resurrected: map[int, Product]
 store users: map[str, User]
@@ -21,13 +27,34 @@ store feed: [str]
 store every_ok: int
 store every_bad: int
 store every_runs: int
+store every_met: int
 store counter: int
 store seen: map[int, int]
 store hdrs: map[str, str]
 store target: str
 store big: [int]
+store scratch: [int]
 
 const N = 2000
+
+// итог держателя: c0 — номер сборки перед ожиданием
+fn mark_ok(c0: int, r: str) -> str {
+    if r != "ok" {
+        return r
+    }
+    if __gc_handed_off() {
+        return "ok+"
+    }
+    let s = __gc_stats()
+    if s.marking && s.cycles > c0 {
+        return "ok~"
+    }
+    return "ok"
+}
+
+fn cyc() -> int {
+    return __gc_stats().cycles
+}
 
 // имя версии v товара id: "p{id}:{v}:{проверка}"
 fn name_of(id: int, v: int) -> str {
@@ -117,11 +144,55 @@ route GET "/hold/{id}" (id: int, ms: int = 200) -> str | 404 {
     }
     let name = p.name
     let tags = p.tags
+    let c0 = cyc()
     sleep(ms)
     if name != p.name || tags.len() != p.tags.len() {
         return "changed under the request"
     }
-    return check(p)
+    return mark_ok(c0, check(p))
+}
+
+// держит каждый товар звеном в своей арене, а за ними — 60 000 звеньев на
+// один счёт (сотни кусков просмотра при передаче арены), через ожидание:
+// товары заменяют писатели, и держит их только эта арена
+route GET "/hold-many" (ms: int = 30) -> str {
+    var head: PNode? = none
+    for id in 0..N {
+        if let p = products[id] {
+            head = PNode { p: p, next: head }
+        }
+    }
+    let a = accounts[0] else {
+        return "no account"
+    }
+    var tail: ANode? = none
+    for j in 0..60000 {
+        tail = ANode { a: a, next: tail }
+    }
+    let c0 = cyc()
+    sleep(ms)
+    var q = head
+    while true {
+        let n = q else {
+            break
+        }
+        let r = check(n.p)
+        if r != "ok" {
+            return r
+        }
+        q = n.next
+    }
+    var t = tail
+    while true {
+        let n = t else {
+            break
+        }
+        if n.a.id != 0 {
+            return "bad account"
+        }
+        t = n.next
+    }
+    return mark_ok(c0, "ok")
 }
 
 // срез строки store держит всю строку
@@ -130,11 +201,12 @@ route GET "/slice/{id}" (id: int, ms: int = 50) -> str | 404 {
         return 404
     }
     let s = p.name[1..]
+    let c0 = cyc()
     sleep(ms)
     if version(id, "p" + s) < 0 {
         return "bad slice {s}"
     }
-    return "ok"
+    return mark_ok(c0, "ok")
 }
 
 // держит, ждёт, меняет и кладёт обратно в store под другим ключом
@@ -142,10 +214,11 @@ route POST "/resurrect/{id}" (id: int, ms: int = 20) -> str | 404 {
     let p = products[id] else {
         return 404
     }
+    let c0 = cyc()
     sleep(ms)
     p.tags.push("x")
     resurrected[id] = p
-    return check(p)
+    return mark_ok(c0, check(p))
 }
 
 route GET "/resurrected" -> str {
@@ -167,6 +240,7 @@ route GET "/loop/{id}" (id: int) -> str | 404 {
         return 404
     }
     var n = 0
+    let c0 = cyc()
     for t in p.tags {
         sleep(1)
         // "x" дописывает /resurrect — тому же объекту
@@ -175,7 +249,7 @@ route GET "/loop/{id}" (id: int) -> str | 404 {
         }
         n += 1
     }
-    return check(p)
+    return mark_ok(c0, check(p))
 }
 
 fn slow_name(id: int) -> str {
@@ -196,6 +270,7 @@ route GET "/temps/{id}" (id: int) -> str | 404 {
         return 404
     }
     var xs: [str] = []
+    let c0 = cyc()
     xs.push(slow_name((id + 1) % N))
     let both = pair(u.name, slow_name((id + 2) % N))
     let box = Pair { a: u.name, b: slow_name((id + 3) % N) }
@@ -214,7 +289,7 @@ route GET "/temps/{id}" (id: int) -> str | 404 {
     if words.len() != 3 || version(id, words[0]) < 0 || version((id + 4) % N, words[1]) < 0 || words[2] != "t{id}" {
         return "bad interpolation {msg}"
     }
-    return check(u)
+    return mark_ok(c0, check(u))
 }
 
 // map и filter по store держатся через ожидание
@@ -224,6 +299,7 @@ route GET "/map/{id}" (id: int) -> str {
         ids.push((id + i * 11) % N)
     }
     let ps = ids.map(k => products[k]).filter(p => p != none)
+    let c0 = cyc()
     sleep(20)
     for p in ps {
         if let q = p {
@@ -233,12 +309,13 @@ route GET "/map/{id}" (id: int) -> str {
             }
         }
     }
-    return "ok"
+    return mark_ok(c0, "ok")
 }
 
 // долгий опрос: все значения разом, ожидание 60 раз
 route GET "/poll" (ms: int = 50) -> str {
     let all = products.values()
+    let c0 = cyc()
     for i in 0..60 {
         sleep(ms)
     }
@@ -248,7 +325,7 @@ route GET "/poll" (ms: int = 50) -> str {
             return c
         }
     }
-    return "ok"
+    return mark_ok(c0, "ok")
 }
 
 // хеш пароля ждёт в своём окне; пользователя тем временем заменяют
@@ -256,13 +333,14 @@ route POST "/login" -> str | 404 {
     let u = users["alice"] else {
         return 404
     }
+    let c0 = cyc()
     if !check_password("pw-alice", u.hash) {
         return "wrong password"
     }
     if u.name != "alice" {
         return "bad name"
     }
-    return "ok"
+    return mark_ok(c0, "ok")
 }
 
 route POST "/rotate" -> str {
@@ -271,12 +349,20 @@ route POST "/rotate" -> str {
 }
 
 // fetch по адресу и заголовкам из store, пока их заменяют
-route POST "/fx" -> str {
-    let r = fetch GET target headers hdrs
-    if r.status != 200 || r.body != "abc" {
-        return "fetch {r.status} {r.body}"
+route POST "/fx" (n: int = 1) -> str {
+    var res = "ok"
+    for i in 0..n {
+        let c0 = cyc()
+        let r = fetch GET target headers hdrs
+        if r.status != 200 || r.body != "abc" {
+            return "fetch {r.status} {r.body}"
+        }
+        let m = mark_ok(c0, "ok")
+        if m != "ok" {
+            res = m
+        }
     }
-    return "ok"
+    return res
 }
 
 route POST "/hdrs/{n}" (n: int) -> str {
@@ -290,8 +376,9 @@ route GET "/search/{id}" (id: int) -> str | 404 {
     let p = products[id] else {
         return 404
     }
+    let c0 = cyc()
     sleep(30)
-    return check(p)
+    return mark_ok(c0, check(p))
 }
 
 // паника после ожидания (в том числе после fetch): 500, запись отозвана
@@ -388,14 +475,44 @@ route GET "/gcstats" -> str {
 }
 
 route GET "/every" -> str {
-    return "{every_runs} {every_ok} {every_bad}"
+    return "{every_runs} {every_ok} {every_bad} {every_met}"
+}
+
+// сборка у жёсткого предела посреди запроса (с KHRIP_GC_STRESS — чаще всего
+// посреди разметки потока сборщика): список store из чисел растёт (старые
+// массивы — мусор), пока запрос не соберёт сам (номер сборки меняется только
+// так: поток сборщика без мьютекса писателей сборку не начнёт и не закончит;
+// порог — помеченное + max(512 КБ, четверть помеченного), не больше 32 МБ), и
+// уходит. Без KHRIP_GC_STRESS — 1 МБ мусора. Арена запроса не растёт.
+route POST "/grow" -> str {
+    let c0 = cyc()
+    var cap = 131072
+    if (env("KHRIP_GC_STRESS") ?? "") == "1" {
+        cap = 4194304
+    }
+    var i = 0
+    while i < cap && cyc() == c0 {
+        for j in 0..4096 {
+            scratch.push(i + j)
+        }
+        i += 4096
+    }
+    scratch = []
+    if cap > 131072 && cyc() == c0 {
+        return "no collection in the request"
+    }
+    return "ok"
 }
 
 // фоновая задача держит список store через ожидание, маршруты меняют его
 every 100 ms {
     let snapshot = feed
     let n = snapshot.len()
+    let c0 = cyc()
     sleep(30)
+    if mark_ok(c0, "ok") != "ok" {
+        every_met += 1
+    }
     var ok = true
     for i in 0..n {
         let parts = snapshot[i].split(":")
@@ -411,6 +528,11 @@ every 100 ms {
     }
 }
 
+// ответ держателя без ошибки (ok~, ok+ — посреди разметки)
+fn good(b: str) -> bool {
+    return b == "ok" || b == "ok~" || b == "ok+"
+}
+
 // call в тестах: тест держит товар, маршрут его заменяет и ждёт
 test "a test holds a product across calls that replace it" {
     expect (call POST "/seed").status == 200
@@ -421,11 +543,11 @@ test "a test holds a product across calls that replace it" {
     for i in 0..20 {
         expect (call PATCH "/p/5").body == "ok"
         expect (call POST "/churn/{i}/50").body == "ok"
-        expect (call GET "/hold/5?ms=1").body == "ok"
+        expect good((call GET "/hold/5?ms=1").body)
     }
     expect check(p) == "ok" && version(5, p.name) == 0
-    expect (call GET "/temps/7").body == "ok"
+    expect good((call GET "/temps/7").body)
     expect (call GET "/boom/3").status == 500
-    expect (call POST "/resurrect/9?ms=1").body == "ok"
+    expect good((call POST "/resurrect/9?ms=1").body)
     expect (call GET "/resurrected").body == "ok 1"
 }

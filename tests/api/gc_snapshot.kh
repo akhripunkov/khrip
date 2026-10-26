@@ -1,0 +1,152 @@
+// Что держал ожидающий контекст в начале сборки, разметка не теряет
+// (docs/design/v0.13-store-gc.md §6.3, §8.7): значение только на стеке теста
+// (слова записи), ссылки только в его арене — просмотренные сборщиком кусками
+// и переданные самим контекстом (hbuf, разбирается пачками), и элемент, снятый
+// pop посреди разметки и оставшийся только у теста, и арена, которую контекст
+// смотрит дважды (первый раз hbuf не вырос). Каждый объект перед сборкой убран
+// из store (clear: старый массив списка — без старых ссылок, даже если до него
+// доходит случайное слово стека), так что пометить его может только то, что
+// проверяется. tests/run.sh запускает этот файл ещё и на копиях библиотеки, где
+// разметка теряет слова записей, кусок арены или барьер pop: проверка конца
+// разметки (KHRIP_GC_VERIFY, снимок начала сборки) должна остановить
+// программу, хотя потерянный объект больше ни от чего не достижим; и с
+// KHRIP_GC_FAULT=hbuf (нет памяти на hbuf: контекст размечает арену сам) и
+// hbuf2 (hbuf не растёт после первого куска).
+
+type Item { name: str, n: int }
+
+type Node { item: Item, next: Node? }
+
+store held_src: [Item]
+store arena_src: [Item]
+store handed_src: [Item]
+store popl: [Item]
+store rescan_src: [Item]
+
+const N = 3000
+
+// объект и его имя на месте (не освобождены) и имя — то самое
+fn alive(x: Item, name: str) -> bool {
+    let a: int = __cast(x)
+    let s: int = __cast(x.name)
+    return __gc_is_allocated(a) && __gc_is_allocated(s) && x.name == name
+}
+
+fn fill(n: int, what: str) -> [Item] {
+    var xs: [Item] = []
+    for i in 0..n {
+        xs.push(Item { name: "{what} {i}", n: i })
+    }
+    return xs
+}
+
+test "build" {
+    held_src = fill(8, "held")
+    arena_src = fill(N, "arena")
+    handed_src = fill(N, "handed")
+    popl = fill(N, "pop")
+    rescan_src = fill(N, "rescan")
+    __gc_collect()
+    expect popl.len() == N
+}
+
+test "a value only on the test's stack (record words) survives" {
+    let held = held_src[5]
+    held_src[5] = Item { name: "new", n: -1 }
+    __gc_begin()
+    __gc_finish()
+    expect alive(held, "held 5")
+}
+
+// звенья списка в арене: каждая ссылка в store — ровно в одном слове арены
+// (у растущего списка старые массивы держали бы копии); старый список store
+// обходит отдельная функция — её кадр после возврата не публикуется, а на
+// стеке теста не остаётся старого слова, которое пометило бы весь список
+fn link_all() -> Node? {
+    var head: Node? = none
+    for i in 0..arena_src.len() {
+        head = Node { item: arena_src[i], next: head }
+    }
+    arena_src.clear()
+    return head
+}
+
+fn copy_all() -> [Item] {
+    var xs: [Item] = []
+    for x in handed_src {
+        xs.push(x)
+    }
+    handed_src.clear()
+    return xs
+}
+
+fn link_rescan() -> Node? {
+    var head: Node? = none
+    for i in 0..rescan_src.len() {
+        head = Node { item: rescan_src[i], next: head }
+    }
+    rescan_src.clear()
+    return head
+}
+
+test "references only in the arena, scanned by the collector in chunks" {
+    let head = link_all()
+    __gc_begin_scanned()
+    __gc_finish()
+    var bad = 0
+    var count = 0
+    var p = head
+    while true {
+        let n = p else {
+            break
+        }
+        if !alive(n.item, "arena {N - 1 - count}") {
+            bad += 1
+        }
+        count += 1
+        p = n.next
+    }
+    expect bad == 0 && count == N
+}
+
+test "references only in the arena, handed off by the test (hbuf in batches)" {
+    let xs = copy_all()
+    __gc_begin()
+    __gc_finish()
+    var bad = 0
+    for i in 0..xs.len() {
+        if !alive(xs[i], "handed {i}") {
+            bad += 1
+        }
+    }
+    expect bad == 0 && xs.len() == N
+}
+
+test "an element popped while marking, held only by the test" {
+    __gc_begin_from_roots()
+    let x = popl.pop()
+    __gc_finish()
+    expect alive(x, "pop {N - 1}") && popl.len() == N - 1
+}
+
+// звенья — в первом куске просмотра арены (64 КБ), строка за ними — во втором
+test "an arena scanned twice keeps what the first scan found" {
+    let head = link_rescan()
+    let pad = "p".repeat(100000)
+    __gc_begin_rescan()
+    __gc_finish()
+    var bad = 0
+    var count = 0
+    var p = head
+    while true {
+        let n = p else {
+            break
+        }
+        if !alive(n.item, "rescan {N - 1 - count}") {
+            bad += 1
+        }
+        count += 1
+        p = n.next
+    }
+    expect bad == 0 && count == N && pad.byte_len() == 100000
+}
