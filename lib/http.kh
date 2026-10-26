@@ -37,9 +37,9 @@ const HTTP_IN_SIZE = 65536
 const HTTP_OUT_SIZE = 65536
 // Буферы соединения (вход HTTP_IN_SIZE, выход 2 · HTTP_OUT_SIZE) — из запаса
 // потока, пока у соединения есть работа (__conn_bufs, __conn_rest): молчащее
-// соединение keep-alive их не держит. Свободных в запасе — не больше
-// CONN_POOL каждого вида (лишние — системе); буфер, занятый дальше CONN_KEEP
-// байт, возвращается в запас с первыми CONN_KEEP байт в памяти.
+// соединение keep-alive их не держит. Свободных пар в запасе — не больше
+// CONN_POOL (лишние — системе); пара, занятая дальше CONN_KEEP байт,
+// возвращается в запас с первыми CONN_KEEP байт каждого буфера в памяти.
 const CONN_POOL = 256
 const CONN_KEEP = 16384
 const HTTP_MAX_FD = 65536
@@ -103,10 +103,11 @@ type __Server {
     starved_head: int
     // сопрограммы, чей срок вышел
     due: [int]
-    // свободные буферы соединений: входные и выходные (__conn_bufs); буфер,
-    // куда читается и выбрасывается ввод после ответа с закрытием
-    ibufs: [int]
-    obufs: [int]
+    // свободные пары буферов соединений (вход, выход: по 16 байт на пару) и
+    // сколько их (__conn_bufs); буфер, куда читается и выбрасывается ввод
+    // после ответа с закрытием
+    pool: int
+    pool_n: int
     scratch: int
 }
 
@@ -714,54 +715,56 @@ fn __conn_drop(s: __Server, fd: int, c: __Conn) {
 // потока или новые.
 fn __conn_bufs(s: __Server, c: __Conn) {
     if c.inp == 0 {
-        if s.ibufs.len() > 0 {
-            c.inp = s.ibufs.pop()
-        } else {
-            c.inp = __mmap(HTTP_IN_SIZE)
-        }
-        c.hw = 0
+        __conn_take(s, c)
     }
-    if c.out == 0 {
-        if s.obufs.len() > 0 {
-            c.out = s.obufs.pop()
-        } else {
-            c.out = __mmap(HTTP_OUT_SIZE * 2)
-        }
-        c.out_cap = HTTP_OUT_SIZE * 2
+}
+
+fn __conn_take(s: __Server, c: __Conn) {
+    let n = s.pool_n
+    if n > 0 {
+        let e = s.pool + n * 16 - 16
+        c.inp = load64(e)
+        c.out = load64(e + 8)
+        s.pool_n = n - 1
+    } else {
+        c.inp = __mmap(HTTP_IN_SIZE)
+        c.out = __mmap(HTTP_OUT_SIZE * 2)
     }
+    c.out_cap = HTTP_OUT_SIZE * 2
+    c.hw = 0
 }
 
 // Работы у соединения нет (весь ввод разобран, запрос не выполняется, ответы
 // ушли; после ответа с закрытием ввод выбрасывается через общий буфер потока):
-// буферы — в запас. Память за первыми CONN_KEEP байт — системе, если её
-// занимали; выросший выходной буфер и буферы сверх CONN_POOL — тоже.
+// буферы — в запас (__conn_give).
 fn __conn_rest(s: __Server, c: __Conn) {
-    if c.inp == 0 || c.busy || c.out_len != 0 || (c.in_len != 0 && !c.linger) {
-        return
+    if c.inp != 0 && !c.busy && c.out_len == 0 && (c.in_len == 0 || c.linger) {
+        __conn_give(s, c)
     }
-    let big = c.hw > CONN_KEEP
-    if s.ibufs.len() < CONN_POOL {
-        if big {
+}
+
+// Пара буферов — в запас; память за первыми CONN_KEEP байт — системе, если её
+// занимали. Выросший выходной буфер (большой ответ) и пары сверх CONN_POOL —
+// системе целиком. Разобранного ввода нет (сдвиг в __process обнулил off).
+fn __conn_give(s: __Server, c: __Conn) {
+    let n = s.pool_n
+    if n < CONN_POOL && c.out_cap == HTTP_OUT_SIZE * 2 {
+        if c.hw > CONN_KEEP {
             syscall(SYS_MADVISE, c.inp + CONN_KEEP, HTTP_IN_SIZE - CONN_KEEP, 4)
-        }
-        s.ibufs.push(c.inp)
-    } else {
-        syscall(SYS_MUNMAP, c.inp, HTTP_IN_SIZE)
-    }
-    if c.out_cap == HTTP_OUT_SIZE * 2 && s.obufs.len() < CONN_POOL {
-        if big {
             syscall(SYS_MADVISE, c.out + CONN_KEEP, c.out_cap - CONN_KEEP, 4)
         }
-        s.obufs.push(c.out)
+        let e = s.pool + n * 16
+        store64(e, c.inp)
+        store64(e + 8, c.out)
+        s.pool_n = n + 1
     } else {
+        // запас полон или выход вырос (большой ответ): пара — системе
+        syscall(SYS_MUNMAP, c.inp, HTTP_IN_SIZE)
         syscall(SYS_MUNMAP, c.out, c.out_cap)
     }
     c.inp = 0
     c.out = 0
-    c.out_cap = 0
     c.in_len = 0
-    c.off = 0
-    c.hw = 0
 }
 
 // Запрос соединения закончился (used — его размер) или получил сопрограмму
@@ -820,11 +823,6 @@ fn __flush(s: __Server, fd: int, c: __Conn) -> bool {
 // Все полные запросы из входного буфера, затем отправка ответов; если работы
 // не осталось — буферы в запас.
 fn __process(s: __Server, fd: int, c: __Conn) {
-    __process_in(s, fd, c)
-    __conn_rest(s, c)
-}
-
-fn __process_in(s: __Server, fd: int, c: __Conn) {
     while true {
         var more = false
         while c.off < c.in_len && !c.close {
@@ -856,6 +854,7 @@ fn __process_in(s: __Server, fd: int, c: __Conn) {
             __http_error(s, c, 431)
         }
         if !__flush(s, fd, c) || !more {
+            __conn_rest(s, c)
             return
         }
     }
@@ -984,8 +983,8 @@ fn __http_worker(id: int) {
         starved: [],
         starved_head: 0,
         due: [],
-        ibufs: [],
-        obufs: [],
+        pool: __mmap(CONN_POOL * 16),
+        pool_n: 0,
         scratch: __mmap(HTTP_IN_SIZE)
     }
     store64(__ctx() + CTX_SERVER, __cast(s))
