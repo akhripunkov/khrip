@@ -12,9 +12,19 @@
 # заполняется одинаковыми данными (load/seed.py), затем прогрев WARMUP и замер
 # DURATION со смесью запросов из load/<сценарий>.lua. Строки результатов
 # дописываются в results/perf.tsv; таблицу строит perf_table.py.
+#
+# RATE_MODE=1 — постоянная частота запросов, одна для всех языков (wrk2), RSS
+# во времени и от числа соединений: perf_rate.sh. Без него — замкнутый цикл,
+# как выше.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/server.sh"
+
+if [[ ${RATE_MODE:-0} == 1 ]]; then
+	DURATION=${DURATION:-60s}
+	WARMUP=${WARMUP:-60s}
+	LANGS=${LANGS:-khrip go csharp}
+fi
 
 SERVER_CPUS=${SERVER_CPUS:-0,1}
 CLIENT_CPUS=${CLIENT_CPUS:-2,3}
@@ -62,6 +72,11 @@ size_of() {
 	python) stat -c %s "$3/main.py" ;;
 	esac
 }
+
+if [[ ${RATE_MODE:-0} == 1 ]]; then
+	. "$here/perf_rate.sh"
+	exit
+fi
 
 [[ -f "$OUT" ]] || printf 'scenario\tlang\trps\tp50_ms\tp99_ms\terrors_pct\tidle_mb\tseeded_mb\tpeak_mb\tafter_mb\tcpu_us_per_req\tstartup_ms\tbuild_s\tsize_bytes\tinvariant\n' >"$OUT"
 [[ -f "$OUT_DB" ]] || printf 'scenario\tlang\trps\tp50_ms\tp99_ms\terrors_pct\tidle_mb\tseeded_mb\tpeak_mb\tafter_mb\tcpu_us_per_req\tstartup_ms\tbuild_s\tsize_bytes\tinvariant\tdb_cpu_us_per_req\n' >"$OUT_DB"

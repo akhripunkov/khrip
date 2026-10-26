@@ -1,0 +1,5 @@
+== shop / khrip: 900 запросов/с, seeded 756 KB
+load snapshot: RSS 13024 KB, HWM 13024 KB, live by last GC  MB
+after run: RSS 13036 KB, HWM 13036 KB; Requests/sec:    899.25
+idle 15s: RSS 13036 KB, live by GC  MB; khrip: listening on http://0.0.0.0:8080 (2 threads)
+invariant: ok

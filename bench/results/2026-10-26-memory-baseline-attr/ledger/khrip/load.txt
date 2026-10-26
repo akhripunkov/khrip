@@ -1,0 +1,13 @@
+VmRSS 5.9 MB, smaps 5.9 MB
+  live store data                                0.00
+  store: free slots and garbage in spans         0.00
+  store: free pages kept                         0.00
+  GC metadata                                    0.00
+  request arenas                                 3.33
+  thread heaps                                   0.95
+  coroutine stacks                               0.04
+  buffers and pools                              1.14
+  binary                                         0.40
+  other                                          0.02
+  arenas: 69 with memory, KB min 32, median 48, max 88, sum 3.3 MB
+  mmap pieces: thread heap chunk 0.95, conn in 0.36, conn out 0.36, 4 KB block 0.29, db block 0.13, other 32768 0.02, request stack 0.02, conn table 0.01, thread stack 0.00, other 8192 0.00, other 12288 0.00

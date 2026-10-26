@@ -1,0 +1,562 @@
+scenario	snapshot	part	mb
+bank	khrip-load	vmrss	287.43
+bank	khrip-load	live store data	272.40
+bank	khrip-load	store: free slots and garbage in spans	0.94
+bank	khrip-load	store: free pages kept	0.02
+bank	khrip-load	GC metadata	9.29
+bank	khrip-load	request arenas	0.02
+bank	khrip-load	thread heaps	0.03
+bank	khrip-load	coroutine stacks	0.04
+bank	khrip-load	buffers and pools	0.79
+bank	khrip-load	binary	0.14
+bank	khrip-load	other	-0.04
+bank	khrip-load	store committed	288.00
+bank	khrip-load	store resident	273.37
+bank	khrip-load	store inuse_resident	273.34
+bank	khrip-load	store alloc_bytes	284.68
+bank	khrip-load	store alloc_resident	272.40
+bank	khrip-load	store free_slot_bytes	0.04
+bank	khrip-load	store tail_bytes	0.93
+bank	khrip-load	store free_resident	0.02
+bank	khrip-load	arenas with memory (count)	3
+bank	khrip-idle	vmrss	277.52
+bank	khrip-idle	live store data	265.19
+bank	khrip-idle	store: free slots and garbage in spans	0.98
+bank	khrip-idle	store: free pages kept	0.00
+bank	khrip-idle	GC metadata	10.33
+bank	khrip-idle	request arenas	0.02
+bank	khrip-idle	thread heaps	0.03
+bank	khrip-idle	coroutine stacks	0.04
+bank	khrip-idle	buffers and pools	0.79
+bank	khrip-idle	binary	0.14
+bank	khrip-idle	other	0.01
+bank	khrip-idle	store committed	296.00
+bank	khrip-idle	store resident	266.16
+bank	khrip-idle	store inuse_resident	266.16
+bank	khrip-idle	store alloc_bytes	276.79
+bank	khrip-idle	store alloc_resident	265.19
+bank	khrip-idle	store free_slot_bytes	0.05
+bank	khrip-idle	store tail_bytes	0.96
+bank	khrip-idle	store free_resident	0.00
+bank	khrip-idle	arenas with memory (count)	3
+bank	khrip-idle	live by GC log	276.80
+bank	go-load	vmrss	430.58
+bank	go-before	buck_hash_sys	0.00
+bank	go-before	gc_sys	7.01
+bank	go-before	heap_alloc	310.44
+bank	go-before	heap_idle	240.37
+bank	go-before	heap_inuse	314.66
+bank	go-before	heap_released	144.64
+bank	go-before	heap_sys	555.03
+bank	go-before	mcache_inuse	0.00
+bank	go-before	mspan_inuse	3.69
+bank	go-before	other_sys	1.08
+bank	go-before	stack_inuse	0.97
+bank	go-before	stack_sys	0.97
+bank	go-before	heap_objects (count)	3824971
+bank	go-after-gc	buck_hash_sys	0.00
+bank	go-after-gc	gc_sys	7.01
+bank	go-after-gc	heap_alloc	188.68
+bank	go-after-gc	heap_idle	364.41
+bank	go-after-gc	heap_inuse	190.66
+bank	go-after-gc	heap_released	144.64
+bank	go-after-gc	heap_sys	555.06
+bank	go-after-gc	mcache_inuse	0.00
+bank	go-after-gc	mspan_inuse	1.30
+bank	go-after-gc	other_sys	1.08
+bank	go-after-gc	stack_inuse	0.94
+bank	go-after-gc	stack_sys	0.94
+bank	go-after-gc	heap_objects (count)	2686724
+inventory	khrip-load	vmrss	317.50
+inventory	khrip-load	live store data	304.11
+inventory	khrip-load	store: free slots and garbage in spans	0.02
+inventory	khrip-load	store: free pages kept	0.01
+inventory	khrip-load	GC metadata	7.94
+inventory	khrip-load	request arenas	0.05
+inventory	khrip-load	thread heaps	0.03
+inventory	khrip-load	coroutine stacks	0.04
+inventory	khrip-load	buffers and pools	1.57
+inventory	khrip-load	binary	0.18
+inventory	khrip-load	other	-0.04
+inventory	khrip-load	store committed	328.00
+inventory	khrip-load	store resident	304.14
+inventory	khrip-load	store inuse_resident	304.13
+inventory	khrip-load	store alloc_bytes	326.32
+inventory	khrip-load	store alloc_resident	304.11
+inventory	khrip-load	store free_slot_bytes	0.03
+inventory	khrip-load	store tail_bytes	0.00
+inventory	khrip-load	store free_resident	0.01
+inventory	khrip-load	arenas with memory (count)	3
+inventory	khrip-idle	vmrss	282.86
+inventory	khrip-idle	live store data	272.05
+inventory	khrip-idle	store: free slots and garbage in spans	0.02
+inventory	khrip-idle	store: free pages kept	0.00
+inventory	khrip-idle	GC metadata	8.88
+inventory	khrip-idle	request arenas	0.05
+inventory	khrip-idle	thread heaps	0.03
+inventory	khrip-idle	coroutine stacks	0.04
+inventory	khrip-idle	buffers and pools	1.58
+inventory	khrip-idle	binary	0.18
+inventory	khrip-idle	other	0.02
+inventory	khrip-idle	store committed	336.00
+inventory	khrip-idle	store resident	272.08
+inventory	khrip-idle	store inuse_resident	272.08
+inventory	khrip-idle	store alloc_bytes	293.38
+inventory	khrip-idle	store alloc_resident	272.05
+inventory	khrip-idle	store free_slot_bytes	0.04
+inventory	khrip-idle	store tail_bytes	0.00
+inventory	khrip-idle	store free_resident	0.00
+inventory	khrip-idle	arenas with memory (count)	3
+inventory	khrip-idle	live by GC log	293.40
+inventory	go-load	vmrss	363.52
+inventory	go-before	buck_hash_sys	0.00
+inventory	go-before	gc_sys	6.62
+inventory	go-before	heap_alloc	310.53
+inventory	go-before	heap_idle	40.72
+inventory	go-before	heap_inuse	317.41
+inventory	go-before	heap_released	4.16
+inventory	go-before	heap_sys	358.12
+inventory	go-before	mcache_inuse	0.00
+inventory	go-before	mspan_inuse	5.77
+inventory	go-before	other_sys	0.93
+inventory	go-before	stack_inuse	1.53
+inventory	go-before	stack_sys	1.53
+inventory	go-before	heap_objects (count)	4769315
+inventory	go-after-gc	buck_hash_sys	0.00
+inventory	go-after-gc	gc_sys	6.46
+inventory	go-after-gc	heap_alloc	155.16
+inventory	go-after-gc	heap_idle	189.02
+inventory	go-after-gc	heap_inuse	169.82
+inventory	go-after-gc	heap_released	5.35
+inventory	go-after-gc	heap_sys	358.84
+inventory	go-after-gc	mcache_inuse	0.00
+inventory	go-after-gc	mspan_inuse	3.15
+inventory	go-after-gc	other_sys	0.93
+inventory	go-after-gc	stack_inuse	0.97
+inventory	go-after-gc	stack_sys	0.97
+inventory	go-after-gc	heap_objects (count)	3525440
+ledger	khrip-load	vmrss	5.88
+ledger	khrip-load	live store data	0.00
+ledger	khrip-load	store: free slots and garbage in spans	0.00
+ledger	khrip-load	store: free pages kept	0.00
+ledger	khrip-load	GC metadata	0.00
+ledger	khrip-load	request arenas	3.33
+ledger	khrip-load	thread heaps	0.95
+ledger	khrip-load	coroutine stacks	0.04
+ledger	khrip-load	buffers and pools	1.14
+ledger	khrip-load	binary	0.40
+ledger	khrip-load	other	0.02
+ledger	khrip-load	arenas with memory (count)	69
+ledger	khrip-idle	vmrss	5.88
+ledger	khrip-idle	live store data	0.00
+ledger	khrip-idle	store: free slots and garbage in spans	0.00
+ledger	khrip-idle	store: free pages kept	0.00
+ledger	khrip-idle	GC metadata	0.00
+ledger	khrip-idle	request arenas	3.33
+ledger	khrip-idle	thread heaps	0.95
+ledger	khrip-idle	coroutine stacks	0.04
+ledger	khrip-idle	buffers and pools	1.14
+ledger	khrip-idle	binary	0.40
+ledger	khrip-idle	other	0.02
+ledger	khrip-idle	arenas with memory (count)	69
+ledger	go-load	vmrss	18.05
+ledger	go-before	buck_hash_sys	0.00
+ledger	go-before	gc_sys	2.73
+ledger	go-before	heap_alloc	2.17
+ledger	go-before	heap_idle	3.88
+ledger	go-before	heap_inuse	3.53
+ledger	go-before	heap_released	1.94
+ledger	go-before	heap_sys	7.41
+ledger	go-before	mcache_inuse	0.00
+ledger	go-before	mspan_inuse	0.09
+ledger	go-before	other_sys	0.60
+ledger	go-before	stack_inuse	0.59
+ledger	go-before	stack_sys	0.59
+ledger	go-before	heap_objects (count)	12638
+ledger	go-after-gc	buck_hash_sys	0.00
+ledger	go-after-gc	gc_sys	2.73
+ledger	go-after-gc	heap_alloc	1.49
+ledger	go-after-gc	heap_idle	4.32
+ledger	go-after-gc	heap_inuse	3.09
+ledger	go-after-gc	heap_released	1.94
+ledger	go-after-gc	heap_sys	7.41
+ledger	go-after-gc	mcache_inuse	0.00
+ledger	go-after-gc	mspan_inuse	0.08
+ledger	go-after-gc	other_sys	0.60
+ledger	go-after-gc	stack_inuse	0.59
+ledger	go-after-gc	stack_sys	0.59
+ledger	go-after-gc	heap_objects (count)	3732
+notes	khrip-load	vmrss	97.34
+notes	khrip-load	live store data	91.63
+notes	khrip-load	store: free slots and garbage in spans	0.16
+notes	khrip-load	store: free pages kept	1.96
+notes	khrip-load	GC metadata	2.49
+notes	khrip-load	request arenas	0.02
+notes	khrip-load	thread heaps	0.03
+notes	khrip-load	coroutine stacks	0.04
+notes	khrip-load	buffers and pools	0.77
+notes	khrip-load	binary	0.18
+notes	khrip-load	other	0.01
+notes	khrip-load	store committed	104.00
+notes	khrip-load	store resident	93.75
+notes	khrip-load	store inuse_resident	91.79
+notes	khrip-load	store alloc_bytes	98.17
+notes	khrip-load	store alloc_resident	91.63
+notes	khrip-load	store free_slot_bytes	0.05
+notes	khrip-load	store tail_bytes	0.14
+notes	khrip-load	store free_resident	1.96
+notes	khrip-load	arenas with memory (count)	3
+notes	khrip-idle	vmrss	98.06
+notes	khrip-idle	live store data	94.18
+notes	khrip-idle	store: free slots and garbage in spans	0.16
+notes	khrip-idle	store: free pages kept	0.00
+notes	khrip-idle	GC metadata	2.66
+notes	khrip-idle	request arenas	0.02
+notes	khrip-idle	thread heaps	0.03
+notes	khrip-idle	coroutine stacks	0.04
+notes	khrip-idle	buffers and pools	0.77
+notes	khrip-idle	binary	0.18
+notes	khrip-idle	other	0.01
+notes	khrip-idle	store committed	104.00
+notes	khrip-idle	store resident	94.35
+notes	khrip-idle	store inuse_resident	94.35
+notes	khrip-idle	store alloc_bytes	100.14
+notes	khrip-idle	store alloc_resident	94.18
+notes	khrip-idle	store free_slot_bytes	0.06
+notes	khrip-idle	store tail_bytes	0.14
+notes	khrip-idle	store free_resident	0.00
+notes	khrip-idle	arenas with memory (count)	3
+notes	khrip-idle	live by GC log	100.10
+notes	go-load	vmrss	193.99
+notes	go-before	buck_hash_sys	0.00
+notes	go-before	gc_sys	4.60
+notes	go-before	heap_alloc	162.93
+notes	go-before	heap_idle	17.84
+notes	go-before	heap_inuse	168.70
+notes	go-before	heap_released	2.50
+notes	go-before	heap_sys	186.53
+notes	go-before	mcache_inuse	0.00
+notes	go-before	mspan_inuse	3.15
+notes	go-before	other_sys	0.82
+notes	go-before	stack_inuse	1.44
+notes	go-before	stack_sys	1.44
+notes	go-before	heap_objects (count)	2556966
+notes	go-after-gc	buck_hash_sys	0.00
+notes	go-after-gc	gc_sys	4.57
+notes	go-after-gc	heap_alloc	63.81
+notes	go-after-gc	heap_idle	110.87
+notes	go-after-gc	heap_inuse	76.23
+notes	go-after-gc	heap_released	11.69
+notes	go-after-gc	heap_sys	187.09
+notes	go-after-gc	mcache_inuse	0.00
+notes	go-after-gc	mspan_inuse	1.37
+notes	go-after-gc	other_sys	0.82
+notes	go-after-gc	stack_inuse	0.91
+notes	go-after-gc	stack_sys	0.91
+notes	go-after-gc	heap_objects (count)	1573089
+polls	khrip-load	vmrss	167.11
+polls	khrip-load	live store data	161.01
+polls	khrip-load	store: free slots and garbage in spans	0.36
+polls	khrip-load	store: free pages kept	1.98
+polls	khrip-load	GC metadata	2.45
+polls	khrip-load	request arenas	0.02
+polls	khrip-load	thread heaps	0.04
+polls	khrip-load	coroutine stacks	0.03
+polls	khrip-load	buffers and pools	0.85
+polls	khrip-load	binary	0.16
+polls	khrip-load	other	-0.00
+polls	khrip-load	store committed	172.00
+polls	khrip-load	store resident	163.35
+polls	khrip-load	store inuse_resident	161.37
+polls	khrip-load	store alloc_bytes	166.01
+polls	khrip-load	store alloc_resident	161.01
+polls	khrip-load	store free_slot_bytes	0.03
+polls	khrip-load	store tail_bytes	0.34
+polls	khrip-load	store free_resident	1.98
+polls	khrip-load	arenas with memory (count)	3
+polls	khrip-idle	vmrss	169.65
+polls	khrip-idle	live store data	165.38
+polls	khrip-idle	store: free slots and garbage in spans	0.38
+polls	khrip-idle	store: free pages kept	0.00
+polls	khrip-idle	GC metadata	2.79
+polls	khrip-idle	request arenas	0.02
+polls	khrip-idle	thread heaps	0.04
+polls	khrip-idle	coroutine stacks	0.03
+polls	khrip-idle	buffers and pools	0.85
+polls	khrip-idle	binary	0.16
+polls	khrip-idle	other	0.01
+polls	khrip-idle	store committed	172.00
+polls	khrip-idle	store resident	165.75
+polls	khrip-idle	store inuse_resident	165.75
+polls	khrip-idle	store alloc_bytes	168.93
+polls	khrip-idle	store alloc_resident	165.38
+polls	khrip-idle	store free_slot_bytes	0.04
+polls	khrip-idle	store tail_bytes	0.35
+polls	khrip-idle	store free_resident	0.00
+polls	khrip-idle	arenas with memory (count)	3
+polls	khrip-idle	live by GC log	168.90
+polls	go-load	vmrss	297.29
+polls	go-before	buck_hash_sys	0.00
+polls	go-before	gc_sys	5.65
+polls	go-before	heap_alloc	161.31
+polls	go-before	heap_idle	124.41
+polls	go-before	heap_inuse	166.53
+polls	go-before	heap_released	0.00
+polls	go-before	heap_sys	290.94
+polls	go-before	mcache_inuse	0.00
+polls	go-before	mspan_inuse	1.79
+polls	go-before	other_sys	0.75
+polls	go-before	stack_inuse	1.06
+polls	go-before	stack_sys	1.06
+polls	go-before	heap_objects (count)	2302411
+polls	go-after-gc	buck_hash_sys	0.00
+polls	go-after-gc	gc_sys	5.65
+polls	go-after-gc	heap_alloc	125.47
+polls	go-after-gc	heap_idle	160.16
+polls	go-after-gc	heap_inuse	130.80
+polls	go-after-gc	heap_released	0.00
+polls	go-after-gc	heap_sys	290.97
+polls	go-after-gc	mcache_inuse	0.00
+polls	go-after-gc	mspan_inuse	1.11
+polls	go-after-gc	other_sys	0.75
+polls	go-after-gc	stack_inuse	1.03
+polls	go-after-gc	stack_sys	1.03
+polls	go-after-gc	heap_objects (count)	1941525
+ratelimit	khrip-load	vmrss	34.58
+ratelimit	khrip-load	live store data	23.52
+ratelimit	khrip-load	store: free slots and garbage in spans	8.30
+ratelimit	khrip-load	store: free pages kept	0.88
+ratelimit	khrip-load	GC metadata	0.81
+ratelimit	khrip-load	request arenas	0.02
+ratelimit	khrip-load	thread heaps	0.04
+ratelimit	khrip-load	coroutine stacks	0.03
+ratelimit	khrip-load	buffers and pools	0.82
+ratelimit	khrip-load	binary	0.14
+ratelimit	khrip-load	other	0.01
+ratelimit	khrip-load	store committed	36.00
+ratelimit	khrip-load	store resident	32.70
+ratelimit	khrip-load	store inuse_resident	31.82
+ratelimit	khrip-load	store alloc_bytes	25.05
+ratelimit	khrip-load	store alloc_resident	23.52
+ratelimit	khrip-load	store free_slot_bytes	8.31
+ratelimit	khrip-load	store tail_bytes	0.00
+ratelimit	khrip-load	store free_resident	0.88
+ratelimit	khrip-load	arenas with memory (count)	3
+ratelimit	khrip-idle	vmrss	31.88
+ratelimit	khrip-idle	live store data	17.62
+ratelimit	khrip-idle	store: free slots and garbage in spans	12.40
+ratelimit	khrip-idle	store: free pages kept	0.00
+ratelimit	khrip-idle	GC metadata	0.80
+ratelimit	khrip-idle	request arenas	0.02
+ratelimit	khrip-idle	thread heaps	0.04
+ratelimit	khrip-idle	coroutine stacks	0.03
+ratelimit	khrip-idle	buffers and pools	0.83
+ratelimit	khrip-idle	binary	0.14
+ratelimit	khrip-idle	other	0.01
+ratelimit	khrip-idle	store committed	36.00
+ratelimit	khrip-idle	store resident	30.02
+ratelimit	khrip-idle	store inuse_resident	30.02
+ratelimit	khrip-idle	store alloc_bytes	19.16
+ratelimit	khrip-idle	store alloc_resident	17.62
+ratelimit	khrip-idle	store free_slot_bytes	12.41
+ratelimit	khrip-idle	store tail_bytes	0.00
+ratelimit	khrip-idle	store free_resident	0.00
+ratelimit	khrip-idle	arenas with memory (count)	3
+ratelimit	khrip-idle	live by GC log	19.20
+ratelimit	go-load	vmrss	49.36
+ratelimit	go-before	buck_hash_sys	0.00
+ratelimit	go-before	gc_sys	2.72
+ratelimit	go-before	heap_alloc	33.22
+ratelimit	go-before	heap_idle	16.00
+ratelimit	go-before	heap_inuse	35.06
+ratelimit	go-before	heap_released	10.55
+ratelimit	go-before	heap_sys	51.06
+ratelimit	go-before	mcache_inuse	0.00
+ratelimit	go-before	mspan_inuse	0.58
+ratelimit	go-before	other_sys	0.52
+ratelimit	go-before	stack_inuse	0.94
+ratelimit	go-before	stack_sys	0.94
+ratelimit	go-before	heap_objects (count)	569233
+ratelimit	go-after-gc	buck_hash_sys	0.00
+ratelimit	go-after-gc	gc_sys	2.72
+ratelimit	go-after-gc	heap_alloc	16.44
+ratelimit	go-after-gc	heap_idle	32.67
+ratelimit	go-after-gc	heap_inuse	18.52
+ratelimit	go-after-gc	heap_released	10.55
+ratelimit	go-after-gc	heap_sys	51.19
+ratelimit	go-after-gc	mcache_inuse	0.00
+ratelimit	go-after-gc	mspan_inuse	0.28
+ratelimit	go-after-gc	other_sys	0.52
+ratelimit	go-after-gc	stack_inuse	0.81
+ratelimit	go-after-gc	stack_sys	0.81
+ratelimit	go-after-gc	heap_objects (count)	389919
+shop	khrip-load	vmrss	12.72
+shop	khrip-load	live store data	0.00
+shop	khrip-load	store: free slots and garbage in spans	0.00
+shop	khrip-load	store: free pages kept	0.00
+shop	khrip-load	GC metadata	0.00
+shop	khrip-load	request arenas	10.08
+shop	khrip-load	thread heaps	0.93
+shop	khrip-load	coroutine stacks	0.04
+shop	khrip-load	buffers and pools	1.17
+shop	khrip-load	binary	0.46
+shop	khrip-load	other	0.04
+shop	khrip-load	arenas with memory (count)	64
+shop	khrip-idle	vmrss	12.73
+shop	khrip-idle	live store data	0.00
+shop	khrip-idle	store: free slots and garbage in spans	0.00
+shop	khrip-idle	store: free pages kept	0.00
+shop	khrip-idle	GC metadata	0.00
+shop	khrip-idle	request arenas	10.09
+shop	khrip-idle	thread heaps	0.93
+shop	khrip-idle	coroutine stacks	0.04
+shop	khrip-idle	buffers and pools	1.17
+shop	khrip-idle	binary	0.46
+shop	khrip-idle	other	0.04
+shop	khrip-idle	arenas with memory (count)	64
+shop	go-load	vmrss	18.37
+shop	go-before	buck_hash_sys	0.00
+shop	go-before	gc_sys	2.76
+shop	go-before	heap_alloc	2.13
+shop	go-before	heap_idle	3.31
+shop	go-before	heap_inuse	3.94
+shop	go-before	heap_released	1.81
+shop	go-before	heap_sys	7.25
+shop	go-before	mcache_inuse	0.00
+shop	go-before	mspan_inuse	0.09
+shop	go-before	other_sys	0.57
+shop	go-before	stack_inuse	0.75
+shop	go-before	stack_sys	0.75
+shop	go-before	heap_objects (count)	13347
+shop	go-after-gc	buck_hash_sys	0.00
+shop	go-after-gc	gc_sys	2.76
+shop	go-after-gc	heap_alloc	1.26
+shop	go-after-gc	heap_idle	4.02
+shop	go-after-gc	heap_inuse	3.20
+shop	go-after-gc	heap_released	1.88
+shop	go-after-gc	heap_sys	7.22
+shop	go-after-gc	mcache_inuse	0.00
+shop	go-after-gc	mspan_inuse	0.09
+shop	go-after-gc	other_sys	0.57
+shop	go-after-gc	stack_inuse	0.78
+shop	go-after-gc	stack_sys	0.78
+shop	go-after-gc	heap_objects (count)	3009
+shop-1500	khrip-load	vmrss	21.11
+shop-1500	khrip-load	live store data	0.00
+shop-1500	khrip-load	store: free slots and garbage in spans	0.00
+shop-1500	khrip-load	store: free pages kept	0.00
+shop-1500	khrip-load	GC metadata	0.00
+shop-1500	khrip-load	request arenas	18.30
+shop-1500	khrip-load	thread heaps	1.08
+shop-1500	khrip-load	coroutine stacks	0.04
+shop-1500	khrip-load	buffers and pools	1.18
+shop-1500	khrip-load	binary	0.46
+shop-1500	khrip-load	other	0.04
+shop-1500	khrip-load	arenas with memory (count)	77
+shop-1500	khrip-idle	vmrss	27.39
+shop-1500	khrip-idle	live store data	0.00
+shop-1500	khrip-idle	store: free slots and garbage in spans	0.00
+shop-1500	khrip-idle	store: free pages kept	0.00
+shop-1500	khrip-idle	GC metadata	0.00
+shop-1500	khrip-idle	request arenas	24.58
+shop-1500	khrip-idle	thread heaps	1.08
+shop-1500	khrip-idle	coroutine stacks	0.04
+shop-1500	khrip-idle	buffers and pools	1.18
+shop-1500	khrip-idle	binary	0.46
+shop-1500	khrip-idle	other	0.04
+shop-1500	khrip-idle	arenas with memory (count)	77
+shop-1500	go-load	vmrss	18.75
+shop-1500	go-before	buck_hash_sys	0.00
+shop-1500	go-before	gc_sys	2.77
+shop-1500	go-before	heap_alloc	2.06
+shop-1500	go-before	heap_idle	2.91
+shop-1500	go-before	heap_inuse	4.09
+shop-1500	go-before	heap_released	1.50
+shop-1500	go-before	heap_sys	7.00
+shop-1500	go-before	mcache_inuse	0.00
+shop-1500	go-before	mspan_inuse	0.10
+shop-1500	go-before	other_sys	0.55
+shop-1500	go-before	stack_inuse	1.00
+shop-1500	go-before	stack_sys	1.00
+shop-1500	go-before	heap_objects (count)	11049
+shop-1500	go-after-gc	buck_hash_sys	0.00
+shop-1500	go-after-gc	gc_sys	2.77
+shop-1500	go-after-gc	heap_alloc	1.10
+shop-1500	go-after-gc	heap_idle	4.66
+shop-1500	go-after-gc	heap_inuse	2.44
+shop-1500	go-after-gc	heap_released	1.50
+shop-1500	go-after-gc	heap_sys	7.09
+shop-1500	go-after-gc	mcache_inuse	0.00
+shop-1500	go-after-gc	mspan_inuse	0.08
+shop-1500	go-after-gc	other_sys	0.55
+shop-1500	go-after-gc	stack_inuse	0.91
+shop-1500	go-after-gc	stack_sys	0.91
+shop-1500	go-after-gc	heap_objects (count)	2252
+shortener	khrip-load	vmrss	82.78
+shortener	khrip-load	live store data	79.29
+shortener	khrip-load	store: free slots and garbage in spans	0.01
+shortener	khrip-load	store: free pages kept	0.00
+shortener	khrip-load	GC metadata	2.20
+shortener	khrip-load	request arenas	0.03
+shortener	khrip-load	thread heaps	0.04
+shortener	khrip-load	coroutine stacks	0.04
+shortener	khrip-load	buffers and pools	0.79
+shortener	khrip-load	binary	0.18
+shortener	khrip-load	other	0.00
+shortener	khrip-load	store committed	84.00
+shortener	khrip-load	store resident	79.30
+shortener	khrip-load	store inuse_resident	79.30
+shortener	khrip-load	store alloc_bytes	83.29
+shortener	khrip-load	store alloc_resident	79.29
+shortener	khrip-load	store free_slot_bytes	0.02
+shortener	khrip-load	store tail_bytes	0.00
+shortener	khrip-load	store free_resident	0.00
+shortener	khrip-load	arenas with memory (count)	3
+shortener	khrip-idle	vmrss	74.89
+shortener	khrip-idle	live store data	71.39
+shortener	khrip-idle	store: free slots and garbage in spans	0.01
+shortener	khrip-idle	store: free pages kept	0.00
+shortener	khrip-idle	GC metadata	2.41
+shortener	khrip-idle	request arenas	0.03
+shortener	khrip-idle	thread heaps	0.04
+shortener	khrip-idle	coroutine stacks	0.04
+shortener	khrip-idle	buffers and pools	0.79
+shortener	khrip-idle	binary	0.18
+shortener	khrip-idle	other	0.01
+shortener	khrip-idle	store committed	88.00
+shortener	khrip-idle	store resident	71.39
+shortener	khrip-idle	store inuse_resident	71.39
+shortener	khrip-idle	store alloc_bytes	75.10
+shortener	khrip-idle	store alloc_resident	71.39
+shortener	khrip-idle	store free_slot_bytes	0.02
+shortener	khrip-idle	store tail_bytes	0.00
+shortener	khrip-idle	store free_resident	0.00
+shortener	khrip-idle	arenas with memory (count)	3
+shortener	khrip-idle	live by GC log	75.10
+shortener	go-load	vmrss	155.56
+shortener	go-before	buck_hash_sys	0.00
+shortener	go-before	gc_sys	3.96
+shortener	go-before	heap_alloc	112.98
+shortener	go-before	heap_idle	29.30
+shortener	go-before	heap_inuse	117.77
+shortener	go-before	heap_released	2.50
+shortener	go-before	heap_sys	147.06
+shortener	go-before	mcache_inuse	0.00
+shortener	go-before	mspan_inuse	2.08
+shortener	go-before	other_sys	0.67
+shortener	go-before	stack_inuse	0.94
+shortener	go-before	stack_sys	0.94
+shortener	go-before	heap_objects (count)	1703055
+shortener	go-after-gc	buck_hash_sys	0.00
+shortener	go-after-gc	gc_sys	3.96
+shortener	go-after-gc	heap_alloc	52.14
+shortener	go-after-gc	heap_idle	86.86
+shortener	go-after-gc	heap_inuse	60.20
+shortener	go-after-gc	heap_released	2.50
+shortener	go-after-gc	heap_sys	147.06
+shortener	go-after-gc	mcache_inuse	0.00
+shortener	go-after-gc	mspan_inuse	0.98
+shortener	go-after-gc	other_sys	0.67
+shortener	go-after-gc	stack_inuse	0.94
+shortener	go-after-gc	stack_sys	0.94
+shortener	go-after-gc	heap_objects (count)	1083388

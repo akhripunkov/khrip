@@ -1,0 +1,94 @@
+{
+ "vmrss": 102068224,
+ "smaps": 102014976,
+ "categories": {
+  "live store data": 96080160,
+  "store: free slots and garbage in spans": 167648,
+  "store: free pages kept": 2056192,
+  "other": 12288,
+  "GC metadata": 2609152,
+  "request arenas": 24576,
+  "binary": 188416,
+  "coroutine stacks": 36864,
+  "buffers and pools": 806912,
+  "thread heaps": 32768
+ },
+ "store": {
+  "committed": 109051904,
+  "resident": 98304000,
+  "inuse_resident": 96247808,
+  "free_resident": 2056192,
+  "free_released": 3866624,
+  "alloc_bytes": 102936864,
+  "alloc_resident": 96080160,
+  "free_slot_bytes": 48352,
+  "tail_bytes": 143872,
+  "spans": 7477
+ },
+ "store_classes": {
+  "64": [
+   2,
+   384,
+   16384
+  ],
+  "32": [
+   2978,
+   24394176,
+   24395776
+  ],
+  "128": [
+   1,
+   384,
+   8192
+  ],
+  "16": [
+   1,
+   16,
+   8192
+  ],
+  "144": [
+   1,
+   144,
+   8192
+  ],
+  "48": [
+   4484,
+   36587520,
+   36732928
+  ],
+  "224": [
+   2,
+   11200,
+   16384
+  ],
+  "8388608": [
+   2,
+   16777216,
+   16777216
+  ],
+  "4194304": [
+   6,
+   25165824,
+   25165824
+  ]
+ },
+ "arenas": [
+  16384,
+  4096,
+  4096
+ ],
+ "mmap_labels": {
+  "other 8192": 0,
+  "other 12288": 0,
+  "4 KB block": 61440,
+  "thread heap chunk": 32768,
+  "other 36864": 4096,
+  "thread stack": 8192,
+  "request stack": 8192,
+  "other 32768": 4096,
+  "conn table": 8192,
+  "conn in": 368640,
+  "conn out": 368640,
+  "perm chunk": 4096
+ }
+}

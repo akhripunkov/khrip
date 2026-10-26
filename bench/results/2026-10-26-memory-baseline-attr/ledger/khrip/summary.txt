@@ -1,0 +1,5 @@
+== ledger / khrip: 1300 запросов/с, seeded 636 KB
+load snapshot: RSS 6024 KB, HWM 6024 KB, live by last GC  MB
+after run: RSS 6024 KB, HWM 6024 KB; Requests/sec:   1298.26
+idle 15s: RSS 6024 KB, live by GC  MB; khrip: listening on http://0.0.0.0:8080 (2 threads)
+invariant: ok

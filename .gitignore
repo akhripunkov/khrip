@@ -4,3 +4,5 @@ obj/
 __pycache__/
 node_modules/
 package-lock.json
+bench/gc/out/
+bench/mem/out/
