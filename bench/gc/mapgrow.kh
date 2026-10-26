@@ -1,52 +1,94 @@
 // Рост словаря store (этап памяти, часть 2): время каждой вставки нового
-// ключа. Запрос вставляет n ключей подряд и отвечает «записей, самая долгая
-// вставка мкс, на какой записи она была, вставок дольше 1 мс, всего мс»;
+// ключа. Запрос вставляет n ключей подряд и отвечает «записей; самая долгая
+// вставка, мкс, и на какой записи; вставок дольше 1 мс; всего, мс; самая
+// долгая вставка, которая начала рост, сделала шаг роста или прошла без
+// роста, мкс; то же по времени процессора потока (без вытеснения и кражи
+// гипервизора); вставок дольше 1 мс по процессору; вставок шагов роста и
+// вставок без роста — всего и дольше 1 мс по часам» (рост — состояние в слове
+// 56 заголовка, lib/core.kh; у старого словаря его нет, и всё — «без роста»).
 // bench/gc/mapgrow.sh зовёт его, пока словарь не дорастёт до нужного размера.
 
 store ids: map[int, int]
 store names: map[str, int]
 
+fn growing(h: int) -> bool {
+    return load64(h + 56) != 0
+}
+
+// st: [самая долгая, на какой записи, дольше 1 мс, начало роста, шаг, без
+// роста, то же три по процессору, дольше 1 мс по процессору, шагов, шагов
+// дольше 1 мс, без роста, без роста дольше 1 мс]
+fn note(st: [int], i: int, d: int, c: int, before: bool, after: bool) {
+    if d > st[0] {
+        st[0] = d
+        st[1] = i
+    }
+    if d > 1000 {
+        st[2] += 1
+    }
+    if c > 1000 {
+        st[9] += 1
+    }
+    var k = 5
+    if !before && after {
+        k = 3
+    } else if before {
+        k = 4
+    }
+    if d > st[k] {
+        st[k] = d
+    }
+    if k == 4 {
+        st[10] += 1
+        if d > 1000 {
+            st[11] += 1
+        }
+    } else if k == 5 {
+        st[12] += 1
+        if d > 1000 {
+            st[13] += 1
+        }
+    }
+    if c > st[k + 3] {
+        st[k + 3] = c
+    }
+}
+
+fn report(n: int, st: [int], t0: int) -> str {
+    return "{n} {st[0]} {st[1]} {st[2]} {(__gc_now_us() - t0) / 1000} {st[3]} {st[4]} {st[5]} {st[6]} {st[7]} {st[8]} {st[9]} {st[10]} {st[11]} {st[12]} {st[13]}"
+}
+
 route POST "/int/{n}" (n: int) -> str {
+    let st = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let h: int = __cast(ids)
     let base = ids.len()
-    var worst = 0
-    var at = 0
-    var slow = 0
     let t0 = __gc_now_us()
     for i in base..base + n {
+        let g = growing(h)
+        let ca = __gc_clock_us(3)
         let a = __gc_now_us()
         ids[i * 7919] = i
         let d = __gc_now_us() - a
-        if d > worst {
-            worst = d
-            at = i
-        }
-        if d > 1000 {
-            slow += 1
-        }
+        note(st, i, d, __gc_clock_us(3) - ca, g, growing(h))
     }
-    return "{ids.len()} {worst} {at} {slow} {(__gc_now_us() - t0) / 1000}"
+    return report(ids.len(), st, t0)
 }
 
 route POST "/str/{n}" (n: int) -> str {
+    let st = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let h: int = __cast(names)
     let base = names.len()
-    var worst = 0
-    var at = 0
-    var slow = 0
     let t0 = __gc_now_us()
     for i in base..base + n {
         let k = "voter-{i}-x"
+        let g = growing(h)
+        let ca = __gc_clock_us(3)
         let a = __gc_now_us()
         names[k] = i
         let d = __gc_now_us() - a
-        if d > worst {
-            worst = d
-            at = i
-        }
-        if d > 1000 {
-            slow += 1
-        }
+        note(st, i, d, __gc_clock_us(3) - ca, g, growing(h))
     }
-    return "{names.len()} {worst} {at} {slow} {(__gc_now_us() - t0) / 1000}"
+    return report(names.len(), st, t0)
 }
 
 route GET "/len" -> str {
