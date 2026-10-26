@@ -155,11 +155,14 @@ def attr_table(root):
         j = json.load(open(p))
         cat = dict(j["categories"])
         live = idle_live(os.path.join(root, sc))
-        st = j.get("store") or {}
         alloc = cat.get("live store data", 0)
-        if live is not None:
-            # живое — по сборке простоя (те же данные), остальное в спанах — мусор и свободные слоты
-            lv = min(live * MB, alloc)
+        pi = os.path.join(root, sc, "khrip", "idle.json")
+        if os.path.exists(pi):
+            # живое — по сборке простоя (те же данные: запросов больше не было),
+            # в памяти; остальное в занятых спанах снимка под нагрузкой — мусор
+            # до сборки и свободные слоты
+            ji = json.load(open(pi))
+            lv = min(ji["categories"].get("live store data", 0), alloc)
             cat["store: free slots and garbage in spans"] = cat.get("store: free slots and garbage in spans", 0) + alloc - lv
             cat["live store data"] = lv
         cols.append((sc, j, cat, live, go_stats(os.path.join(root, sc))))
@@ -177,6 +180,8 @@ def attr_table(root):
     print("| Go: HeapInuse / свободно и не отдано / стеки | " + " | ".join(
         f"{c[4]['before']['heap_inuse'] / MB:.1f} / {(c[4]['before']['heap_idle'] - c[4]['before']['heap_released']) / MB:.1f} / {c[4]['before']['stack_inuse'] / MB:.1f}"
         if c[4] and "before" in c[4] else "—" for c in cols) + " |")
+    print("| живое store Khrip по сборке (в памяти) | " + " | ".join(
+        f"{c[3]:.1f} ({c[2]['live store data'] / MB:.1f})" if c[3] else "—" for c in cols) + " |")
     print("| живое store Khrip / HeapAlloc Go после сборки | " + " | ".join(
         f"{c[3] / (c[4]['after-gc']['heap_alloc'] / MB):.2f}" if c[3] and c[4] and "after-gc" in c[4] else "—" for c in cols) + " |")
 

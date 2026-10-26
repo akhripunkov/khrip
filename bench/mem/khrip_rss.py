@@ -221,8 +221,8 @@ def store_heap(proc, vmas):
     start_bits = proc.read(GC_START, (end - STORE) // 128)
     pres = proc.present(STORE, (end - STORE) >> 12)
     r = {"committed": end - STORE, "resident": 0, "inuse_resident": 0, "free_resident": 0,
-         "free_released": 0, "alloc_bytes": 0, "free_slot_bytes": 0, "tail_bytes": 0, "spans": 0,
-         "by_class": {}}
+         "free_released": 0, "alloc_bytes": 0, "alloc_resident": 0, "free_slot_bytes": 0, "tail_bytes": 0,
+         "spans": 0, "by_class": {}}
     pg = 0
     while pg < npg:
         res = (pres[2 * pg] + pres[2 * pg + 1]) * 4096
@@ -252,8 +252,17 @@ def store_heap(proc, vmas):
             g = (base + i * es - STORE) >> 4
             n_alloc += (start_bits[g >> 3] >> (g & 7)) & 1
         alloc = n_alloc * es
+        # большой объект (массив словаря или списка) — свой спан: в памяти
+        # только тронутые страницы его ёмкости; у мелких спанов страницы заняты
+        # целиком
+        if (info >> 48) & 4:
+            sres = sum(pres[2 * pg:2 * (pg + np_)]) * 4096
+            alloc_res = min(alloc, sres)
+        else:
+            alloc_res = alloc
         r["spans"] += 1
         r["alloc_bytes"] += alloc
+        r["alloc_resident"] += alloc_res
         r["free_slot_bytes"] += (ne - n_alloc) * es
         r["tail_bytes"] += np_ * PAGE - ne * es
         c = r["by_class"].setdefault(es, [0, 0, 0])
@@ -310,10 +319,14 @@ def main():
     meta_rss = sum(v["rss"] for v in vmas if GCMETA <= v["start"] < GCMETA_END)
     heap = store_heap(proc, vmas)
     if heap:
-        live = heap["alloc_bytes"] if live_mb is None else min(live_mb * MB, heap["inuse_resident"])
+        # живое — занятые слоты в памяти (или меньше: по журналу сборщика);
+        # остальное в занятых спанах — мусор до сборки и свободные слоты;
+        # расхождение smaps и pagemap — в «прочее»
+        live = heap["alloc_resident"] if live_mb is None else min(live_mb * MB, heap["alloc_resident"])
         add("live store data", live)
-        add("store: free slots and garbage in spans", store_rss - heap["free_resident"] - live)
+        add("store: free slots and garbage in spans", heap["inuse_resident"] - live)
         add("store: free pages kept", heap["free_resident"])
+        add("other", store_rss - heap["resident"])
     else:
         add("live store data", store_rss)
     add("GC metadata", meta_rss)
@@ -348,7 +361,7 @@ def main():
         print(f"  {k:42s} {cat.get(k, 0) / MB:8.2f}")
     if heap:
         print(f"  store: committed {heap['committed'] / MB:.1f}, resident {heap['resident'] / MB:.1f}, in spans {heap['inuse_resident'] / MB:.1f}"
-              f" (allocated slots {heap['alloc_bytes'] / MB:.2f}, free slots {heap['free_slot_bytes'] / MB:.2f}, tails {heap['tail_bytes'] / MB:.2f}),"
+              f" (allocated slots {heap['alloc_bytes'] / MB:.2f}, resident {heap['alloc_resident'] / MB:.2f}, free slots {heap['free_slot_bytes'] / MB:.2f}, tails {heap['tail_bytes'] / MB:.2f}),"
               f" free kept {heap['free_resident'] / MB:.2f}, released {heap['free_released'] / MB:.1f}, {heap['spans']} spans")
         top = sorted(heap["by_class"].items(), key=lambda kv: -kv[1][2])[:8]
         print("  classes (slot B: spans, allocated MB / span MB): " + ", ".join(f"{es}: {c[0]}, {c[1] / MB:.1f}/{c[2] / MB:.1f}" for es, c in top))
