@@ -1,0 +1,12 @@
+ok    large new arrays from reused memory are prepared before entries move
+ok    between growth steps a store map answers from the old arrays
+ok    a reader finds every key during growth and changes nothing
+ok    string keys, JSON and to_json during growth keep the insertion order
+ok    clear during growth drops it
+ok    a map outside store grows in the same insert
+ok    growth that started before marking ends during it
+ok    growth that starts and ends during marking
+ok    growth of a string-keyed map during marking
+ok    clear during growth during marking
+ok    no growth had to finish at once
+11 tests: 11 passed, 0 failed

@@ -1,0 +1,54 @@
+// Рост словаря store (этап памяти, часть 2): время каждой вставки нового
+// ключа. Запрос вставляет n ключей подряд и отвечает «записей, самая долгая
+// вставка мкс, на какой записи она была, вставок дольше 1 мс, всего мс»;
+// bench/gc/mapgrow.sh зовёт его, пока словарь не дорастёт до нужного размера.
+
+store ids: map[int, int]
+store names: map[str, int]
+
+route POST "/int/{n}" (n: int) -> str {
+    let base = ids.len()
+    var worst = 0
+    var at = 0
+    var slow = 0
+    let t0 = __gc_now_us()
+    for i in base..base + n {
+        let a = __gc_now_us()
+        ids[i * 7919] = i
+        let d = __gc_now_us() - a
+        if d > worst {
+            worst = d
+            at = i
+        }
+        if d > 1000 {
+            slow += 1
+        }
+    }
+    return "{ids.len()} {worst} {at} {slow} {(__gc_now_us() - t0) / 1000}"
+}
+
+route POST "/str/{n}" (n: int) -> str {
+    let base = names.len()
+    var worst = 0
+    var at = 0
+    var slow = 0
+    let t0 = __gc_now_us()
+    for i in base..base + n {
+        let k = "voter-{i}-x"
+        let a = __gc_now_us()
+        names[k] = i
+        let d = __gc_now_us() - a
+        if d > worst {
+            worst = d
+            at = i
+        }
+        if d > 1000 {
+            slow += 1
+        }
+    }
+    return "{names.len()} {worst} {at} {slow} {(__gc_now_us() - t0) / 1000}"
+}
+
+route GET "/len" -> str {
+    return "{ids.len()} {names.len()}"
+}

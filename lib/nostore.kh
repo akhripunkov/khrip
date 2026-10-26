@@ -18,6 +18,14 @@ fn __struct_salloc(d: int, n: int, tag: int) -> int {
     return __salloc(n, 0, 0)
 }
 
+// Словарей в store нет: роста по частям тоже.
+fn __gc_lazy_alloc(n: int, h: int) -> int {
+    return __salloc(n, 0, 0)
+}
+
+fn __gc_ptrb_on(p: int, n: int) {
+}
+
 // Выделения из store нет, объектов в store тоже.
 fn __store_on() -> bool {
     return false

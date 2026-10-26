@@ -317,6 +317,55 @@ PY
 done
 [[ $pace_ok -eq 1 ]] && pass=$((pass + 1))
 
+# Рост словаря по частям (этап памяти, часть 2) сам по себе: на копиях
+# библиотеки без серения старых массивов ключей, значений и признаков, старой
+# таблицы и G при переключении, без серения G в clear, без битов PTRB и без
+# обнуления новой памяти, без повторения замены и удаления перенесённой записи
+# в новых массивах tests/api/gc_mapgrow.kh с KHRIP_GC_VERIFY=1 падает (серения
+# старой таблицы, признаков и G находит только проверка конца разметки: эти
+# объекты уже мусор, но были достижимы в начале сборки; без серения значений
+# тест падает и без проверок — запись держат только чёрные новые массивы).
+grow_ok=1
+for cut in keys vals alive slots gend gclear ptrb zero set remove; do
+	rm -rf "${tmp:?}/growlib"
+	mkdir -p "$tmp/growlib"
+	cp lib/*.kh "$tmp/growlib/"
+	if ! python3 - "$tmp/growlib" "$cut" <<'PY'
+import sys
+d, m = sys.argv[1], sys.argv[2]
+cuts = {
+    "keys": ("    __gc_old_array(kh)\n    __gc_old_array(vh)\n", "    __gc_old_array(vh)\n"),
+    "vals": ("    __gc_old_array(vh)\n    __gc_old_array(ah)\n", "    __gc_old_array(ah)\n"),
+    "alive": ("    __gc_old_array(ah)\n    __map_adopt(kh", "    __map_adopt(kh"),
+    "slots": ("    __map_adopt(ah, load64(g + 16), w, cap)\n    __gc_old_slots(m)\n", "    __map_adopt(ah, load64(g + 16), w, cap)\n"),
+    "gend": ("    store64(m + 40, load64(g + 32))\n    __gc_old_at(m, m + 56)\n", "    store64(m + 40, load64(g + 32))\n"),
+    "gclear": ("        // рост бросается (§7.5: G уходит из заголовка)\n        __gc_old_at(m, m + 56)\n", "        // рост бросается (§7.5: G уходит из заголовка)\n"),
+    "ptrb": ("            __gc_ptrb_on(p + off, n)\n", ""),
+    "zero": ("            __memset(p + off, 0, n)\n", ""),
+    "set": ("        if load64(m + 56) != 0 {\n            __map_grow_set(m, k, idx, v)\n        }\n", ""),
+    "remove": ("    if load64(m + 56) != 0 {\n        __map_grow_remove(m, k, idx)\n    }\n", ""),
+}
+old, new = cuts[m]
+s = open(f"{d}/core.kh").read()
+if s.count(old) != 1:
+    sys.exit(1)
+open(f"{d}/core.kh", "w").write(s.replace(old, new))
+PY
+	then
+		grow_ok=0
+		failed "рост словаря ($cut)" "место для подложенной ошибки не найдено в lib/core.kh"
+		continue
+	fi
+	# без механизма тест может и упасть (освобождённый живой объект): строку
+	# оболочки о сигнале — мимо вывода набора
+	{ KHRIP_LIB="$tmp/growlib" KHRIP_GC_VERIFY=1 env -u KHRIP_GC_STRESS timeout 120 "$KHC" test tests/api/gc_mapgrow.kh 2>&1 | grep -v '^khrip: gc verify (boot): ' >"$tmp/grow.txt"; } 2>/dev/null
+	if diff -q tests/api/gc_mapgrow.out "$tmp/grow.txt" >/dev/null; then
+		grow_ok=0
+		failed "рост словаря ($cut)" "tests/api/gc_mapgrow.kh проходит и без проверяемого механизма"
+	fi
+done
+[[ $grow_ok -eq 1 ]] && pass=$((pass + 1))
+
 # Примеры учебника (docs/TUTORIAL.md) и ответы к заданиям: программы
 # выполняются, API проходят свои блоки test.
 for src in docs/tutorial/*.kh docs/tutorial/answers/*.kh; do

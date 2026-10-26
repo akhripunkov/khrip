@@ -114,3 +114,82 @@ fn __ph_model_fit(used: int, max: int, np: int) -> int {
     }
     return -1
 }
+
+// ---- Рост словаря по частям (lib/core.kh) для тестов ----
+
+// Записей и байт новой памяти за шаг роста (0 — как обычно).
+fn __map_grow_budget(entries: int, bytes: int) {
+    __map_step_n = entries
+    __map_prep_n = bytes
+}
+
+// Идёт ли рост словаря m.
+fn __map_growing(m: int) -> bool {
+    return load64(m + 56) != 0
+}
+
+// Сколько старых записей рост уже перенёс (−1 — роста нет).
+fn __map_grow_moved(m: int) -> int {
+    let g = load64(m + 56)
+    if g == 0 {
+        return -1
+    }
+    return load64(g + 40)
+}
+
+// Готова ли новая память роста (обнулена и с битами PTRB).
+fn __map_grow_ready(m: int) -> bool {
+    let g = load64(m + 56)
+    return g == 0 || load64(g + 64) == 0
+}
+
+// Новая память роста пришла грязной (на ней были объекты).
+fn __map_grow_dirty(m: int) -> bool {
+    let g = load64(m + 56)
+    return g != 0 && (load64(g + 72) & 15) != 0
+}
+
+// Новые массивы и таблица роста — сплошь нули (до первого переноса).
+fn __map_grow_fresh(m: int) -> bool {
+    let g = load64(m + 56)
+    let z = load64(g + 32) + 1
+    for i in 0..4 {
+        var n = z * 4
+        if i == 3 {
+            n = z * 8
+        }
+        let p = load64(g + i * 8)
+        var j = 0
+        while j < n {
+            if load64(p + j) != 0 {
+                return false
+            }
+            j += 8
+        }
+    }
+    return true
+}
+
+// Ростов, которые пришлось закончить сразу (старые массивы заполнились).
+fn __map_grow_fallbacks() -> int {
+    return __map_fallbacks
+}
+
+// Записей в массивах словаря m (с мёртвыми) и их ёмкость.
+fn __map_entries(m: int) -> int {
+    return load64(load64(m) + 8)
+}
+
+fn __map_cap(m: int) -> int {
+    return load64(load64(m) + 16)
+}
+
+// Длина массивов, с которой следующая вставка нового ключа начнёт рост словаря
+// store (lib/core.kh, __map_set).
+fn __map_grow_at(m: int) -> int {
+    let cap = __map_limit(m)
+    if cap >= 16 {
+        return cap - (cap >> 3)
+    }
+    return cap - 1
+}

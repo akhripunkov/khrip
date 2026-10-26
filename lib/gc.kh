@@ -391,6 +391,42 @@ fn __salloc_for(h: int, n: int, kind: int, mask: int) -> int {
     return p
 }
 
+// Большой массив роста словаря store (lib/core.kh, __map_grow_start) вида
+// старого массива списка h (0 — без ссылок): спан без обнуления и без битов
+// PTRB — память готовят шаги роста кусками (__map_prep, __gc_ptrb_on), и
+// разметка не смотрит неготовые (грязные) слова: у них нет PTRB. Обнуление
+// 256 МБ памяти, где уже были объекты, само по себе — десятки миллисекунд под
+// исключительной блокировкой. → адрес | 1, если память грязная (её надо
+// обнулить), | 2, если в массиве будут ссылки (ему нужны биты PTRB).
+fn __gc_lazy_alloc(n: int, h: int) -> int {
+    var kind = K_NOSCAN
+    if h != 0 {
+        kind = __gc_kind_of(load64(h))
+    }
+    var p = 0
+    if __store_on() {
+        p = __salloc_big(n, kind, 0, true)
+    } else {
+        __gc_hard_check()
+        __pmode_on()
+        p = __salloc_big(n, kind, 0, true)
+        __pmode_off()
+    }
+    if __gc_took_dirty {
+        p = p | 1
+    }
+    if kind != K_NOSCAN {
+        p = p | 2
+    }
+    return p
+}
+
+// Биты PTRB слов [p, p + n) — массив роста словаря готов до p + n (__map_prep).
+fn __gc_ptrb_on(p: int, n: int) {
+    let b = (p - STORE_REGION) >> 3
+    __bits_put(GC_PTRB, b, b + (n >> 3), true)
+}
+
 // Структура по описанию d в куче store (lib/api.kh, __struct_alloc): ссылки
 // объекта — поля по маске описания (у варианта — со сдвигом на слово метки);
 // полей больше 63 — каждое слово ссылка.
@@ -546,6 +582,12 @@ fn __span_free(s: int) {
 
 // Объект больше GC_SMALL_MAX — свой спан из целых страниц.
 fn __salloc_large(n: int, kind: int, mask: int) -> int {
+    return __salloc_big(n, kind, mask, false)
+}
+
+// Большой объект; lazy — без обнуления и без битов PTRB (рост словаря,
+// __gc_lazy_alloc): __gc_took_dirty — память грязная.
+fn __salloc_big(n: int, kind: int, mask: int, lazy: bool) -> int {
     let np = (n + GC_PAGE - 1) >> GC_PAGE_SHIFT
     let pg = __gc_pages(np)
     let base = STORE_REGION + (pg << GC_PAGE_SHIFT)
@@ -574,11 +616,13 @@ fn __salloc_large(n: int, kind: int, mask: int) -> int {
         if __gc_verify {
             __gc_check_poison(base, bytes)
         }
-        __memset(base, 0, bytes)
+        if !lazy {
+            __memset(base, 0, bytes)
+        }
     } else if __gc_verify {
         __gc_check_zero(base, bytes)
     }
-    if kind != K_NOSCAN {
+    if kind != K_NOSCAN && !lazy {
         __gc_ptrbits(base, n, kind, mask)
     }
     __heap_live += bytes
