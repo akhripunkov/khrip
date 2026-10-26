@@ -14,15 +14,17 @@
 #   go             — копия решения с bench/mem/go_memstats.go, GODEBUG=gctrace=1
 #
 # Окружение: RATE (по умолчанию из eval/load/rates.tsv), WARMUP (60 с),
-# DURATION (600 с), IDLE_MAX (180 с — сколько ждать сборки простоя Khrip после
-# замера), OUT (bench/mem/out/long/<сценарий>), OUT_TSV
+# DURATION (600 с), IDLE_MAX (180 с — сколько ждать первой сборки Khrip после
+# замера: её «live» — живое в конце), OUT (bench/mem/out/long/<сценарий>), OUT_TSV
 # (bench/mem/out/long.tsv), PROBE (1 — ловушка пауз), SERVER_CPUS (0,1),
 # CLIENT_CPUS (2,3). Только сценарии без базы.
 #
 # В OUT/<вариант>: rss.tsv (фаза, мс CLOCK_MONOTONIC, RSS КБ; каждые 100 мс),
 # stderr.log (строки сервера с временем: журнал сборщика, gctrace),
-# memstats.log (Go), wrk.txt, probe.tsv, threads.tsv, summary.txt, run.txt
-# (границы замера). Строка итогов — в OUT_TSV.
+# memstats.log (Go), wrk.txt, probe.tsv, threads.tsv, summary.txt, cpu.tsv
+# (кража гипервизора по ядрам и процессор потоков сервера каждые 50 мс,
+# bench/mem/cpu_trace.py), gaps.1 и gaps.2 (щели в отправке у потоков wrk2,
+# bench/mem/gaps.lua), run.txt (границы замера). Строка итогов — в OUT_TSV.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
@@ -48,7 +50,8 @@ tmp=$(mktemp -d)
 pid=
 spid=
 ppid_=
-trap '[[ -n $spid ]] && kill $spid 2>/dev/null; [[ -n $ppid_ ]] && kill $ppid_ 2>/dev/null; [[ -n $pid ]] && kill $pid 2>/dev/null; wait 2>/dev/null; rm -rf "$tmp"' EXIT
+cpid=
+trap '[[ -n $spid ]] && kill $spid 2>/dev/null; [[ -n $ppid_ ]] && kill $ppid_ 2>/dev/null; [[ -n $cpid ]] && kill $cpid 2>/dev/null; [[ -n $pid ]] && kill $pid 2>/dev/null; wait 2>/dev/null; rm -rf "$tmp"' EXIT
 
 mono() { python3 -c 'import time; print(int(time.monotonic() * 1000))'; }
 kb() { awk -v k="$1:" '$1 == k {print $2}' "/proc/$pid/status"; }
@@ -106,8 +109,12 @@ for v in $variants; do
 	if [[ $PROBE == 1 ]]; then
 		taskset -c "$CLIENT_CPUS" python3 "$here/stall_probe.py" "$pid" "$o" &
 		ppid_=$!
+		taskset -c "$CLIENT_CPUS" python3 "$here/cpu_trace.py" "$pid" "$o/cpu.tsv" &
+		cpid=$!
 	fi
-	wrk=(taskset -c "$CLIENT_CPUS" "$WRK2" -t2 -c64 -R"$rate" -s "$ev/load/$sc.lua")
+	# сценарий — через обёртку: щели в отправке у потоков wrk2 (gaps.lua)
+	export GAPS_SCENARIO=$ev/load/$sc.lua GAPS_OUT=$o/gaps
+	wrk=(taskset -c "$CLIENT_CPUS" "$WRK2" -t2 -c64 -R"$rate" -s "$here/gaps.lua")
 	sampler "$o/rss.tsv" warmup
 	"${wrk[@]}" -d"${WARMUP}s" http://127.0.0.1:8080 >"$o/wrk-warmup.txt" 2>&1
 	sampler_stop
@@ -131,14 +138,15 @@ for v in $variants; do
 		gc_total=$(awk -F'\t' -v t="$t1" '$1 <= t && $2 ~ /^gc [0-9]+ @/' "$o/stderr.log" | wc -l)
 		gc_run=$(awk -F'\t' -v a="$t0" -v t="$t1" '$1 >= a && $1 <= t && $2 ~ /^gc [0-9]+ @/' "$o/stderr.log" | wc -l)
 	else
-		# сборка простоя: через 10 с без выделений store; у большой кучи
-		# разметка идёт четвертью времени — ждём её строку
+		# первая сборка после замера — простоя (через 10 с без выделений store)
+		# или по таймеру (forced: store меняли, а сборки не было 2 минуты); у
+		# большой кучи разметка идёт четвертью времени — ждём её строку
 		for _ in $(seq $((IDLE_MAX * 5))); do
-			awk -F'\t' -v t="$t1" '$1 > t && $2 ~ /\(idle\)/ {f = 1} END {exit !f}' "$o/stderr.log" && break
+			awk -F'\t' -v t="$t1" '$1 > t && $2 ~ /^gc [0-9]+ \(/ {f = 1} END {exit !f}' "$o/stderr.log" && break
 			[[ $v == khrip-gcoff ]] && break
 			sleep 0.2
 		done
-		live=$(awk -F'\t' -v t="$t1" '$1 > t && $2 ~ /\(idle\)/' "$o/stderr.log" | grep -o 'live [0-9.]* MB' | tail -1 | awk '{print $2}')
+		live=$(awk -F'\t' -v t="$t1" '$1 > t && $2 ~ /^gc [0-9]+ \(/' "$o/stderr.log" | head -1 | grep -o 'live [0-9.]* MB' | awk '{print $2}')
 		gc_total=$(awk -F'\t' -v t="$t1" '$1 <= t && $2 ~ /^gc [0-9]+ \(/' "$o/stderr.log" | wc -l)
 		gc_run=$(awk -F'\t' -v a="$t0" -v t="$t1" '$1 >= a && $1 <= t && $2 ~ /^gc [0-9]+ \(/' "$o/stderr.log" | wc -l)
 	fi
@@ -148,6 +156,11 @@ for v in $variants; do
 		kill "$ppid_" 2>/dev/null
 		wait "$ppid_" 2>/dev/null
 		ppid_=
+	fi
+	if [[ -n $cpid ]]; then
+		kill "$cpid" 2>/dev/null
+		wait "$cpid" 2>/dev/null
+		cpid=
 	fi
 	kill "$pid" 2>/dev/null
 	wait "$pid" 2>/dev/null
