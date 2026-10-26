@@ -1,0 +1,6 @@
+ok    build: half of every span becomes garbage
+ok    allocation during the sweep takes only swept and new spans
+ok    a stale word into a span the sweep has not reached is ignored, and a new cycle sweeps it first
+ok    a collection while the sweep is unfinished finishes it first
+ok    sweep steps between store changes keep exactly what lives
+5 tests: 5 passed, 0 failed

@@ -1962,9 +1962,9 @@ fn begin_fn(fi: int) -> int {
     emit8(0x81)
     emit8(0xEC)
     let frame_at = emit_hole()
-    // место под сохранение rbx, r12–r15: 5 четырёхбайтовых nop
+    // место под сохранение rbx, r12–r15: SAVE_REGS четырёхбайтовых nop
     var k = 0
-    while k < 5 {
+    while k < SAVE_REGS {
         emit8(0x0F)
         emit8(0x1F)
         emit8(0x40)
@@ -1996,7 +1996,7 @@ fn end_fn(frame_at: int, diverged: bool) {
     }
     var k = 0
     var nsaved = 0
-    while k < 5 {
+    while k < SAVE_REGS {
         if (used_regs & (1 << k)) != 0 {
             save_reg_bytes(sled + 4 * nsaved, 0x89, k)
             nsaved += 1
@@ -2010,12 +2010,12 @@ fn end_fn(frame_at: int, diverged: bool) {
     emit8(0x5D)
     emit8(0xC3)
     emit_panic_stubs()
-    put32_at(code + frame_at, (40 + frame + 15) & ~15)
+    put32_at(code + frame_at, (SAVE_REGS * 8 + frame + 15) & ~15)
     // убрать неиспользованные места сохранения: тело сдвигается назад,
     // ссылки на другие функции (fixups) из этого тела — тоже
-    let gap = (5 - nsaved) * 4
+    let gap = (SAVE_REGS - nsaved) * 4
     if gap > 0 {
-        let from = sled + 20
+        let from = sled + SAVE_REGS * 4
         __memcpy(code + from - gap, code + from, code_len - from)
         code_len -= gap
         var i = fixups.len() - 1

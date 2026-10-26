@@ -39,7 +39,7 @@ up() {
 }
 
 # --- patch: soak ---
-"$kroot/build/khc" -o "$tmp/catalog" "$root/eval/solutions/catalog/khrip/main.kh" || exit 1
+KHRIP_GC_LOG=1 "$kroot/build/khc" -o "$tmp/catalog" "$root/eval/solutions/catalog/khrip/main.kh" || exit 1
 KHRIP_GC_LOG=1 PORT=$port taskset -c "$SERVER_CPUS" "$tmp/catalog" 2>"$OUT/soak.log" &
 pid=$!
 up products/1
@@ -82,12 +82,17 @@ if p:
 if inc:
     print(stats("start", [int(r[0]) / 1000 for r in inc], "ms") + "; " + stats("max slice", [int(r[3]) / 1000 for r in inc], "ms") + "; " + stats("max slice cpu", [int(r[4]) / 1000 for r in inc], "ms"))
     print(stats("termination", [int(r[6]) / 1000 for r in inc], "ms") + "; " + stats("sweep", [float(r[7]) for r in inc], "ms") + f"; slices per cycle median {sorted(int(r[2]) for r in inc)[len(inc) // 2]}")
+# уборка кусками (шаг 6b): самый долгий кусок сборки по часам и процессору;
+# помощи писателей
+sw = re.findall(r"slices \(longest (\d+) µs, cpu (\d+) µs\)", log)
+if sw:
+    print(stats("longest sweep slice", [int(a) / 1000 for a, _ in sw], "ms") + "; " + stats("cpu", [int(b) / 1000 for _, b in sw], "ms") + f"; writer assists {sum(int(x) for x in re.findall(r'assists (\d+)', log))}")
 PY
 
 # --- удаление 90%: подряд и вразнобой (DELETE=0 — без него, например для
 # khc без сборщика) ---
 [[ ${DELETE:-1} == 1 ]] || exit 0
-"$kroot/build/khc" -o "$tmp/delete" "$here/delete.kh" || exit 1
+KHRIP_GC_LOG=1 "$kroot/build/khc" -o "$tmp/delete" "$here/delete.kh" || exit 1
 : >"$OUT/delete.txt"
 for how in oldest random; do
 	KHRIP_GC_LOG=1 PORT=$port taskset -c "$SERVER_CPUS" "$tmp/delete" 2>"$OUT/delete-$how.log" &

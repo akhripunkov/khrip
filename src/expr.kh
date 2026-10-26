@@ -34,6 +34,13 @@ var last_was_call: bool
 
 // ---- Локальные переменные ----
 
+// Регистры для локальных — сохраняемые вызываемым rbx, r12–r15 (reg_of: k =
+// 0..SAVE_REGS − 1). Каждая функция сохраняет те, что взяла, в [rbp − 8(k+1)]
+// (end_fn, save_reg_bytes): место сохранения — SAVE_REGS слов прямо под rbp,
+// ячейки локальных — ниже него (new_slot). Его размер библиотека узнаёт через
+// __save_area() (lib/gc.kh, __pin_publish: там значения вызывающих).
+const SAVE_REGS = 5
+
 fn reg_of(k: int) -> int {
     if k == 0 {
         return RBX
@@ -43,7 +50,7 @@ fn reg_of(k: int) -> int {
 
 fn new_slot() -> int {
     frame += 8
-    return -(40 + frame)
+    return -(SAVE_REGS * 8 + frame)
 }
 
 fn add_local(name: str, t: int, mutable: bool, reg: int, off: int) -> int {
@@ -217,7 +224,7 @@ fn alloc_temp_reg() -> int {
     if inline_depth > 0 {
         return -1
     }
-    var k = 4
+    var k = SAVE_REGS - 1
     while k >= 0 {
         let bit = 1 << k
         if (plan_mask & bit) == 0 && (temp_regs & bit) == 0 {

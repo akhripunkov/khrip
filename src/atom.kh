@@ -1559,7 +1559,7 @@ fn parse_builtin(t: Token, w: int) -> int {
         }
         return ty_opt(inner)
     }
-    let lib_only = name == "__fsqrt" || name.starts_with("__simd_") || name == "__sha256_x64" || name == "__sha512_x64" || name == "__cpu_aes" || name == "__aes_ctr" || name == "__ghash" || name == "__chacha_block" || name == "__mp_add" || name == "__mp_sub" || name == "__mont_mul" || name == "__madd" || name == "__msub" || name == "__wmul" || name == "__cpu_avx2" || name == "__cpu_pdep" || name == "__cpu_sha" || name == "__spawn" || name == "__co_call" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset" || name == "__data_end" || name == "__data_hex" || name == "__gc_roots" || name == "__ctz" || name == "__clz" || name == "__sp" || name == "__cpu_pause" || name == "__noinline"
+    let lib_only = name == "__fsqrt" || name.starts_with("__simd_") || name == "__sha256_x64" || name == "__sha512_x64" || name == "__cpu_aes" || name == "__aes_ctr" || name == "__ghash" || name == "__chacha_block" || name == "__mp_add" || name == "__mp_sub" || name == "__mont_mul" || name == "__madd" || name == "__msub" || name == "__wmul" || name == "__cpu_avx2" || name == "__cpu_pdep" || name == "__cpu_sha" || name == "__spawn" || name == "__co_call" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset" || name == "__data_end" || name == "__data_hex" || name == "__gc_roots" || name == "__ctz" || name == "__clz" || name == "__sp" || name == "__cpu_pause" || name == "__noinline" || name == "__save_area"
     if lib_only && !files[t.file].is_lib {
         return -1
     }
@@ -1880,6 +1880,15 @@ fn parse_builtin(t: Token, w: int) -> int {
         advance()
         expect_tok(')')
         emit_hex("48 89 E0")
+        return ty_int
+    }
+    if name == "__save_area" {
+        // байт места сохранения rbx, r12–r15 под rbp каждой функции
+        // (SAVE_REGS, src/expr.kh): запись контекста копирует стек от rbp
+        // минус оно (lib/gc.kh, __pin_publish)
+        advance()
+        expect_tok(')')
+        emit_mov_imm(RAX, SAVE_REGS * 8)
         return ty_int
     }
     if name == "__cpu_pause" {

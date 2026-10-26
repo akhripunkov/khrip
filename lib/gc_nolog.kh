@@ -1,0 +1,16 @@
+// Заглушки журнала сборщика store для программ, собранных без KHRIP_GC_LOG
+// (src/main.kh выбирает между этим файлом и lib/gc_log.kh): сборщик
+// ссылается на журнал, но в такой программе его кода нет.
+
+// KHRIP_GC_LOG при запуске, а программа собрана без него: писать нечем.
+fn __gc_log_init() {
+    if env("KHRIP_GC_LOG") != none {
+        eprint("khrip: KHRIP_GC_LOG is ignored: build the program with KHRIP_GC_LOG=1 set to include the collector log")
+    }
+}
+
+fn __gc_report() {
+}
+
+fn __gc_thread_log() {
+}

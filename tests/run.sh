@@ -262,6 +262,63 @@ for fault in "gc_snapshot hbuf" "gc_snapshot hbuf2" "gc_satb_oracle hbuf"; do
 done
 [[ $snap_ok -eq 1 ]] && pass=$((pass + 1))
 
+# Темп и уборка кусками (шаг 6b) сами по себе: tests/api/gc_pace.kh с
+# KHRIP_GC_LIMIT_MB=3 (первый тест сверяет цель с ним) — тот же вывод; на
+# копиях библиотеки без сброса текущих спанов в конце разметки, без номера
+# уборки у нового спана, без доуборки в начале сборки (tests/api/gc_sweep.kh),
+# без удвоения и сброса m, с удвоением m после сборки без выделений, без
+# мягкого предела, без помощи писателя и без помощи по счёту
+# (tests/api/gc_pace.kh), с записью, которая не копирует место сохранения
+# регистров __pin_publish (tests/api/gc_regs.kh: значение только в r14 —
+# если кодогенерация уведёт его оттуда, тест перестанет что-то проверять, и
+# это заметно здесь), тесты падают.
+pace_ok=1
+KHRIP_GC_LIMIT_MB=3 "$KHC" test tests/api/gc_pace.kh 2>&1 | grep -v '^khrip: gc verify (boot): ' >"$tmp/pace.txt"
+if ! diff -u tests/api/gc_pace.out "$tmp/pace.txt" >"$tmp/pace.diff"; then
+	pace_ok=0
+	failed "tests/api/gc_pace.kh (KHRIP_GC_LIMIT_MB=3)" "$(cat "$tmp/pace.diff")"
+fi
+for cut in "gc_sweep cur" "gc_sweep newgen" "gc_sweep finish" "gc_pace mup" "gc_pace mdown" "gc_pace mhold" "gc_pace soft" "gc_pace assist" "gc_pace credit" "gc_regs savearea"; do
+	read -r name mut <<<"$cut"
+	rm -rf "${tmp:?}/pacelib"
+	mkdir -p "$tmp/pacelib"
+	cp lib/*.kh "$tmp/pacelib/"
+	if ! python3 - "$tmp/pacelib" "$mut" <<'PY'
+import sys
+d, m = sys.argv[1], sys.argv[2]
+cuts = {
+    "cur": ("        store64(__gc_cur + j * 8, __gc_none)\n        store64(__gc_partial + j * 16, 0)\n", "        store64(__gc_partial + j * 16, 0)\n"),
+    "newgen": ("    store64(s + S_SWEEPGEN, __gc_sweepgen)\n    store64(s + S_MAGIC, ((", "    store64(s + S_SWEEPGEN, __gc_sweepgen - 1)\n    store64(s + S_MAGIC, (("),
+    "finish": ("    if __gc_phase == GC_PH_SWEEP {\n        __gc_sweep_finish(why)\n    }\n", ""),
+    "mup": ("        if __gc_m < 8 {\n            __gc_m *= 2\n        }\n", ""),
+    "mdown": ("    } else if mb * 2 < b {\n        __gc_m = 1\n    }\n", "    }\n"),
+    "mhold": ("    __gc_m_hold = __heap_live == __gc_swept_heap\n", "    __gc_m_hold = false\n"),
+    "savearea": ("    let sp = load64(rec.regs + 16) - __save_area()\n", "    let sp = load64(rec.regs + 16) + 16\n"),
+    "soft": ("        if goal > __gc_soft {\n            goal = __gc_soft\n        }\n", ""),
+    "assist": ("        } else if __gc_phase == GC_PH_MARK && __heap_live > __gc_cgoal {\n            __gc_assist()\n        }\n", "        }\n"),
+    "credit": ("        if debt <= 0 || rem <= 0 {\n            return\n        }\n", "        if true {\n            return\n        }\n"),
+}
+old, new = cuts[m]
+s = open(f"{d}/gc.kh").read()
+if s.count(old) != 1:
+    sys.exit(1)
+open(f"{d}/gc.kh", "w").write(s.replace(old, new))
+PY
+	then
+		pace_ok=0
+		failed "темп и уборка кусками ($mut)" "место для подложенной ошибки не найдено в lib/gc.kh"
+		continue
+	fi
+	# без механизма тест может и упасть (освобождённый живой объект): строку
+	# оболочки о сигнале — мимо вывода набора
+	{ KHRIP_LIB="$tmp/pacelib" env -u KHRIP_GC_VERIFY -u KHRIP_GC_STRESS "$KHC" test "tests/api/$name.kh" >"$tmp/pace.txt" 2>&1; } 2>/dev/null
+	if diff -q "tests/api/$name.out" "$tmp/pace.txt" >/dev/null; then
+		pace_ok=0
+		failed "темп и уборка кусками ($mut)" "tests/api/$name.kh проходит и без проверяемого механизма"
+	fi
+done
+[[ $pace_ok -eq 1 ]] && pass=$((pass + 1))
+
 # Примеры учебника (docs/TUTORIAL.md) и ответы к заданиям: программы
 # выполняются, API проходят свои блоки test.
 for src in docs/tutorial/*.kh docs/tutorial/answers/*.kh; do
@@ -401,9 +458,10 @@ fi
 
 # Программа без store не несёт кода кучи store (lib/nostore.kh вместо
 # lib/gc.kh) — и с драйвером и слоем ClickHouse (ch "...", таблицы,
-# маршруты: ch_lex.kh, chdb/api.kh), а без KHRIP_GC_VERIFY при сборке
-# программа со store — кода проверок сборщика (lib/gc_noverify.kh вместо
-# lib/gc_verify.kh).
+# маршруты: ch_lex.kh, chdb/api.kh), а без KHRIP_GC_VERIFY и KHRIP_GC_LOG при
+# сборке программа со store — кода проверок и журнала сборщика
+# (lib/gc_noverify.kh вместо lib/gc_verify.kh, lib/gc_nolog.kh вместо
+# lib/gc_log.kh).
 for src in tests/run/arith.kh tests/run/net_sigpipe.kh tests/run/ch_lex.kh tests/chdb/api.kh; do
 	env -u KHRIP_GC_VERIFY -u KHRIP_GC_STRESS "$KHC" --sizes -o "$tmp/nostore" "$src" >"$tmp/nostore.txt" 2>&1
 	if grep -E ' (__salloc|__pmode_|__gc_|__span_|__ph_|__store_mut)' "$tmp/nostore.txt" >"$tmp/nostore.bad"; then
@@ -412,9 +470,9 @@ for src in tests/run/arith.kh tests/run/net_sigpipe.kh tests/run/ch_lex.kh tests
 		pass=$((pass + 1))
 	fi
 done
-env -u KHRIP_GC_VERIFY -u KHRIP_GC_STRESS "$KHC" --sizes -o "$tmp/store" tests/api/crud.kh >"$tmp/store.txt" 2>&1
-if grep -E ' (__gcv_|__gc_verify_graph|__gc_verify_heap|__ph_check|__ph_selftest)' "$tmp/store.txt" >"$tmp/store.bad"; then
-	failed "tests/api/crud.kh" "проверки сборщика без KHRIP_GC_VERIFY:"$'\n'"$(cat "$tmp/store.bad")"
+env -u KHRIP_GC_VERIFY -u KHRIP_GC_STRESS -u KHRIP_GC_LOG "$KHC" --sizes -o "$tmp/store" tests/api/crud.kh >"$tmp/store.txt" 2>&1
+if grep -E ' (__gcv_|__gc_verify_graph|__gc_verify_heap|__ph_check|__ph_selftest|__gc_line|__gc_why)' "$tmp/store.txt" >"$tmp/store.bad"; then
+	failed "tests/api/crud.kh" "проверки или журнал сборщика без KHRIP_GC_VERIFY и KHRIP_GC_LOG:"$'\n'"$(cat "$tmp/store.bad")"
 else
 	pass=$((pass + 1))
 fi
