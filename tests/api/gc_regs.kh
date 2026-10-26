@@ -1,0 +1,96 @@
+// Указатель в store, который через сборку живёт только в сохраняемом
+// вызываемым регистре (docs/design/v0.13-store-gc.md I7, §6.2): запись
+// контекста копирует место сохранения rbx, r12–r15 функции __pin_publish
+// (lib/gc.kh) — там значения вызывающих, которые она заняла под свои. Здесь
+// held — в r14: четыре переменные с весом больше (src/stmt.kh plan_regs: вес —
+// упоминания, в цикле — ×8) берут rbx, r12, r13, а held — r14; между ним и
+// __pin_publish только __gc_collect_self, которая r14 не трогает, а сама
+// __pin_publish берёт r14 под свой параметр до __setjmp. Значит, held — только
+// в её месте сохранения: без него (или если оно разойдётся с кадром
+// компилятора, __save_area()) сборка освободит объект, и проверка упадёт.
+// Старые копии адреса на стеке затираются: scrub() проходит те же глубины
+// своими нулями.
+
+type Item { name: str, n: int }
+
+store items: [Item]
+
+fn addr(x: Item) -> int {
+    let a: int = __cast(x)
+    return a
+}
+
+// кадр с двумя десятками нулевых ячеек на глубине __gc_collect_self и
+// __pin_publish
+fn scrub() -> int {
+    var z0 = 0
+    var z1 = 0
+    var z2 = 0
+    var z3 = 0
+    var z4 = 0
+    var z5 = 0
+    var z6 = 0
+    var z7 = 0
+    var z8 = 0
+    var z9 = 0
+    var z10 = 0
+    var z11 = 0
+    var z12 = 0
+    var z13 = 0
+    var z14 = 0
+    var z15 = 0
+    var z16 = 0
+    var z17 = 0
+    var z18 = 0
+    var z19 = 0
+    return z0 + z1 + z2 + z3 + z4 + z5 + z6 + z7 + z8 + z9 + z10 + z11 + z12 + z13 + z14 + z15 + z16 + z17 + z18 + z19
+}
+
+fn scrub_deep(n: int) -> int {
+    if n == 0 {
+        return scrub()
+    }
+    return scrub_deep(n - 1) + scrub()
+}
+
+// held — четвёртый по весу: r14
+fn keep_in_r14(k: int) -> bool {
+    var w0 = 0
+    var w1 = 0
+    var w2 = 0
+    var held = items.pop()
+    while w2 < 1000 {
+        w0 += 1
+        w1 += w0
+        w2 += w1
+        w0 += w2
+        w1 += w0
+        w2 += w1
+    }
+    w0 += scrub_deep(4)
+    __gc_collect()
+    if w0 + w1 + w2 < 0 {
+        held = items[0]
+    }
+    return __gc_is_allocated(addr(held)) && held.name == "item {k}" && held.n == k
+}
+
+test "build" {
+    for i in 0..2000 {
+        items.push(Item { name: "item {i}", n: i })
+    }
+    __gc_collect()
+    expect items.len() == 2000
+}
+
+test "a value held only in a callee-saved register survives a collection" {
+    var bad = 0
+    var k = 1999
+    while k >= 1990 {
+        if !keep_in_r14(k) {
+            bad += 1
+        }
+        k -= 1
+    }
+    expect bad == 0
+}

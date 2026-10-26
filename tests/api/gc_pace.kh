@@ -58,18 +58,25 @@ test "KHRIP_GC_LIMIT_MB caps the goal from the start" {
     __gc_set_limit_mb(0)
 }
 
+// между сборками — немного нового живого: сборка без выделений после прошлой
+// уборки m не меняет
+fn collect_after_push(k: int) {
+    small.push(Item { name: "kept {k}", n: k })
+    __gc_collect()
+}
+
 test "m doubles while nearly everything survives, up to 8" {
     for i in 0..20000 {
         items.push(Item { name: "item {i} xxxxxxxxxxxxxxxx", n: i })
     }
-    __gc_collect()
-    __gc_collect()
-    __gc_collect()
-    __gc_collect()
+    collect_after_push(1)
+    collect_after_push(2)
+    collect_after_push(3)
+    collect_after_push(4)
     let s = __gc_stats()
     expect s.m == 8
     expect !exact() || s.goal == goal_for(s.live, 8)
-    __gc_collect()
+    collect_after_push(5)
     expect __gc_stats().m == 8
 }
 
@@ -79,6 +86,26 @@ test "m falls back to 1 when less than half survives" {
     let s = __gc_stats()
     expect s.m == 1
     expect !exact() || s.goal == goal_for(s.live, 1)
+}
+
+// сборка целиком сразу после доделки идущей (__gc_collect посреди разметки)
+// начинается с только что убранной кучи: её выживание ≈ 1 не удваивает m
+// (раньше m шёл 2 → 4 → 8 при настоящем выживании 0,65)
+test "a whole collection right after a finished cycle does not move m" {
+    for i in 0..20000 {
+        items.push(Item { name: "item {i} xxxxxxxxxxxxxxxx", n: i })
+    }
+    __gc_collect()
+    let m0 = __gc_stats().m
+    for round in 0..4 {
+        // 70% кучи — мусор
+        for i in 0..14000 {
+            items[i] = Item { name: "repl {i} {round} yyyyyyyyyyyy", n: i }
+        }
+        __gc_begin_from_roots()
+        __gc_collect()
+    }
+    expect !exact() || __gc_stats().m == m0
 }
 
 test "the soft limit caps the goal, but not below 1.1 x live" {
@@ -119,7 +146,7 @@ test "a reader does not assist, a window does not assist" {
     let a0 = __gc_stats().assists
     __gc_begin_from_roots()
     __gc_set_limit_mb(1)
-    expect (call GET "/count").body == "60000"
+    expect (call GET "/count").body == "80000"
     expect !exact() || __gc_stats().assists == a0
     __gc_begin_from_roots()
     expect (call POST "/blob-wait/30000000").status == 204

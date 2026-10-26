@@ -1,0 +1,3 @@
+ok    build
+ok    a value held only in a callee-saved register survives a collection
+2 tests: 2 passed, 0 failed
