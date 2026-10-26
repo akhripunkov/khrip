@@ -2129,7 +2129,9 @@ fn __list_sort_str(self: [str]) -> [str] {
 // таблица, [40] r — следующая старая запись, [48] w — записей в новых массивах,
 // [56] сколько байт текущей области уже готово, [64] что ещё готовить: бит i
 // — обнулить область i (грязная память), бит 4 + i — поставить ей PTRB
-// (области 0–3 — слова 0–3 G), [72] что было готовить в начале.
+// (области 0–3 — слова 0–3 G), [72] что было готовить в начале, [80] номер
+// темпа сборщика, при котором рост поднял порог сборки, или −1
+// (__gc_grow_hold, lib/gc.kh).
 
 // старых записей за шаг; байт новой памяти за шаг
 const MAP_STEP = 64
@@ -2326,7 +2328,14 @@ fn __map_grow_start(m: int) {
         z *= 2
     }
     let n = z / 2 * 8
-    let g = __alloc_for_k(m, 80, K_MASK, 15)
+    // большой рост словаря store не приближает сборку, пока не переключится
+    // (lib/gc.kh, __gc_grow_hold): иначе она держала бы оба набора живыми
+    var held = -1
+    if z * 8 > MAP_LAZY && __in_store(m) {
+        held = __gc_grow_hold(n * 3 + z * 8)
+    }
+    let g = __alloc_for_k(m, 88, K_MASK, 15)
+    store64(g + 80, held)
     let pk = __map_arr(m, n, kh)
     let pv = __map_arr(m, n, load64(m + 16))
     let pa = __map_arr(m, n, 0)
@@ -2462,6 +2471,7 @@ fn __map_grow_end(m: int) {
     store64(m + 40, load64(g + 32))
     __gc_old_at(m, m + 56)
     store64(m + 56, 0)
+    __gc_grow_done((load64(g + 32) + 1) * 20, load64(g + 80))
 }
 
 // Рост целиком: вся подготовка и все переносы сразу (шаг с подготовкой
@@ -2675,10 +2685,12 @@ fn __map_values(m: int, esize: int) -> int {
 
 fn __map_clear(m: int) {
     __store_mut(m)
-    if load64(m + 56) != 0 {
+    let g = load64(m + 56)
+    if g != 0 {
         // рост бросается (§7.5: G уходит из заголовка)
         __gc_old_at(m, m + 56)
         store64(m + 56, 0)
+        __gc_grow_done((load64(g + 32) + 1) * 20, load64(g + 80))
     }
     if __in_store(m) {
         let n = load64(load64(m) + 8)

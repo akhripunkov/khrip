@@ -147,9 +147,13 @@ test "large new arrays from reused memory are prepared before entries move" {
     }
     junk = []
     __gc_collect()
+    let t0 = __gc_stats().trigger
     big["key {k}"] = item(k, "g")
     k += 1
     expect __map_growing(h) && !__map_grow_ready(h) && __map_grow_moved(h) == 0
+    // выделенное на рост (массивы по 64 КБ и таблица 128 КБ) порог сборки
+    // не приближает, пока рост не кончится (lib/gc.kh, __gc_grow_hold)
+    expect !exact() || __gc_stats().trigger == t0 + 20 * 16384
     // память — из-под мусора (иначе тест не проверял бы обнуление)
     expect __map_grow_dirty(h)
     var preps = 0
@@ -170,6 +174,7 @@ test "large new arrays from reused memory are prepared before entries move" {
         big["key {k}"] = item(k, "g")
         k += 1
     }
+    expect !exact() || __gc_stats().trigger == t0
     expect __map_cap(h) == 8192
     __gc_collect()
     var bad = 0

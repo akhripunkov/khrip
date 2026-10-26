@@ -321,12 +321,13 @@ done
 # библиотеки без серения старых массивов ключей, значений и признаков, старой
 # таблицы и G при переключении, без серения G в clear, без битов PTRB и без
 # обнуления новой памяти, без повторения замены и удаления перенесённой записи
-# в новых массивах tests/api/gc_mapgrow.kh с KHRIP_GC_VERIFY=1 падает (серения
+# в новых массивах, без подъёма порога сборки на время роста и без его
+# возврата tests/api/gc_mapgrow.kh с KHRIP_GC_VERIFY=1 падает (серения
 # старой таблицы, признаков и G находит только проверка конца разметки: эти
 # объекты уже мусор, но были достижимы в начале сборки; без серения значений
 # тест падает и без проверок — запись держат только чёрные новые массивы).
 grow_ok=1
-for cut in keys vals alive slots gend gclear ptrb zero set remove; do
+for cut in keys vals alive slots gend gclear ptrb zero set remove hold release; do
 	rm -rf "${tmp:?}/growlib"
 	mkdir -p "$tmp/growlib"
 	cp lib/*.kh "$tmp/growlib/"
@@ -344,6 +345,8 @@ cuts = {
     "zero": ("            __memset(p + off, 0, n)\n", ""),
     "set": ("        if load64(m + 56) != 0 {\n            __map_grow_set(m, k, idx, v)\n        }\n", ""),
     "remove": ("    if load64(m + 56) != 0 {\n        __map_grow_remove(m, k, idx)\n    }\n", ""),
+    "hold": ("        held = __gc_grow_hold(n * 3 + z * 8)\n", ""),
+    "release": ("    store64(m + 56, 0)\n    __gc_grow_done((load64(g + 32) + 1) * 20, load64(g + 80))\n}\n", "    store64(m + 56, 0)\n}\n"),
 }
 old, new = cuts[m]
 s = open(f"{d}/core.kh").read()
