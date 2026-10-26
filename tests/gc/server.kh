@@ -15,6 +15,10 @@ type Account { id: int, balance: int }
 
 type Pair { a: str, b: str }
 
+type PNode { p: Product, next: PNode? }
+
+type ANode { a: Account, next: ANode? }
+
 store products: map[int, Product]
 store resurrected: map[int, Product]
 store users: map[str, User]
@@ -146,6 +150,49 @@ route GET "/hold/{id}" (id: int, ms: int = 200) -> str | 404 {
         return "changed under the request"
     }
     return mark_ok(c0, check(p))
+}
+
+// держит каждый товар звеном в своей арене, а за ними — 60 000 звеньев на
+// один счёт (сотни кусков просмотра при передаче арены), через ожидание:
+// товары заменяют писатели, и держит их только эта арена
+route GET "/hold-many" (ms: int = 30) -> str {
+    var head: PNode? = none
+    for id in 0..N {
+        if let p = products[id] {
+            head = PNode { p: p, next: head }
+        }
+    }
+    let a = accounts[0] else {
+        return "no account"
+    }
+    var tail: ANode? = none
+    for j in 0..60000 {
+        tail = ANode { a: a, next: tail }
+    }
+    let c0 = cyc()
+    sleep(ms)
+    var q = head
+    while true {
+        let n = q else {
+            break
+        }
+        let r = check(n.p)
+        if r != "ok" {
+            return r
+        }
+        q = n.next
+    }
+    var t = tail
+    while true {
+        let n = t else {
+            break
+        }
+        if n.a.id != 0 {
+            return "bad account"
+        }
+        t = n.next
+    }
+    return mark_ok(c0, "ok")
 }
 
 // срез строки store держит всю строку

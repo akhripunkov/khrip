@@ -219,7 +219,9 @@ fi
 # слова записей, кусок арены или барьер pop, tests/api/gc_snapshot.kh с
 # KHRIP_GC_VERIFY=1 останавливается на ней, хотя потерянный объект больше ни
 # от чего не достижим; и с KHRIP_GC_FAULT=hbuf (системе не хватило памяти на
-# hbuf передачи арены: контекст размечает её сам) — тот же вывод.
+# hbuf передачи арены: контекст размечает её сам) и hbuf2 (hbuf не растёт
+# после первого куска: часть арены уже в нём) — тот же вывод, как и у оракула
+# tests/api/gc_satb_oracle.kh с KHRIP_GC_FAULT=hbuf.
 snap_ok=1
 for cut in pins arena pop; do
 	rm -rf "${tmp:?}/snaplib"
@@ -250,11 +252,14 @@ PY
 		failed "проверка конца разметки ($cut)" "не нашла потерянный объект:"$'\n'"$(cat "$tmp/snap.txt")"
 	fi
 done
-KHRIP_GC_VERIFY=1 KHRIP_GC_FAULT=hbuf "$KHC" test tests/api/gc_snapshot.kh 2>&1 | grep -v '^khrip: gc verify (boot): ' >"$tmp/snap.txt"
-if ! diff -u tests/api/gc_snapshot.out "$tmp/snap.txt" >"$tmp/snap.diff"; then
-	snap_ok=0
-	failed "tests/api/gc_snapshot.kh (KHRIP_GC_FAULT=hbuf)" "$(cat "$tmp/snap.diff")"
-fi
+for fault in "gc_snapshot hbuf" "gc_snapshot hbuf2" "gc_satb_oracle hbuf"; do
+	read -r name mode <<<"$fault"
+	KHRIP_GC_VERIFY=1 KHRIP_GC_FAULT=$mode "$KHC" test "tests/api/$name.kh" 2>&1 | grep -v '^khrip: gc verify (boot): ' >"$tmp/snap.txt"
+	if ! diff -u "tests/api/$name.out" "$tmp/snap.txt" >"$tmp/snap.diff"; then
+		snap_ok=0
+		failed "tests/api/$name.kh (KHRIP_GC_FAULT=$mode)" "$(cat "$tmp/snap.diff")"
+	fi
+done
 [[ $snap_ok -eq 1 ]] && pass=$((pass + 1))
 
 # Примеры учебника (docs/TUTORIAL.md) и ответы к заданиям: программы

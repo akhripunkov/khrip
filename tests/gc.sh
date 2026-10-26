@@ -127,7 +127,7 @@ if "$KHC" -o "$tmp/gcsrv" tests/gc/server.kh 2>"$tmp/gcsrv.err" && KHRIP_GC_STRE
 	curl -s -o /dev/null -X POST "$gc_url/seed"
 	gc_probes=""
 	gc_probe_bad=""
-	for probe in "sleep /hold/{i}?ms=20 30" "reader /search/{i} 30" "fetch /fx?n=10 30" "hash /login 12" "poll /poll?ms=2 12"; do
+	for probe in "sleep /hold/{i}?ms=20 30" "reader /search/{i} 30" "fetch /fx?n=10 30" "hash /login 12" "poll /poll?ms=2 12" "many /hold-many?ms=30 12"; do
 		read -r kind path times <<<"$probe"
 		res=$(python3 tests/gc/drive.py probe "$GC_PORT" "$path" "$times" 2>&1)
 		gc_probes+="$kind $res; "
@@ -146,32 +146,38 @@ if "$KHC" -o "$tmp/gcsrv" tests/gc/server.kh 2>"$tmp/gcsrv.err" && KHRIP_GC_STRE
 		failed "gc: окна по видам посреди разметки" "${gc_probe_bad:-сервер упал или ошибка проверок}"$'\n'"$gc_probes"$'\n'"$(grep -v '^gc [0-9]' "$tmp/gc.log" | tail -5)"
 	fi
 
-	# нет памяти на hbuf (KHRIP_GC_FAULT=hbuf, только с проверками): держатель,
-	# который продолжил посреди разметки, не передаёт арену, а возвращает её
-	# сборщику и ждёт в окне (читатель) или размечает сам (писатель) —
-	# сервер не падает, значения целы, проверки молчат
-	gc_start "$tmp/gcsrv_s" KHRIP_GC=20 KHRIP_GC_MIN_MB=1 KHRIP_GC_STRESS=1 KHRIP_GC_FAULT=hbuf
-	curl -s -o /dev/null -X POST "$gc_url/seed"
-	gc_probes=""
-	gc_probe_bad=""
-	for probe in "sleep /hold/{i}?ms=20 20" "reader /search/{i} 20" "fetch /fx?n=10 20"; do
-		read -r kind path times <<<"$probe"
-		res=$(python3 tests/gc/drive.py probe "$GC_PORT" "$path" "$times" 2>&1)
-		gc_probes+="$kind $res; "
-		if ! python3 -c 'import json, sys; r = json.loads(sys.argv[1]); sys.exit(0 if not r["bad"] and r["ok~"] + r["ok+"] > 0 else 1)' "$res" 2>/dev/null; then
-			gc_probe_bad+="$kind: $res; "
+	# нет памяти на hbuf (только с проверками): KHRIP_GC_FAULT=hbuf — ни разу,
+	# hbuf2 — только при росте hbuf, где уже лежит часть арены. Держатель,
+	# который продолжил посреди разметки, не передаёт арену, а размечает её
+	# сам (читатель — под мьютексом писателей, вернув арену сборщику на время
+	# ожидания). /hold-many держит каждый товар одним звеном в начале большой
+	# арены, писатели товары заменяют: потерянное найденное слово — неверный
+	# ответ или строка проверки. Сервер не падает, значения целы, проверки
+	# молчат
+	for fault in hbuf hbuf2; do
+		gc_start "$tmp/gcsrv_s" KHRIP_GC=20 KHRIP_GC_MIN_MB=1 KHRIP_GC_STRESS=1 KHRIP_GC_FAULT=$fault
+		curl -s -o /dev/null -X POST "$gc_url/seed"
+		gc_probes=""
+		gc_probe_bad=""
+		for probe in "many /hold-many?ms=30 16" "sleep /hold/{i}?ms=20 16" "reader /search/{i} 16" "fetch /fx?n=10 16"; do
+			read -r kind path times <<<"$probe"
+			res=$(python3 tests/gc/drive.py probe "$GC_PORT" "$path" "$times" 2>&1)
+			gc_probes+="$kind $res; "
+			if ! python3 -c 'import json, sys; r = json.loads(sys.argv[1]); sys.exit(0 if not r["bad"] and r["ok~"] + r["ok+"] > 0 else 1)' "$res" 2>/dev/null; then
+				gc_probe_bad+="$kind: $res; "
+			fi
+		done
+		gc_alive=0
+		kill -0 "$gc_pid" 2>/dev/null && gc_alive=1
+		gc_stop
+		gc_vfail=$(grep 'gc verify' "$tmp/gc.log" | grep -cv 'gc verify (boot): ')
+		if [[ -z $gc_probe_bad && $gc_alive == 1 && $gc_vfail == 0 ]]; then
+			http_ok
+			echo "gc windows without memory for hbuf (KHRIP_GC_FAULT=$fault): $gc_probes"
+		else
+			failed "gc: окна без памяти на hbuf ($fault)" "${gc_probe_bad:-сервер упал или ошибка проверок}"$'\n'"$gc_probes"$'\n'"$(grep -v '^gc [0-9]' "$tmp/gc.log" | tail -5)"
 		fi
 	done
-	gc_alive=0
-	kill -0 "$gc_pid" 2>/dev/null && gc_alive=1
-	gc_stop
-	gc_vfail=$(grep 'gc verify' "$tmp/gc.log" | grep -cv 'gc verify (boot): ')
-	if [[ -z $gc_probe_bad && $gc_alive == 1 && $gc_vfail == 0 ]]; then
-		http_ok
-		echo "gc windows without memory for hbuf (KHRIP_GC_FAULT=hbuf): $gc_probes"
-	else
-		failed "gc: окна без памяти на hbuf" "${gc_probe_bad:-сервер упал или ошибка проверок}"$'\n'"$gc_probes"$'\n'"$(grep -v '^gc [0-9]' "$tmp/gc.log" | tail -5)"
-	fi
 
 	# KHRIP_DATA: SIGTERM посреди нагрузки сохраняет целый снимок; перезапуск
 	# восстанавливает его, сборки идут дальше, второй снимок тоже цел

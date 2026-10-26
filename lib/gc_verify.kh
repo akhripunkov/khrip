@@ -20,16 +20,23 @@ fn __gc_verify_init() {
         __gc_verify = true
         __gc_verify_slow = true
     }
-    // отказ памяти на hbuf передачи арены (tests/gc.sh): запасной путь
-    // __pin_self_fallback
-    __gcv_hbuf_fault = (env("KHRIP_GC_FAULT") ?? "") == "hbuf"
+    // отказ памяти на hbuf передачи арены (tests/gc.sh, tests/run.sh):
+    // запасной путь __pin_self_fallback; hbuf — каждый раз, hbuf2 — только
+    // при росте hbuf, который уже есть (часть арены в нём)
+    let f = env("KHRIP_GC_FAULT") ?? ""
+    __gcv_hbuf_fault = 0
+    if f == "hbuf" {
+        __gcv_hbuf_fault = 1
+    } else if f == "hbuf2" {
+        __gcv_hbuf_fault = 2
+    }
     __gc_slow_update()
 }
 
-var __gcv_hbuf_fault: bool
+var __gcv_hbuf_fault: int
 
-fn __gc_hbuf_fault() -> bool {
-    return __gcv_hbuf_fault
+fn __gc_hbuf_fault(cap: int) -> bool {
+    return __gcv_hbuf_fault == 1 || (__gcv_hbuf_fault == 2 && cap > 0)
 }
 
 // KHRIP_GC_VERIFY: каждые 1024 операции — дерево против карты.
@@ -210,9 +217,10 @@ fn __gc_verify_records(self: int, acquiring: bool) {
         if rec.linked {
             linked += 1
         }
-        let st = rec.ast & 7
+        let a = rec.ast
+        let st = a & 7
         if st != PIN_IDLE {
-            if __gc_phase != GC_PH_MARK || (rec.ast >> 3) != __gc_cycle_no {
+            if __gc_phase != GC_PH_MARK || (a >> 3) != __gc_cycle_no {
                 __gc_fatal("an arena hand-off outside marking (I9)")
             }
             if st == PIN_GC || st == PIN_SELF || st > PIN_DONE {

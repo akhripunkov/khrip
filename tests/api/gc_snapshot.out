@@ -3,4 +3,5 @@ ok    a value only on the test's stack (record words) survives
 ok    references only in the arena, scanned by the collector in chunks
 ok    references only in the arena, handed off by the test (hbuf in batches)
 ok    an element popped while marking, held only by the test
-5 tests: 5 passed, 0 failed
+ok    an arena scanned twice keeps what the first scan found
+6 tests: 6 passed, 0 failed

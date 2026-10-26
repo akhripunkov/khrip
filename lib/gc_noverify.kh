@@ -45,7 +45,7 @@ fn __gc_verify_graph(when: str) {
 fn __gc_verify_snap() {
 }
 
-fn __gc_hbuf_fault() -> bool {
+fn __gc_hbuf_fault(cap: int) -> bool {
     return false
 }
 
