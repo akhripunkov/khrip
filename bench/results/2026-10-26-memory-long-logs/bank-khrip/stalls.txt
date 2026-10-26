@@ -1,0 +1,5 @@
+bench/mem/out/long/bank/khrip: probe answers 95 slow (≥ 20 ms), episodes ≥ 100 ms: 3; run 42298614..42898655
+  wrk2 send gaps ≥ 100 ms: 0
+  other          +393.4 s    140 ms; probe max 138 ms; busiest thread 0 ms; steal server 0 / client 0 ms; probe
+  other          +456.4 s    156 ms; probe max 156 ms; busiest thread 0 ms; steal server 0 / client 0 ms; probe
+  other          +554.4 s    132 ms; probe max 132 ms; busiest thread 0 ms; steal server 0 / client 0 ms; probe

@@ -2,7 +2,12 @@
 """Паузы прогона bench/mem/long.sh: что было в машине и в сервере, пока зонд
 ждал ответа.
 
-    stalls.py <папка варианта> [--min-ms 50] [--all]   (--all — и вне замера)
+    stalls.py <папка варианта> [--min-ms 50] [--all] [--classify]
+        --all — и вне замера; --classify — одна строка на эпизод с причиной:
+        lock (рабочий поток держит store исключительно и считает, другой ждёт
+        блокировку store), steal-server, steal-client (кража гипервизора на
+        ядрах сервера или wrk2), wrk2-timer (щель wrk2 ≈ 1 с, зонд и сервер в
+        порядке), other
 
 Эпизод — подряд идущие медленные ответы зонда (probe.tsv), окно — от первой
 отправки до последнего ответа. Для каждого эпизода:
@@ -87,6 +92,9 @@ def main():
         gaps = [x for x in gaps if t0 <= x[0] <= t1]
     items.sort()
     print(f"  wrk2 send gaps ≥ {min_ms:g} ms: {len(gaps)}")
+    if "--classify" in sys.argv:
+        classify(items, probe, cpu, threads, t0)
+        return
     for a, b, cs, mx, kind in items:
         if kind == "gap":
             seen = [p for p in probe if p[0] < b and p[0] + p[2] > a]
@@ -114,6 +122,45 @@ def main():
             print(f"    blocked: {x}")
         for x in g:
             print(f"    gc: {x}")
+
+
+def classify(items, probe, cpu, threads, t0):
+    # эпизоды зонда и щели wrk2, которые пересекаются, — один эпизод
+    merged = []
+    for a, b, cs, mx, kind in sorted(items):
+        if merged and a <= merged[-1][1]:
+            m = merged[-1]
+            m[1] = max(m[1], b)
+            m[2].add(kind)
+            m[3] = max(m[3], mx)
+        else:
+            merged.append([a, b, {kind}, mx])
+    for a, b, kinds, mx in merged:
+        w = b - a
+        bins = [x for x in cpu if a - 50 <= x[0] <= b + 50]
+        st_s = sum(x[1][0] + x[1][1] for x in bins)
+        st_c = sum(x[1][2] + x[1][3] for x in bins)
+        runs = {}
+        for x in bins:
+            for tid, (r, _) in x[3].items():
+                runs[tid] = runs.get(tid, 0.0) + r
+        lockwait = any(sc.startswith("202 ") and (sc.endswith(" 0x2") or sc.endswith(" 0x1")) and s < b and s + dur > a and dur >= 0.3 * w
+                       for tid, s, dur, sc, _ in threads)
+        busy = max(runs.values()) if runs else 0
+        seen = [p for p in probe if p[0] < b and p[0] + p[2] > a]
+        pmax = max((p[2] for p in seen), default=0)
+        if lockwait and busy >= 0.5 * w:
+            why = "lock"
+        elif st_s >= 0.3 * w:
+            why = "steal-server"
+        elif "probe" not in kinds and st_c >= 0.3 * w:
+            why = "steal-client"
+        elif "probe" not in kinds and 900 <= w <= 1100:
+            why = "wrk2-timer"
+        else:
+            why = "other"
+        rel = f"{(a - t0) / 1000:+.1f} s" if t0 else ""
+        print(f"  {why:13s} {rel:>9s} {w:6.0f} ms; probe max {pmax:.0f} ms; busiest thread {busy:.0f} ms; steal server {st_s:.0f} / client {st_c:.0f} ms; {'+'.join(sorted(kinds))}")
 
 
 if __name__ == "__main__":

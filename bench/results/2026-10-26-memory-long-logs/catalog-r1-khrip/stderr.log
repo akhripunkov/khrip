@@ -1,0 +1,2 @@
+41706645.2	khrip: listening on http://0.0.0.0:8080 (2 threads)
+41717632.5	gc 1 (idle): heap 0.6->0.5 MB, live 0.5 MB (14008 obj, 0 black), m 2, pins 0 rec/0 words, arenas 0 (0 KB, 0 handed off), start 49 µs, mark 0.57 ms in 3 slices (max 200 µs, cpu 199 µs) over 2.78 ms, term 39 µs (1 tries), assists 0, sweep 0.08 ms in 1 slices (longest 88 µs, cpu 88 µs), released 0.2 MB in 0.00 ms, rss-store 0.6 MB, next at 3.0 MB

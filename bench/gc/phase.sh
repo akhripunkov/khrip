@@ -5,7 +5,8 @@
 # мусор копится до этой цели или до сборки по таймеру (2 минуты без сборки).
 #
 #   bench/gc/phase.sh <вариант> ...     khrip | khrip-m1 (компилятор KHC_M1:
-#                                        копия библиотеки, где m всегда 1) | go
+#                                        копия библиотеки, где m всегда 1) |
+#                                        khrip-m1-gc50 (то же с KHRIP_GC=50) | go
 #
 # Заполнение: FILL_REQ запросов по FILL_N записей (40 × 50 000) с паузой 1 с;
 # затем замены: wrk2, CHURN_RATE запросов в секунду по CHURN_N записей
@@ -48,11 +49,12 @@ for v in "$@"; do
 	mkdir -p "$o"
 	envs=(PORT=8080)
 	case $v in
-	khrip | khrip-m1)
+	khrip | khrip-m1 | khrip-m1-gc50)
 		khc=$root/build/khc
-		[[ $v == khrip-m1 ]] && khc=${KHC_M1:?KHC_M1}
+		[[ $v == khrip-m1* ]] && khc=${KHC_M1:?KHC_M1}
 		KHRIP_GC_LOG=1 "$khc" -o "$tmp/server" "$here/phase.kh" || exit 1
 		envs+=(KHRIP_GC_LOG=1)
+		[[ $v == *-gc50 ]] && envs+=(KHRIP_GC=50)
 		;;
 	go)
 		(cd "$here/phase_go" && go build -o "$tmp/server" .) || exit 1

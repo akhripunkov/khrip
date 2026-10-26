@@ -1,0 +1,6 @@
+bench/mem/out/long/inventory/khrip: probe answers 108 slow (≥ 20 ms), episodes ≥ 100 ms: 4; run 45159385..45759428
+  wrk2 send gaps ≥ 100 ms: 6
+  lock            +47.2 s    114 ms; probe max 113 ms; busiest thread 164 ms; steal server 0 / client 0 ms; gap+probe
+  lock           +154.2 s    266 ms; probe max 266 ms; busiest thread 300 ms; steal server 0 / client 0 ms; gap+probe
+  steal-client   +247.9 s    815 ms; probe max 0 ms; busiest thread 259 ms; steal server 40 / client 860 ms; gap
+  lock           +368.2 s    574 ms; probe max 573 ms; busiest thread 525 ms; steal server 0 / client 10 ms; gap+probe

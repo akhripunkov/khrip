@@ -1,0 +1,11 @@
+bench/mem/out/long/bank/go: probe answers 219 slow (≥ 20 ms), episodes ≥ 100 ms: 11; run 44498151..45098187
+  wrk2 send gaps ≥ 100 ms: 0
+  other           +38.7 s    395 ms; probe max 395 ms; busiest thread 0 ms; steal server 0 / client 0 ms; probe
+  other           +63.4 s    786 ms; probe max 786 ms; busiest thread 0 ms; steal server 0 / client 0 ms; probe
+  other           +84.7 s    103 ms; probe max 103 ms; busiest thread 0 ms; steal server 0 / client 0 ms; probe
+  other           +94.2 s   1054 ms; probe max 1054 ms; busiest thread 0 ms; steal server 0 / client 0 ms; probe
+  other          +173.1 s    108 ms; probe max 108 ms; busiest thread 0 ms; steal server 0 / client 0 ms; probe
+  other          +240.9 s   1433 ms; probe max 1433 ms; busiest thread 0 ms; steal server 0 / client 0 ms; probe
+  other          +316.1 s   1586 ms; probe max 1586 ms; busiest thread 0 ms; steal server 0 / client 0 ms; probe
+  other          +410.2 s   2189 ms; probe max 2189 ms; busiest thread 0 ms; steal server 0 / client 0 ms; probe
+  other          +527.8 s    249 ms; probe max 249 ms; busiest thread 0 ms; steal server 0 / client 0 ms; probe

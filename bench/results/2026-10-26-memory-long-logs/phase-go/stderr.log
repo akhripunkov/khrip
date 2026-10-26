@@ -1,0 +1,16 @@
+56687208.2	gc 1 @0.024s 0%: 0.051+0.34+0.002 ms clock, 0.10+0.021/0.065/0.14+0.005 ms cpu, 0->0->0 MB, 4 MB goal, 0 MB stacks, 0 MB globals, 2 P (forced)
+56687244.2	gc 2 @0.054s 2%: 0.079+8.3+0.005 ms clock, 0.15+1.1/1.2/0+0.010 ms cpu, 3->4->3 MB, 4 MB goal, 0 MB stacks, 0 MB globals, 2 P
+56687268.2	gc 3 @0.071s 4%: 0.036+11+0.004 ms clock, 0.072+1.0/4.1/0.073+0.008 ms cpu, 6->7->6 MB, 7 MB goal, 0 MB stacks, 0 MB globals, 2 P
+56688305.4	gc 4 @1.116s 0%: 0.058+11+0.086 ms clock, 0.11+0.13/0.68/10+0.17 ms cpu, 10->12->10 MB, 12 MB goal, 0 MB stacks, 0 MB globals, 2 P
+56689376.4	gc 5 @2.169s 0%: 0.098+30+0.16 ms clock, 0.19+4.2/13/22+0.33 ms cpu, 18->20->18 MB, 21 MB goal, 0 MB stacks, 0 MB globals, 2 P
+56691535.5	gc 6 @4.306s 0%: 0.040+51+0.089 ms clock, 0.080+0.63/28/33+0.17 ms cpu, 31->37->34 MB, 36 MB goal, 0 MB stacks, 0 MB globals, 2 P
+56694765.9	gc 7 @7.526s 0%: 0.14+62+0.004 ms clock, 0.28+0.35/33/79+0.008 ms cpu, 59->60->53 MB, 69 MB goal, 0 MB stacks, 0 MB globals, 2 P
+56698040.8	gc 8 @10.759s 0%: 0.069+104+0.005 ms clock, 0.13+0.10/43/162+0.011 ms cpu, 91->91->79 MB, 107 MB goal, 0 MB stacks, 0 MB globals, 2 P
+56706850.5	gc 9 @19.248s 1%: 0.090+425+0.006 ms clock, 0.18+162/225/262+0.012 ms cpu, 135->162->151 MB, 159 MB goal, 0 MB stacks, 0 MB globals, 2 P
+56724684.6	gc 10 @36.718s 1%: 0.058+789+0.007 ms clock, 0.11+16/402/1048+0.014 ms cpu, 258->266->239 MB, 303 MB goal, 0 MB stacks, 0 MB globals, 2 P
+56753644.8	gc 11 @65.627s 1%: 0.064+840+0.006 ms clock, 0.12+0.096/418/1177+0.012 ms cpu, 407->413->305 MB, 478 MB goal, 0 MB stacks, 0 MB globals, 2 P
+56786963.0	gc 12 @98.902s 0%: 0.067+883+0.12 ms clock, 0.13+3.4/454/1226+0.24 ms cpu, 519->525->306 MB, 610 MB goal, 0 MB stacks, 0 MB globals, 2 P
+56820700.7	gc 13 @132.417s 0%: 0.097+1106+0.006 ms clock, 0.19+0.082/549/1530+0.013 ms cpu, 522->529->308 MB, 613 MB goal, 0 MB stacks, 0 MB globals, 2 P
+56854477.3	gc 14 @166.257s 0%: 0.12+1043+0.089 ms clock, 0.25+4.9/536/1444+0.17 ms cpu, 524->531->307 MB, 616 MB goal, 0 MB stacks, 0 MB globals, 2 P
+56895328.2	gc 15 @207.296s 0%: 0.076+854+0.005 ms clock, 0.15+5.3/434/1193+0.011 ms cpu, 572->578->306 MB, 615 MB goal, 0 MB stacks, 0 MB globals, 2 P
+56923369.1	gc 16 @235.472s 0%: 0.18+719+0.005 ms clock, 0.36+0/364/1068+0.011 ms cpu, 486->486->300 MB, 613 MB goal, 0 MB stacks, 0 MB globals, 2 P (forced)

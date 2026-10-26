@@ -1,0 +1,3 @@
+bench/mem/out/long/polls/go: probe answers 974 slow (≥ 20 ms), episodes ≥ 100 ms: 1; run 55514241..56114275
+  wrk2 send gaps ≥ 100 ms: 1
+  other          +212.5 s    126 ms; probe max 126 ms; busiest thread 201 ms; steal server 0 / client 10 ms; gap+probe

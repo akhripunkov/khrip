@@ -1,0 +1,11 @@
+round	wrk2	scenario	variant	rate	achieved_rps	behind	p50_ms	p99_ms	p999_ms	max_ms	rss_peak_mb	rss_mean_last300_mb	rss_last_mb	rss_slope_last300_mb_s	hwm_mb	live_end_mb	gc_total	gc_in_run	cpu_us_per_req	probe_max_ms	warmup_s	duration_s
+r1	orig	catalog	khrip	2800	2797	ok	1.39	5.78	28.27	50.24	2.0	2.0	2.0	0.0001	2.0	-	1	0	326.7	67.4	20	60
+r1	orig	catalog	khrip-gcoff	2800	2797	ok	1.43	43.84	207.23	320.00	2.1	2.1	2.1	0.0001	2.1	-	0	0	325.3	81.9	20	60
+r2	orig	catalog	khrip	2800	2797	ok	1.44	8.10	39.58	67.84	2.1	2.1	2.1	0.0001	2.1	-	1	0	343.3	109.0	20	60
+r2	orig	catalog	khrip-gcoff	2800	2797	ok	1.40	5.87	33.28	54.56	2.0	2.0	2.0	0.0000	2.0	-	0	0	329.5	39.2	20	60
+r3	orig	catalog	khrip	2800	2797	ok	1.44	6.88	37.76	64.42	2.0	2.0	2.0	0.0000	2.0	-	1	0	342.6	220.9	20	60
+r3	orig	catalog	khrip-gcoff	2800	2797	ok	1.42	5.03	17.57	49.57	2.1	2.1	2.1	0.0001	2.1	-	0	0	329.1	35.8	20	60
+r4	fixed	catalog	khrip	2800	2797	ok	1.41	4.64	11.65	39.94	2.0	2.0	2.0	0.0000	2.0	-	1	0	334.0	38.5	20	60
+r4	fixed	catalog	khrip-gcoff	2800	2797	ok	1.41	13.91	108.42	166.40	2.1	2.1	2.1	0.0000	2.1	-	0	0	338.8	115.7	20	60
+r5	fixed	catalog	khrip	2800	2797	ok	1.44	6.00	27.33	50.21	2.1	2.1	2.1	0.0001	2.1	-	1	0	340.8	45.9	20	60
+r5	fixed	catalog	khrip-gcoff	2800	2797	ok	1.46	5.77	22.43	62.21	2.0	2.0	2.0	0.0000	2.0	-	0	0	343.7	38.6	20	60
