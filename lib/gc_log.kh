@@ -1,0 +1,107 @@
+// Журнал сборщика store (KHRIP_GC_LOG=1, docs/design/v0.13-store-gc.md §8.6):
+// строка о каждой сборке в stderr. Файл подключается к программе со store,
+// только если её собирают с KHRIP_GC_LOG=1 в окружении, и к khc test
+// (src/main.kh); иначе — заглушки lib/gc_nolog.kh, и кода журнала в программе
+// нет (≈ 3 КБ).
+
+var __gc_log: bool
+
+fn __gc_log_init() {
+    __gc_log = (env("KHRIP_GC_LOG") ?? "") == "1"
+}
+
+// Строка о последней сборке — в stderr (сборка внутри работы и в тестах).
+fn __gc_report() {
+    if __gc_log {
+        eprint(__gc_line())
+    }
+}
+
+// Строка о сборке потока сборщика — в его арене.
+fn __gc_thread_log() {
+    if __gc_log {
+        __arena_begin()
+        eprint(__gc_line())
+        __arena_end()
+    }
+}
+
+fn __gc_why(w: int) -> str {
+    if w == GC_WHY_IDLE {
+        return "idle"
+    } else if w == GC_WHY_EMERGENCY {
+        return "in request"
+    } else if w == GC_WHY_RELEASE {
+        return "at release"
+    } else if w == GC_WHY_TEST {
+        return "test"
+    } else if w == GC_WHY_CALL {
+        return "explicit"
+    } else if w == GC_WHY_WINDOW {
+        return "window"
+    } else if w == GC_WHY_FORCED {
+        return "forced"
+    } else if w == GC_WHY_STRESS {
+        return "stress"
+    }
+    return "pace"
+}
+
+// Инкрементальная сборка: начало (мкс), разметка — сумма кусков, их число,
+// самый долгий по часам и по времени процессора, и сколько она шла, конец
+// разметки (мкс) или сколько заняла доделка целиком, помощи писателей;
+// сборка целиком — пауза и её начало и разметка. Затем уборка (у
+// инкрементальной — куски: число, самый долгий по часам и по времени
+// процессора; кто её доубрал, если не она сама) и возврат памяти.
+fn __gc_line() -> str {
+    var line = "gc {__gc_cycle_no} ({__gc_why(__gc_st_why)}"
+    if __gc_st_fin != 0 {
+        line += ", finished {__gc_why(__gc_st_fin)}"
+    }
+    line += "): heap {__gc_mbs(__gc_st_before)}->{__gc_mbs(__gc_st_after)} MB, live {__gc_mbs(__heap_marked)} MB ({__gc_marked_objs + __gc_black_objs} obj, {__gc_black_objs} black), m {__gc_m}, pins {__gc_st_recs} rec/{__gc_st_words} words, arenas {__gc_st_arenas} ({(__gc_st_abytes + 1023) / 1024} KB, {__gc_st_handoffs} handed off), "
+    if !__gc_st_inc {
+        line += "pause {__gc_ms(__gc_st_pause)} ms (start {__gc_ms(__gc_st_start)}, mark {__gc_ms(__gc_st_term)})"
+    } else {
+        line += "start {__gc_st_start} µs, mark {__gc_ms(__gc_st_mark)} ms in {__gc_st_slices} slices (max {__gc_st_slice_max} µs, cpu {__gc_st_slice_cpu} µs) over {__gc_ms(__gc_st_wall)} ms, "
+        if __gc_st_fin != 0 {
+            line += "finished in {__gc_ms(__gc_st_term)} ms"
+        } else {
+            line += "term {__gc_st_term} µs ({__gc_term_tries} tries)"
+        }
+        line += ", assists {__gc_st_assists}"
+    }
+    line += ", sweep {__gc_ms(__gc_st_sweep)} ms"
+    if __gc_st_sweeps > 0 {
+        line += " in {__gc_st_sweeps} slices (longest {__gc_st_sw_max} µs, cpu {__gc_st_sw_cpu} µs)"
+    }
+    if __gc_st_swfin != 0 {
+        line += ", finished {__gc_why(__gc_st_swfin)}"
+    } else if __gc_st_relhanded {
+        line += ", pages released by the GC thread"
+    } else if __gc_st_fin == 0 {
+        line += ", released {__gc_mbs(__gc_st_released)} MB in {__gc_ms(__gc_st_release)} ms, rss-store {__gc_mbs(__gc_st_rss)} MB"
+    }
+    if __gc_st_long > 0 {
+        line += ", long holders {__gc_st_long} ({__gc_st_long_age} cycles, {__gc_st_long_words} words)"
+    }
+    return line + ", next at {__gc_mbs(__gc_trigger)} MB"
+}
+
+// Байты в мегабайтах с одним знаком (не встраивается).
+fn __gc_mbs(b: int) -> str {
+    __noinline()
+    if b == GC_MAX {
+        return "-"
+    }
+    let t = (b * 10 + GC_MB / 2) / GC_MB
+    return "{t / 10}.{t % 10}"
+}
+
+// Микросекунды в миллисекундах с двумя знаками.
+fn __gc_ms(us: int) -> str {
+    let f = (us % 1000) / 10
+    if f < 10 {
+        return "{us / 1000}.0{f}"
+    }
+    return "{us / 1000}.{f}"
+}

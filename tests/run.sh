@@ -401,9 +401,10 @@ fi
 
 # Программа без store не несёт кода кучи store (lib/nostore.kh вместо
 # lib/gc.kh) — и с драйвером и слоем ClickHouse (ch "...", таблицы,
-# маршруты: ch_lex.kh, chdb/api.kh), а без KHRIP_GC_VERIFY при сборке
-# программа со store — кода проверок сборщика (lib/gc_noverify.kh вместо
-# lib/gc_verify.kh).
+# маршруты: ch_lex.kh, chdb/api.kh), а без KHRIP_GC_VERIFY и KHRIP_GC_LOG при
+# сборке программа со store — кода проверок и журнала сборщика
+# (lib/gc_noverify.kh вместо lib/gc_verify.kh, lib/gc_nolog.kh вместо
+# lib/gc_log.kh).
 for src in tests/run/arith.kh tests/run/net_sigpipe.kh tests/run/ch_lex.kh tests/chdb/api.kh; do
 	env -u KHRIP_GC_VERIFY -u KHRIP_GC_STRESS "$KHC" --sizes -o "$tmp/nostore" "$src" >"$tmp/nostore.txt" 2>&1
 	if grep -E ' (__salloc|__pmode_|__gc_|__span_|__ph_|__store_mut)' "$tmp/nostore.txt" >"$tmp/nostore.bad"; then
@@ -412,9 +413,9 @@ for src in tests/run/arith.kh tests/run/net_sigpipe.kh tests/run/ch_lex.kh tests
 		pass=$((pass + 1))
 	fi
 done
-env -u KHRIP_GC_VERIFY -u KHRIP_GC_STRESS "$KHC" --sizes -o "$tmp/store" tests/api/crud.kh >"$tmp/store.txt" 2>&1
-if grep -E ' (__gcv_|__gc_verify_graph|__gc_verify_heap|__ph_check|__ph_selftest)' "$tmp/store.txt" >"$tmp/store.bad"; then
-	failed "tests/api/crud.kh" "проверки сборщика без KHRIP_GC_VERIFY:"$'\n'"$(cat "$tmp/store.bad")"
+env -u KHRIP_GC_VERIFY -u KHRIP_GC_STRESS -u KHRIP_GC_LOG "$KHC" --sizes -o "$tmp/store" tests/api/crud.kh >"$tmp/store.txt" 2>&1
+if grep -E ' (__gcv_|__gc_verify_graph|__gc_verify_heap|__ph_check|__ph_selftest|__gc_line|__gc_why)' "$tmp/store.txt" >"$tmp/store.bad"; then
+	failed "tests/api/crud.kh" "проверки или журнал сборщика без KHRIP_GC_VERIFY и KHRIP_GC_LOG:"$'\n'"$(cat "$tmp/store.bad")"
 else
 	pass=$((pass + 1))
 fi

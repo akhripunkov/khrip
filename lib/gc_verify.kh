@@ -473,7 +473,9 @@ fn __gcv_map(st: int, size: int) -> int {
 // Куча: дерево кучки страниц; у каждой занятой страницы — спан, записи спанов
 // согласованы с картой страниц и таблицей классов; биты START — только в
 // началах слотов; у свободных слотов и спанов NOSCAN биты PTRB — нули; сумма
-// размеров выделенных объектов — __heap_live.
+// размеров выделенных объектов — __heap_live. Пока идёт уборка, объект спана,
+// который она ещё не прошла, жив, только если он помечен (остальные она
+// освободит); бит MARK вне разметки — только у объектов (START) таких спанов.
 fn __gc_verify_heap(st: int, when: str) {
     __gc_check_slow()
     let ph = __gc_ph
@@ -525,11 +527,19 @@ fn __gcv_span(st: int, when: str, pg: int) -> int {
             __gcv_fail(st, when, "span at page {pg}: page {pg + i} is not its own")
         }
     }
-    // все биты START спана: слова [g0, g0 + np · 8)
+    // все биты START спана: слова [g0, g0 + np · 8); пока идёт уборка, спан
+    // ещё не убран (unswept) — живы только помеченные; вне разметки бит MARK —
+    // только у объектов неубранного спана
     let g0 = (base - STORE_REGION) >> 4
+    let unswept = __gc_phase == GC_PH_SWEEP && load64(s + S_SWEEPGEN) != __gc_sweepgen
     var bits = 0
     for j in 0..np * 8 {
-        bits += __popcount(load64(GC_START + ((g0 >> 6) << 3) + (j << 3)))
+        let sw = load64(GC_START + ((g0 >> 6) << 3) + (j << 3))
+        let mw = load64(GC_MARK + ((g0 >> 6) << 3) + (j << 3))
+        bits += __popcount(sw)
+        if (mw & ~sw) != 0 || (mw != 0 && !unswept && __gc_phase != GC_PH_MARK) {
+            __gcv_fail(st, when, "span at page {pg}: a mark bit on no object, or outside marking in a swept span")
+        }
     }
     let noscan = (fl & F_NOSCAN) != 0
     if noscan && __bits_any(GC_PTRB, (base - STORE_REGION) >> 3, ((base - STORE_REGION) >> 3) + np * 1024, true) {
@@ -538,6 +548,9 @@ fn __gcv_span(st: int, when: str, pg: int) -> int {
     if (fl & F_LARGE) != 0 {
         if sc != 0 || load64(s + S_SIZE) != np << GC_PAGE_SHIFT || load64(s + S_MAGIC) != 1 << 32 || load64(s + S_FAST) != 0 || bits > 1 || (bits == 1 && !__gc_bit(GC_START, base)) {
             __gcv_fail(st, when, "large span at page {pg}: a broken record")
+        }
+        if unswept && !__gc_bit(GC_MARK, base) {
+            return 0
         }
         return bits * (np << GC_PAGE_SHIFT)
     }
@@ -551,10 +564,14 @@ fn __gcv_span(st: int, when: str, pg: int) -> int {
         __gcv_fail(st, when, "span at page {pg}: a broken record")
     }
     var objs = 0
+    var live = 0
     for i in 0..ne {
         let p = base + i * es
         if __gc_bit(GC_START, p) {
             objs += 1
+            if !unswept || __gc_bit(GC_MARK, p) {
+                live += 1
+            }
         } else if !noscan && __bits_any(GC_PTRB, (p - STORE_REGION) >> 3, ((p - STORE_REGION) >> 3) + (es >> 3), true) {
             __gcv_fail(st, when, "a free slot at " + __gc_hex(p) + " has pointer bits")
         }
@@ -562,7 +579,7 @@ fn __gcv_span(st: int, when: str, pg: int) -> int {
     if objs != bits {
         __gcv_fail(st, when, "span at page {pg}: START bits outside the starts of slots")
     }
-    return objs * es
+    return live * es
 }
 
 // Значение v с описанием d: проверить его адрес, а у объекта в store — и его
@@ -731,7 +748,7 @@ fn __gcv_ptr(st: int, when: str, p: int, what: str, exact: bool) {
     }
     let o = __gc_obj_of(p)
     if o == 0 {
-        __gcv_fail(st, when, what + " at " + __gc_hex(p) + ", outside the objects of STORE")
+        __gcv_fail(st, when, what + " at " + __gc_hex(p) + ", outside the objects of STORE (or unmarked in a span the sweep has not reached)")
     }
     if exact && p != o && p != o + 8 {
         __gcv_fail(st, when, what + " at " + __gc_hex(p) + ", inside the object at " + __gc_hex(o))
@@ -840,14 +857,15 @@ fn __gcv_place(t: int, cap: int, p: int) {
 // KHRIP_GC_STRESS без потока сборщика (khc test): шаг сборки вместо сборки
 // целиком — в точке внутри работы (жёсткий предел; self — запись контекста,
 // он держит store исключительно) и в окне (self = 0: запись уже опубликована,
-// блокировку сборщика взял вызывающий). Нет разметки — начать (в точке внутри
+// блокировку сборщика взял вызывающий). Нет сборки — начать (в точке внутри
 // работы контекст публикует себя на время начала и, отзывая запись, сам
-// передаёт свою арену); идёт — GC_STRESS_WORK единиц; кончилась — конец
-// разметки и уборка. Так разметка идёт, пока тесты меняют store: барьеры,
-// правило частичного массива и передача арен работают на всём наборе.
+// передаёт свою арену); идёт разметка — GC_STRESS_WORK единиц, а кончилась —
+// её конец; идёт уборка — GC_STRESS_WORK единиц уборки. Так разметка и уборка
+// идут, пока тесты меняют store и выделяют: барьеры, правило частичного
+// массива, передача арен и выделение во время уборки работают на всём наборе.
 fn __gc_stress_step(self: int) -> bool {
     __gc_busy = true
-    if __gc_phase != GC_PH_MARK {
+    if __gc_phase == GC_PH_IDLE {
         if self != 0 {
             __pin_publish(self)
         }
@@ -855,10 +873,19 @@ fn __gc_stress_step(self: int) -> bool {
         if self != 0 {
             __pin_withdraw(__cast(self))
         }
-    } else if __gc_mark(0, GC_STRESS_WORK, false) {
-        __gc_finish_stw(GC_WHY_STRESS)
-        if !__gc_has_thread {
-            __gc_scavenge(false, true, __gc_runs)
+    } else if __gc_phase == GC_PH_MARK {
+        if __gc_mark(0, GC_STRESS_WORK, false) {
+            let t0 = __gc_now_us()
+            __gc_terminate_try()
+            __gc_term_stats(t0)
+        }
+    } else {
+        __gc_st_sweeps += 1
+        if __gc_sweep(0, GC_STRESS_WORK) {
+            if !__gc_has_thread {
+                __gc_scavenge(false, true, __gc_runs)
+            }
+            __gc_report()
         }
     }
     __gc_busy = false

@@ -1,15 +1,17 @@
 // Сборщик мусора store (docs/design/v0.13-store-gc.md): куча store (§4:
 // классы размеров, спаны, кучка страниц, битовые карты), загрузка store (§5.3),
 // записи контекстов (§3.4, §6: что держат запросы, задачи и тесты, когда
-// отпускают store посреди работы) и сама сборка (§7, §8). Сборка пока целиком
-// инкрементальная (шаг 6a проекта): начало — под исключительной блокировкой,
+// отпускают store посреди работы) и сама сборка (§7, §8). Сборка
+// инкрементальная (шаг 6 проекта): начало — под исключительной блокировкой,
 // разметка — кусками под мьютексом писателей (читающие запросы идут дальше,
-// пишущие — между кусками, с барьером SATB), конец разметки и уборка — тоже под
-// ним. Уборка кусками — шаг 6b.
+// пишущие — между кусками, с барьером SATB), конец разметки — тоже под ним, а
+// уборка — снова кусками. Доля разметки растёт с кучей, писатели, которые
+// выделяют быстрее, чем идёт разметка, помогают ей (§8.2, §8.3).
 //
 // Программы без store вместо этого файла получают lib/nostore.kh; проверки
 // (KHRIP_GC_VERIFY) — в lib/gc_verify.kh или заглушки lib/gc_noverify.kh;
-// самопроверка кучки страниц — lib/gc_test.kh (src/main.kh).
+// журнал (KHRIP_GC_LOG при сборке программы) — lib/gc_log.kh или заглушки
+// lib/gc_nolog.kh; самопроверка кучки страниц — lib/gc_test.kh (src/main.kh).
 
 // Признак проверок сборщика __gc_verify — в lib/core.kh (его смотрит и код
 // рантайма, общий с программами без store).
@@ -23,13 +25,15 @@ var __gc_slow: bool
 // ---- Настройки (§8.6) ----
 // KHRIP_GC — запас кучи над живыми данными в процентах (100) или off: сборки
 // нет (выделение — те же классы размеров); KHRIP_GC_MIN_MB — наименьшая цель
-// (4 МБ); KHRIP_GC_LOG=1 — строка о каждой сборке в stderr; KHRIP_GC_STRESS=1
-// — сборка очень часто: цель — помеченное + 64 КБ (у большой кучи — плюс
-// четверть помеченного), а запрос или тест, который выделил столько, собирает
-// сам (с проверками, если они есть в программе).
+// (4 МБ); KHRIP_GC_LIMIT_MB — мягкий предел: цель не выше него, но не ниже
+// 1,1 · живого; KHRIP_GC_LOG=1 — строка о каждой сборке в stderr (если
+// программу собрали с ним, lib/gc_log.kh); KHRIP_GC_STRESS=1 — сборка очень
+// часто: цель — помеченное + 64 КБ (у большой кучи — плюс четверть
+// помеченного), а запрос или тест, который выделил столько, собирает сам (с
+// проверками, если они есть в программе).
 var __gc_pct: int
 var __gc_min: int
-var __gc_log: bool
+var __gc_soft: int
 var __gc_stress: bool
 // KHRIP_GC_SLICE_US — кусок разметки, мкс (200; с KHRIP_GC_STRESS — 5)
 var __gc_slice_us: int
@@ -40,7 +44,7 @@ const GC_MAX = 0x7FFFFFFFFFFFFFFF
 // Настройки сборщика из окружения.
 fn __gc_init() {
     __gc_pct = 100
-    __gc_min = 4 * GC_MB
+    __gc_m = 1
     if let v = env("KHRIP_GC") {
         if v == "off" {
             __gc_pct = -1
@@ -50,29 +54,31 @@ fn __gc_init() {
             }
         }
     }
-    if let v = env("KHRIP_GC_MIN_MB") {
-        if let n = v.to_int() {
-            if n >= 1 && n <= 1000000 {
-                __gc_min = n * GC_MB
-            }
-        }
-    }
-    __gc_log = (env("KHRIP_GC_LOG") ?? "") == "1"
+    __gc_min = __gc_env_int("KHRIP_GC_MIN_MB", 4) * GC_MB
+    __gc_soft = __gc_env_int("KHRIP_GC_LIMIT_MB", 0) * GC_MB
+    __gc_log_init()
     __gc_stress = (env("KHRIP_GC_STRESS") ?? "") == "1"
-    __gc_slice_us = 200
+    var sl = 200
     if __gc_stress {
-        __gc_slice_us = 5
+        sl = 5
     }
-    if let n = (env("KHRIP_GC_SLICE_US") ?? "").to_int() {
-        if n >= 1 && n <= 1000000 {
-            __gc_slice_us = n
-        }
-    }
+    __gc_slice_us = __gc_env_int("KHRIP_GC_SLICE_US", sl)
     __gc_goal = GC_MAX
     __gc_trigger = GC_MAX
     __gc_hard = GC_MAX
     __gc_limit = GC_MAX
     __gc_verify_init()
+}
+
+// Число из переменной окружения name (1..1000000), иначе dflt.
+fn __gc_env_int(name: str, dflt: int) -> int {
+    __noinline()
+    if let n = (env(name) ?? "").to_int() {
+        if n >= 1 && n <= 1000000 {
+            return n
+        }
+    }
+    return dflt
 }
 
 fn __gc_slow_update() {
@@ -663,7 +669,9 @@ fn __gc_kind_of(p: int) -> int {
 }
 
 // Начало выделенного объекта, внутри которого лежит p, или 0: p вне занятых
-// страниц STORE, в хвосте спана или в свободном слоте.
+// страниц STORE, в хвосте спана, в свободном слоте или (пока идёт уборка) в
+// мёртвом объекте спана, который уборка ещё не прошла: бит START у него ещё
+// есть, а пометки разметки нет — уборка его освободит.
 fn __gc_obj_of(p: int) -> int {
     let off = p - STORE_REGION
     if off < 0 || off >= (load64(__gc_ph + PH_HW) << GC_PAGE_SHIFT) {
@@ -689,6 +697,9 @@ fn __gc_obj_of(p: int) -> int {
         slot = base + i * load64(s + S_SIZE)
     }
     if !__gc_bit(GC_START, slot) {
+        return 0
+    }
+    if __gc_phase == GC_PH_SWEEP && load64(s + S_SWEEPGEN) != __gc_sweepgen && !__gc_bit(GC_MARK, slot) {
         return 0
     }
     return slot
@@ -1500,24 +1511,71 @@ fn __pin_unfinished(c: int) -> bool {
 }
 
 // Последнее отпускание под блокировкой (__store_release_final): проверки
-// сборщика (граф и куча после работы под исключительной блокировкой), хук
-// писателя — сборка, если куча дошла до жёсткого предела (§8.4; с
-// KHRIP_GC_STRESS — каждые 64 КБ): публиковать ничего не нужно, контекст со
-// store закончил (I8). Кроме запроса внутри call теста (__gc_nested): его
+// сборщика (граф и куча после работы под исключительной блокировкой), хуки
+// писателя. Куча дошла до жёсткого предела (§8.4; с KHRIP_GC_STRESS —
+// каждые 64 КБ) — сборка: публиковать ничего не нужно, контекст со store
+// закончил (I8); кроме запроса внутри call теста (__gc_nested): его
 // последнее отпускание — не конец работы теста, кадры и арена теста над ним
 // ещё держат указатели в store; собирать — точке сборки теста сразу после
-// запроса, которая публикует тест. Помощь разметке — шаг 6b. Работа
-// закончена.
+// запроса, которая публикует тест. Иначе, пока идёт разметка, а куча выше
+// цели, — помощь разметке (§8.3, __gc_assist; она ничего не освобождает, и
+// вложенному запросу тоже можно). Работа закончена.
 fn __pin_final(c: int) {
     __gc_verify_release()
     let r = load64(c + CTX_PINREC)
-    if __heap_live >= __gc_limit && load64(c + CTX_STORE_HELD) == 1 && !__gc_busy && !__store_on() && !__gc_nested(c) {
-        __gc_collect_now(r, GC_WHY_RELEASE)
+    if load64(c + CTX_STORE_HELD) == 1 && !__gc_busy && !__store_on() {
+        if __heap_live >= __gc_limit && !__gc_nested(c) {
+            __gc_collect_now(r, GC_WHY_RELEASE)
+        } else if __gc_phase == GC_PH_MARK && __heap_live > __gc_goal {
+            __gc_assist()
+        }
     }
     if r != 0 {
         let rec: __Pin = __cast(r)
         rec.touched = false
     }
+}
+
+// Помощь писателя (§8.3) при последнем отпускании, под его исключительной
+// блокировкой (мьютекс писателей — его): разметка не дольше куска
+// KHRIP_GC_SLICE_US, а если она кончилась — и её конец (он тогда короткий:
+// серого и арен не осталось). Выше 1,5 · цели — кусок целиком. Между целью и
+// 1,5 · цели — по счёту, как в Go: писатель платит за байты, которые выделил
+// чёрными с последней оплаты, по столько единиц разметки на байт, чтобы
+// оставшаяся работа (оценка — работа прошлой сборки) кончилась до 1,5 · цели;
+// кто выделяет быстрее, чем идёт разметка, платит за своё выделение сам, и
+// сборка не доходит до жёсткого предела и остановки мира. Не в окне: здесь
+// контекст держит store.
+fn __gc_assist() {
+    let g = __gc_goal
+    let top = g + g / 2
+    let debt = __gc_black_bytes - __gc_paid
+    var units = 0
+    if __heap_live <= top {
+        var rem = __gc_work_est - __gc_work
+        if rem < __gc_work_est / 8 {
+            rem = __gc_work_est / 8
+        }
+        if debt <= 0 || rem <= 0 {
+            return
+        }
+        units = debt / ((top - __heap_live) / rem + 1) + 1
+    }
+    __gc_busy = true
+    let w0 = __gc_work
+    if __gc_mark(__gc_slice_us, units, false) {
+        let t0 = __gc_now_us()
+        __gc_terminate_try()
+        __gc_term_stats(t0)
+    }
+    if units == 0 || __gc_work - w0 >= units {
+        __gc_paid += debt
+    } else {
+        __gc_paid += debt * (__gc_work - w0) / units
+    }
+    __gc_st_assists += 1
+    __gc_assists += 1
+    __gc_busy = false
 }
 
 // Запрос вложен в call теста (lib/api.kh, __call): __serve_one вернул в
@@ -1557,14 +1615,18 @@ fn __gc_register_thread(c: int) {
 // Цикл: начало под исключительной блокировкой — номер сборки, корни, слова
 // опубликованных записей (в массив записей), их арены (в список захваченных);
 // разметка кусками под мьютексом писателей (__store_lock_marker); конец
-// разметки и уборка всех спанов — тоже под ним. Читающие запросы идут всё это
-// время: граф они не меняют, а всё, что они достают из store, достижимо и
-// будет помечено. Пишущие идут между кусками: каждое затирание ссылки сначала
-// серит старое значение (SATB, I6: барьеры компилятора __barrier_at,
-// __barrier_idx и __persist_root в lib/api.kh, хуки операций контейнеров в
-// lib/core.kh), а каждый новый объект сразу помечен (чёрный, __salloc_slow).
-// Так к концу разметки помечено всё, что было достижимо в начале, и всё новое;
-// остальное уходит в уборку.
+// разметки — тоже под ним; уборка спанов по адресам — снова кусками под ним
+// (§7.7). Читающие запросы идут всё это время: граф они не меняют, а всё, что
+// они достают из store, достижимо и будет помечено. Пишущие идут между
+// кусками: каждое затирание ссылки сначала серит старое значение (SATB, I6:
+// барьеры компилятора __barrier_at, __barrier_idx и __persist_root в
+// lib/api.kh, хуки операций контейнеров в lib/core.kh), а каждый новый объект
+// сразу помечен (чёрный, __salloc_slow). Так к концу разметки помечено всё,
+// что было достижимо в начале, и всё новое; остальное уходит в уборку. Пока
+// идёт уборка, выделение берёт только убранные спаны и новые (I10: конец
+// разметки сбросил текущие спаны и списки частично занятых, новый спан
+// получает номер этой уборки), а следующая сборка начинается, только когда
+// уборка дошла до конца (__gc_start доубирает остаток сам).
 //
 // Начинает сборку поток сборщика (по порогу). Целиком («остановкой мира»)
 // собирает тот, кто держит store исключительно: запрос или задача у жёсткого
@@ -1702,6 +1764,18 @@ var __gc_black_bytes: int
 var __gc_black_objs: int
 // попыток конца разметки в этой сборке
 var __gc_term_tries: int
+// множитель запаса m ∈ {1, 2, 4, 8} (§8.2): растёт, пока почти всё живо
+var __gc_m: int
+// уборка кусками (§7.7): следующая страница и байт в объектах, которые
+// оставили уже убранные спаны (проверка: ровно живое)
+var __gc_sweep_pg: int
+var __gc_kept: int
+// работа разметки в этой сборке (единицы __gc_mark) и её оценка по прошлой
+// сборке; помощь писателей (§8.3): байт чёрного, за которые они уже
+// заплатили разметкой
+var __gc_work: int
+var __gc_work_est: int
+var __gc_paid: int
 // последняя сборка (журнал, __gc_stats): кто, куча до неё, записи и слова,
 // арены, их байты и сколько передали сами контексты, долгие держатели, времена
 // (мкс), возвращено системе, память страниц store после неё
@@ -1728,12 +1802,18 @@ var __gc_st_slices: int
 var __gc_st_slice_max: int
 var __gc_st_slice_cpu: int
 // hbuf, которые поток сборщика вернёт системе, отпустив мьютекс писателей:
-// GC_HFREE пар (адрес, байт) с __gc_fr + GC_HFREE_AT; __gc_in_thread — конец
-// разметки идёт в потоке сборщика
+// GC_HFREE пар (адрес, байт) с __gc_fr + GC_HFREE_AT
 var __gc_nhfree: int
-var __gc_in_thread: bool
 var __gc_st_term: int
 var __gc_st_fin: int
+// помощи писателей в этой сборке; куски уборки: число, самый долгий по
+// часам и по времени процессора (мкс); кто доубрал её сам (0 — никто)
+var __gc_st_assists: int
+var __gc_assists: int
+var __gc_st_sweeps: int
+var __gc_st_sw_max: int
+var __gc_st_sw_cpu: int
+var __gc_st_swfin: int
 // конец начала и время от него до конца разметки (мкс)
 var __gc_st_t1: int
 var __gc_st_wall: int
@@ -1809,11 +1889,11 @@ fn __gc_sleep_us(us: int) {
 
 // Сборка целиком под исключительной блокировкой вызывающего (мьютекс
 // писателей, читателей нет): идущая разметка сначала дорабатывается
-// (__gc_finish_stw), затем — новая сборка от начала до уборки. self — запись
-// собирающего контекста или 0 (поток сборщика): она опубликована (запрос
-// посреди работы, тест после call) или контекст со store уже закончил
-// (последнее отпускание, конец теста, I8). Затем возврат памяти
-// (__gc_release_locked) и строка журнала.
+// (__gc_finish_stw), идущая уборка — доубирается (__gc_begin_cycle), затем —
+// новая сборка от начала до уборки. self — запись собирающего контекста или 0
+// (поток сборщика): она опубликована (запрос посреди работы, тест после call)
+// или контекст со store уже закончил (последнее отпускание, конец теста, I8).
+// Затем возврат памяти (__gc_release_locked) и строка журнала.
 fn __gc_collect_now(self: int, why: int) {
     __gc_busy = true
     while __gc_phase == GC_PH_MARK {
@@ -1839,13 +1919,16 @@ fn __gc_finish_stw(by: int) {
     __gc_report()
 }
 
-// Разметка до конца, её конец и уборка под исключительной блокировкой (сборка
-// целиком и доделка идущей): времена — в журнал и паузы.
+// Разметка до конца, её конец и вся уборка под исключительной блокировкой
+// (сборка целиком и доделка идущей): времена — в журнал и паузы.
 fn __gc_complete() {
     let t0 = __gc_now_us()
     __gc_mark(0, 0, true)
     __gc_mark_done()
-    let t2 = __gc_after(t0)
+    let t1 = __gc_term_stats(t0)
+    __gc_sweep(0, 0)
+    let t2 = __gc_now_us()
+    __gc_st_sweep = t2 - t1
     __gc_st_pause = t2 - t0
     if !__gc_st_inc {
         __gc_st_pause += __gc_st_start
@@ -1856,21 +1939,22 @@ fn __gc_complete() {
     }
 }
 
-// После конца разметки (начатого в t0): уборка, темп, времена. → конец.
-fn __gc_after(t0: int) -> int {
+// Конец разметки, начатый в t0, сделан: его времена; уборка ещё впереди. →
+// время конца.
+fn __gc_term_stats(t0: int) -> int {
+    __noinline()
     let t1 = __gc_now_us()
-    __gc_sweep_all()
-    __gc_pace()
-    let t2 = __gc_now_us()
     __gc_st_term = t1 - t0
     __gc_st_wall = t1 - __gc_st_t1
-    __gc_st_sweep = t2 - t1
-    __gc_st_after = __heap_live
+    __gc_st_sweep = 0
+    __gc_st_sweeps = 0
+    __gc_st_sw_max = 0
+    __gc_st_sw_cpu = 0
+    __gc_st_swfin = 0
     __gc_st_release = 0
     __gc_st_relhanded = false
     __gc_st_released = 0
-    __gc_last_us = t2
-    return t2
+    return t1
 }
 
 // Возврат памяти после сборки, которую контекст сделал под своей
@@ -1896,9 +1980,17 @@ fn __gc_release_locked() {
     }
 }
 
-// Начало инкрементальной сборки (поток сборщика, шаги тестов и
+// Начало сборки (поток сборщика, сборки целиком, шаги тестов и
 // KHRIP_GC_STRESS) — под исключительной блокировкой, со временем начала.
+// Уборка прошлой сборки ещё идёт — сначала доубрать её (I10: иначе слово
+// записи на объект, который она ещё не освободила, воскресило бы его, а
+// пометки прошлой сборки в неубранных спанах сочлись бы за пометки этой);
+// поток сборщика доубирает свою уборку кусками сам и сюда с ней не приходит.
 fn __gc_begin_cycle(self: int, why: int) {
+    __noinline()
+    if __gc_phase == GC_PH_SWEEP {
+        __gc_sweep_finish(why)
+    }
     let t0 = __gc_now_us()
     __gc_st_why = why
     __gc_st_inc = true
@@ -1916,6 +2008,9 @@ fn __gc_begin_cycle(self: int, why: int) {
 // Разметки здесь нет: корни только серятся, слова записей копируются.
 fn __gc_start(self: int) {
     if __gc_verify {
+        if __gc_phase != GC_PH_IDLE {
+            __gc_fatal("a cycle starts before the last one has been swept (I10)")
+        }
         __gc_verify_records(self, false)
     }
     __gc_cycle_no += 1
@@ -1941,6 +2036,9 @@ fn __gc_start(self: int) {
     __gc_st_term = 0
     __gc_st_fin = 0
     __gc_st_handoffs = 0
+    __gc_st_assists = 0
+    __gc_work = 0
+    __gc_paid = 0
     if __gc_fr == 0 {
         // кадры, а с GC_HFREE_AT — список hbuf, которые вернёт поток сборщика
         __gc_fr = __gc_scratch(4096)
@@ -2346,6 +2444,7 @@ fn __gc_mark(us: int, work: int, spin: bool) -> bool {
         }
         done += w
         since += w
+        __gc_work += w
         if work > 0 && done >= work {
             return false
         }
@@ -2400,7 +2499,11 @@ fn __gc_terminate_try() -> bool {
 // разметка выключена; живое — помеченное разметкой и выделенное за время
 // разметки (чёрное); номер уборки растёт, и каждый спан становится неубранным;
 // текущих спанов и частично занятых больше нет (I10): выделение возьмёт только
-// убранные спаны.
+// убранные спаны и новые. Затем m и темп следующей сборки (§8.2): выжило
+// больше 0,85 кучи начала сборки — m вдвое (не больше 8), меньше половины —
+// m = 1. Выжившее — помеченное разметкой без чёрного: новые объекты в кучу
+// начала не входят (и в основном это ещё не убранный мусор). Уборка — с
+// первой страницы, кусками (__gc_sweep).
 fn __gc_mark_done() {
     var i = 0
     while i < __gc_ncap {
@@ -2434,16 +2537,29 @@ fn __gc_mark_done() {
         store64(__gc_partial + j * 16, 0)
         store64(__gc_partial + j * 16 + 8, 0)
     }
+    __gc_sweep_pg = 0
+    __gc_kept = 0
     __gc_poked = false
+    let b = __gc_st_before
+    if __gc_marked_bytes * 20 > b * 17 {
+        if __gc_m < 8 {
+            __gc_m *= 2
+        }
+    } else if __gc_marked_bytes * 2 < b {
+        __gc_m = 1
+    }
+    __gc_work_est = __gc_work
+    __gc_pace()
 }
 
 // hbuf, снятый с записи в конце разметки. munmap мегабайт заполненных страниц
-// — миллисекунды: поток сборщика (конец разметки у него — под мьютексом
-// писателей) откладывает его до того, как отпустит мьютекс (__gc_hbuf_free;
-// список трогает только он сам), а сборка под исключительной блокировкой —
-// та и так пауза — возвращает память сразу.
+// — миллисекунды: если есть поток сборщика, конец разметки (у самого потока, у
+// помощи писателя, у сборки целиком — всё под мьютексом писателей) оставляет
+// его в списке потоку: тот снимает список под мьютексом (__gc_hbuf_take) и
+// возвращает память, отпустив его (__gc_hbuf_free). Без потока (khc test) —
+// сразу.
 fn __gc_hbuf_drop(p: int, n: int) {
-    if __gc_in_thread && __gc_nhfree < GC_HFREE {
+    if __gc_has_thread && __gc_nhfree < GC_HFREE {
         let e = __gc_fr + GC_HFREE_AT + __gc_nhfree * 16
         store64(e, p)
         store64(e + 8, n)
@@ -2453,34 +2569,82 @@ fn __gc_hbuf_drop(p: int, n: int) {
     syscall(SYS_MUNMAP, p, n)
 }
 
-fn __gc_hbuf_free() {
-    while __gc_nhfree > 0 {
-        __gc_nhfree -= 1
-        let e = __gc_fr + GC_HFREE_AT + __gc_nhfree * 16
-        syscall(SYS_MUNMAP, load64(e), load64(e + 8))
+// Поток сборщика под мьютексом писателей: отложенные hbuf — в buf (место на
+// GC_HFREE пар), список пуст. → сколько их.
+fn __gc_hbuf_take(buf: int) -> int {
+    let n = __gc_nhfree
+    if n > 0 {
+        __memcpy(buf, __gc_fr + GC_HFREE_AT, n * 16)
+    }
+    __gc_nhfree = 0
+    return n
+}
+
+// ... и без мьютекса — системе.
+fn __gc_hbuf_free(buf: int, n: int) {
+    for i in 0..n {
+        syscall(SYS_MUNMAP, load64(buf + i * 16), load64(buf + i * 16 + 8))
     }
 }
 
-// Уборка всех спанов по адресам (§7.7): спан без объектов — страницы кучке,
-// спан со свободными слотами — в конец списка частично занятых своего класса.
-// Память разметки больше 1 МБ — системе.
-fn __gc_sweep_all() {
-    var kept = 0
-    let hw = load64(__gc_ph + PH_HW)
-    var pg = 0
-    while pg < hw {
-        if load32(GC_PAGEMAP + (pg << 2)) != pg + 1 {
-            pg += 1
-            continue
-        }
-        let s = GC_SPANS + (pg << 6)
-        let np = load64(s + S_INFO) & 0xFFFFFFFF
-        if load64(s + S_SWEEPGEN) != __gc_sweepgen {
-            kept += __gc_sweep_span(s)
-        }
-        pg += np
+// Уборка (§7.7) по адресам с __gc_sweep_pg: спан без объектов — страницы
+// кучке, спан со свободными слотами — в конец списка частично занятых своего
+// класса; спан, созданный после конца разметки, уже с номером этой уборки, —
+// пропускается. Не дольше us мкс (часы — через каждые GC_CLOCK_WORK единиц:
+// единица — слово битов START спана; кусок кончается до промежутка, который
+// вышел бы за us), если us > 0, и не больше work единиц, если work > 0;
+// между кусками выделение и освобождение спанов меняют кучку страниц, поэтому
+// граница занятых читается каждый раз, а страница без начала спана
+// пропускается по одной. → true, если уборка закончена (__gc_sweep_end).
+fn __gc_sweep(us: int, work: int) -> bool {
+    var t0 = 0
+    if us > 0 {
+        t0 = __gc_now_us()
     }
+    var tl = t0
+    var done = 0
+    var since = 0
+    while true {
+        let pg = __gc_sweep_pg
+        if pg >= load64(__gc_ph + PH_HW) {
+            break
+        }
+        var w = 1
+        var np = 1
+        if load32(GC_PAGEMAP + (pg << 2)) == pg + 1 {
+            let s = GC_SPANS + (pg << 6)
+            np = load64(s + S_INFO) & 0xFFFFFFFF
+            if load64(s + S_SWEEPGEN) != __gc_sweepgen {
+                __gc_kept += __gc_sweep_span(s)
+                w = np << 3
+            }
+        }
+        __gc_sweep_pg = pg + np
+        done += w
+        since += w
+        if work > 0 && done >= work {
+            return false
+        }
+        if us > 0 && since >= GC_CLOCK_WORK {
+            since = 0
+            let now = __gc_now_us()
+            if now - t0 + (now - tl) >= us {
+                return false
+            }
+            tl = now
+        }
+    }
+    __gc_sweep_end()
+    return true
+}
+
+// Уборка дошла до конца: сборка закончена (I10 — следующая может начаться).
+// Память разметки больше 1 МБ — системе; с KHRIP_GC_VERIFY — уборка оставила
+// ровно живое, куча согласована.
+fn __gc_sweep_end() {
     __gc_phase = GC_PH_IDLE
+    __gc_st_after = __heap_live
+    __gc_last_us = __gc_now_us()
     if __gc_gcap * 16 > GC_MB {
         syscall(SYS_MUNMAP, __gc_grey, __gc_gcap * 16)
         __gc_grey = 0
@@ -2492,8 +2656,19 @@ fn __gc_sweep_all() {
         __gc_pincap = 0
     }
     if __gc_verify {
-        __gc_verify_swept(kept)
+        __gc_verify_swept(__gc_kept)
     }
+}
+
+// Новая сборка, а уборка прошлой ещё идёт (__gc_begin_cycle): остаток — сразу,
+// под исключительной блокировкой начинающего; строка журнала прошлой сборки —
+// с тем, кто её доубрал (by).
+fn __gc_sweep_finish(by: int) {
+    let t0 = __gc_now_us()
+    __gc_sweep(0, 0)
+    __gc_st_sweep += __gc_now_us() - t0
+    __gc_st_swfin = by
+    __gc_report()
 }
 
 // Уборка спана s → байт в оставшихся объектах. Освобождённый слот (START без
@@ -2968,8 +3143,30 @@ fn __gc_step(n: int) -> bool {
     return fin
 }
 
-// Доделать разметку, конец разметки и уборка.
+// Доделать разметку, конец разметки и уборку (или только уборку).
 fn __gc_finish() {
+    let held = load64(__ctx() + CTX_STORE_HELD)
+    if __gc_phase == GC_PH_IDLE || held == 2 || __gc_busy {
+        return
+    }
+    if held == 0 {
+        __store_lock_gc()
+    }
+    __gc_busy = true
+    if __gc_phase == GC_PH_MARK {
+        __gc_finish_stw(GC_WHY_CALL)
+    } else {
+        __gc_sweep_finish(GC_WHY_CALL)
+    }
+    __gc_busy = false
+    if held == 0 {
+        __store_unlock_gc()
+    }
+}
+
+// Доделать разметку и её конец; уборка остаётся (её делают __gc_sweep_step,
+// __gc_finish или начало следующей сборки).
+fn __gc_finish_mark() {
     let held = load64(__ctx() + CTX_STORE_HELD)
     if __gc_phase != GC_PH_MARK || held == 2 || __gc_busy {
         return
@@ -2977,12 +3174,41 @@ fn __gc_finish() {
     if held == 0 {
         __store_lock_gc()
     }
-    __gc_busy = true
-    __gc_finish_stw(GC_WHY_CALL)
-    __gc_busy = false
+    __gc_mark(0, 0, true)
+    __gc_mark_done()
+    __gc_term_stats(__gc_now_us())
     if held == 0 {
         __store_unlock_gc()
     }
+}
+
+// n единиц уборки (единица — слово битов START спана: 8 на страницу). → true,
+// если уборка кончилась (или её нет).
+fn __gc_sweep_step(n: int) -> bool {
+    let held = load64(__ctx() + CTX_STORE_HELD)
+    if __gc_phase != GC_PH_SWEEP || held == 2 {
+        return __gc_phase != GC_PH_SWEEP
+    }
+    if held == 0 {
+        __store_lock_gc()
+    }
+    let fin = __gc_sweep(0, n)
+    if held == 0 {
+        __store_unlock_gc()
+    }
+    return fin
+}
+
+// Идёт уборка, и спан, где лежит p, она ещё не прошла.
+fn __gc_unswept(p: int) -> bool {
+    let o = __gc_obj_of(p)
+    return __gc_phase == GC_PH_SWEEP && o != 0 && load64(__gc_span_of(o) + S_SWEEPGEN) != __gc_sweepgen
+}
+
+// Мягкий предел, как KHRIP_GC_LIMIT_MB (0 — нет), и темп по нему.
+fn __gc_set_limit_mb(n: int) {
+    __gc_soft = n * GC_MB
+    __gc_pace()
 }
 
 // Контекст передал арену сам в идущей (или только что законченной) сборке:
@@ -3025,11 +3251,12 @@ fn __gc_is_allocated(p: int) -> bool {
     return __gc_obj_of(p) != 0
 }
 
-// ---- Темп и пределы (§8.2, §8.4; m = 1 до шага 6b) ----
+// ---- Темп и пределы (§8.2, §8.4) ----
 
-// По помеченному после сборки: цель — помеченное · (1 + KHRIP_GC/100), не
-// меньше KHRIP_GC_MIN_MB; порог — 70% запаса; жёсткий предел — вдвое выше цели,
-// но не меньше цели + 64 МБ. KHRIP_GC=off — сборки нет. KHRIP_GC_STRESS — цель
+// По помеченному после сборки: цель — помеченное · (1 + m · KHRIP_GC/100), не
+// меньше KHRIP_GC_MIN_MB; с KHRIP_GC_LIMIT_MB — не выше него, но не ниже
+// 1,1 · помеченного; порог — 70% запаса; жёсткий предел — вдвое выше цели, но
+// не меньше цели + 64 МБ. KHRIP_GC=off — сборки нет. KHRIP_GC_STRESS — цель
 // — помеченное + шаг (64 КБ, а у кучи больше 256 КБ — четверть помеченного);
 // с потоком сборщика следующая сборка начинается, как только выделено 8 КБ
 // после уборки (под нагрузкой разметка идёт почти всё время, и почти каждый
@@ -3049,9 +3276,18 @@ fn __gc_pace() {
         __gc_limit = GC_MAX
         return
     }
-    var goal = m + (m / 100) * __gc_pct + (m % 100) * __gc_pct / 100
+    let p = __gc_pct * __gc_m
+    var goal = m + (m / 100) * p + (m % 100) * p / 100
     if goal < __gc_min {
         goal = __gc_min
+    }
+    if __gc_soft > 0 {
+        if goal > __gc_soft {
+            goal = __gc_soft
+        }
+        if goal < m + m / 10 {
+            goal = m + m / 10
+        }
     }
     // KHRIP_GC_STRESS: шаг — 64 КБ, а у большой кучи — четверть помеченного,
     // иначе работа сборок росла бы как квадрат кучи
@@ -3100,10 +3336,10 @@ fn __gc_poke() {
 // контекст публикует себя (I7: всё, что живо через вызов, — в rbx, rbp, r12–r15
 // или в памяти), собирает и отзывает запись. С KHRIP_GC_STRESS без потока
 // сборщика (khc test) — шаг сборки (__gc_stress_step): начало у порога, а
-// пока идёт разметка — в каждой точке.
+// пока идёт разметка или уборка — в каждой точке.
 fn __gc_hard_check() {
     if __heap_live < __gc_limit {
-        if !__gc_stress || __gc_has_thread || __gc_phase != GC_PH_MARK {
+        if !__gc_stress || __gc_has_thread || __gc_phase == GC_PH_IDLE {
             return
         }
     }
@@ -3223,10 +3459,14 @@ type __GcStats {
     marking: bool
     // выделено чёрным в последней (или идущей) сборке: байт
     black: int
+    // идёт уборка; множитель запаса m; помощей писателей за всё время
+    sweeping: bool
+    m: int
+    assists: int
 }
 
 fn __gc_stats() -> __GcStats {
-    return __GcStats { cycles: __gc_cycle_no, heap: __heap_live, live: __heap_marked, objects: __gc_marked_objs + __gc_black_objs, goal: __gc_goal, trigger: __gc_trigger, pages: load64(__gc_ph + PH_HW), released: __gc_total_released, max_pause_us: __gc_max_pause, marking: __gc_marking != 0, black: __gc_black_bytes }
+    return __GcStats { cycles: __gc_cycle_no, heap: __heap_live, live: __heap_marked, objects: __gc_marked_objs + __gc_black_objs, goal: __gc_goal, trigger: __gc_trigger, pages: load64(__gc_ph + PH_HW), released: __gc_total_released, max_pause_us: __gc_max_pause, marking: __gc_marking != 0, black: __gc_black_bytes, sweeping: __gc_phase == GC_PH_SWEEP, m: __gc_m, assists: __gc_assists }
 }
 
 // ---- Возврат памяти системе (§4.8) ----
@@ -3434,8 +3674,8 @@ fn __gc_thread_main() {
 }
 
 // Сборка потока сборщика: начало (если сборки нет и, по порогу, куча дошла до
-// него), разметка кусками, возврат памяти (и тот, что оставила сборка под
-// чужой блокировкой), строка журнала.
+// него), разметка и уборка кусками, возврат памяти (и тот, что оставила
+// сборка под чужой блокировкой), строка журнала.
 fn __gc_thread_cycle(why: int, runs: int) {
     __store_lock_gc()
     store64(__gc_ctl, 0)
@@ -3449,158 +3689,116 @@ fn __gc_thread_cycle(why: int, runs: int) {
     if !ran {
         __gc_poked = false
     }
+    let nh = __gc_hbuf_take(runs)
     __store_unlock_gc()
+    __gc_hbuf_free(runs, nh)
     var done = false
     if ran {
-        done = __gc_thread_mark()
+        done = __gc_thread_work(runs)
     }
     if ran || scav {
         __gc_scavenge(why == GC_WHY_IDLE, false, runs)
     }
-    if done && __gc_log {
-        __arena_begin()
-        eprint(__gc_line())
-        __arena_end()
+    if done {
+        __gc_thread_log()
     }
 }
 
-// Разметка кусками (§7.4, §8.1): кусок — не дольше KHRIP_GC_SLICE_US под
-// мьютексом писателей, между кусками — пауза в три куска (разметке — четверть
-// времени; подстройка под давление кучи — шаг 6b), чтобы писатели шли: мьютекс
-// не честный, и сразу взятый снова он им бы не достался. Кусок, который
-// закончил разметку, — тут же и конец разметки (§7.6) с уборкой. → true, если
-// сборку закончил поток; false — её доделал кто-то другой (сборка внутри
-// работы, __gc_collect).
-fn __gc_thread_mark() -> bool {
+// Пауза между кусками (§8.1, §8.2) — по куче: ниже цели разметке четверть
+// времени (пауза — три куска), выше цели — половина (кусок), выше 1,25 · цели
+// — всё (без паузы); уборка, пока куча не ниже порога следующей сборки, — тоже
+// без паузы (сборка ждёт её конца, I10). Мьютекс писателей не честный: сразу
+// взятый снова, он писателям не достался бы, поэтому без паузы поток отдаёт
+// его на время, только если писатель ждёт (waiting).
+fn __gc_gap(waiting: bool) -> int {
+    let g = __gc_goal
+    var live = __heap_live
+    if __gc_phase == GC_PH_SWEEP && live >= __gc_trigger {
+        live = GC_MAX
+    }
+    if live < g {
+        return __gc_slice_us * 3
+    }
+    if live - g < g / 4 {
+        return __gc_slice_us
+    }
+    if waiting {
+        return 20
+    }
+    return 0
+}
+
+// Разметка и уборка кусками (§7.4, §7.7, §8.1): кусок — не дольше
+// KHRIP_GC_SLICE_US под мьютексом писателей, между кусками — пауза по куче
+// (__gc_gap), чтобы писатели шли. Кусок, который закончил разметку, — тут же и
+// конец разметки (§7.6); если он не уложился в GC_TERM_US, это был ещё кусок.
+// Конец разметки может сделать и помощь писателя (§8.3) — тогда поток просто
+// убирает дальше. → true, если сборку закончил поток; false — её доделал
+// кто-то другой целиком (сборка внутри работы, __gc_collect). runs — место для
+// отложенных hbuf.
+fn __gc_thread_work(runs: int) -> bool {
     let k = __gc_cycle_no
+    var waiting = false
     while true {
-        __gc_sleep_us(__gc_slice_us * 3)
+        let gap = __gc_gap(waiting)
+        if gap > 0 {
+            __gc_sleep_us(gap)
+        }
         __store_lock_marker()
-        if __gc_phase != GC_PH_MARK || __gc_cycle_no != k {
+        if __gc_phase == GC_PH_IDLE || __gc_cycle_no != k {
             __store_unlock_marker()
             return false
         }
         __gc_busy = true
         let t0 = __gc_now_us()
         let c0 = __gc_clock_us(3)
-        let fin = __gc_mark(__gc_slice_us, 0, false)
-        var t1 = __gc_now_us()
-        var c1 = __gc_clock_us(3)
         var done = false
-        if fin {
-            __gc_in_thread = true
-            let term = __gc_terminate_try()
-            __gc_in_thread = false
-            if term {
-                __gc_after(t1)
-                done = true
-            } else {
-                // конец разметки не уложился в GC_TERM_US: это был ещё кусок
-                t1 = __gc_now_us()
-                c1 = __gc_clock_us(3)
+        if __gc_phase == GC_PH_MARK {
+            let fin = __gc_mark(__gc_slice_us, 0, false)
+            var t1 = __gc_now_us()
+            var c1 = __gc_clock_us(3)
+            if fin {
+                if __gc_terminate_try() {
+                    __gc_term_stats(t1)
+                } else {
+                    // конец разметки не уложился в GC_TERM_US: это был ещё кусок
+                    t1 = __gc_now_us()
+                    c1 = __gc_clock_us(3)
+                }
+            }
+            __gc_st_slices += 1
+            __gc_st_mark += t1 - t0
+            if t1 - t0 > __gc_st_slice_max {
+                __gc_st_slice_max = t1 - t0
+            }
+            // время процессора куска: часы отделяют работу от вытеснения потока
+            if c1 - c0 > __gc_st_slice_cpu {
+                __gc_st_slice_cpu = c1 - c0
+            }
+        } else {
+            done = __gc_sweep(__gc_slice_us, 0)
+            let dt = __gc_now_us() - t0
+            let dc = __gc_clock_us(3) - c0
+            __gc_st_sweeps += 1
+            __gc_st_sweep += dt
+            if dt > __gc_st_sw_max {
+                __gc_st_sw_max = dt
+            }
+            if dc > __gc_st_sw_cpu {
+                __gc_st_sw_cpu = dc
             }
         }
-        let dt = t1 - t0
-        __gc_st_slices += 1
-        __gc_st_mark += dt
-        if dt > __gc_st_slice_max {
-            __gc_st_slice_max = dt
-        }
-        // время процессора куска: часы отделяют работу от вытеснения потока
-        if c1 - c0 > __gc_st_slice_cpu {
-            __gc_st_slice_cpu = c1 - c0
-        }
         __gc_busy = false
+        let nh = __gc_hbuf_take(runs)
+        // писатель ждёт мьютекс (слово 2, lib/rt.kh)
+        waiting = load64(__store_rw) == 2
         __store_unlock_marker()
-        if __gc_nhfree > 0 {
-            __gc_hbuf_free()
-        }
+        __gc_hbuf_free(runs, nh)
         if done {
             return true
         }
     }
     return false
-}
-
-// ---- Журнал (KHRIP_GC_LOG=1, §8.6) ----
-
-// Строка о последней сборке — в stderr (сборка внутри работы и в тестах).
-fn __gc_report() {
-    if __gc_log {
-        eprint(__gc_line())
-    }
-}
-
-fn __gc_why(w: int) -> str {
-    if w == GC_WHY_IDLE {
-        return "idle"
-    } else if w == GC_WHY_EMERGENCY {
-        return "in request"
-    } else if w == GC_WHY_RELEASE {
-        return "at release"
-    } else if w == GC_WHY_TEST {
-        return "test"
-    } else if w == GC_WHY_CALL {
-        return "explicit"
-    } else if w == GC_WHY_WINDOW {
-        return "window"
-    } else if w == GC_WHY_FORCED {
-        return "forced"
-    } else if w == GC_WHY_STRESS {
-        return "stress"
-    }
-    return "pace"
-}
-
-// Инкрементальная сборка: начало (мкс), разметка — сумма кусков, их число и
-// самый долгий, и сколько она шла, конец разметки (мкс) или сколько заняла
-// доделка целиком; сборка целиком — пауза и её начало и разметка. Затем уборка
-// и возврат памяти.
-fn __gc_line() -> str {
-    var line = "gc {__gc_cycle_no} ({__gc_why(__gc_st_why)}"
-    if __gc_st_fin != 0 {
-        line += ", finished {__gc_why(__gc_st_fin)}"
-    }
-    line += "): heap {__gc_mbs(__gc_st_before)}->{__gc_mbs(__gc_st_after)} MB, live {__gc_mbs(__heap_marked)} MB ({__gc_marked_objs + __gc_black_objs} obj, {__gc_black_objs} black), m 1, pins {__gc_st_recs} rec/{__gc_st_words} words, arenas {__gc_st_arenas} ({(__gc_st_abytes + 1023) / 1024} KB, {__gc_st_handoffs} handed off), "
-    if !__gc_st_inc {
-        line += "pause {__gc_ms(__gc_st_pause)} ms (start {__gc_ms(__gc_st_start)}, mark {__gc_ms(__gc_st_term)})"
-    } else {
-        line += "start {__gc_st_start} µs, mark {__gc_ms(__gc_st_mark)} ms in {__gc_st_slices} slices (max {__gc_st_slice_max} µs, cpu {__gc_st_slice_cpu} µs) over {__gc_ms(__gc_st_wall)} ms, "
-        if __gc_st_fin != 0 {
-            line += "finished in {__gc_ms(__gc_st_term)} ms"
-        } else {
-            line += "term {__gc_st_term} µs ({__gc_term_tries} tries)"
-        }
-    }
-    line += ", sweep {__gc_ms(__gc_st_sweep)} ms"
-    if __gc_st_relhanded {
-        line += ", pages released by the GC thread"
-    } else if __gc_st_fin == 0 {
-        line += ", released {__gc_mbs(__gc_st_released)} MB in {__gc_ms(__gc_st_release)} ms, rss-store {__gc_mbs(__gc_st_rss)} MB"
-    }
-    if __gc_st_long > 0 {
-        line += ", long holders {__gc_st_long} ({__gc_st_long_age} cycles, {__gc_st_long_words} words)"
-    }
-    return line + ", next at {__gc_mbs(__gc_trigger)} MB"
-}
-
-// Байты в мегабайтах с одним знаком (журнал: не встраивается).
-fn __gc_mbs(b: int) -> str {
-    __noinline()
-    if b == GC_MAX {
-        return "-"
-    }
-    let t = (b * 10 + GC_MB / 2) / GC_MB
-    return "{t / 10}.{t % 10}"
-}
-
-// Микросекунды в миллисекундах с двумя знаками.
-fn __gc_ms(us: int) -> str {
-    let f = (us % 1000) / 10
-    if f < 10 {
-        return "{us / 1000}.0{f}"
-    }
-    return "{us / 1000}.{f}"
 }
 
 // ---- Загрузка ----

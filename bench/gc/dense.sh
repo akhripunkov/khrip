@@ -20,7 +20,7 @@ SLICE_CPU_MAX=${SLICE_CPU_MAX:-300}
 tmp=$(mktemp -d)
 pid=
 trap '[[ -n $pid ]] && kill $pid 2>/dev/null; wait 2>/dev/null; rm -rf "$tmp"' EXIT
-"$kroot/build/khc" -o "$tmp/dense" "$here/dense.kh" || exit 1
+KHRIP_GC_LOG=1 "$kroot/build/khc" -o "$tmp/dense" "$here/dense.kh" || exit 1
 
 start() {
 	PORT=$port THREADS=4 KHRIP_GC_LOG=1 "$tmp/dense" 2>"$1" &

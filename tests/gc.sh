@@ -58,14 +58,17 @@ gc_matrix() {
 	gc_stop
 	cycles=$(grep -c '^gc [0-9]* (' "$tmp/gc.log")
 	verify=$(grep 'gc verify' "$tmp/gc.log" | grep -cv 'gc verify (boot): ')
-	local stress=0 handed emerg
+	local stress=0 handed emerg assists sweeps
 	[[ $name == *STRESS* ]] && stress=1
 	handed=$(grep -o '[0-9]* handed off' "$tmp/gc.log" | awk '{ s += $1 } END { print s + 0 }')
 	emerg=$(grep -c '^gc [0-9]* ([a-z]*, finished in request)' "$tmp/gc.log")
-	if python3 - "$out" "$alive" "$cycles" "$verify" "${rss:-0}" "$stress" "$handed" "$emerg" >"$tmp/gc.check" 2>&1 <<'PY'; then
+	# помощи писателей и куски уборки (шаг 6b) — по строкам журнала
+	assists=$(grep -o 'assists [0-9]*' "$tmp/gc.log" | awk '{ s += $2 } END { print s + 0 }')
+	sweeps=$(grep -o 'in [0-9]* slices (longest' "$tmp/gc.log" | awk '{ s += $2 } END { print s + 0 }')
+	if python3 - "$out" "$alive" "$cycles" "$verify" "${rss:-0}" "$stress" "$handed" "$emerg" "$assists" "$sweeps" >"$tmp/gc.check" 2>&1 <<'PY'; then
 import json, sys
 out, alive, cycles, verify, rss = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
-stress, handed, emerg = int(sys.argv[6]), int(sys.argv[7]), int(sys.argv[8])
+stress, handed, emerg, assists, sweeps = int(sys.argv[6]), int(sys.argv[7]), int(sys.argv[8]), int(sys.argv[9]), int(sys.argv[10])
 r = json.loads(out)
 errs = []
 if not alive:
@@ -96,6 +99,10 @@ if stress:
         errs.append("no arena was handed off by its holder")
     if emerg == 0:
         errs.append("no collection at the hard limit finished the GC thread's marking")
+    if assists == 0:
+        errs.append("no writer assisted marking")
+    if sweeps == 0:
+        errs.append("no sweep slices")
 if not r["resurrected"].startswith("ok"):
     errs.append(f"resurrected: {r['resurrected']}")
 if r["poll"] != "ok":
@@ -104,7 +111,7 @@ if r["poll"] != "ok":
 # стеки и арены сопрограмм
 if rss > 48 * 1024:
     errs.append(f"RSS {rss} KB")
-print(f"{cycles} collections, RSS {rss} KB, " + ", ".join(f"{k} {v[0]}" for k, v in sorted(r["routes"].items())) + f"; mid-marking: " + ", ".join(f"{k} {v}" for k, v in sorted(met.items())) + f", every {every_met}; arenas handed off {handed}, finished in request {emerg}")
+print(f"{cycles} collections, RSS {rss} KB, " + ", ".join(f"{k} {v[0]}" for k, v in sorted(r["routes"].items())) + f"; mid-marking: " + ", ".join(f"{k} {v}" for k, v in sorted(met.items())) + f", every {every_met}; arenas handed off {handed}, finished in request {emerg}, writer assists {assists}, sweep slices {sweeps}")
 if errs:
     print("; ".join(errs))
     sys.exit(1)
@@ -116,7 +123,7 @@ PY
 	fi
 }
 
-if "$KHC" -o "$tmp/gcsrv" tests/gc/server.kh 2>"$tmp/gcsrv.err" && KHRIP_GC_STRESS=1 "$KHC" -o "$tmp/gcsrv_s" tests/gc/server.kh 2>>"$tmp/gcsrv.err"; then
+if KHRIP_GC_LOG=1 "$KHC" -o "$tmp/gcsrv" tests/gc/server.kh 2>"$tmp/gcsrv.err" && KHRIP_GC_LOG=1 KHRIP_GC_STRESS=1 "$KHC" -o "$tmp/gcsrv_s" tests/gc/server.kh 2>>"$tmp/gcsrv.err"; then
 	gc_matrix plain "$tmp/gcsrv" 8
 	gc_matrix "KHRIP_GC_STRESS=1" "$tmp/gcsrv_s" 8 KHRIP_GC_STRESS=1
 
@@ -234,7 +241,7 @@ if "$KHC" -o "$tmp/gcsrv" tests/gc/server.kh 2>"$tmp/gcsrv.err" && KHRIP_GC_STRE
 	# другой — оба вида окна продолжают посреди разметки
 	if [[ -z ${MONGODB_URI:-} || -z ${CLICKHOUSE_URL:-} ]]; then
 		echo "SKIP gc driver windows: set MONGODB_URI and CLICKHOUSE_URL"
-	elif KHRIP_GC_STRESS=1 "$KHC" -o "$tmp/gcdb" tests/gc/dbwin.kh 2>"$tmp/gcdb.err"; then
+	elif KHRIP_GC_LOG=1 KHRIP_GC_STRESS=1 "$KHC" -o "$tmp/gcdb" tests/gc/dbwin.kh 2>"$tmp/gcdb.err"; then
 		gc_start "$tmp/gcdb" KHRIP_GC=20 KHRIP_GC_MIN_MB=1 KHRIP_GC_STRESS=1
 		curl -s -o /dev/null -X POST "$gc_url/seed"
 		gc_probes=""

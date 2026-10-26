@@ -39,7 +39,7 @@ up() {
 }
 
 # --- patch: soak ---
-"$kroot/build/khc" -o "$tmp/catalog" "$root/eval/solutions/catalog/khrip/main.kh" || exit 1
+KHRIP_GC_LOG=1 "$kroot/build/khc" -o "$tmp/catalog" "$root/eval/solutions/catalog/khrip/main.kh" || exit 1
 KHRIP_GC_LOG=1 PORT=$port taskset -c "$SERVER_CPUS" "$tmp/catalog" 2>"$OUT/soak.log" &
 pid=$!
 up products/1
@@ -87,7 +87,7 @@ PY
 # --- удаление 90%: подряд и вразнобой (DELETE=0 — без него, например для
 # khc без сборщика) ---
 [[ ${DELETE:-1} == 1 ]] || exit 0
-"$kroot/build/khc" -o "$tmp/delete" "$here/delete.kh" || exit 1
+KHRIP_GC_LOG=1 "$kroot/build/khc" -o "$tmp/delete" "$here/delete.kh" || exit 1
 : >"$OUT/delete.txt"
 for how in oldest random; do
 	KHRIP_GC_LOG=1 PORT=$port taskset -c "$SERVER_CPUS" "$tmp/delete" 2>"$OUT/delete-$how.log" &
