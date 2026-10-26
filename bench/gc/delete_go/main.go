@@ -1,8 +1,9 @@
 // Перенос bench/gc/delete.kh на Go (этап памяти, часть 1): 200 тысяч товаров,
 // затем удаляются 90% — старые подряд (oldest) или вразнобой (random), затем
 // простой. Сборщик Go тоже не перемещает объекты: сравнение показывает, общий
-// ли это предел. GET /stats — «товаров живое куча сборок» (байт, после
-// принудительной сборки — как живое по последней сборке у Khrip).
+// ли это предел. GET /stats — «товаров живое куча сборок» (байт: HeapAlloc и
+// HeapInuse после принудительной сборки — как живое по последней сборке у
+// Khrip); POST /free — debug.FreeOSMemory.
 package main
 
 import (
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"sync"
 )
@@ -66,6 +68,11 @@ func main() {
 		l := len(products)
 		mu.Unlock()
 		fmt.Fprintf(w, "%d %d %d %d", l, m.HeapAlloc, m.HeapInuse, m.NumGC)
+	})
+	// всё свободное — системе сразу (нижняя граница RSS после сборки)
+	http.HandleFunc("POST /free", func(w http.ResponseWriter, r *http.Request) {
+		debug.FreeOSMemory()
+		fmt.Fprint(w, "ok")
 	})
 	port := os.Getenv("PORT")
 	if port == "" {
