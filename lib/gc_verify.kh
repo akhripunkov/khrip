@@ -680,19 +680,22 @@ fn __gcv_visit(st: int, when: str, v: int, d: int) {
                 }
             }
         }
-        // рост по частям (lib/core.kh): новые массивы и таблица в G, записи
-        // [0, w) уже перенесены; пока новая память не готова, записей нет, а
-        // её свободное место без PTRB
+        // рост по частям (lib/core.kh): новые массивы (на c2 записей, слово 88)
+        // и таблица в G (0 — остаётся старая), записи [0, w) уже перенесены;
+        // пока новая память не готова, записей нет, а её свободное место без
+        // PTRB
         __gcv_slot(st, when, v + 56)
         let g = load64(v + 56)
         if g != 0 {
             __gcv_ptr(st, when, g, "map growth", true)
             for j in 0..4 {
-                __gcv_ptr(st, when, load64(g + j * 8), "map growth arrays", true)
+                if j < 3 || load64(g + j * 8) != 0 {
+                    __gcv_ptr(st, when, load64(g + j * 8), "map growth arrays", true)
+                }
                 __gcv_slot(st, when, g + j * 8)
             }
             let w = load64(g + 48)
-            let cap = (load64(g + 32) + 1) / 2
+            let cap = load64(g + 88)
             let ready = load64(g + 64) == 0
             if w > 0 && !ready {
                 __gcv_fail(st, when, "a growing map at " + __gc_hex(v) + " moved entries before its new arrays were ready")

@@ -8,5 +8,8 @@ ok    growth that started before marking ends during it
 ok    growth that starts and ends during marking
 ok    growth of a string-keyed map during marking
 ok    clear during growth during marking
+ok    a copied store map grows twofold and keeps a large enough table
+ok    a copied store map whose table is too small gets a new one, arrays twofold
+ok    small growths do not hold the trigger, and a hold stops at the goal
 ok    no growth had to finish at once
-11 tests: 11 passed, 0 failed
+14 tests: 14 passed, 0 failed

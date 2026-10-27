@@ -78,8 +78,7 @@ fn __gc_lazy_alloc(n: int, h: int) -> int {
 fn __gc_ptrb_on(p: int, n: int) {
 }
 
-fn __gc_grow_hold(n: int) -> int {
-    return -1
+fn __gc_grow_hold(n: int, g: int) {
 }
 
 fn __gc_grow_done(n: int, at: int) {

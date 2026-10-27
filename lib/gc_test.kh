@@ -152,13 +152,15 @@ fn __map_grow_dirty(m: int) -> bool {
 // Новые массивы и таблица роста — сплошь нули (до первого переноса).
 fn __map_grow_fresh(m: int) -> bool {
     let g = load64(m + 56)
-    let z = load64(g + 32) + 1
     for i in 0..4 {
-        var n = z * 4
+        var n = load64(g + 88) * 8
         if i == 3 {
-            n = z * 8
+            n = (load64(g + 32) + 1) * 8
         }
         let p = load64(g + i * 8)
+        if p == 0 {
+            continue
+        }
         var j = 0
         while j < n {
             if load64(p + j) != 0 {
@@ -168,6 +170,32 @@ fn __map_grow_fresh(m: int) -> bool {
         }
     }
     return true
+}
+
+// Остаётся ли у роста старая таблица (−1 — роста нет).
+fn __map_grow_keeps_table(m: int) -> int {
+    let g = load64(m + 56)
+    if g == 0 {
+        return -1
+    }
+    if load64(g + 24) == 0 {
+        return 1
+    }
+    return 0
+}
+
+// На сколько байт рост словаря m поднял порог сборки (−1 — роста нет).
+fn __map_grow_held(m: int) -> int {
+    let g = load64(m + 56)
+    if g == 0 {
+        return -1
+    }
+    return load64(g + 96)
+}
+
+// Слотов в таблице словаря m.
+fn __map_slots(m: int) -> int {
+    return load64(m + 40) + 1
 }
 
 // Ростов, которые пришлось закончить сразу (старые массивы заполнились).

@@ -321,13 +321,15 @@ done
 # библиотеки без серения старых массивов ключей, значений и признаков, старой
 # таблицы и G при переключении, без серения G в clear, без битов PTRB и без
 # обнуления новой памяти, без повторения замены и удаления перенесённой записи
-# в новых массивах, без подъёма порога сборки на время роста и без его
-# возврата tests/api/gc_mapgrow.kh с KHRIP_GC_VERIFY=1 падает (серения
+# в новых массивах (и по тому же номеру, если таблица остаётся старой), без
+# подъёма порога сборки на время роста, без его возврата, без предела подъёма
+# целью и без порога в восьмую часть кучи tests/api/gc_mapgrow.kh с
+# KHRIP_GC_VERIFY=1 падает (серения
 # старой таблицы, признаков и G находит только проверка конца разметки: эти
 # объекты уже мусор, но были достижимы в начале сборки; без серения значений
 # тест падает и без проверок — запись держат только чёрные новые массивы).
 grow_ok=1
-for cut in keys vals alive slots gend gclear ptrb zero set remove hold release; do
+for cut in keys vals alive slots gend gclear ptrb zero set remove keepset hold release goal share; do
 	rm -rf "${tmp:?}/growlib"
 	mkdir -p "$tmp/growlib"
 	cp lib/*.kh "$tmp/growlib/"
@@ -338,25 +340,29 @@ cuts = {
     "keys": ("    __gc_old_array(kh)\n    __gc_old_array(vh)\n", "    __gc_old_array(vh)\n"),
     "vals": ("    __gc_old_array(vh)\n    __gc_old_array(ah)\n", "    __gc_old_array(ah)\n"),
     "alive": ("    __gc_old_array(ah)\n    __map_adopt(kh", "    __map_adopt(kh"),
-    "slots": ("    __map_adopt(ah, load64(g + 16), w, cap)\n    __gc_old_slots(m)\n", "    __map_adopt(ah, load64(g + 16), w, cap)\n"),
-    "gend": ("    store64(m + 40, load64(g + 32))\n    __gc_old_at(m, m + 56)\n", "    store64(m + 40, load64(g + 32))\n"),
+    "slots": ("    if load64(g + 24) != 0 {\n        __gc_old_slots(m)\n", "    if load64(g + 24) != 0 {\n"),
+    "gend": ("        store64(m + 40, load64(g + 32))\n    }\n    __gc_old_at(m, m + 56)\n", "        store64(m + 40, load64(g + 32))\n    }\n"),
     "gclear": ("        // рост бросается (§7.5: G уходит из заголовка)\n        __gc_old_at(m, m + 56)\n", "        // рост бросается (§7.5: G уходит из заголовка)\n"),
     "ptrb": ("            __gc_ptrb_on(p + off, n)\n", ""),
     "zero": ("            __memset(p + off, 0, n)\n", ""),
     "set": ("        if load64(m + 56) != 0 {\n            __map_grow_set(m, k, idx, v)\n        }\n", ""),
     "remove": ("    if load64(m + 56) != 0 {\n        __map_grow_remove(m, k, idx)\n    }\n", ""),
-    "hold": ("        held = __gc_grow_hold(n * 3 + z * 8)\n", ""),
-    "release": ("    store64(m + 56, 0)\n    __gc_grow_done((load64(g + 32) + 1) * 20, load64(g + 80))\n}\n", "    store64(m + 56, 0)\n}\n"),
+    "keepset": ("        store64(load64(g + 8) + idx * 8, v)\n        return\n", "        return\n"),
+    "hold": ("        __gc_grow_hold(total, g)\n", ""),
+    "release": ("    store64(m + 56, 0)\n    __gc_grow_done(load64(g + 96), load64(g + 80))\n}\n", "    store64(m + 56, 0)\n}\n"),
+    "goal": ("    if __gc_trigger + up > __gc_goal {\n        up = __gc_goal - __gc_trigger\n    }\n", "", "gc.kh"),
+    "share": (" || n < __heap_live / 8 {\n", " {\n", "gc.kh"),
 }
-old, new = cuts[m]
-s = open(f"{d}/core.kh").read()
+old, new = cuts[m][0], cuts[m][1]
+f = cuts[m][2] if len(cuts[m]) > 2 else "core.kh"
+s = open(f"{d}/{f}").read()
 if s.count(old) != 1:
     sys.exit(1)
-open(f"{d}/core.kh", "w").write(s.replace(old, new))
+open(f"{d}/{f}", "w").write(s.replace(old, new))
 PY
 	then
 		grow_ok=0
-		failed "рост словаря ($cut)" "место для подложенной ошибки не найдено в lib/core.kh"
+		failed "рост словаря ($cut)" "место для подложенной ошибки не найдено в lib/core.kh или lib/gc.kh"
 		continue
 	fi
 	# без механизма тест может и упасть (освобождённый живой объект): строку
