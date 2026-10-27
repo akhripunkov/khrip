@@ -578,8 +578,9 @@ test "a copied store map whose table is too small gets a new one, arrays twofold
 }
 
 // подъём порога — только у роста, который выделил не меньше восьмой части
-// кучи, и не выше цели: много маленьких ростов сразу его не поднимают
-test "small growths do not hold the trigger, and a hold stops at the goal" {
+// кучи, и не выше середины между целью и жёстким пределом: много маленьких
+// ростов сразу его не поднимают
+test "small growths do not hold the trigger, and a hold stops halfway to the hard limit" {
     for i in 0..8 {
         var e: map[int, int] = {}
         inner[i] = e
@@ -610,7 +611,8 @@ test "small growths do not hold the trigger, and a hold stops at the goal" {
         expect __map_growing(hs[i]) && __map_grow_held(hs[i]) == 0
     }
     expect !exact() || __gc_stats().trigger == s0.trigger
-    // большой рост, которому до цели не хватает места: порог — ровно цель
+    // большой рост выделяет больше, чем осталось до цели: порог поднимается
+    // выше цели на всё выделенное
     var k = 0
     let hi: int = __cast(ints)
     while __map_cap(hi) < 16384 || __map_entries(hi) < __map_grow_at(hi) {
@@ -621,15 +623,22 @@ test "small growths do not hold the trigger, and a hold stops at the goal" {
     let s1 = __gc_stats()
     // массивы по 256 КБ и таблица 512 КБ
     let total = 3 * 262144 + 524288
-    expect !exact() || (total >= s1.heap / 8 && total > s1.goal - s1.trigger)
+    let top = s1.goal + (__gc_hard_now() - s1.goal) / 2
+    expect !exact() || (total >= s1.heap / 8 && total > s1.goal - s1.trigger && s1.trigger + total < top)
     ints[k] = k
     expect __map_growing(hi)
-    expect !exact() || (__map_grow_held(hi) == s1.goal - s1.trigger && __gc_stats().trigger == s1.goal)
+    expect !exact() || (__map_grow_held(hi) == total && __gc_stats().trigger == s1.trigger + total)
     while __map_growing(hi) {
         k += 1
         ints[k] = k
     }
     expect !exact() || __gc_stats().trigger == s1.trigger
+    // подъём больше, чем до середины: порог — ровно середина
+    let g = __alloc(104)
+    __gc_grow_hold(1 << 40, g)
+    expect !exact() || (load64(g + 96) == top - s1.trigger && __gc_stats().trigger == top)
+    __gc_grow_done(load64(g + 96), load64(g + 80))
+    expect __gc_stats().trigger == s1.trigger
 }
 
 test "no growth had to finish at once" {

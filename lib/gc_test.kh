@@ -193,6 +193,11 @@ fn __map_grow_held(m: int) -> int {
     return load64(g + 96)
 }
 
+// Жёсткий предел кучи (§8.2).
+fn __gc_hard_now() -> int {
+    return __gc_hard
+}
+
 // Слотов в таблице словаря m.
 fn __map_slots(m: int) -> int {
     return load64(m + 40) + 1
