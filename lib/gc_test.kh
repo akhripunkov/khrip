@@ -339,3 +339,26 @@ fn __map_tail_zero(m: int) -> bool {
     }
     return true
 }
+
+// Система даёт куче store ещё mb МБ памяти сверх подключённой, дальше
+// отказывает (mprotect, __gc_commit_try); 0 — без предела. → предел в байтах
+// от начала STORE.
+fn __gc_commit_limit(mb: int) -> int {
+    if mb == 0 {
+        __gc_commit_lim = 0
+        return 0
+    }
+    __gc_commit_lim = (__gc_committed + mb * GC_MB + COMMIT - 1) & ~(COMMIT - 1)
+    return __gc_commit_lim
+}
+
+fn __gc_committed_bytes() -> int {
+    return __gc_committed
+}
+
+// Страниц запаса за большим спаном объекта p (сверх страниц объекта).
+fn __gc_reserve_of(p: int) -> int {
+    let pg = (p - STORE_REGION) >> GC_PAGE_SHIFT
+    let s = GC_SPANS + (pg << 6)
+    return (load64(s + S_INFO) & 0xFFFFFFFF) - (load64(s + S_SIZE) >> GC_PAGE_SHIFT)
+}

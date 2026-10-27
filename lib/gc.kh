@@ -502,8 +502,8 @@ fn __salloc_extend(p: int, n: int, lazy: bool) -> int {
             return -1
         }
         let end = (at + k) << GC_PAGE_SHIFT
-        if end > __gc_committed {
-            __gc_commit_to(end)
+        if end > __gc_committed && !__gc_commit_try(end) {
+            return -1
         }
         dirty = __ph_take(ph, at, k)
         __gc_pagemap_set(at, k, pg + 1)
@@ -580,9 +580,18 @@ fn __gc_reserve_after(at: int, want: int) -> int {
     if n == 0 {
         return 0
     }
+    // запас — не повод для паники: если система не даёт памяти (RLIMIT_DATA),
+    // он только в уже подключённой, а страницы самого объекта уже заняты
+    // (__gc_pages) и без спана остались бы ничьими
     let end = (at + n) << GC_PAGE_SHIFT
-    if end > __gc_committed {
-        __gc_commit_to(end)
+    if end > __gc_committed && !__gc_commit_try(end) {
+        let top = __gc_committed >> GC_PAGE_SHIFT
+        if top <= at {
+            return 0
+        }
+        if at + n > top {
+            n = top - at
+        }
     }
     __ph_take(ph, at, n)
     return n
@@ -1011,6 +1020,9 @@ fn __gc_pages(np: int) -> int {
     let ph = __gc_ph
     let pg = __ph_find(ph, np)
     if pg < 0 {
+        if load64(ph + PH_CAP) < load64(ph + PH_MAX) {
+            __panic(PANIC_MEMORY, "mprotect")
+        }
         __panic(PANIC_MEMORY, "region")
     }
     let end = (pg + np) << GC_PAGE_SHIFT
@@ -1033,27 +1045,45 @@ fn __gc_pagemap_set(pg: int, np: int, v: int) {
 // START, MARK, PTRB, PAGEMAP и SPANS — по паре в таблице: смещение от GCMETA
 // в гигабайтах и сдвиг (байт метаданных — байт STORE >> сдвиг).
 fn __gc_commit_to(end: int) {
-    let old = __gc_committed
-    let nw = (end + COMMIT - 1) & ~(COMMIT - 1)
-    if nw > STORE_SIZE {
+    if (end + COMMIT - 1) & ~(COMMIT - 1) > STORE_SIZE {
         __panic(PANIC_MEMORY, "region")
     }
-    __gc_mprotect(STORE_REGION, old, nw)
+    if !__gc_commit_try(end) {
+        __panic(PANIC_MEMORY, "mprotect")
+    }
+}
+
+// То же без паники: → false, если система отказала (подключённое раньше
+// остаётся, повтор mprotect уже подключённого безвреден). __gc_commit_lim —
+// предел подключённого для тестов (lib/gc_test.kh, __gc_commit_limit; 0 — нет).
+var __gc_commit_lim: int
+
+fn __gc_commit_try(end: int) -> bool {
+    let old = __gc_committed
+    let nw = (end + COMMIT - 1) & ~(COMMIT - 1)
+    if nw > STORE_SIZE || (__gc_commit_lim > 0 && nw > __gc_commit_lim) {
+        return false
+    }
+    if !__gc_mprotect(STORE_REGION, old, nw) {
+        return false
+    }
     let t = __data_hex("00 07 02 07 04 06 08 0B 09 07")
     for i in 0..5 {
         let sh = load8(t + i * 2 + 1)
-        __gc_mprotect(GCMETA + (load8(t + i * 2) << 30), old >> sh, nw >> sh)
+        if !__gc_mprotect(GCMETA + (load8(t + i * 2) << 30), old >> sh, nw >> sh) {
+            return false
+        }
     }
     __gc_committed = nw
+    return true
 }
 
 // Память [base + from, base + to) — на чтение и запись (по целым страницам ОС).
-fn __gc_mprotect(base: int, from: int, to: int) {
+// → false, если система отказала.
+fn __gc_mprotect(base: int, from: int, to: int) -> bool {
     let a = from & ~4095
     let b = (to + 4095) & ~4095
-    if b > a && syscall(10, base + a, b - a, 3) < 0 {
-        __panic(PANIC_MEMORY, "mprotect")
-    }
+    return b <= a || syscall(10, base + a, b - a, 3) >= 0
 }
 
 // Вид памяти, где лежит p (массив списка в store): K_NOSCAN — спан без
@@ -1238,7 +1268,9 @@ fn __ph_init(ph: int, fr: int, dt: int, rl: int, tr: int, cap: int, max: int, co
     var cm = 0
     if commit {
         cm = 1
-        __ph_commit(ph, cap)
+        if !__ph_commit(ph, cap) {
+            __panic(PANIC_MEMORY, "mprotect")
+        }
     }
     store64(ph + PH_COMMIT, cm)
     __bits_put(fr, 0, cap, true)
@@ -1246,21 +1278,19 @@ fn __ph_init(ph: int, fr: int, dt: int, rl: int, tr: int, cap: int, max: int, co
 }
 
 // Память карт и дерева кучки STORE для ёмкости cap.
-fn __ph_commit(ph: int, cap: int) {
-    __gc_mprotect(load64(ph + PH_FREE), 0, cap >> 3)
-    __gc_mprotect(load64(ph + PH_DIRTY), 0, cap >> 3)
-    __gc_mprotect(load64(ph + PH_REL), 0, cap >> 3)
-    __gc_mprotect(load64(ph + PH_TREE), 0, (cap >> 1) + 16)
+fn __ph_commit(ph: int, cap: int) -> bool {
+    return __gc_mprotect(load64(ph + PH_FREE), 0, cap >> 3) && __gc_mprotect(load64(ph + PH_DIRTY), 0, cap >> 3) && __gc_mprotect(load64(ph + PH_REL), 0, cap >> 3) && __gc_mprotect(load64(ph + PH_TREE), 0, (cap >> 1) + 16)
 }
 
-// Удвоить ёмкость. → false, если она уже наибольшая.
+// Удвоить ёмкость. → false, если она уже наибольшая или система не дала
+// памяти под карты (ёмкость прежняя).
 fn __ph_grow(ph: int) -> bool {
     let cap = load64(ph + PH_CAP)
     if cap >= load64(ph + PH_MAX) {
         return false
     }
-    if load64(ph + PH_COMMIT) != 0 {
-        __ph_commit(ph, cap * 2)
+    if load64(ph + PH_COMMIT) != 0 && !__ph_commit(ph, cap * 2) {
+        return false
     }
     __bits_put(load64(ph + PH_FREE), cap, cap * 2, true)
     store64(ph + PH_CAP, cap * 2)

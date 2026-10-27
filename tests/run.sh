@@ -404,7 +404,10 @@ done
 #   reservefree — запас спана не возвращается кучке (gc_inplace, verify:
 #              занятая страница без спана);
 #   sharedprep — массив словаря, выросший на месте, готовится с начала:
-#              записи стираются (gc_inplace, plain).
+#              записи стираются (gc_inplace, plain);
+#   reservecommit — система не дала памяти на запас роста: паника посреди
+#              выделения, страницы массива заняты без спана (gc_commit,
+#              plain).
 mem3_ok=1
 while read -r cut test mode; do
 	[[ -z $cut ]] && continue
@@ -432,6 +435,7 @@ cuts = {
     "inplaceptrb": ("    if !lazy && (fl & F_NOSCAN) == 0 {\n        __gc_ptrb_on(q, bytes)\n    }\n", "", "gc.kh"),
     "reservefree": ("    if np > used {\n        __ph_free_clean(__gc_ph, pg + used, np - used)\n    }\n", "", "gc.kh"),
     "sharedprep": ("        if off < start {\n            off = start\n        }\n", "", "core.kh"),
+    "reservecommit": ("    let end = (at + n) << GC_PAGE_SHIFT\n    if end > __gc_committed && !__gc_commit_try(end) {\n", "    let end = (at + n) << GC_PAGE_SHIFT\n    if end > __gc_committed {\n        __gc_commit_to(end)\n    }\n    if false {\n", "gc.kh"),
 }
 old, new, f = cuts[m]
 s = open(f"{d}/{f}").read()
@@ -470,6 +474,7 @@ inplacekept gc_inplace stress
 inplaceptrb gc_inplace verify
 reservefree gc_inplace verify
 sharedprep gc_inplace plain
+reservecommit gc_commit plain
 CUTS
 [[ $mem3_ok -eq 1 ]] && pass=$((pass + 1))
 

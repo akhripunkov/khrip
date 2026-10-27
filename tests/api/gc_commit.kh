@@ -1,0 +1,50 @@
+// Запас роста больших массивов store (этап памяти, часть 3, п. 3; lib/gc.kh,
+// __gc_reserve_after) и отказ системы в памяти: запас — не повод для паники.
+// Страницы самого массива к этому времени уже заняты, и паника посреди
+// выделения оставила бы их занятыми без спана (tests/http.sh, «память
+// кончилась», под KHRIP_GC_VERIFY: «page … is taken but does not start a
+// span»). Запас — сколько есть в подключённой памяти. Предел памяти здесь —
+// тестовый (__gc_commit_limit): ulimit -d отказывает в зависимости от
+// раскладки кучи, а этот — всегда на одном месте.
+
+store capped: [int]
+store fill: [str]
+
+fn capped_data() -> int {
+    let h: int = __cast(capped)
+    return load64(h)
+}
+
+fn exact() -> bool {
+    return (env("KHRIP_GC_STRESS") ?? "") != "1"
+}
+
+test "a growth reserve stops where the system stops giving memory" {
+    // система даст ещё 8 МБ: массив 4 МБ поместится, а запас за ним втрое
+    // больше — нет. Строки store между удвоениями занимают страницы за
+    // массивом: дальше запаса он растёт переездом, и новый массив — наверху
+    // кучи, за подключённой памятью
+    let lim = __gc_commit_limit(8)
+    for i in 0..300000 {
+        capped.push(i)
+        if i % 64 == 0 {
+            fill.push("fill {i}")
+        }
+    }
+    expect __gc_committed_bytes() <= lim
+    expect !exact() || __gc_reserve_of(capped_data()) < 3 * 512
+    __gc_collect()
+    // без предела — растёт дальше, на месте или переездом
+    __gc_commit_limit(0)
+    for i in 300000..1000000 {
+        capped.push(i)
+    }
+    __gc_collect()
+    var bad = 0
+    for i in 0..1000000 {
+        if capped[i] != i {
+            bad += 1
+        }
+    }
+    expect bad == 0 && fill.len() == 4688 && fill[4687] == "fill 299968"
+}
