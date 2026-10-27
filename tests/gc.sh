@@ -209,7 +209,9 @@ if KHRIP_GC_LOG=1 "$KHC" -o "$tmp/gcsrv" tests/gc/server.kh 2>"$tmp/gcsrv.err" &
 	cyc=$(grep -c '^gc [0-9]* (' "$tmp/gc.log")
 	c2=$(python3 tests/gc/drive.py check "$tmp/gc.json" 2>&1)
 	want='{"products": 2000, "bad": [], "money": 100000}'
-	if [[ "$c1" == "$want" && "$c2" == "$want" && "$r1 $r2 $r3" == "ok 100000 ok" ]] && ((cyc >= 1)); then
+	# ответ долгого опроса — держателя: с KHRIP_GC_STRESS=1 он может
+	# продолжить посреди разметки (ok~) и передать арену сам (ok+)
+	if [[ "$c1" == "$want" && "$c2" == "$want" && "$r1" =~ ^ok[~+]?$ && "$r2" == 100000 && "$r3" =~ ^ok[~+]?$ ]] && ((cyc >= 1)); then
 		http_ok
 	else
 		failed "gc: KHRIP_DATA под сборкой" "снимок под нагрузкой: $c1; после восстановления: $r1 $r2 $r3, сборок $cyc; второй снимок: $c2"$'\n'"$(grep -v '^gc [0-9]' "$tmp/gc.log" | tail -5)"
