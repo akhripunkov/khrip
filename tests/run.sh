@@ -342,12 +342,12 @@ cuts = {
     "alive": ("    __gc_old_at(m, m + 24)\n    store64(m, load64(g))\n", "    store64(m, load64(g))\n"),
     "slots": ("    if load64(g + 24) != 0 {\n        __gc_old_slots(m)\n", "    if load64(g + 24) != 0 {\n"),
     "gend": ("        store32(m + 40, load64(g + 32))\n    }\n    __gc_old_at(m, m + 56)\n", "        store32(m + 40, load64(g + 32))\n    }\n"),
-    "gclear": ("        // рост бросается (§7.5: G уходит из заголовка)\n        __gc_old_at(m, m + 56)\n", "        // рост бросается (§7.5: G уходит из заголовка)\n"),
+    "gclear": ("выросшие становятся мусором\n        __gc_old_at(m, m + 56)\n", "выросшие становятся мусором\n"),
     "ptrb": ("            __gc_ptrb_on(p + off, n)\n", ""),
     "zero": ("            __memset(p + off, 0, n)\n", ""),
     "set": ("    if load64(m + 56) != 0 {\n        __map_grow_set(m, k, idx, v)\n    }\n", ""),
     "remove": ("    if load64(m + 56) != 0 {\n        __map_grow_remove(m, k, idx)\n    }\n", ""),
-    "keepset": ("        // таблица остаётся старой: номер записи тот же\n        return idx\n", "        return -1\n"),
+    "keepset": ("        // записи тот же\n        return idx\n", "        // записи тот же\n        return -1\n"),
     "hold": ("        __gc_grow_hold(total, g)\n", ""),
     "release": ("    store64(m + 56, 0)\n    __gc_grow_done(load64(g + 96), load64(g + 80))\n}\n", "    store64(m + 56, 0)\n}\n"),
     "goal": ("    if __gc_trigger + up > top {\n        up = top - __gc_trigger\n    }\n", "", "gc.kh"),
@@ -376,8 +376,9 @@ done
 [[ $grow_ok -eq 1 ]] && pass=$((pass + 1))
 
 # Представление данных store (этап памяти, часть 3) само по себе: на копиях
-# библиотеки с подложенной ошибкой тест пункта падает — без проверок (plain)
-# или с KHRIP_GC_VERIFY=1 (verify), как указано у каждой мутации:
+# библиотеки с подложенной ошибкой тест пункта падает — без проверок (plain),
+# с KHRIP_GC_VERIFY=1 (verify) или с KHRIP_GC_STRESS=1 (stress), как указано
+# у каждой мутации:
 #   keyshare — ключ словаря не берётся из поля значения (gc_keys, plain);
 #   keyreplace — ключ копируется и при замене значения (gc_keys, plain);
 #   listptrb — ёмкость списка — весь слот, а биты PTRB — только на
@@ -395,7 +396,15 @@ done
 #   listgrow — рост списка store без вида старого массива: новый массив
 #              ссылок без PTRB (gc_lists, verify);
 #   listvacate — серение ушедших элементов списка store по слову 24 старого
-#              заголовка (gc_satb, verify).
+#              заголовка (gc_satb, verify);
+#   inplaceblack — массив, помеченный разметкой и выросший на месте, — без
+#              новых байтов в живом (gc_inplace, verify: уборка насчитала больше);
+#   inplacekept — то же в уборке, до спана (gc_inplace, stress);
+#   inplaceptrb — новый хвост списка ссылок без PTRB (gc_inplace, verify);
+#   reservefree — запас спана не возвращается кучке (gc_inplace, verify:
+#              занятая страница без спана);
+#   sharedprep — массив словаря, выросший на месте, готовится с начала:
+#              записи стираются (gc_inplace, plain).
 mem3_ok=1
 while read -r cut test mode; do
 	[[ -z $cut ]] && continue
@@ -418,6 +427,11 @@ cuts = {
     "listroom": ("    return slot + size - p\n", "    return size\n", "gc.kh"),
     "listgrow": ("fn __salloc_list(h: int, cap: int, es: int) -> int {\n    let kind = __gc_kind_of(load64(h))\n", "fn __salloc_list(h: int, cap: int, es: int) -> int {\n    let kind = K_NOSCAN\n", "gc.kh"),
     "listvacate": ("    if __gc_marking != 0 && __list_es(h) == 8 {\n", "    if __gc_marking != 0 && load64(h + 24) == 8 {\n", "gc.kh"),
+    "inplaceblack": ("    if __gc_marking != 0 && __gc_bit(GC_MARK, p) {\n        __gc_black_bytes += bytes\n    } else if", "    if false {\n        __gc_black_bytes += bytes\n    } else if", "gc.kh"),
+    "inplacekept": ("        __gc_kept -= bytes\n", "", "gc.kh"),
+    "inplaceptrb": ("    if !lazy && (fl & F_NOSCAN) == 0 {\n        __gc_ptrb_on(q, bytes)\n    }\n", "", "gc.kh"),
+    "reservefree": ("    if np > used {\n        __ph_free_clean(__gc_ph, pg + used, np - used)\n    }\n", "", "gc.kh"),
+    "sharedprep": ("        if off < start {\n            off = start\n        }\n", "", "core.kh"),
 }
 old, new, f = cuts[m]
 s = open(f"{d}/{f}").read()
@@ -432,6 +446,7 @@ PY
 	fi
 	venv=(env -u KHRIP_GC_VERIFY -u KHRIP_GC_STRESS)
 	[[ $mode == verify ]] && venv=(env -u KHRIP_GC_STRESS KHRIP_GC_VERIFY=1)
+	[[ $mode == stress ]] && venv=(env -u KHRIP_GC_VERIFY KHRIP_GC_STRESS=1)
 	{ KHRIP_LIB="$tmp/mem3lib" "${venv[@]}" timeout 120 "$KHC" test "tests/api/$test.kh" 2>&1 | grep -v '^khrip: gc verify (boot): ' >"$tmp/mem3.txt"; } 2>/dev/null
 	if diff -q "tests/api/$test.out" "$tmp/mem3.txt" >/dev/null; then
 		mem3_ok=0
@@ -450,6 +465,11 @@ listbool gc_lists plain
 listroom gc_lists verify
 listgrow gc_lists verify
 listvacate gc_satb verify
+inplaceblack gc_inplace verify
+inplacekept gc_inplace stress
+inplaceptrb gc_inplace verify
+reservefree gc_inplace verify
+sharedprep gc_inplace plain
 CUTS
 [[ $mem3_ok -eq 1 ]] && pass=$((pass + 1))
 

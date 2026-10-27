@@ -221,7 +221,7 @@ def store_heap(proc, vmas):
     start_bits = proc.read(GC_START, (end - STORE) // 128)
     pres = proc.present(STORE, (end - STORE) >> 12)
     r = {"committed": end - STORE, "resident": 0, "inuse_resident": 0, "free_resident": 0,
-         "free_released": 0, "alloc_bytes": 0, "alloc_resident": 0, "free_slot_bytes": 0, "tail_bytes": 0,
+         "free_released": 0, "alloc_bytes": 0, "alloc_resident": 0, "free_slot_bytes": 0, "tail_bytes": 0, "reserve_bytes": 0,
          "spans": 0, "by_class": {}}
     pg = 0
     while pg < npg:
@@ -264,7 +264,13 @@ def store_heap(proc, vmas):
         r["alloc_bytes"] += alloc
         r["alloc_resident"] += alloc_res
         r["free_slot_bytes"] += (ne - n_alloc) * es
-        r["tail_bytes"] += np_ * PAGE - ne * es
+        if (info >> 48) & 4:
+            # большой спан с запасом для роста на месте (этап памяти, часть 3,
+            # п. 3): объект — es байт, остальные страницы спана — запас (не
+            # тронут, в памяти его нет)
+            r["reserve_bytes"] += np_ * PAGE - es
+        else:
+            r["tail_bytes"] += np_ * PAGE - ne * es
         c = r["by_class"].setdefault(es, [0, 0, 0])
         c[0] += 1
         c[1] += alloc
@@ -361,7 +367,7 @@ def main():
         print(f"  {k:42s} {cat.get(k, 0) / MB:8.2f}")
     if heap:
         print(f"  store: committed {heap['committed'] / MB:.1f}, resident {heap['resident'] / MB:.1f}, in spans {heap['inuse_resident'] / MB:.1f}"
-              f" (allocated slots {heap['alloc_bytes'] / MB:.2f}, resident {heap['alloc_resident'] / MB:.2f}, free slots {heap['free_slot_bytes'] / MB:.2f}, tails {heap['tail_bytes'] / MB:.2f}),"
+              f" (allocated slots {heap['alloc_bytes'] / MB:.2f}, resident {heap['alloc_resident'] / MB:.2f}, free slots {heap['free_slot_bytes'] / MB:.2f}, tails {heap['tail_bytes'] / MB:.2f}, growth reserve {heap['reserve_bytes'] / MB:.2f}),"
               f" free kept {heap['free_resident'] / MB:.2f}, released {heap['free_released'] / MB:.1f}, {heap['spans']} spans")
         top = sorted(heap["by_class"].items(), key=lambda kv: -kv[1][2])[:8]
         print("  classes (slot B: spans, allocated MB / span MB): " + ", ".join(f"{es}: {c[0]}, {c[1] / MB:.1f}/{c[2] / MB:.1f}" for es, c in top))

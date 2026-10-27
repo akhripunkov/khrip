@@ -546,13 +546,14 @@ fn __gcv_span(st: int, when: str, pg: int) -> int {
         __gcv_fail(st, when, "span at page {pg}: NOSCAN, but pointer bits are set")
     }
     if (fl & F_LARGE) != 0 {
-        if sc != 0 || load64(s + S_SIZE) != np << GC_PAGE_SHIFT || load64(s + S_MAGIC) != 1 << 32 || load64(s + S_FAST) != 0 || bits > 1 || (bits == 1 && !__gc_bit(GC_START, base)) {
+        if sc != 0 || load64(s + S_SIZE) > np << GC_PAGE_SHIFT || load64(s + S_SIZE) == 0 || (load64(s + S_SIZE) & (GC_PAGE - 1)) != 0 || load64(s + S_MAGIC) != 1 << 32 || load64(s + S_FAST) != 0 || bits > 1 || (bits == 1 && !__gc_bit(GC_START, base)) {
             __gcv_fail(st, when, "large span at page {pg}: a broken record")
         }
         if unswept && !__gc_bit(GC_MARK, base) {
             return 0
         }
-        return bits * (np << GC_PAGE_SHIFT)
+        // объект — его страницы (S_SIZE), запас за ним в живое не входит
+        return bits * load64(s + S_SIZE)
     }
     let c = sc >> 1
     let es = load64(s + S_SIZE)

@@ -52,6 +52,10 @@ fn __salloc_list(h: int, cap: int, es: int) -> int {
     return __salloc(cap * es, 0, 0)
 }
 
+fn __salloc_list_inplace(h: int, cap: int, es: int) -> bool {
+    return false
+}
+
 fn __store_room(p: int) -> int {
     return 0
 }
@@ -103,6 +107,13 @@ fn __store_panic() {
 fn __gc_lazy_alloc(n: int, kind: int) -> int {
     exit(101)
     return 0
+}
+
+fn __gc_lazy_extend(p: int, n: int, kind: int) -> int {
+    return 0
+}
+
+fn __gc_abandon(bytes: int) {
 }
 
 fn __gc_ptrb_on(p: int, n: int) {

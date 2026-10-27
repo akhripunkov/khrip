@@ -43,6 +43,8 @@ fn __gc_why(w: int) -> str {
         return "forced"
     } else if w == GC_WHY_STRESS {
         return "stress"
+    } else if w == GC_WHY_ABANDON {
+        return "abandoned arrays"
     }
     return "pace"
 }
@@ -83,6 +85,9 @@ fn __gc_line() -> str {
     }
     if __gc_st_long > 0 {
         line += ", long holders {__gc_st_long} ({__gc_st_long_age} cycles, {__gc_st_long_words} words)"
+    }
+    if __gc_inplace_n + __gc_moved_n > 0 {
+        line += ", arrays grown in place {__gc_inplace_n} (+{__gc_mbs(__gc_inplace_bytes)} MB), moved {__gc_moved_n} ({__gc_mbs(__gc_moved_bytes)} MB left)"
     }
     return line + ", next at {__gc_mbs(__gc_trigger)} MB"
 }

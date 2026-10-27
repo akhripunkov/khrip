@@ -410,14 +410,223 @@ fn __salloc_for(h: int, n: int, kind: int, mask: int) -> int {
 // __salloc_for.
 fn __salloc_list(h: int, cap: int, es: int) -> int {
     let kind = __gc_kind_of(load64(h))
+    if load64(h + 8) * es > GC_SMALL_MAX {
+        __gc_moved_n += 1
+        __gc_moved_bytes += load64(h + 8) * es
+        __gc_abandon(__store_room(load64(h)))
+    }
     if __store_on() {
-        return __list_data_k(cap, es, kind)
+        return __salloc_list_data(cap, es, kind)
     }
     __gc_hard_check()
     __pmode_on()
-    let d = __list_data_k(cap, es, kind)
+    let d = __salloc_list_data(cap, es, kind)
     __pmode_off()
     return d
+}
+
+// Новый массив роста списка: большой — целыми страницами (с битами PTRB на
+// все, ёмкость — по ним) и с запасом GC_RESERVE для следующих ростов на месте.
+fn __salloc_list_data(cap: int, es: int, kind: int) -> int {
+    var n = cap * es
+    if es == 1 {
+        n += 8
+    }
+    if n <= GC_SMALL_MAX {
+        return __list_data_k(cap, es, kind)
+    }
+    let p = __salloc_big_r(__salloc_size(n), kind, 0, false, GC_RESERVE)
+    if es == 1 {
+        return p + 8
+    }
+    return p
+}
+
+// Запас за растущим большим массивом — во столько раз больше его страниц
+// (__salloc_big_r): два следующих удвоения — на месте.
+const GC_RESERVE = 3
+
+// Рост больших массивов (этап памяти, часть 3, п. 3): сколько раз массив вырос
+// на месте и на сколько байт, сколько раз — переездом и сколько байт старых
+// массивов стало мусором (журнал сборщика, lib/gc_log.kh).
+var __gc_inplace_n: int
+var __gc_inplace_bytes: int
+var __gc_moved_n: int
+var __gc_moved_bytes: int
+
+// Большой объект p (начало большого спана) — на месте до n байт, если
+// страницы сразу за спаном свободны: спан забирает их. Без lazy новые
+// страницы обнуляются (если на них были объекты) и получают биты PTRB (у
+// спана со ссылками); с lazy — нет, их готовит вызывающий (рост словаря,
+// __map_prep). Объект, уже помеченный идущей разметкой, растёт чёрным: новые
+// байты — в живое этой сборки. → −1, если не вышло; иначе 1, если новые
+// страницы грязные, и 0, если чистые.
+fn __salloc_extend(p: int, n: int, lazy: bool) -> int {
+    let off = p - STORE_REGION
+    if off < 0 || off >= __gc_committed || (off & (GC_PAGE - 1)) != 0 {
+        return -1
+    }
+    let pg = off >> GC_PAGE_SHIFT
+    if load32(GC_PAGEMAP + (pg << 2)) != pg + 1 {
+        return -1
+    }
+    let s = GC_SPANS + (pg << 6)
+    let info = load64(s + S_INFO)
+    let fl = info >> 48
+    if (fl & F_LARGE) == 0 || (fl & F_INUSE) == 0 {
+        return -1
+    }
+    // страниц у спана (с запасом) и у объекта
+    var own = info & 0xFFFFFFFF
+    let np = load64(s + S_SIZE) >> GC_PAGE_SHIFT
+    let np2 = (n + GC_PAGE - 1) >> GC_PAGE_SHIFT
+    if np2 <= np {
+        return 0
+    }
+    var dirty = false
+    let own0 = own
+    if np2 > own {
+        // запаса мало: страницы сразу за спаном, если свободны
+        let k = np2 - own
+        let at = pg + own
+        if (at + k) << GC_PAGE_SHIFT > STORE_SIZE {
+            return -1
+        }
+        let ph = __gc_ph
+        while at + k > load64(ph + PH_CAP) {
+            if !__ph_grow(ph) {
+                return -1
+            }
+        }
+        if __bits_any(load64(ph + PH_FREE), at, at + k, false) {
+            return -1
+        }
+        let end = (at + k) << GC_PAGE_SHIFT
+        if end > __gc_committed {
+            __gc_commit_to(end)
+        }
+        dirty = __ph_take(ph, at, k)
+        __gc_pagemap_set(at, k, pg + 1)
+        own = np2
+    }
+    // новые страницы объекта: из запаса — чистые (их никто не трогал), взятые
+    // сейчас — какие есть
+    let q = p + (np << GC_PAGE_SHIFT)
+    let bytes = (np2 - np) << GC_PAGE_SHIFT
+    var tail = 0
+    if own0 > np {
+        tail = own0 - np
+    }
+    if np2 - np < tail {
+        tail = np2 - np
+    }
+    if __gc_verify {
+        // запас — нули; взятое сейчас — нули или яд уборки
+        __gc_check_zero(q, tail << GC_PAGE_SHIFT)
+        if dirty {
+            __gc_check_poison(q + (tail << GC_PAGE_SHIFT), bytes - (tail << GC_PAGE_SHIFT))
+        } else {
+            __gc_check_zero(q + (tail << GC_PAGE_SHIFT), bytes - (tail << GC_PAGE_SHIFT))
+        }
+    }
+    if dirty && !lazy {
+        __memset(q + (tail << GC_PAGE_SHIFT), 0, bytes - (tail << GC_PAGE_SHIFT))
+    }
+    if !lazy && (fl & F_NOSCAN) == 0 {
+        __gc_ptrb_on(q, bytes)
+    }
+    store64(s + S_INFO, own | (fl << 48))
+    store64(s + S_SIZE, np2 << GC_PAGE_SHIFT)
+    store64(s + S_FREE, p + (np2 << GC_PAGE_SHIFT))
+    __heap_live += bytes
+    if __gc_marking != 0 && __gc_bit(GC_MARK, p) {
+        __gc_black_bytes += bytes
+    } else if __gc_phase == GC_PH_SWEEP && load64(s + S_SWEEPGEN) != __gc_sweepgen {
+        // уборка ещё не дошла до спана и насчитает ему новый размер, а
+        // разметка — старый: проверка уборки сравнивает их (__gc_kept)
+        __gc_kept -= bytes
+    }
+    __gc_inplace_n += 1
+    __gc_inplace_bytes += bytes
+    if __heap_live >= __gc_trigger && !__gc_poked {
+        __gc_poke()
+    }
+    if dirty {
+        return 1
+    }
+    return 0
+}
+
+// Запас за спаном (__salloc_big_r): до want страниц с at, свободных и чистых
+// (на них не было объектов или их память вернули системе), подряд; они
+// заняты для спана. → сколько взято.
+fn __gc_reserve_after(at: int, want: int) -> int {
+    let ph = __gc_ph
+    while at + want > load64(ph + PH_CAP) && __ph_grow(ph) {
+    }
+    let cap = load64(ph + PH_CAP)
+    let fr = load64(ph + PH_FREE)
+    let dt = load64(ph + PH_DIRTY)
+    var n = 0
+    while n < want && at + n < cap && ((at + n + 1) << GC_PAGE_SHIFT) <= STORE_SIZE {
+        let b = at + n
+        let w = (b >> 6) << 3
+        let m = 1 << (b & 63)
+        if (load64(fr + w) & m) == 0 || (load64(dt + w) & m) != 0 {
+            break
+        }
+        n += 1
+    }
+    if n == 0 {
+        return 0
+    }
+    let end = (at + n) << GC_PAGE_SHIFT
+    if end > __gc_committed {
+        __gc_commit_to(end)
+    }
+    __ph_take(ph, at, n)
+    return n
+}
+
+// Байт больших массивов, брошенных ростом (переездом списка, переключением
+// словаря) с начала последней сборки, и ждёт ли поток сборщика сборку из-за
+// них. Брошенный массив — мусор до следующей сборки; когда их набирается на
+// десятую часть живого (и не меньше 4 МБ), сборка начинается раньше порога:
+// её страницы займут следующие выделения, а не новые страницы.
+var __gc_abandoned: int
+var __gc_abandon_due: bool
+
+fn __gc_abandon(bytes: int) {
+    __gc_abandoned += bytes
+    if __gc_phase == GC_PH_IDLE && !__gc_abandon_due && !__gc_stress && __gc_abandoned >= 4 * GC_MB && __gc_abandoned * 10 >= __heap_marked {
+        __gc_abandon_due = true
+        __gc_poke()
+    }
+}
+
+// Список store h растёт до cap элементов размера es на месте, если его массив
+// большой и за ним свободные страницы (__salloc_extend; массив [bool] — с
+// 8-го байта своего слота). → удалось ли.
+fn __salloc_list_inplace(h: int, cap: int, es: int) -> bool {
+    var d = load64(h)
+    var n = cap * es
+    if es == 1 {
+        d -= 8
+        n += 8
+    }
+    if n <= GC_SMALL_MAX {
+        return false
+    }
+    __gc_hard_check()
+    var ok = false
+    if __store_on() {
+        ok = __salloc_extend(d, n, false) >= 0
+    } else {
+        __pmode_on()
+        ok = __salloc_extend(d, n, false) >= 0
+        __pmode_off()
+    }
+    return ok
 }
 
 // Байт от p до конца слота объекта store, в котором лежит p (массив списка
@@ -495,11 +704,11 @@ fn __gc_grow_done(n: int, at: int) {
 fn __gc_lazy_alloc(n: int, kind: int) -> int {
     var p = 0
     if __store_on() {
-        p = __salloc_big(n, kind, 0, true)
+        p = __salloc_big_r(n, kind, 0, true, GC_RESERVE)
     } else {
         __gc_hard_check()
         __pmode_on()
-        p = __salloc_big(n, kind, 0, true)
+        p = __salloc_big_r(n, kind, 0, true, GC_RESERVE)
         __pmode_off()
     }
     if __gc_took_dirty {
@@ -509,6 +718,30 @@ fn __gc_lazy_alloc(n: int, kind: int) -> int {
         p = p | 2
     }
     return p
+}
+
+// Массив словаря store p (вида kind) — на месте до n байт (__salloc_extend,
+// без обнуления и PTRB: хвост готовят шаги роста, __map_prep). → 0, если не
+// вышло, иначе p | 1, если новые страницы грязные, | 2, если массиву нужны
+// биты PTRB (как у __gc_lazy_alloc).
+fn __gc_lazy_extend(p: int, n: int, kind: int) -> int {
+    var r = -1
+    if __store_on() {
+        r = __salloc_extend(p, n, true)
+    } else {
+        __gc_hard_check()
+        __pmode_on()
+        r = __salloc_extend(p, n, true)
+        __pmode_off()
+    }
+    if r < 0 {
+        return 0
+    }
+    var q = p | r
+    if kind != K_NOSCAN {
+        q = q | 2
+    }
+    return q
 }
 
 // Биты PTRB слов [p, p + n) — массив роста словаря готов до p + n (__map_prep).
@@ -651,7 +884,11 @@ fn __span_free(s: int) {
     let fl = load64(s + S_INFO) >> 48
     let pg = (base - STORE_REGION) >> GC_PAGE_SHIFT
     let g = (base - STORE_REGION) >> 4
+    // страниц объекта: у большого спана с запасом (__salloc_big_r) — меньше,
+    // чем у спана; биты PTRB и грязь — только у них, запас возвращается чистым
+    var used = np
     if (fl & F_LARGE) != 0 {
+        used = load64(s + S_SIZE) >> GC_PAGE_SHIFT
         let a = ((base >> 10) << 3) + GC_START_P
         let b = ~(1 << ((base >> 4) & 63))
         store64(a, load64(a) & b)
@@ -661,13 +898,16 @@ fn __span_free(s: int) {
         __bits_put(GC_MARK, g, g + (np << 9), false)
     }
     if (fl & F_NOSCAN) == 0 {
-        __bits_put(GC_PTRB, g << 1, (g << 1) + (np << 10), false)
+        __bits_put(GC_PTRB, g << 1, (g << 1) + (used << 10), false)
     }
     __gc_pagemap_set(pg, np, 0)
     store64(s + S_INFO, 0)
     store64(s + S_FREE, 0)
     store64(s + S_FAST, 0)
-    __ph_free(__gc_ph, pg, np)
+    __ph_free(__gc_ph, pg, used)
+    if np > used {
+        __ph_free_clean(__gc_ph, pg + used, np - used)
+    }
 }
 
 // Объект больше GC_SMALL_MAX — свой спан из целых страниц.
@@ -678,8 +918,26 @@ fn __salloc_large(n: int, kind: int, mask: int) -> int {
 // Большой объект; lazy — без обнуления и без битов PTRB (рост словаря,
 // __gc_lazy_alloc): __gc_took_dirty — память грязная.
 fn __salloc_big(n: int, kind: int, mask: int, lazy: bool) -> int {
+    return __salloc_big_r(n, kind, mask, lazy, 0)
+}
+
+// То же с запасом: растущий массив (рост списка store, массивы роста
+// словаря) берёт за собой ещё до reserve · своих страниц, если они свободны и
+// чисты (у верха кучки — почти всегда): спан владеет ими, но объект — только
+// своими страницами (S_SIZE), в живое и в память они не входят, их не
+// обнуляют и не размечают. Следующий рост массива забирает запас на месте
+// (__salloc_extend) — без копии и без брошенного старого массива. Без
+// запаса массив вырос бы на месте, только если за ним ничего не выделили, а
+// мелкие спаны занимают страницы над ним (растущая куча — первая подходящая
+// серия наверху).
+fn __salloc_big_r(n: int, kind: int, mask: int, lazy: bool, reserve: int) -> int {
     let np = (n + GC_PAGE - 1) >> GC_PAGE_SHIFT
     let pg = __gc_pages(np)
+    let dirty = __gc_took_dirty
+    var own = np
+    if reserve > 0 {
+        own += __gc_reserve_after(pg + np, reserve * np)
+    }
     let base = STORE_REGION + (pg << GC_PAGE_SHIFT)
     let bytes = np << GC_PAGE_SHIFT
     var fl = F_INUSE | F_LARGE
@@ -688,14 +946,15 @@ fn __salloc_big(n: int, kind: int, mask: int, lazy: bool) -> int {
     }
     let s = GC_SPANS + (pg << 6)
     store64(s + S_BASE, base)
-    store64(s + S_INFO, np | (fl << 48))
+    store64(s + S_INFO, own | (fl << 48))
     store64(s + S_SIZE, bytes)
     store64(s + S_FREE, base + bytes)
     store64(s + S_SWEEPGEN, __gc_sweepgen)
     store64(s + S_MAGIC, 1 << 32)
     store64(s + S_NEXT, 0)
     store64(s + S_FAST, 0)
-    __gc_pagemap_set(pg, np, pg + 1)
+    __gc_pagemap_set(pg, own, pg + 1)
+    __gc_took_dirty = dirty
     __gc_bit_set(GC_START, base)
     if __gc_marking != 0 {
         __gc_bit_set(GC_MARK, base)
@@ -1184,6 +1443,18 @@ fn __ph_free(ph: int, pg: int, np: int) {
     }
     __bits_put(fr, pg, pg + np, true)
     __bits_put(load64(ph + PH_DIRTY), pg, pg + np, true)
+    __ph_update(ph, pg, pg + np)
+    __ph_lower_hw(ph, pg, np)
+    __ph_tick(ph)
+}
+
+// Вернуть запас спана [pg, pg + np) (занят, не тронут): свободен и чист.
+fn __ph_free_clean(ph: int, pg: int, np: int) {
+    let fr = load64(ph + PH_FREE)
+    if __gc_verify && __bits_any(fr, pg, pg + np, true) {
+        __gc_fatal("page heap: a freed page is already free")
+    }
+    __bits_put(fr, pg, pg + np, true)
     __ph_update(ph, pg, pg + np)
     __ph_lower_hw(ph, pg, np)
     __ph_tick(ph)
@@ -1810,6 +2081,9 @@ const GC_WHY_CALL = 6
 const GC_WHY_WINDOW = 7
 const GC_WHY_FORCED = 8
 const GC_WHY_STRESS = 9
+// брошенные ростом большие массивы дошли до десятой части живого (этап
+// памяти, часть 3, п. 3; __gc_abandon)
+const GC_WHY_ABANDON = 10
 // запись опубликована столько сборок назад — долгий держатель (§8.6)
 const GC_LONG = 10
 // тиков (по секунде) без выделений — простой: всё свободное — системе
@@ -2157,6 +2431,8 @@ fn __gc_begin_cycle(self: int, why: int) {
     if __gc_phase == GC_PH_SWEEP {
         __gc_sweep_finish(why)
     }
+    __gc_abandoned = 0
+    __gc_abandon_due = false
     let t0 = __gc_now_us()
     __gc_st_why = why
     __gc_st_inc = true
@@ -3845,7 +4121,11 @@ fn __gc_thread_main() {
         store64(ts + 8, 0)
         syscall(SYS_FUTEX, __gc_ctl, FUTEX_WAIT_PRIVATE, 0, ts, 0, 0)
         if load64(__gc_ctl) != 0 || __heap_live >= __gc_trigger {
-            __gc_thread_cycle(GC_WHY_PACE, runs)
+            var why = GC_WHY_PACE
+            if __gc_abandon_due {
+                why = GC_WHY_ABANDON
+            }
+            __gc_thread_cycle(why, runs)
             idle = 0
             idle_done = false
             continue
