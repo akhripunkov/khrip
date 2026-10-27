@@ -478,7 +478,9 @@ test "clear during growth during marking" {
 }
 
 // копия словаря в store (запись, восстановление KHRIP_DATA): массивы на
-// n + n/16 + 2 записи, таблица — степень двойки не меньше 4n. Первый рост
+// n + n/16 + 2 записи (столько, сколько вмещает их слот: 1500 записей —
+// 1595 → 1696, 4000 — 4252 → 5120, пять страниц), таблица — степень двойки не
+// меньше 4n. Первый рост
 // удваивает массивы (не больше половины таблицы) и, если половины таблицы
 // хватает, оставляет её: записи переносятся на те же номера
 test "a copied store map grows twofold and keeps a large enough table" {
@@ -493,7 +495,7 @@ test "a copied store map grows twofold and keeps a large enough table" {
     }
     copied = local
     let h = mi(copied)
-    expect __map_cap(h) == 1595 && __map_slots(h) == 8192
+    expect __map_cap(h) == 1696 && __map_slots(h) == 8192
     var k = 1500
     while !__map_growing(h) {
         copied[k] = item(k, "p")
@@ -525,7 +527,7 @@ test "a copied store map grows twofold and keeps a large enough table" {
         expect same_int(copied, keys, names)
     }
     // вдвое, а не до половины таблицы (4096), и таблица та же
-    expect __map_cap(h) == 3190 && __map_slots(h) == 8192
+    expect __map_cap(h) == 3392 && __map_slots(h) == 8192
     __gc_collect()
     expect same_int(copied, keys, names)
     // следующий рост: мёртвые записи есть — новая таблица, записи сжимаются
@@ -543,7 +545,7 @@ test "a copied store map grows twofold and keeps a large enough table" {
         k += 1
     }
     expect same_int(copied, keys, names)
-    expect __map_cap(h) == 6380 && __map_slots(h) == 16384
+    expect __map_cap(h) == 6784 && __map_slots(h) == 16384
     __map_grow_budget(0, 0)
 }
 
@@ -558,7 +560,7 @@ test "a copied store map whose table is too small gets a new one, arrays twofold
     }
     copied = local
     let h = mi(copied)
-    expect __map_cap(h) == 4252 && __map_slots(h) == 16384
+    expect __map_cap(h) == 5120 && __map_slots(h) == 16384
     var k = 4000
     while !__map_growing(h) {
         copied[k] = item(k, "u")
@@ -573,7 +575,7 @@ test "a copied store map whose table is too small gets a new one, arrays twofold
         names.push("u {k}")
         k += 1
     }
-    expect __map_cap(h) == 8504 && __map_slots(h) == 32768
+    expect __map_cap(h) == 10240 && __map_slots(h) == 32768
     expect same_int(copied, keys, names)
 }
 
