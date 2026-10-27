@@ -1,4 +1,5 @@
 ok    a list copied into store has the capacity of its slot
 ok    a copied list grows by pushes and keeps its elements
 ok    a large list copied into store fills its pages
-3 tests: 3 passed, 0 failed
+ok    every list operation on store lists with 16-byte headers
+4 tests: 4 passed, 0 failed

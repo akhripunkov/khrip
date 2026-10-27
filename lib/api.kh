@@ -407,7 +407,7 @@ fn __dc_copy(st: int, v: int, d: int) -> int {
     if k == D_LIST {
         let ed = load64(d + 8)
         let n = load64(v + 8)
-        let es = load64(v + 24)
+        let es = __list_es(v)
         let h = __list_new_k(n, es, !__is_scalar(ed))
         __dc_put(st, v, h)
         let data = load64(h)

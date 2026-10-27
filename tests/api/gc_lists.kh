@@ -1,7 +1,9 @@
 // Списки в store (этап памяти, часть 3, п. 4): копия списка в store получает
 // массив по своей длине — столько элементов, сколько вмещает слот (у пустого и
 // короткого — слот 16 байт), а не от 4 элементов; дальше список растёт вдвое,
-// как обычно.
+// как обычно. Заголовок списка store — 16 байт (data и len): ёмкость — по
+// слоту массива, размер элемента — по адресу массива (массив [bool] — с 8-го
+// байта своего слота).
 
 type Line { sku: str, qty: int }
 
@@ -62,6 +64,11 @@ fn fit(n: int, es: int) -> int {
     return ((b + 15) / 16 * 16) / es
 }
 
+// то же для [bool]: массив — с 8-го байта слота
+fn fitb(n: int) -> int {
+    return (n + 8 + 15) / 16 * 16 - 8
+}
+
 test "a list copied into store has the capacity of its slot" {
     for n in [0, 1, 2, 3, 4, 5, 7, 17, 31] {
         expect (call POST "/orders/{n}/{n}").status == 201
@@ -78,10 +85,13 @@ test "a list copied into store has the capacity of its slot" {
         let hn: int = __cast(o.nums)
         expect __list_capacity(h) == fit(n, 8)
         expect __list_capacity(ht) == fit(n, 8)
-        expect __list_capacity(hf) == fit(n, 1)
+        expect __list_capacity(hf) == fitb(n)
         expect __list_capacity(hn) == fit(n, 8)
         expect __list_data_slot(h) == fit(n, 8) * 8
-        expect __list_data_slot(hf) == fit(n, 1)
+        expect __list_data_slot(hf) == fitb(n) + 8
+        let df: int = load64(hf)
+        expect df % 16 == 8 && load64(h) % 16 == 0
+        expect __list_header_slot(h) == 16 && __list_header_slot(hf) == 16 && __list_header_slot(hn) == 16
         for i in 0..n {
             expect o.lines[i].sku == "s{i}" && o.lines[i].qty == i
             expect o.tags[i] == "t{i}" && o.flags[i] == (i % 2 == 0) && o.nums[i] == i * 10
@@ -125,4 +135,90 @@ test "a large list copied into store fills its pages" {
     // больше 32 КБ — целые страницы: 800 000 байт — 98 страниц
     expect __list_capacity(h2) == 98 * 8192 / 8
     expect plain[99999] == 99999
+}
+
+store words: [str]
+store bits: [bool]
+store nums2: [int]
+
+route POST "/ops" -> str {
+    words = []
+    bits = []
+    nums2 = []
+    for i in 0..40 {
+        words.push("w{i}")
+        bits.push(i % 3 == 0)
+        nums2.push(40 - i)
+    }
+    // вставка, удаление, вынимание
+    words.insert(0, "first")
+    bits.insert(1, true)
+    nums2.insert(40, 1000)
+    expect_eq(words.remove_at(5), "w4")
+    expect_eq_b(bits.remove_at(0), true)
+    expect_eq_i(nums2.pop(), 1000)
+    words[3] = "three"
+    bits[2] = true
+    nums2[0] = -1
+    words.reverse()
+    bits.reverse()
+    nums2.sort()
+    let sorted = words.sort_by(w => w.byte_len())
+    words.truncate(30)
+    bits.truncate(25)
+    return "{words.len()} {bits.len()} {nums2.len()} {nums2[0]} {nums2[39]} {words.contains("w20")} {words.index_of("w39") ?? -1} {bits.contains(true)} {sorted[0]}"
+}
+
+fn expect_eq(a: str, b: str) {
+    if a != b {
+        fail(500, "{a} != {b}")
+    }
+}
+
+fn expect_eq_b(a: bool, b: bool) {
+    if a != b {
+        fail(500, "{a} != {b}")
+    }
+}
+
+fn expect_eq_i(a: int, b: int) {
+    if a != b {
+        fail(500, "{a} != {b}")
+    }
+}
+
+test "every list operation on store lists with 16-byte headers" {
+    let r = call POST "/ops"
+    expect r.status == 200
+    // sort_by сортирует на месте: короткие имена — вперёд
+    expect r.body == "30 25 40 -1 39 true 8 true w9"
+    let h: int = __cast(words)
+    let hb: int = __cast(bits)
+    expect __list_header_slot(h) == 16 && __list_header_slot(hb) == 16
+    expect __list_capacity(h) >= 30 && __list_capacity(hb) >= 25
+    // копии и срезы — в арене, обычные списки
+    let c = words.copy()
+    let sl = bits[2..10]
+    let rep = nums2[0..2] * 3
+    expect c.len() == 30 && c[0] == "w9" && sl.len() == 8 && rep.len() == 6 && rep[4] == -1
+    expect to_json(bits[0..4]) == to_json([bits[0], bits[1], bits[2], bits[3]])
+    expect words.join(",").starts_with("w9,w8,w7,w6,w5,w3,w1,w0,w39,") && words.join(",").ends_with(",w19,w18")
+    var n = 0
+    for b in bits {
+        if b {
+            n += 1
+        }
+    }
+    expect n > 0 && n < 25
+    __gc_collect()
+    expect words[0] == "w9" && words[29] == "w18" && nums2[39] == 39
+    words.clear()
+    bits.clear()
+    expect words.len() == 0 && bits.len() == 0
+    for i in 0..100 {
+        words.push("again {i}")
+        bits.push(i % 2 == 1)
+    }
+    __gc_collect()
+    expect words[99] == "again 99" && bits[99] && !bits[98] && to_json(bits).byte_len() > 100
 }

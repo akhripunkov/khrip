@@ -67,7 +67,7 @@ fn str_alive(s: str, want: str) -> bool {
 
 fn cap_of(xs: [Item]) -> int {
     let h: int = __cast(xs)
-    return load64(h + 16)
+    return __list_capacity(h)
 }
 
 test "build the store" {

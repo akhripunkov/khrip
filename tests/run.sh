@@ -380,14 +380,22 @@ done
 # или с KHRIP_GC_VERIFY=1 (verify), как указано у каждой мутации:
 #   keyshare — ключ словаря не берётся из поля значения (gc_keys, plain);
 #   keyreplace — ключ копируется и при замене значения (gc_keys, plain);
-#   listptrb — ёмкость списка — весь слот, а биты PTRB — только на cap
-#              элементов (gc_lists, verify: ссылка без бита PTRB);
+#   listptrb — ёмкость списка — весь слот, а биты PTRB — только на
+#              запрошенные байты (gc_lists, verify: ссылка без бита PTRB);
 #   listcap — ёмкость копии снова от 4 элементов (gc_lists, plain);
 #   mapvkind — массив значений-ссылок словаря без битов PTRB (gc_maps,
 #              verify: ссылка без бита PTRB);
 #   mapkkind — то же у массива строковых ключей (gc_maps, verify);
 #   mapalive — признак «жива» не снимается при удалении (gc_maps, plain);
-#   mapbytes — копия словаря кладёт значения bool словом (gc_maps, plain).
+#   mapbytes — копия словаря кладёт значения bool словом (gc_maps, plain);
+#   listbool — массив [bool] в store с начала слота: размер элемента по адресу
+#              не узнать (gc_lists, plain);
+#   listroom — ёмкость списка store — весь слот, без сдвига массива [bool]
+#              (gc_lists, verify);
+#   listgrow — рост списка store без вида старого массива: новый массив
+#              ссылок без PTRB (gc_lists, verify);
+#   listvacate — серение ушедших элементов списка store по слову 24 старого
+#              заголовка (gc_satb, verify).
 mem3_ok=1
 while read -r cut test mode; do
 	[[ -z $cut ]] && continue
@@ -400,12 +408,16 @@ d, m = sys.argv[1], sys.argv[2]
 cuts = {
     "keyshare": ("    var key = __map_key_share(k, v, vd)\n", "    var key = 0\n", "api.kh"),
     "keyreplace": ("    __store_mut(m)\n    let idx = __map_find(m, k)\n    if idx >= 0 {\n        __map_update(m, k, idx, v)\n        return\n    }\n    var key = __map_key_share(k, v, vd)\n", "    __store_mut(m)\n    let k2 = __persist_copy(k, kd)\n    let idx = __map_find(m, k)\n    if idx >= 0 {\n        __map_update(m, k2, idx, v)\n        return\n    }\n    var key = __map_key_share(k, v, vd)\n", "api.kh"),
-    "listptrb": ("    store64(h, __alloc_k(n, kind, 0))\n    store64(h + 16, n / esize)\n", "    var m = cap * esize\n    if m < 16 {\n        m = 16\n    }\n    store64(h, __alloc_k(m, kind, 0))\n    store64(h + 16, n / esize)\n", "core.kh"),
-    "listcap": ("    var n = cap * esize\n    if n < 16 {\n        n = 16\n    }\n", "    var n = cap * esize\n    if n < 32 {\n        n = 32\n    }\n", "core.kh"),
+    "listptrb": ("    return __salloc(__salloc_size(n), kind, 0)\n}\n", "    return __salloc(n, kind, 0)\n}\n", "core.kh"),
+    "listcap": ("    var n = cap * 8\n    if n < 16 {\n        n = 16\n    }\n", "    var n = cap * 8\n    if n < 32 {\n        n = 32\n    }\n", "core.kh"),
     "mapvkind": ("fn __map_vkind(flags: int) -> int {\n    if (flags & MAP_REFS) != 0 {\n        return K_PTRS\n", "fn __map_vkind(flags: int) -> int {\n    if false {\n        return K_PTRS\n", "core.kh"),
     "mapkkind": ("fn __map_kkind(flags: int) -> int {\n    if (flags & MAP_STR) != 0 {\n        return K_PTRS\n", "fn __map_kkind(flags: int) -> int {\n    if false {\n        return K_PTRS\n", "core.kh"),
     "mapalive": ("    store8(load64(m + 24) + idx, 0)\n    store64(m + 8, load64(m + 8) - 1)\n", "    store64(m + 8, load64(m + 8) - 1)\n", "core.kh"),
     "mapbytes": ("                __map_val_put(m, vals, w, sv)\n", "                store64(vals + w * 8, sv)\n", "api.kh"),
+    "listbool": ("        return __salloc(__salloc_size(cap + 8), kind, 0) + 8\n", "        return __salloc(__salloc_size(cap + 8), kind, 0)\n", "core.kh"),
+    "listroom": ("    return slot + size - p\n", "    return size\n", "gc.kh"),
+    "listgrow": ("fn __salloc_list(h: int, cap: int, es: int) -> int {\n    let kind = __gc_kind_of(load64(h))\n", "fn __salloc_list(h: int, cap: int, es: int) -> int {\n    let kind = K_NOSCAN\n", "gc.kh"),
+    "listvacate": ("    if __gc_marking != 0 && __list_es(h) == 8 {\n", "    if __gc_marking != 0 && load64(h + 24) == 8 {\n", "gc.kh"),
 }
 old, new, f = cuts[m]
 s = open(f"{d}/{f}").read()
@@ -434,6 +446,10 @@ mapvkind gc_maps verify
 mapkkind gc_maps verify
 mapalive gc_maps plain
 mapbytes gc_maps plain
+listbool gc_lists plain
+listroom gc_lists verify
+listgrow gc_lists verify
+listvacate gc_satb verify
 CUTS
 [[ $mem3_ok -eq 1 ]] && pass=$((pass + 1))
 

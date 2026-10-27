@@ -1256,9 +1256,20 @@ fn buf_str(b: Buf) -> str {
 
 // ---- Списки ----
 // Заголовок: [0] data, [8] len, [16] cap, [24] размер элемента — 8 байт,
-// а у [bool] — 1 байт.
+// а у [bool] — 1 байт. Список в store — заголовок 16 байт, только [0] data и
+// [8] len (этап памяти, часть 3, п. 4): размер элемента — по адресу
+// массива (массив [bool] начинается на 8 байт дальше начала своего слота,
+// массив слов — с начала), ёмкость — сколько элементов вмещает слот массива
+// от data до конца (__store_room, lib/gc.kh). Компилятор читает только data и
+// len, у обоих видов они на месте; ёмкость и размер элемента — через
+// __list_cap и __list_es.
 
 fn __list_new(cap: int, esize: int) -> int {
+    if __store_on() {
+        // в режиме store список — только вида store (вид элементов
+        // неизвестен: каждое слово — возможная ссылка)
+        return __list_new_k(cap, esize, true)
+    }
     var c = cap
     if c < 4 {
         c = 4
@@ -1271,36 +1282,68 @@ fn __list_new(cap: int, esize: int) -> int {
 }
 
 // То же с видами объектов для кучи store: в заголовке ссылка — только data
-// (слово 0); в data ссылки — элементы, если elem_ref. Ёмкость — не меньше cap
-// и сколько вмещает слот массива (__alloc_round): копия списка в store
-// (__deep_copy) получает массив по своей длине, а не от 4 элементов (этап
-// памяти, часть 3, п. 4); слот целиком — с битами PTRB, если elem_ref.
+// (слово 0); в data ссылки — элементы, если elem_ref. В store (копия списка,
+// __deep_copy) массив — по длине списка, а не от 4 элементов: ёмкость —
+// сколько вмещает слот массива (у пустого и короткого — слот 16 байт), слот
+// целиком — с битами PTRB, если elem_ref; вне store — как __list_new.
 fn __list_new_k(cap: int, esize: int, elem_ref: bool) -> int {
+    if !__store_on() {
+        return __list_new(cap, esize)
+    }
     var kind = K_NOSCAN
     if elem_ref {
         kind = K_PTRS
     }
-    var n = cap * esize
-    if n < 16 {
-        n = 16
-    }
-    n = __alloc_round(n)
-    let h = __alloc_k(32, K_MASK, 1)
-    store64(h, __alloc_k(n, kind, 0))
-    store64(h + 16, n / esize)
-    store64(h + 24, esize)
+    let h = __salloc(16, K_MASK, 1)
+    store64(h, __list_data_k(cap, esize, kind))
     return h
 }
 
+// Массив списка store на cap элементов размера esize (вида kind; только в
+// режиме store): слот, в котором помещается cap элементов; у [bool] массив —
+// с 8-го байта слота.
+fn __list_data_k(cap: int, esize: int, kind: int) -> int {
+    if esize == 1 {
+        return __salloc(__salloc_size(cap + 8), kind, 0) + 8
+    }
+    var n = cap * 8
+    if n < 16 {
+        n = 16
+    }
+    return __salloc(__salloc_size(n), kind, 0)
+}
+
+// Ёмкость и размер элемента списка h (у списка store — по массиву).
+fn __list_cap(h: int) -> int {
+    if __in_store(h) {
+        let d = load64(h)
+        if (d & 8) != 0 {
+            return __store_room(d)
+        }
+        return __store_room(d) >> 3
+    }
+    return load64(h + 16)
+}
+
+fn __list_es(h: int) -> int {
+    if __in_store(h) {
+        if (load64(h) & 8) != 0 {
+            return 1
+        }
+        return 8
+    }
+    return load64(h + 24)
+}
+
 fn __lget(h: int, i: int) -> int {
-    if load64(h + 24) == 1 {
+    if __list_es(h) == 1 {
         return load8(load64(h) + i)
     }
     return load64(load64(h) + i * 8)
 }
 
 fn __lset(h: int, i: int, v: int) {
-    if load64(h + 24) == 1 {
+    if __list_es(h) == 1 {
         store8(load64(h) + i, v)
         return
     }
@@ -1308,26 +1351,34 @@ fn __lset(h: int, i: int, v: int) {
 }
 
 fn __list_grow(h: int, need: int) {
-    var cap = load64(h + 16) * 2
+    var cap = __list_cap(h) * 2
     while cap < need {
         cap *= 2
     }
-    let es = load64(h + 24)
-    // новый массив списка в store — того же вида, что старый ([int] — без ссылок)
-    let data = __alloc_for_k(h, cap * es, K_LIST_DATA, 0)
+    let es = __list_es(h)
+    var data = 0
+    if __in_store(h) {
+        // новый массив списка store — того же вида, что старый ([int] — без
+        // ссылок); ёмкость — по его слоту
+        data = __salloc_list(h, cap, es)
+    } else {
+        data = __alloc_for_k(h, cap * es, K_LIST_DATA, 0)
+    }
     __memcpy(data, load64(h), load64(h + 8) * es)
     // SATB (lib/gc.kh, §7.5): заголовок больше не ссылается на старый массив, а
     // новый — чёрный, разметка его не смотрит
     __gc_old_array(h)
     store64(h, data)
-    store64(h + 16, cap)
+    if !__in_store(h) {
+        store64(h + 16, cap)
+    }
 }
 
 fn __list_push(self: [T], v: T) {
     let h: int = __cast(self)
     __store_mut(h)
     let len = load64(h + 8)
-    if len == load64(h + 16) {
+    if len == __list_cap(h) {
         __list_grow(h, len + 1)
     }
     __lset(h, len, __cast(v))
@@ -1379,7 +1430,7 @@ fn __list_truncate(self: [T], n: int) {
 // чтобы в массиве не оставалось ссылок на то, что из него уже убрано.
 fn __list_vacate(h: int, from: int) {
     if __in_store(h) {
-        let es = load64(h + 24)
+        let es = __list_es(h)
         __gc_vacate(h, from)
         __memset(load64(h) + from * es, 0, (load64(h + 8) - from) * es)
     }
@@ -1392,7 +1443,7 @@ fn __list_insert(self: [T], i: int, v: T) {
     if i < 0 || i > len {
         __panic(PANIC_INDEX, "insert")
     }
-    if len == load64(h + 16) {
+    if len == __list_cap(h) {
         __list_grow(h, len + 1)
     }
     var j = len
@@ -1446,7 +1497,7 @@ fn __list_reverse(self: [T]) -> [T] {
 fn __list_copy(self: [T]) -> [T] {
     let h: int = __cast(self)
     let len = load64(h + 8)
-    let es = load64(h + 24)
+    let es = __list_es(h)
     let n = __list_new(len, es)
     __memcpy(load64(n), load64(h), len * es)
     store64(n + 8, len)
@@ -1457,7 +1508,7 @@ fn __list_copy(self: [T]) -> [T] {
 fn __list_repeat(self: [T], n: int) -> [T] {
     let h: int = __cast(self)
     let len = load64(h + 8)
-    let es = load64(h + 24)
+    let es = __list_es(h)
     var count = n
     if count < 0 {
         count = 0
@@ -1653,7 +1704,7 @@ fn __list_slice(self: [T], from: int, to: int) -> [T] {
     let h: int = __cast(self)
     let a = __clamp(from, 0, load64(h + 8))
     let b = __clamp(to, a, load64(h + 8))
-    let es = load64(h + 24)
+    let es = __list_es(h)
     let n = __list_new(b - a, es)
     __memcpy(load64(n), load64(h) + a * es, (b - a) * es)
     store64(n + 8, b - a)
@@ -1809,7 +1860,7 @@ fn __sort_by(self: [T], keys: [int], by_str: bool) -> [T] {
         width *= 2
     }
     // переставить элементы по номерам
-    let es = load64(h + 24)
+    let es = __list_es(h)
     let data = load64(h)
     let copy = __alloc(n * es + 8)
     __memcpy(copy, data, n * es)

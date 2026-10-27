@@ -15,6 +15,15 @@ fn __salloc_size(n: int) -> int {
     return (n + 15) & ~15
 }
 
+// Списков в store нет.
+fn __salloc_list(h: int, cap: int, es: int) -> int {
+    return __salloc(cap * es, 0, 0)
+}
+
+fn __store_room(p: int) -> int {
+    return 0
+}
+
 fn __salloc_for(h: int, n: int, kind: int, mask: int) -> int {
     return __salloc(n, kind, mask)
 }

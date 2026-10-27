@@ -244,7 +244,12 @@ fn __map_grow_at(m: int) -> int {
 
 // Ёмкость списка h и размер слота его массива (0 — массив не в store).
 fn __list_capacity(h: int) -> int {
-    return load64(h + 16)
+    return __list_cap(h)
+}
+
+// Размер слота заголовка списка h.
+fn __list_header_slot(h: int) -> int {
+    return __gc_obj_size(__gc_obj_of(h))
 }
 
 fn __list_data_slot(h: int) -> int {

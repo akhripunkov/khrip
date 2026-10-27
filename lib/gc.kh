@@ -405,6 +405,35 @@ fn __salloc_for(h: int, n: int, kind: int, mask: int) -> int {
     return p
 }
 
+// Новый массив на cap элементов размера es для роста списка store h
+// (lib/core.kh, __list_grow) — того же вида, что нынешний: из кучи store, как
+// __salloc_for.
+fn __salloc_list(h: int, cap: int, es: int) -> int {
+    let kind = __gc_kind_of(load64(h))
+    if __store_on() {
+        return __list_data_k(cap, es, kind)
+    }
+    __gc_hard_check()
+    __pmode_on()
+    let d = __list_data_k(cap, es, kind)
+    __pmode_off()
+    return d
+}
+
+// Байт от p до конца слота объекта store, в котором лежит p (массив списка
+// store, lib/core.kh: его ёмкость).
+fn __store_room(p: int) -> int {
+    let e = load32(GC_PAGEMAP + (((p - STORE_REGION) >> GC_PAGE_SHIFT) << 2))
+    let s = GC_SPANS + ((e - 1) << 6)
+    let base = load64(s + S_BASE)
+    let size = load64(s + S_SIZE)
+    if ((load64(s + S_INFO) >> 48) & F_LARGE) != 0 {
+        return base + size - p
+    }
+    let slot = base + (((p - base) * (load64(s + S_MAGIC) & 0xFFFFFFFF)) >> 32) * size
+    return slot + size - p
+}
+
 // Темп и рост словаря по частям (lib/core.kh): новые массивы и таблица
 // большого словаря store выделяются в начале роста, а старые становятся
 // мусором только при переключении. Сборка, начатая между ними, держала бы
@@ -3011,7 +3040,7 @@ fn __gc_old_at(m: int, a: int) {
 
 // Элементы [from, len) списка store h уходят (truncate, clear).
 fn __gc_vacate(h: int, from: int) {
-    if __gc_marking != 0 && load64(h + 24) == 8 {
+    if __gc_marking != 0 && __list_es(h) == 8 {
         __gc_shade_words(h, load64(h) + from * 8, load64(h + 8) - from)
     }
 }

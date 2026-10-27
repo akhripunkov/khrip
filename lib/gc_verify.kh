@@ -617,12 +617,25 @@ fn __gcv_visit(st: int, when: str, v: int, d: int) {
         __gcv_ptr(st, when, data, "list data", true)
         __gcv_slot(st, when, v)
         let ed = load64(t + 8)
+        let n = load64(v + 8)
+        let cap = __list_cap(v)
+        if __in_store(v) {
+            // список store: заголовок — слот 16 байт, массив [bool] — с 8-го
+            // байта своего слота, массив слов — с начала (lib/core.kh)
+            let es = __list_es(v)
+            let o = __gc_obj_of(data)
+            if __gc_obj_size(__gc_obj_of(v)) != 16 || (es == 1) != (load64(ed) == D_BOOL) || (es == 1 && data != o + 8) || (es == 8 && data != o) {
+                __gcv_fail(st, when, "a store list at " + __gc_hex(v) + " has a broken header or data at " + __gc_hex(data))
+            }
+        }
+        if n > cap {
+            __gcv_fail(st, when, "a list at " + __gc_hex(v) + " has " + n.to_str() + " elements for room of " + cap.to_str())
+        }
         if !__is_scalar(ed) {
-            let n = load64(v + 8)
             for i in 0..n {
                 __gcv_child(st, when, data + i * 8, ed)
             }
-            for i in n..load64(v + 16) {
+            for i in n..cap {
                 __gcv_slot(st, when, data + i * 8)
             }
         }

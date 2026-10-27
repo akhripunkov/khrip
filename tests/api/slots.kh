@@ -38,7 +38,7 @@ fn names_of(xs: [Item]) -> str {
 // За длиной списка (до его ёмкости) — нули.
 fn list_clean(xs: [Item]) -> bool {
     let h: int = __cast(xs)
-    for i in load64(h + 8)..load64(h + 16) {
+    for i in load64(h + 8)..__list_capacity(h) {
         if load64(load64(h) + i * 8) != 0 {
             return false
         }
