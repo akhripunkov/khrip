@@ -1,0 +1,8 @@
+# bank, замкнутый цикл 10 с (wrk -t2 -c64 на ядрах 2–3, сервер THREADS=2 на ядрах 0–1), сборка с KHRIP_GC_LOG=1; сумма по журналу сборщика.
+# tree0 = a6176a0, tree1 = 9ea9e57 (пункт 1), tree5 = e7fd905 (итог)
+tree0 Requests/sec: 108179.40 proc cpu s 16.37 cycles 3 mark ms 18 sweep ms 0 assists 0 last live MB 22.2
+tree1 Requests/sec:  98415.87 proc cpu s 15.63 cycles 11 mark ms 165 sweep ms 4 assists 9221 last live MB 77.5
+tree5 Requests/sec: 100966.26 proc cpu s 15.7 cycles 11 mark ms 175 sweep ms 4 assists 8312 last live MB 77.7
+tree0 Requests/sec:  94475.98 proc cpu s 15.7 cycles 3 mark ms 20 sweep ms 1 assists 0 last live MB 22.1
+tree1 Requests/sec:  98353.91 proc cpu s 15.96 cycles 11 mark ms 173 sweep ms 4 assists 8178 last live MB 77.5
+tree5 Requests/sec: 103027.99 proc cpu s 15.58 cycles 11 mark ms 159 sweep ms 4 assists 8376 last live MB 77.2

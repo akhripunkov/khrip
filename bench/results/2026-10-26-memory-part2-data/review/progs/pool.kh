@@ -1,0 +1,39 @@
+// Server for buffer-pool tests: every response identifies its request.
+route GET "/echo/{tag}" (tag: str) -> str {
+    return "E:" + tag
+}
+
+type Blob { d: str }
+
+route POST "/body/{tag}" (tag: str, b: Blob) -> str {
+    let body = b.d
+    var h = 0
+    for i in 0..body.byte_len() {
+        h = (h * 31 + body.byte(i)) & 0xFFFFFFF
+    }
+    return "B:{tag}:{body.byte_len()}:{h}"
+}
+
+// n bytes: tag repeated, then padded
+route GET "/large/{n}/{tag}" (n: int, tag: str) -> str {
+    let unit = tag + "."
+    let k = n / unit.byte_len()
+    var s = unit.repeat(k)
+    s += "#".repeat(n - s.byte_len())
+    return s
+}
+
+route GET "/sleep/{ms}/{tag}" (ms: int, tag: str) -> str {
+    sleep(ms)
+    return "S:" + tag
+}
+
+route GET "/fetch/{port}/{tag}" (port: int, tag: str) -> str {
+    let r = fetch GET "http://127.0.0.1:{port}/large/70000/{tag}"
+    return "F:{r.status}:{r.body.byte_len()}:{r.body.byte_slice(0, tag.byte_len())}"
+}
+
+route GET "/sleepbig/{ms}/{n}" (ms: int, n: int) -> str {
+    sleep(ms)
+    return "z".repeat(n)
+}

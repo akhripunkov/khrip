@@ -1,0 +1,4 @@
+tree0: after copy: entries 1100000 arrays cap 1100000 table 8388608 heap 89 MB after 137500 inserts: entries 1237500 arrays cap 2200000 table 8388608 heap 114 MB peak 139 MB 
+tree5: after copy: entries 1100000 arrays cap 1168752 table 8388608 heap 90 MB after 137500 inserts: entries 1237500 arrays cap 4194304 table 8388608 heap 160 MB peak 250 MB 
+tree6: after copy: entries 1100000 arrays cap 1168752 table 8388608 heap 90 MB after 137500 inserts: entries 1237500 arrays cap 2337504 table 8388608 heap 117 MB peak 144 MB 
+tree7: after copy: entries 1100000 arrays cap 1168752 table 8388608 heap 90 MB after 137500 inserts: entries 1237500 arrays cap 2337504 table 8388608 heap 117 MB peak 144 MB 

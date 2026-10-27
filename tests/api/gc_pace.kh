@@ -1,6 +1,6 @@
-// Темп сборок (docs/design/v0.13-store-gc.md §8.2, §8.3): множитель запаса m
-// растёт вдвое (до 8), пока почти всё живо, и падает до 1, когда выжило меньше
-// половины, а цель следует за ним; мягкий предел (KHRIP_GC_LIMIT_MB, здесь —
+// Темп сборок (docs/design/v0.13-store-gc.md §8.2, §8.3): цель — живое · 1,5
+// (KHRIP_GC = 50 по умолчанию, множитель запаса m всегда 1: и когда почти всё
+// живо, и когда выжило меньше половины); мягкий предел (KHRIP_GC_LIMIT_MB, здесь —
 // __gc_set_limit_mb) держит цель не выше себя, но не ниже 1,1 · живого;
 // пишущий запрос, который выделяет, пока идёт разметка, а куча выше 1,5 · цели,
 // при последнем отпускании (под своей исключительной блокировкой) помогает
@@ -8,7 +8,7 @@
 // и 1,5 · цели — по счёту выделенного; читающий запрос и окно не помогают.
 // Цель здесь — цель сборки: цель или куча в начале сборки, если та выше.
 // tests/run.sh запускает файл ещё и с KHRIP_GC_LIMIT_MB=3 (первый тест
-// сверяет цель с ним) и проверяет, что без удвоения m, без сброса m, без
+// сверяет цель с ним) и проверяет, что с запасом 100 % по умолчанию, без
 // мягкого предела, без помощи писателя и без помощи по счёту тесты падают. С
 // KHRIP_GC_STRESS цель — от помеченного и шага, и цифры цели не проверяются.
 
@@ -24,9 +24,9 @@ fn exact() -> bool {
     return (env("KHRIP_GC_STRESS") ?? "") != "1"
 }
 
-// цель по живому: max(4 МБ, живое · (1 + m)) (KHRIP_GC = 100)
-fn goal_for(live: int, m: int) -> int {
-    let g = live + live * m
+// цель по живому: max(4 МБ, живое · 1,5) (KHRIP_GC = 50)
+fn goal_for(live: int) -> int {
+    let g = live + live / 2
     if g < 4 * MB {
         return 4 * MB
     }
@@ -58,15 +58,17 @@ test "KHRIP_GC_LIMIT_MB caps the goal from the start" {
     __gc_set_limit_mb(0)
 }
 
-// между сборками — немного нового живого: сборка без выделений после прошлой
-// уборки m не меняет
+// между сборками — немного нового живого
 fn collect_after_push(k: int) {
     small.push(Item { name: "kept {k}", n: k })
     __gc_collect()
 }
 
-test "m doubles while nearly everything survives, up to 8" {
-    for i in 0..20000 {
+// раньше цель росла как живое · (1 + m), и m удваивался до 8 сборками, где
+// выживало больше 0,85 кучи (смена фазы — рост, затем замены — копила мусор до
+// 9 × живого)
+test "the goal stays 1.5 x live while nearly everything survives" {
+    for i in 0..60000 {
         items.push(Item { name: "item {i} xxxxxxxxxxxxxxxx", n: i })
     }
     collect_after_push(1)
@@ -74,29 +76,27 @@ test "m doubles while nearly everything survives, up to 8" {
     collect_after_push(3)
     collect_after_push(4)
     let s = __gc_stats()
-    expect s.m == 8
-    expect !exact() || s.goal == goal_for(s.live, 8)
+    // выше наименьшей цели (4 МБ): запас виден
+    expect s.live > 3 * MB
+    expect !exact() || s.goal == goal_for(s.live)
     collect_after_push(5)
-    expect __gc_stats().m == 8
+    expect !exact() || __gc_stats().goal == goal_for(__gc_stats().live)
 }
 
-test "m falls back to 1 when less than half survives" {
+test "the goal stays 1.5 x live when less than half survives" {
     items = []
     __gc_collect()
     let s = __gc_stats()
-    expect s.m == 1
-    expect !exact() || s.goal == goal_for(s.live, 1)
+    expect !exact() || s.goal == goal_for(s.live)
 }
 
 // сборка целиком сразу после доделки идущей (__gc_collect посреди разметки)
-// начинается с только что убранной кучи: её выживание ≈ 1 не удваивает m
-// (раньше m шёл 2 → 4 → 8 при настоящем выживании 0,65)
-test "a whole collection right after a finished cycle does not move m" {
+// начинается с только что убранной кучи — цель та же
+test "a whole collection right after a finished cycle keeps the goal" {
     for i in 0..20000 {
         items.push(Item { name: "item {i} xxxxxxxxxxxxxxxx", n: i })
     }
     __gc_collect()
-    let m0 = __gc_stats().m
     for round in 0..4 {
         // 70% кучи — мусор
         for i in 0..14000 {
@@ -105,7 +105,8 @@ test "a whole collection right after a finished cycle does not move m" {
         __gc_begin_from_roots()
         __gc_collect()
     }
-    expect !exact() || __gc_stats().m == m0
+    let s = __gc_stats()
+    expect !exact() || s.goal == goal_for(s.live)
 }
 
 test "the soft limit caps the goal, but not below 1.1 x live" {
@@ -122,7 +123,7 @@ test "the soft limit caps the goal, but not below 1.1 x live" {
     __gc_collect()
     expect !exact() || __gc_stats().goal == 8 * MB
     __gc_set_limit_mb(0)
-    expect !exact() || __gc_stats().goal == goal_for(__gc_stats().live, __gc_stats().m)
+    expect !exact() || __gc_stats().goal == goal_for(__gc_stats().live)
 }
 
 test "a writer's final release assists marking above 1.5 x goal" {

@@ -1,0 +1,5 @@
+400
+2
+gc 1 (in request): heap 68.0->52.1 MB, live 52.1 MB (401874 obj, 0 black) pause 23.22 ms (start 0.03, mark 22.05), sweep 1.14 ms, pages released by the GC thread, next at 70.3 MB
+gc 2 (pace): heap 71.2->55.5 MB, live 55.5 MB (796410 obj, 0 black) start 6 µs, mark 13.96 ms in 70 slices (max 260 µs, cpu 260 µs) over 62.69 ms, term 3 µs (1 tries), assists 0, sweep 1.46 ms in 7 slices (longest 345 µs, cpu 273 µs), released 0.0 MB in 
+gc 3 (pace): heap 138.3->132.8 MB, live 131.0 MB (940610 obj, 141400 black) start 3 µs, mark 22.35 ms in 113 slices (max 231 µs, cpu 231 µs) over 114.80 ms, term 2 µs (1 tries), assists 7, sweep 2.79 ms in 14 slices (longest 222 µs, cpu 221 µs), released

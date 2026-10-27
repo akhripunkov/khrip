@@ -1,0 +1,9 @@
+// A route that touches kb KB of its arena.
+route GET "/big/{kb}" (kb: int) -> int {
+    var xs: [int] = []
+    let n = kb * 128
+    var i = 0
+    // list grows by doubling: allocate exactly via a pre-sized loop of strings
+    let s = "abcdefgh".repeat(kb * 128)
+    return s.byte_len()
+}

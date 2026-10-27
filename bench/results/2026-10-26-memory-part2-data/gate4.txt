@@ -1,0 +1,8 @@
+seeded: 1120 KB
+patch soak 60s: Requests/sec:  64057.66, p99 87.32ms, peak 3880 KB, end 3880 KB
+ok
+RSS after 10 s: min 3796 KB, max 3880 KB, slope 0.0021 MB/s
+cycles 153 (153 incremental, 0 whole); heap before 3.0 MB, live 0.8 MB (14637 objects)
+start median 0.004, p99 0.047, max 0.049 ms; max slice median 0.202, p99 0.737, max 2.061 ms; max slice cpu median 0.200, p99 0.249, max 1.119 ms
+termination median 0.003, p99 0.009, max 0.086 ms; sweep median 0.180, p99 0.420, max 0.560 ms; slices per cycle median 5
+longest sweep slice median 0.182, p99 0.314, max 0.400 ms; cpu median 0.178, p99 0.209, max 0.215 ms; writer assists 0

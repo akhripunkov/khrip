@@ -1,0 +1,6 @@
+tree0	a6176a0 (base)
+tree4	3495ef8 (no trigger hold)
+tree3x	c0a762c (items 1-3, old map growth)
+tree5	e7fd905 (before review)
+tree6	c39e803 (review fixes, hold capped at the goal)
+tree7	49e9055 (review fixes, hold capped halfway to the hard limit)

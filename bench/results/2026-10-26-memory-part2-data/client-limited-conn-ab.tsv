@@ -1,0 +1,33 @@
+variant	scenario	lang	rps	p50_ms	p99_ms	errors_pct	idle_mb	seeded_mb	peak_mb	after_mb	cpu_us_per_req	startup_ms	build_s	size_bytes	invariant
+item 2	shortener	khrip	61736	0.32	324.49	0.0	0.3	0.6	19.6	19.6	13.9	16	0.1	182248	ok
+item 2	bank	khrip	62667	0.40	34.02	0.0	0.3	0.3	69.9	69.9	15.8	18	0.1	144248	ok
+item 2	shortener	khrip	62723	0.31	163.29	0.0	0.3	0.6	18.0	18.0	13.5	16	0.1	182248	ok
+item 2	bank	khrip	61854	0.43	47.43	0.0	0.3	0.4	69.1	69.1	16.5	15	0.1	144248	ok
+item 2	shortener	khrip	61280	0.32	17.26	0.0	0.3	0.6	19.6	19.6	13.8	20	0.1	182248	ok
+item 2	bank	khrip	64776	0.39	8.24	0.0	0.3	0.4	71.6	71.6	16.3	19	0.1	144248	ok
+item 2	shortener	khrip	59152	0.32	9.15	0.0	0.3	0.6	19.2	19.2	14.1	17	0.1	182248	ok
+item 2	bank	khrip	71620	0.42	49.37	0.0	0.3	0.3	77.1	77.1	15.7	18	0.1	144248	ok
+item 2	shortener	khrip	56655	0.34	29.39	0.0	0.3	0.6	18.0	18.0	14.9	18	0.1	182248	ok
+item 2	bank	khrip	64726	0.45	6.43	0.0	0.3	0.3	70.3	70.3	16.8	20	0.1	144248	ok
+item 2	shortener	khrip	58591	0.32	8.84	0.0	0.3	0.6	18.7	18.7	14.2	17	0.1	182248	ok
+item 2	bank	khrip	67690	0.40	6.54	0.0	0.3	0.3	74.1	74.1	16.1	15	0.1	144248	ok
+item 2	shortener	khrip	60738	0.31	45.33	0.0	0.3	0.6	19.3	19.3	13.3	14	0.1	182248	ok
+item 2	bank	khrip	65124	0.42	7.32	0.0	0.3	0.4	71.3	71.3	16.3	17	0.1	144248	ok
+item 2	shortener	khrip	56299	0.34	7.38	0.0	0.3	0.6	18.0	18.0	14.9	16	0.1	182248	ok
+item 2	bank	khrip	65806	0.41	38.56	0.0	0.3	0.3	71.5	71.5	15.9	16	0.1	144248	ok
+item 3 (list pool)	shortener	khrip	58400	0.31	7.33	0.0	0.3	0.6	18.2	18.2	13.7	16	0.1	182248	ok
+item 3 (list pool)	bank	khrip	66270	0.40	51.35	0.0	0.3	0.3	72.1	72.1	15.3	20	0.1	148344	ok
+item 3 (list pool)	shortener	khrip	63169	0.31	7.36	0.0	0.3	0.6	17.5	17.5	14.1	19	0.1	182248	ok
+item 3 (list pool)	bank	khrip	58220	0.41	6.51	0.0	0.3	0.3	65.4	65.4	16.8	17	0.1	148344	ok
+item 3 (list pool)	shortener	khrip	57543	0.33	7.28	0.0	0.3	0.6	17.7	17.7	14.2	15	0.1	182248	ok
+item 3 (list pool)	bank	khrip	62015	0.45	7.80	0.0	0.3	0.4	67.8	67.8	16.6	13	0.1	148344	ok
+item 3 (list pool)	shortener	khrip	60758	0.32	8.18	0.0	0.3	0.6	17.4	17.4	14.2	14	0.1	182248	ok
+item 3 (list pool)	bank	khrip	60720	0.43	33.01	0.0	0.3	0.4	66.3	66.3	16.6	18	0.1	148344	ok
+item 3 (list pool)	shortener	khrip	59419	0.33	98.45	0.0	0.3	0.6	17.3	17.3	14.0	16	0.1	182248	ok
+item 3 (list pool)	bank	khrip	61106	0.41	13.77	0.0	0.3	0.3	66.5	66.5	16.4	14	0.1	148344	ok
+item 3 (list pool)	shortener	khrip	58473	0.31	10.57	0.0	0.3	0.6	17.3	17.3	13.5	16	0.1	182248	ok
+item 3 (list pool)	bank	khrip	64580	0.40	26.45	0.0	0.3	0.3	69.5	69.5	16.0	15	0.1	148344	ok
+item 3 (list pool)	shortener	khrip	57151	0.33	6.70	0.0	0.3	0.6	17.3	17.3	14.1	16	0.1	182248	ok
+item 3 (list pool)	bank	khrip	63525	0.42	52.09	0.0	0.3	0.3	68.7	68.7	16.3	17	0.1	148344	ok
+item 3 (list pool)	shortener	khrip	57535	0.33	8.11	0.0	0.3	0.6	17.3	17.3	14.9	20	0.1	182248	ok
+item 3 (list pool)	bank	khrip	62741	0.39	7.05	0.0	0.3	0.4	67.7	67.7	16.3	18	0.1	148344	ok

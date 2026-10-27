@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Смена фазы: рост store, затем замены (этап памяти, часть 1b). Проверяет
-# адаптивный m сборщика: пока store только растёт, выживает всё, m удваивается
+# Смена фазы: рост store, затем замены (этап памяти, часть 1b). Проверял
+# адаптивный m сборщика: пока store только растёт, выживает всё, m удваивался
 # до 8 и цель следующей сборки — 9 × живого; когда рост сменяется заменами,
-# мусор копится до этой цели или до сборки по таймеру (2 минуты без сборки).
+# мусор копился до этой цели или до сборки по таймеру (2 минуты без сборки).
+# С части 2 m всегда 1, а запас по умолчанию — 50 % (KHRIP_GC=50).
 #
-#   bench/gc/phase.sh <вариант> ...     khrip | khrip-m1 (компилятор KHC_M1:
-#                                        копия библиотеки, где m всегда 1) |
-#                                        khrip-m1-gc50 (то же с KHRIP_GC=50) | go
+#   bench/gc/phase.sh <вариант> ...     khrip | khrip-gc100 (KHRIP_GC=100) |
+#                                        khrip-m1, khrip-m1-gc50 (компилятор
+#                                        KHC_M1, для старой библиотеки) | go
 #
 # Заполнение: FILL_REQ запросов по FILL_N записей (40 × 50 000) с паузой 1 с;
 # затем замены: wrk2, CHURN_RATE запросов в секунду по CHURN_N записей
@@ -49,12 +50,13 @@ for v in "$@"; do
 	mkdir -p "$o"
 	envs=(PORT=8080)
 	case $v in
-	khrip | khrip-m1 | khrip-m1-gc50)
+	khrip | khrip-gc100 | khrip-m1 | khrip-m1-gc50)
 		khc=$root/build/khc
 		[[ $v == khrip-m1* ]] && khc=${KHC_M1:?KHC_M1}
 		KHRIP_GC_LOG=1 "$khc" -o "$tmp/server" "$here/phase.kh" || exit 1
 		envs+=(KHRIP_GC_LOG=1)
 		[[ $v == *-gc50 ]] && envs+=(KHRIP_GC=50)
+		[[ $v == *-gc100 ]] && envs+=(KHRIP_GC=100)
 		;;
 	go)
 		(cd "$here/phase_go" && go build -o "$tmp/server" .) || exit 1

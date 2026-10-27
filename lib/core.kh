@@ -113,8 +113,20 @@ const CTX_CHWAIT = 304
 // вершина стека потока (__entry, __thread_main): до неё запись сборщика store
 // (lib/gc.kh) копирует стек контекста вне сопрограммы
 const CTX_STACK_TOP = 312
+// сколько байт арены (от начала, обнулённых) оставил в памяти последний
+// __arena_end этого потока (lib/http.kh, __co_job)
+const CTX_ARENA_KEPT = 320
 // запас в конце арены для ответа 500 и журнала после исчерпания памяти
 const ARENA_RESERVE = 16777216
+// Память арены после запроса (этап памяти, часть 2, с правкой ревью).
+// __arena_end обнуляет то, что занял запрос, и держит в памяти до ARENA_WARM
+// байт: следующий запрос той же сопрограммы возьмёт их без отказов страниц
+// (≈ 1,3 мкс на страницу 4 КБ в этой виртуальной машине, обнуление — ≈ 0,2).
+// Тёплые — только CO_WARM верхних свободных сопрограмм потока (lib/http.kh,
+// __co_put): сопрограмма, ушедшая глубже, отдаёт системе всё сверх
+// ARENA_KEEP, ушедшая глубже CO_KEEP — всё.
+const ARENA_KEEP = 32768
+const ARENA_WARM = 8388608
 // арена, которая подключается кусками (без MAP_NORESERVE): столько подключённой
 // памяти держится сверх нужного — на ответ 500, если система откажет в
 // следующем куске
@@ -485,20 +497,40 @@ fn __strc_clear() {
 }
 
 // Освободить всё, что выделено в арене, и вернуться к обычной памяти.
-// Арена обнуляется: выделитель обещает нулевую память. Подключённая память
-// остаётся подключённой (CTX_ARENA_END) — для следующего запроса.
+// Арена обнуляется: выделитель обещает нулевую память. В памяти остаются
+// обнулёнными первые ARENA_WARM байт того, что занял запрос; остальное —
+// системе (MADV_DONTNEED: страницы вернутся нулевыми при первом касании).
+// Сколько осталось — в CTX_ARENA_KEPT: сопрограмма, которая остынет
+// (lib/http.kh, __co_cool), отдаст и это. Подключённая память
+// (CTX_ARENA_END) остаётся подключённой — для следующего запроса: madvise не
+// меняет учёт памяти, и запас ARENA_PANIC остаётся за ней.
 fn __arena_end() {
     let c = __ctx()
     let base = load64(c + CTX_ARENA)
     let used = load64(c + CTX_PTR) - base
-    if used > 8 * COMMIT {
-        // большой запрос: вернуть страницы системе (они вернутся нулевыми)
-        syscall(28, base, (used + 4095) & ~4095, 4)
+    var kept = used
+    if used > ARENA_WARM {
+        __memset(base, 0, ARENA_WARM)
+        __arena_release(base + ARENA_WARM, ((used + 4095) & ~4095) - ARENA_WARM)
+        kept = ARENA_WARM
     } else {
         __memset(base, 0, used)
     }
+    store64(c + CTX_ARENA_KEPT, kept)
     store64(c + CTX_PTR, load64(c + CTX_SAVE_PTR))
     store64(c + CTX_END, load64(c + CTX_SAVE_END))
+}
+
+// Отдать системе страницы [p, p + n) арены, где лежали данные запроса
+// (MADV_DONTNEED, 28: вернутся нулевыми). Если система отказала, страницы
+// обнуляются: следующий запрос получил бы чужие данные.
+fn __arena_release(p: int, n: int) {
+    if n <= 0 {
+        return
+    }
+    if syscall(28, p, n, 4) != 0 {
+        __memset(p, 0, n)
+    }
 }
 
 fn __memcpy(dst: int, src: int, n: int) {
@@ -2098,7 +2130,44 @@ fn __list_sort_str(self: [str]) -> [str] {
 // Записи хранятся по порядку вставки в списках keys, vals и alive (1 — жива);
 // slots — открытая адресация: номер записи + 1, 0 — пусто, -1 — удалено.
 // Заголовок: [0] keys, [8] count, [16] vals, [24] alive, [32] slots, [40] mask,
-// [48] строковые ключи, [56] удалённые записи.
+// [48] строковые ключи, [56] состояние роста или 0.
+//
+// Рост по частям (docs/design/v0.13-store-gc.md §14, «As built», этап памяти,
+// часть 2). Вставка нового ключа в словарь, чьи списки заполнены до порога
+// (у словаря store — до ёмкости без 1/32, у остальных — до ёмкости),
+// начинает рост: новые массивы записей, новая таблица или старая, если она
+// достаточно велика и мёртвых записей нет (__map_grow_start), и состояние
+// роста G в слове 56. Каждая следующая вставка нового ключа делает шаг
+// (__map_grow_step): готовит до MAP_PREP байт новой памяти, затем переносит
+// до MAP_STEP старых записей — живые по порядку в новые массивы и в новую
+// таблицу (со старой таблицей — все записи на те же номера); когда
+// перенесены все, словарь переключается на новое (__map_grow_end). Всё это время старые таблица и массивы полны и верны: в них
+// идут вставки (их перенесут позже) и каждое изменение, поэтому поиск, обход,
+// keys(), values(), JSON и копия смотрят только их, а читатели ничего не пишут.
+// Изменение и удаление уже перенесённой записи писатель повторяет в новых
+// (__map_grow_set, __map_grow_remove). Словарь вне store проходит рост целиком
+// в той же вставке: его рост задерживает только свой запрос.
+// G (104 байта; в store слова 0–3 — ссылки): [0] keys, [8] vals, [16] alive —
+// новые массивы на c2 записей, [24] slots, [32] mask2 — новая таблица (slots
+// 0 — остаётся старая таблица с маской mask2), [40] r — следующая старая
+// запись, [48] w — записей в новых массивах, [56] сколько байт текущей
+// области уже готово, [64] что ещё готовить: бит i — обнулить область i
+// (грязная память), бит 4 + i — поставить ей PTRB (области 0–3 — слова 0–3 G),
+// [72] что было готовить в начале, [80] номер темпа сборщика, при котором рост
+// поднял порог сборки, или −1, [88] c2, [96] на сколько поднят порог
+// (__gc_grow_hold, lib/gc.kh).
+
+// старых записей за шаг; байт новой памяти за шаг
+const MAP_STEP = 64
+const MAP_PREP = 32768
+// массив больше — у словаря store без обнуления и PTRB (__gc_lazy_alloc)
+const MAP_LAZY = 32768
+// для тестов (__map_grow_budget): записей и байт за шаг, 0 — как обычно
+var __map_step_n: int
+var __map_prep_n: int
+// ростов, которые пришлось закончить сразу: старые массивы заполнились раньше,
+// чем рост кончился (при обычном шаге этого не бывает)
+var __map_fallbacks: int
 
 fn __map_new(str_keys: int) -> int {
     let m = __alloc(64)
@@ -2112,17 +2181,22 @@ fn __map_new(str_keys: int) -> int {
 }
 
 // Пустой словарь на n записей с видами объектов для кучи store: в заголовке
-// ссылки — keys, vals, alive и slots (слова 0, 2, 3, 4); в массивах ссылки —
-// строковые ключи и значения, если vals_ref; alive и slots — числа.
+// ссылки — keys, vals, alive, slots и состояние роста (слова 0, 2, 3, 4, 7); в
+// массивах ссылки — строковые ключи и значения, если vals_ref; alive и slots —
+// числа. Массивы — на n + n/16 + 2 записей: рост копии (запись в store,
+// восстановление KHRIP_DATA) начнётся с местом для вставок во время роста (с
+// массивами ровно на n первая же вставка начала бы рост без места, и его
+// пришлось бы закончить сразу; нетронутый хвост массивов памяти не занимает).
 fn __map_new_k(str_keys: int, vals_ref: bool, n: int) -> int {
     var size = 16
     while size < n * 4 {
         size *= 2
     }
-    let m = __alloc_k(64, K_MASK, 0x1D)
-    store64(m, __list_new_k(n, 8, str_keys != 0))
-    store64(m + 16, __list_new_k(n, 8, vals_ref))
-    store64(m + 24, __list_new_k(n, 8, false))
+    let c = n + n / 16 + 2
+    let m = __alloc_k(64, K_MASK, 0x9D)
+    store64(m, __list_new_k(c, 8, str_keys != 0))
+    store64(m + 16, __list_new_k(c, 8, vals_ref))
+    store64(m + 24, __list_new_k(c, 8, false))
     store64(m + 32, __alloc_k(size * 8, K_NOSCAN, 0))
     store64(m + 40, size - 1)
     store64(m + 48, str_keys)
@@ -2212,48 +2286,310 @@ fn __map_place(m: int, k: int, idx: int) {
     store64(slots + i * 8, idx + 1)
 }
 
-// Перестройка: выбросить удалённые записи и увеличить таблицу.
-fn __map_rehash(m: int) {
-    let keys = load64(m)
-    let vals = load64(m + 16)
-    let alive = load64(m + 24)
-    let n = load64(keys + 8)
-    // сжатие переставляет записи на месте (lib/gc.kh, §7.5)
-    __gc_permute(keys)
-    __gc_permute(vals)
-    var w = 0
-    var r = 0
-    while r < n {
-        if __word_at(alive, r) != 0 {
-            store64(load64(keys) + w * 8, __word_at(keys, r))
-            store64(load64(vals) + w * 8, __word_at(vals, r))
-            store64(load64(alive) + w * 8, 1)
+// Слот ключа k в таблице slots (маска mask) с записями в массиве kd или −1.
+fn __map_probe(m: int, slots: int, mask: int, kd: int, k: int) -> int {
+    var i = __map_hash(m, k) & mask
+    while true {
+        let e = load64(slots + i * 8)
+        if e == 0 {
+            return -1
+        }
+        if e > 0 && __map_key_eq(m, load64(kd + (e - 1) * 8), k) {
+            return i
+        }
+        i = (i + 1) & mask
+    }
+    return -1
+}
+
+// Запись idx с ключом k — в таблицу slots (маска mask); ключа там нет.
+fn __map_put(m: int, slots: int, mask: int, k: int, idx: int) {
+    var i = __map_hash(m, k) & mask
+    while load64(slots + i * 8) > 0 {
+        i = (i + 1) & mask
+    }
+    store64(slots + i * 8, idx + 1)
+}
+
+// Массив роста на n байт вида старого массива списка like (0 — без ссылок):
+// до MAP_LAZY байт и у словаря вне store — обычная нулевая память с битами
+// PTRB; больше у словаря store — __gc_lazy_alloc (младшие биты адреса: 1 —
+// обнулить, 2 — поставить PTRB).
+fn __map_arr(m: int, n: int, like: int) -> int {
+    if n > MAP_LAZY && __in_store(m) {
+        return __gc_lazy_alloc(n, like)
+    }
+    if like == 0 {
+        return __alloc_for_k(m, n, K_NOSCAN, 0)
+    }
+    return __alloc_for_k(like, n, K_LIST_DATA, 0)
+}
+
+// Сколько записей (с мёртвыми) вмещает словарь: ёмкость массивов, но не
+// больше половины таблицы (после clear таблица — 16 слотов, а массивы
+// остаются прежними).
+fn __map_limit(m: int) -> int {
+    let cap = load64(load64(m) + 16)
+    let half = (load64(m + 40) + 1) >> 1
+    if half < cap {
+        return half
+    }
+    return cap
+}
+
+// Начать рост. Новым массивам нужно need = max(2 · live, live + room + 1)
+// записей: вставки до конца роста идут в старые массивы и таблицу (room — их
+// место). Если need больше ёмкости cap, словарь растёт вдвое (2 · cap; need ≤
+// 2 · cap всегда), иначе — мёртвых записей много или после clear таблица мала
+// — массивы сжимаются до степени двойки не меньше need. Старая таблица
+// остаётся, если мёртвых записей нет и в половину её помещается need: тогда
+// записи переносятся на те же номера, и таблица верна для новых массивов, а
+// массивы — не больше её половины (копия словаря в store и словарь после
+// KHRIP_DATA растут без новой таблицы, если её хватает). Иначе таблица новая —
+// степень двойки не меньше 2 · need, и массивы — не больше её половины.
+fn __map_grow_start(m: int) {
+    let kh = load64(m)
+    let len = load64(kh + 8)
+    let cap = load64(kh + 16)
+    let live = load64(m + 8)
+    let room = __map_limit(m) - len
+    var need = live * 2
+    if need < live + room + 1 {
+        need = live + room + 1
+    }
+    var c2 = cap * 2
+    if need <= cap {
+        c2 = 8
+        while c2 < need {
+            c2 *= 2
+        }
+    }
+    var z = load64(m + 40) + 1
+    let keep = live == len && z / 2 >= need
+    if !keep {
+        z = 16
+        while z < need * 2 {
+            z *= 2
+        }
+    }
+    if c2 > z / 2 {
+        c2 = z / 2
+    }
+    let n = c2 * 8
+    var total = n * 3
+    if !keep {
+        total += z * 8
+    }
+    let g = __alloc_for_k(m, 104, K_MASK, 15)
+    // большой рост словаря store не приближает сборку, пока не переключится
+    // (lib/gc.kh, __gc_grow_hold: слова 80 и 96 G): иначе она держала бы оба
+    // набора живыми
+    store64(g + 80, -1)
+    store64(g + 96, 0)
+    if total > MAP_LAZY && __in_store(m) {
+        __gc_grow_hold(total, g)
+    }
+    store64(g + 88, c2)
+    let pk = __map_arr(m, n, kh)
+    let pv = __map_arr(m, n, load64(m + 16))
+    let pa = __map_arr(m, n, 0)
+    var ps = 0
+    if !keep {
+        ps = __map_arr(m, z * 8, 0)
+    }
+    store64(g, pk & ~7)
+    store64(g + 8, pv & ~7)
+    store64(g + 16, pa & ~7)
+    store64(g + 24, ps & ~7)
+    store64(g + 32, z - 1)
+    var flags = (pk & 1) | ((pv & 1) << 1) | ((pa & 1) << 2) | ((ps & 1) << 3)
+    flags = flags | (((pk >> 1) & 1) << 4) | (((pv >> 1) & 1) << 5) | (((pa >> 1) & 1) << 6) | (((ps >> 1) & 1) << 7)
+    store64(g + 72, flags)
+    if !keep && z * 8 > MAP_LAZY && __in_store(m) {
+        // новая таблица заполняется вразнобой, и первое касание каждой её
+        // страницы — отказ (в виртуальной машине — до десятков мкс): шаги
+        // переноса задели бы десятки новых страниц каждый; подготовка
+        // касается таблицы кусками заранее, и переносы идут по готовой памяти
+        flags = flags | 8
+    }
+    store64(g + 64, flags)
+    store64(m + 56, g)
+}
+
+// Подготовить новую память роста g, не больше budget байт: обнулить грязную,
+// поставить PTRB массивам со ссылками. → true, если готово всё.
+fn __map_prep(g: int, budget: int) -> bool {
+    var left = budget
+    while load64(g + 64) != 0 {
+        let flags = load64(g + 64)
+        var i = 0
+        while ((flags >> i) & 0x11) == 0 {
+            i += 1
+        }
+        let p = load64(g + i * 8)
+        var size = load64(g + 88) * 8
+        if i == 3 {
+            size = (load64(g + 32) + 1) * 8
+        }
+        let off = load64(g + 56)
+        var n = size - off
+        if n > left {
+            n = left
+        }
+        if n <= 0 {
+            return false
+        }
+        if ((flags >> i) & 1) != 0 {
+            __memset(p + off, 0, n)
+        }
+        if ((flags >> (4 + i)) & 1) != 0 {
+            __gc_ptrb_on(p + off, n)
+        }
+        left -= n
+        if off + n < size {
+            store64(g + 56, off + n)
+            return false
+        }
+        store64(g + 64, flags & ~(0x11 << i))
+        store64(g + 56, 0)
+    }
+    return true
+}
+
+// Шаг роста: если новая память ещё не готова — подготовить до prep байт;
+// иначе перенести до n старых записей (живые — по порядку в новые массивы и
+// таблицу; если таблица остаётся старой — все, на те же номера: мёртвые
+// записи в store — нули); перенесены все — переключиться на новое.
+fn __map_grow_step(m: int, n: int, prep: int) {
+    let g = load64(m + 56)
+    if load64(g + 64) != 0 {
+        __map_prep(g, prep)
+        return
+    }
+    let kh = load64(m)
+    let len = load64(kh + 8)
+    let kd = load64(kh)
+    let vd = load64(load64(m + 16))
+    let ad = load64(load64(m + 24))
+    let nk = load64(g)
+    let nv = load64(g + 8)
+    let na = load64(g + 16)
+    let ns = load64(g + 24)
+    let nm = load64(g + 32)
+    var r = load64(g + 40)
+    var w = load64(g + 48)
+    var e = len
+    if n < len - r {
+        e = r + n
+    }
+    if ns == 0 {
+        while r < e {
+            store64(nk + r * 8, load64(kd + r * 8))
+            store64(nv + r * 8, load64(vd + r * 8))
+            store64(na + r * 8, load64(ad + r * 8))
+            r += 1
+        }
+        w = r
+    }
+    while r < e {
+        if load64(ad + r * 8) != 0 {
+            let k = load64(kd + r * 8)
+            store64(nk + w * 8, k)
+            store64(nv + w * 8, load64(vd + r * 8))
+            store64(na + w * 8, 1)
+            __map_put(m, ns, nm, k, w)
             w += 1
         }
         r += 1
     }
-    if __in_store(m) {
-        // слоты [w, n) освободились: в store в них не остаётся старых ссылок
-        __memset(load64(keys) + w * 8, 0, (n - w) * 8)
-        __memset(load64(vals) + w * 8, 0, (n - w) * 8)
-        __memset(load64(alive) + w * 8, 0, (n - w) * 8)
+    store64(g + 40, r)
+    store64(g + 48, w)
+    if r == len {
+        __map_grow_end(m)
     }
-    store64(keys + 8, w)
-    store64(vals + 8, w)
-    store64(alive + 8, w)
+}
+
+// Список h получает новый массив data (len записей, cap места).
+fn __map_adopt(h: int, data: int, len: int, cap: int) {
+    store64(h, data)
+    store64(h + 8, len)
+    store64(h + 16, cap)
+}
+
+// Всё перенесено: словарь переключается на новые массивы и таблицу. Пока идёт
+// разметка, серится всё, что уходит из заголовка (§7.5): старые массивы, как
+// при росте списка (в них перенесённые записи, если новые выделены чёрными или
+// уже просмотрены), старая таблица и G.
+fn __map_grow_end(m: int) {
+    let g = load64(m + 56)
+    let w = load64(g + 48)
+    let cap = load64(g + 88)
+    let kh = load64(m)
+    let vh = load64(m + 16)
+    let ah = load64(m + 24)
+    __gc_old_array(kh)
+    __gc_old_array(vh)
+    __gc_old_array(ah)
+    __map_adopt(kh, load64(g), w, cap)
+    __map_adopt(vh, load64(g + 8), w, cap)
+    __map_adopt(ah, load64(g + 16), w, cap)
+    if load64(g + 24) != 0 {
+        __gc_old_slots(m)
+        store64(m + 32, load64(g + 24))
+        store64(m + 40, load64(g + 32))
+    }
+    __gc_old_at(m, m + 56)
     store64(m + 56, 0)
-    var size = 16
-    while size < w * 4 {
-        size *= 2
+    __gc_grow_done(load64(g + 96), load64(g + 80))
+}
+
+// Рост целиком: вся подготовка и все переносы сразу (шаг с подготовкой
+// ничего не переносит, поэтому шагов — два и больше).
+fn __map_grow_finish(m: int) {
+    while load64(m + 56) != 0 {
+        __map_grow_step(m, 0x7FFFFFFFFFFFFFFF, 0x7FFFFFFFFFFFFFF8)
     }
-    let ns = __alloc_for_k(m, size * 8, K_NOSCAN, 0)
-    __gc_old_slots(m)
-    store64(m + 32, ns)
-    store64(m + 40, size - 1)
-    var i = 0
-    while i < w {
-        __map_place(m, __word_at(keys, i), i)
-        i += 1
+}
+
+// Идёт рост, и значение записи idx (ключ k) стало v: если запись уже
+// перенесена, то и в новых массивах.
+fn __map_grow_set(m: int, k: int, idx: int, v: int) {
+    let g = load64(m + 56)
+    if idx >= load64(g + 40) {
+        return
+    }
+    if load64(g + 24) == 0 {
+        // таблица остаётся старой: номер записи тот же
+        store64(load64(g + 8) + idx * 8, v)
+        return
+    }
+    let s = __map_probe(m, load64(g + 24), load64(g + 32), load64(g), k)
+    if s >= 0 {
+        store64(load64(g + 8) + (load64(load64(g + 24) + s * 8) - 1) * 8, v)
+    }
+}
+
+// Идёт рост, и запись idx (ключ k) удалена: если она уже перенесена, то и из
+// новых массивов и таблицы (ключ и значение уже серены, §7.5).
+fn __map_grow_remove(m: int, k: int, idx: int) {
+    let g = load64(m + 56)
+    if idx >= load64(g + 40) {
+        return
+    }
+    let ns = load64(g + 24)
+    var j = idx
+    if ns != 0 {
+        let s = __map_probe(m, ns, load64(g + 32), load64(g), k)
+        if s < 0 {
+            return
+        }
+        j = load64(ns + s * 8) - 1
+        store64(ns + s * 8, -1)
+    }
+    store64(load64(g + 16) + j * 8, 0)
+    if __in_store(m) {
+        store64(load64(g) + j * 8, 0)
+        store64(load64(g + 8) + j * 8, 0)
     }
 }
 
@@ -2264,11 +2600,37 @@ fn __map_set(m: int, k: int, v: int) {
         let a = load64(load64(m + 16)) + idx * 8
         __gc_old_at(m, a)
         store64(a, v)
+        if load64(m + 56) != 0 {
+            __map_grow_set(m, k, idx, v)
+        }
         return
     }
-    let used = load64(load64(m) + 8) + 1
-    if used * 2 > load64(m + 40) {
-        __map_rehash(m)
+    let len = load64(load64(m) + 8)
+    let cap = __map_limit(m)
+    let inc = __in_store(m)
+    if load64(m + 56) == 0 {
+        var lim = cap
+        if inc {
+            // место на вставки во время роста: 1/32 (шаг переносит 64
+            // записи, рост кончается за ≈ cap/64 вставок; раньше порог — и
+            // раньше двойные массивы: с 1/8 phase.sh держал 80 МБ лишнего)
+            if cap >= 64 {
+                lim = cap - (cap >> 5)
+            } else {
+                lim = cap - 1
+            }
+        }
+        if len >= lim {
+            __map_grow_start(m)
+        }
+    }
+    if load64(m + 56) != 0 && (!inc || len >= cap) {
+        // словарь вне store растёт целиком; у словаря store старые массивы
+        // заполнились раньше, чем рост кончился, — так не бывает
+        if inc {
+            __map_fallbacks += 1
+        }
+        __map_grow_finish(m)
     }
     let keys: [int] = __cast(load64(m))
     let vals: [int] = __cast(load64(m + 16))
@@ -2278,6 +2640,17 @@ fn __map_set(m: int, k: int, v: int) {
     alive.push(1)
     store64(m + 8, load64(m + 8) + 1)
     __map_place(m, k, keys.len() - 1)
+    if load64(m + 56) != 0 {
+        var n = __map_step_n
+        if n == 0 {
+            n = MAP_STEP
+        }
+        var b = __map_prep_n
+        if b == 0 {
+            b = MAP_PREP
+        }
+        __map_grow_step(m, n, b)
+    }
 }
 
 fn __map_get_ref(m: int, k: int) -> int {
@@ -2331,9 +2704,11 @@ fn __map_remove_word(m: int, k: int, found: int) -> int {
     store64(load64(m + 32) + s * 8, -1)
     store64(load64(load64(m + 24)) + idx * 8, 0)
     store64(m + 8, load64(m + 8) - 1)
-    store64(m + 56, load64(m + 56) + 1)
     store64(found, 1)
     let v = __word_at(load64(m + 16), idx)
+    if load64(m + 56) != 0 {
+        __map_grow_remove(m, k, idx)
+    }
     if __in_store(m) {
         // SATB (lib/gc.kh, §7.5): ключ-строка и значение уходят
         __gc_map_removed(m, idx, v)
@@ -2387,6 +2762,13 @@ fn __map_values(m: int, esize: int) -> int {
 
 fn __map_clear(m: int) {
     __store_mut(m)
+    let g = load64(m + 56)
+    if g != 0 {
+        // рост бросается (§7.5: G уходит из заголовка)
+        __gc_old_at(m, m + 56)
+        store64(m + 56, 0)
+        __gc_grow_done(load64(g + 96), load64(g + 80))
+    }
     if __in_store(m) {
         let n = load64(load64(m) + 8)
         __gc_map_cleared(m, n)
@@ -2398,7 +2780,6 @@ fn __map_clear(m: int) {
     store64(load64(m + 16) + 8, 0)
     store64(load64(m + 24) + 8, 0)
     store64(m + 8, 0)
-    store64(m + 56, 0)
     // словарь в store: новая таблица — тоже в постоянной памяти, не в арене
     let ns = __alloc_for_k(m, 16 * 8, K_NOSCAN, 0)
     __gc_old_slots(m)

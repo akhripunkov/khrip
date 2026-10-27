@@ -23,7 +23,7 @@ var __gc_verify_slow: bool
 var __gc_slow: bool
 
 // ---- Настройки (§8.6) ----
-// KHRIP_GC — запас кучи над живыми данными в процентах (100) или off: сборки
+// KHRIP_GC — запас кучи над живыми данными в процентах (50) или off: сборки
 // нет (выделение — те же классы размеров); KHRIP_GC_MIN_MB — наименьшая цель
 // (4 МБ); KHRIP_GC_LIMIT_MB — мягкий предел: цель не выше него, но не ниже
 // 1,1 · живого; KHRIP_GC_LOG=1 — строка о каждой сборке в stderr (если
@@ -43,8 +43,7 @@ const GC_MAX = 0x7FFFFFFFFFFFFFFF
 
 // Настройки сборщика из окружения.
 fn __gc_init() {
-    __gc_pct = 100
-    __gc_m = 1
+    __gc_pct = 50
     if let v = env("KHRIP_GC") {
         if v == "off" {
             __gc_pct = -1
@@ -392,6 +391,93 @@ fn __salloc_for(h: int, n: int, kind: int, mask: int) -> int {
     return p
 }
 
+// Темп и рост словаря по частям (lib/core.kh): новые массивы и таблица
+// большого словаря store выделяются в начале роста, а старые становятся
+// мусором только при переключении. Сборка, начатая между ними, держала бы
+// живыми оба набора (её снимок — со старыми) и подняла бы цель на их размер
+// (polls за 10 минут: две такие сборки, пик +6 %). Поэтому выделенное на рост
+// не приближает сборку, пока рост не кончился: порог поднимается на n байт,
+// но не выше середины между целью и жёстким пределом, и только у роста,
+// который выделил не меньше восьмой части кучи (__gc_grow_hold: в слово 80 G
+// — номер темпа или −1, в слово 96 — на сколько поднят порог). Многие
+// маленькие росты сразу поэтому порога не поднимают, а все подъёмы вместе
+// оставляют разметке до жёсткого предела не меньше половины пути от цели.
+// Предел — не цель: большой рост выделяет больше, чем есть между порогом и
+// целью (polls: 640 МБ при 300 МБ до цели), и с пределом в цель сборка
+// начиналась посреди роста, как без подъёма (пик 1 299 МБ вместо 1 216,
+// сборок 14 вместо 20). Порог опускается
+// при переключении или clear (__gc_grow_done), если темп с тех пор не
+// пересчитан (конец сборки пересчитывает его сам, и подъём исчезает — и у
+// словаря, который бросили посреди роста). Цель, жёсткий предел и помощь
+// писателей не меняются. С KHRIP_GC_STRESS порог не трогается: сборки
+// посреди роста там нужны.
+var __gc_paces: int
+
+fn __gc_grow_hold(n: int, g: int) {
+    store64(g + 80, -1)
+    store64(g + 96, 0)
+    if __gc_stress || __gc_trigger >= GC_MAX / 2 || n < __heap_live / 8 {
+        return
+    }
+    var up = n
+    let top = __gc_goal + (__gc_hard - __gc_goal) / 2
+    if __gc_trigger + up > top {
+        up = top - __gc_trigger
+    }
+    if up <= 0 {
+        return
+    }
+    __gc_trigger += up
+    store64(g + 80, __gc_paces)
+    store64(g + 96, up)
+}
+
+fn __gc_grow_done(n: int, at: int) {
+    if at < 0 || at != __gc_paces {
+        return
+    }
+    __gc_trigger -= n
+    if __heap_live >= __gc_trigger && !__gc_poked {
+        __gc_poke()
+    }
+}
+
+// Большой массив роста словаря store (lib/core.kh, __map_grow_start) вида
+// старого массива списка h (0 — без ссылок): спан без обнуления и без битов
+// PTRB — память готовят шаги роста кусками (__map_prep, __gc_ptrb_on), и
+// разметка не смотрит неготовые (грязные) слова: у них нет PTRB. Обнуление
+// 256 МБ памяти, где уже были объекты, само по себе — десятки миллисекунд под
+// исключительной блокировкой. → адрес | 1, если память грязная (её надо
+// обнулить), | 2, если в массиве будут ссылки (ему нужны биты PTRB).
+fn __gc_lazy_alloc(n: int, h: int) -> int {
+    var kind = K_NOSCAN
+    if h != 0 {
+        kind = __gc_kind_of(load64(h))
+    }
+    var p = 0
+    if __store_on() {
+        p = __salloc_big(n, kind, 0, true)
+    } else {
+        __gc_hard_check()
+        __pmode_on()
+        p = __salloc_big(n, kind, 0, true)
+        __pmode_off()
+    }
+    if __gc_took_dirty {
+        p = p | 1
+    }
+    if kind != K_NOSCAN {
+        p = p | 2
+    }
+    return p
+}
+
+// Биты PTRB слов [p, p + n) — массив роста словаря готов до p + n (__map_prep).
+fn __gc_ptrb_on(p: int, n: int) {
+    let b = (p - STORE_REGION) >> 3
+    __bits_put(GC_PTRB, b, b + (n >> 3), true)
+}
+
 // Структура по описанию d в куче store (lib/api.kh, __struct_alloc): ссылки
 // объекта — поля по маске описания (у варианта — со сдвигом на слово метки);
 // полей больше 63 — каждое слово ссылка.
@@ -547,6 +633,12 @@ fn __span_free(s: int) {
 
 // Объект больше GC_SMALL_MAX — свой спан из целых страниц.
 fn __salloc_large(n: int, kind: int, mask: int) -> int {
+    return __salloc_big(n, kind, mask, false)
+}
+
+// Большой объект; lazy — без обнуления и без битов PTRB (рост словаря,
+// __gc_lazy_alloc): __gc_took_dirty — память грязная.
+fn __salloc_big(n: int, kind: int, mask: int, lazy: bool) -> int {
     let np = (n + GC_PAGE - 1) >> GC_PAGE_SHIFT
     let pg = __gc_pages(np)
     let base = STORE_REGION + (pg << GC_PAGE_SHIFT)
@@ -575,11 +667,13 @@ fn __salloc_large(n: int, kind: int, mask: int) -> int {
         if __gc_verify {
             __gc_check_poison(base, bytes)
         }
-        __memset(base, 0, bytes)
+        if !lazy {
+            __memset(base, 0, bytes)
+        }
     } else if __gc_verify {
         __gc_check_zero(base, bytes)
     }
-    if kind != K_NOSCAN {
+    if kind != K_NOSCAN && !lazy {
         __gc_ptrbits(base, n, kind, mask)
     }
     __heap_live += bytes
@@ -1797,12 +1891,6 @@ var __gc_black_bytes: int
 var __gc_black_objs: int
 // попыток конца разметки в этой сборке
 var __gc_term_tries: int
-// множитель запаса m ∈ {1, 2, 4, 8} (§8.2): растёт, пока почти всё живо;
-// __gc_swept_heap — куча в конце последней уборки, __gc_m_hold — сборка
-// началась без выделений после неё и m не меняет (__gc_begin_cycle)
-var __gc_m: int
-var __gc_swept_heap: int
-var __gc_m_hold: bool
 // уборка кусками (§7.7): следующая страница и байт в объектах, которые
 // оставили уже убранные спаны (проверка: ровно живое)
 var __gc_sweep_pg: int
@@ -2030,11 +2118,6 @@ fn __gc_begin_cycle(self: int, why: int) {
     if __gc_phase == GC_PH_SWEEP {
         __gc_sweep_finish(why)
     }
-    // с конца прошлой уборки ничего не выделено (сборка целиком сразу после
-    // доделки идущей, начало, которое само доубрало уборку): куча начала —
-    // только что убранная, её выживание ≈ 1 ничего не говорит о программе, и
-    // m эта сборка не трогает (__gc_mark_done)
-    __gc_m_hold = __heap_live == __gc_swept_heap
     let t0 = __gc_now_us()
     __gc_st_why = why
     __gc_st_inc = true
@@ -2552,12 +2635,12 @@ fn __gc_terminate_try() -> bool {
 // разметка выключена; живое — помеченное разметкой и выделенное за время
 // разметки (чёрное); номер уборки растёт, и каждый спан становится неубранным;
 // текущих спанов и частично занятых больше нет (I10): выделение возьмёт только
-// убранные спаны и новые. Затем m и темп следующей сборки (§8.2): выжило
-// больше 0,85 кучи начала сборки — m вдвое (не больше 8), меньше половины —
-// m = 1; сборка, начатая без выделений после прошлой уборки, m не меняет.
-// Выжившее — помеченное разметкой без чёрного: новые объекты в кучу
-// начала не входят. Чёрное уборка оставит целиком, но живо из него, скорее
-// всего, столько же, сколько из кучи начала (у писателя, который мусорит
+// убранные спаны и новые. Затем темп следующей сборки (§8.2; множитель запаса
+// m всегда 1 — адаптивное удвоение убрано на этапе памяти: при смене фазы,
+// рост, затем замены, цель 9 × живого давала пик 2 × Go). Выжившее —
+// помеченное разметкой без чёрного: новые объекты в кучу начала не входят.
+// Чёрное уборка оставит целиком, но живо из него, скорее всего, столько же,
+// сколько из кучи начала (у писателя, который мусорит
 // быстрее разметки, это почти всё мусор, и считать его живым — раздуть цель
 // следующей сборки вдвое от мусора): темп — от помеченного и такой же доли
 // чёрного (__gc_base; с KHRIP_GC_STRESS — от всего оставленного). Если это
@@ -2601,14 +2684,6 @@ fn __gc_mark_done() {
     __gc_poked = false
     let b = __gc_st_before
     let mb = __gc_marked_bytes
-    if __gc_m_hold {
-    } else if mb * 20 > b * 17 {
-        if __gc_m < 8 {
-            __gc_m *= 2
-        }
-    } else if mb * 2 < b {
-        __gc_m = 1
-    }
     __gc_base = __heap_marked
     if b > mb && !__gc_stress {
         __gc_base = mb + __gc_black_bytes / 1024 * (mb * 1024 / b)
@@ -2711,7 +2786,6 @@ fn __gc_sweep(us: int, work: int) -> bool {
 fn __gc_sweep_end() {
     __gc_phase = GC_PH_IDLE
     __gc_st_after = __heap_live
-    __gc_swept_heap = __heap_live
     __gc_last_us = __gc_now_us()
     if __gc_gcap * 16 > GC_MB {
         syscall(SYS_MUNMAP, __gc_grey, __gc_gcap * 16)
@@ -3327,7 +3401,7 @@ fn __gc_is_allocated(p: int) -> bool {
 // ---- Темп и пределы (§8.2, §8.4) ----
 
 // По живому после сборки (__gc_base: помеченное и живая доля чёрного, см.
-// __gc_mark_done): цель — живое · (1 + m · KHRIP_GC/100), не меньше
+// __gc_mark_done): цель — живое · (1 + KHRIP_GC/100), не меньше
 // KHRIP_GC_MIN_MB; с KHRIP_GC_LIMIT_MB — не выше него, но не ниже 1,1 ·
 // живого; порог — 70% запаса; жёсткий предел — вдвое выше цели, но не меньше
 // цели + 64 МБ. KHRIP_GC=off — сборки нет. KHRIP_GC_STRESS — цель
@@ -3343,6 +3417,7 @@ fn __gc_is_allocated(p: int) -> bool {
 // шаги сборки (__gc_stress_step), и маленький store тестов размечается, пока
 // тест его меняет.
 fn __gc_pace() {
+    __gc_paces += 1
     let m = __gc_base
     if __gc_pct < 0 {
         __gc_goal = GC_MAX
@@ -3351,7 +3426,7 @@ fn __gc_pace() {
         __gc_limit = GC_MAX
         return
     }
-    let p = __gc_pct * __gc_m
+    let p = __gc_pct
     var goal = m + (m / 100) * p + (m % 100) * p / 100
     if goal < __gc_min {
         goal = __gc_min
@@ -3541,16 +3616,15 @@ type __GcStats {
     marking: bool
     // выделено чёрным в последней (или идущей) сборке: байт
     black: int
-    // идёт уборка; множитель запаса m; помощей писателей за всё время и
-    // концов разметки, которые сделали они
+    // идёт уборка; помощей писателей за всё время и концов разметки, которые
+    // сделали они
     sweeping: bool
-    m: int
     assists: int
     assist_ends: int
 }
 
 fn __gc_stats() -> __GcStats {
-    return __GcStats { cycles: __gc_cycle_no, heap: __heap_live, live: __heap_marked, objects: __gc_marked_objs + __gc_black_objs, goal: __gc_goal, trigger: __gc_trigger, pages: load64(__gc_ph + PH_HW), released: __gc_total_released, max_pause_us: __gc_max_pause, marking: __gc_marking != 0, black: __gc_black_bytes, sweeping: __gc_phase == GC_PH_SWEEP, m: __gc_m, assists: __gc_assists, assist_ends: __gc_assist_ends }
+    return __GcStats { cycles: __gc_cycle_no, heap: __heap_live, live: __heap_marked, objects: __gc_marked_objs + __gc_black_objs, goal: __gc_goal, trigger: __gc_trigger, pages: load64(__gc_ph + PH_HW), released: __gc_total_released, max_pause_us: __gc_max_pause, marking: __gc_marking != 0, black: __gc_black_bytes, sweeping: __gc_phase == GC_PH_SWEEP, assists: __gc_assists, assist_ends: __gc_assist_ends }
 }
 
 // ---- Возврат памяти системе (§4.8) ----

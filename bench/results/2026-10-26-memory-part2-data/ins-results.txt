@@ -1,0 +1,10 @@
+# ins.kh: вставка нового ключа в словарь store (строковые ключи — как voters в polls), запросы по 65 536 вставок до 4 194 304 записей;
+# время процессора потока внутри запросов. tree3x = c0a762c (пункты 1–3, старый рост), tree5 = e7fd905 (итог). Сервер на ядре 0, THREADS=1, KHRIP_GC=50.
+ins_tree3x str 4194304: request cpu 7059074 us, 1.683 us/insert; process cpu 7310000 us
+ins_tree5 str 4194304: request cpu 7384020 us, 1.760 us/insert; process cpu 7630000 us
+ins_tree3x str 4194304: request cpu 6851083 us, 1.633 us/insert; process cpu 7110000 us
+ins_tree5 str 4194304: request cpu 7310785 us, 1.743 us/insert; process cpu 7570000 us
+ins_tree3x int 4194304: request cpu 2483724 us, 0.592 us/insert; process cpu 2490000 us
+ins_tree5 int 4194304: request cpu 2538890 us, 0.605 us/insert; process cpu 2550000 us
+ins_tree3x int 4194304: request cpu 2375761 us, 0.566 us/insert; process cpu 2390000 us
+ins_tree5 int 4194304: request cpu 2422492 us, 0.578 us/insert; process cpu 2430000 us

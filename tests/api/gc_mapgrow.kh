@@ -1,0 +1,646 @@
+// Рост словаря по частям (docs/design/v0.13-store-gc.md §14, «As built», этап
+// памяти, часть 2; lib/core.kh): вставка нового ключа в словарь store,
+// заполненный до 31/32 ёмкости, начинает рост, каждая следующая вставка
+// переносит часть записей в новые массивы и таблицу, последняя —
+// переключает словарь на них. Всё это время поиск, обход, JSON и читатели
+// видят старые массивы, полные и верные; изменение и удаление уже
+// перенесённой записи повторяются в новых. Шаг здесь маленький
+// (__map_grow_budget), и проверки идут между шагами: поиск, вставка, замена,
+// удаление, обход и его порядок, JSON, читатель (ничего не пишет), clear,
+// словарь вне store (растёт в той же вставке) и рост посреди разметки
+// сборщика — начатый до неё и в ней, с заменой, удалением и clear. Правило
+// SATB роста: всё, что уходит из заголовка (старые массивы, старая таблица,
+// G), серится; без этого записи, которые держат только новые массивы,
+// выделенные чёрными, ушли бы в уборку (tests/run.sh: без каждого серения
+// тест падает — без проверок или с KHRIP_GC_VERIFY). Большие новые массивы
+// (больше 32 КБ) приходят из памяти, где были объекты, без обнуления и PTRB:
+// шаги готовят их, прежде чем переносить записи.
+
+type Item { name: str, n: int }
+
+store byid: map[int, Item]
+store bystr: map[str, Item]
+store big: map[str, Item]
+store cleared: map[int, Item]
+store junk: [Item]
+store copied: map[int, Item]
+store inner: map[int, map[int, int]]
+store ints: map[int, int]
+
+fn exact() -> bool {
+    return (env("KHRIP_GC_STRESS") ?? "") != "1"
+}
+
+fn mi(m: map[int, Item]) -> int {
+    let h: int = __cast(m)
+    return h
+}
+
+fn ms(m: map[str, Item]) -> int {
+    let h: int = __cast(m)
+    return h
+}
+
+fn item(i: int, tag: str) -> Item {
+    return Item { name: "{tag} {i}", n: i }
+}
+
+// объект и его строка не освобождены, имя верное
+fn live_ok(x: Item, name: str) -> bool {
+    let a: int = __cast(x)
+    let s: int = __cast(x.name)
+    return __gc_is_allocated(a) && __gc_is_allocated(s) && x.name == name
+}
+
+// Словарь с ключами int против образца (ключи по порядку вставки и имена):
+// обход — те же пары в том же порядке, поиск каждого ключа, len; значения в
+// store (stored) не освобождены.
+fn same_int(m: map[int, Item], keys: [int], names: [str]) -> bool {
+    return same_ints(m, keys, names, true)
+}
+
+fn same_ints(m: map[int, Item], keys: [int], names: [str], stored: bool) -> bool {
+    if m.len() != keys.len() {
+        return false
+    }
+    var i = 0
+    for k, v in m {
+        if i >= keys.len() || k != keys[i] || v.name != names[i] || (stored && !live_ok(v, names[i])) {
+            return false
+        }
+        i += 1
+    }
+    if i != keys.len() {
+        return false
+    }
+    for j in 0..keys.len() {
+        let v = m[keys[j]] else {
+            return false
+        }
+        if v.name != names[j] {
+            return false
+        }
+    }
+    return true
+}
+
+fn same_str(m: map[str, Item], keys: [str], names: [str]) -> bool {
+    if m.len() != keys.len() {
+        return false
+    }
+    var i = 0
+    for k, v in m {
+        if i >= keys.len() || k != keys[i] || !live_ok(v, names[i]) {
+            return false
+        }
+        i += 1
+    }
+    if i != keys.len() {
+        return false
+    }
+    for j in 0..keys.len() {
+        let v = m[keys[j]] else {
+            return false
+        }
+        if v.name != names[j] {
+            return false
+        }
+    }
+    return true
+}
+
+fn index_of(xs: [int], k: int) -> int {
+    for i in 0..xs.len() {
+        if xs[i] == k {
+            return i
+        }
+    }
+    return -1
+}
+
+// читатель (store на чтение): имя по ключу
+route GET "/byid/{k}" (k: int) -> str | 404 {
+    let v = byid[k] else {
+        return 404
+    }
+    return v.name
+}
+
+// читатель: весь словарь (JSON — по старым массивам)
+route GET "/bystr" -> map[str, Item] {
+    return bystr
+}
+
+// большие новые массивы (> 32 КБ) — из памяти, где были объекты: шаги сначала
+// обнуляют их и ставят PTRB, потом переносят записи; после переключения хвост
+// массивов — нули, а строки-ключи живы (их держат только новые массивы)
+test "large new arrays from reused memory are prepared before entries move" {
+    __map_grow_budget(0, 8192)
+    // словарь на 4096 записей, до самого роста: следующая вставка начнёт рост
+    // с новыми массивами по 8192 записи (64 КБ)
+    var k = 0
+    let h = ms(big)
+    while __map_cap(h) < 4096 || __map_growing(h) || __map_entries(h) < __map_grow_at(h) {
+        big["key {k}"] = item(k, "g")
+        k += 1
+    }
+    // мусор и сборка: свободные страницы — из-под объектов (грязные)
+    for j in 0..60000 {
+        junk.push(item(j, "junk"))
+    }
+    junk = []
+    __gc_collect()
+    let s0 = __gc_stats()
+    let t0 = s0.trigger
+    big["key {k}"] = item(k, "g")
+    k += 1
+    expect __map_growing(h) && !__map_grow_ready(h) && __map_grow_moved(h) == 0
+    // выделенное на рост (массивы по 64 КБ и таблица 128 КБ — больше восьмой
+    // части кучи и меньше, чем осталось до цели) порог сборки не приближает,
+    // пока рост не кончится (lib/gc.kh, __gc_grow_hold)
+    expect !exact() || (s0.heap / 8 <= 20 * 16384 && s0.goal - t0 >= 20 * 16384)
+    expect !exact() || (__map_grow_held(h) == 20 * 16384 && __gc_stats().trigger == t0 + 20 * 16384)
+    // память — из-под мусора (иначе тест не проверял бы обнуление)
+    expect __map_grow_dirty(h)
+    var preps = 0
+    while !__map_grow_ready(h) {
+        big["key {k}"] = item(k, "g")
+        k += 1
+        preps += 1
+    }
+    expect preps > 4
+    // шаг, который доготовил память, записей не переносит: всё ещё нули
+    expect __map_grow_moved(h) == 0
+    if !__map_grow_fresh(h) {
+        // дальше вставки в грязную таблицу искали бы пустой слот вечно
+        eprint("new map memory is not zeroed")
+        exit(1)
+    }
+    while __map_growing(h) {
+        big["key {k}"] = item(k, "g")
+        k += 1
+    }
+    expect !exact() || __gc_stats().trigger == t0
+    expect __map_cap(h) == 8192
+    __gc_collect()
+    var bad = 0
+    for j in 0..k {
+        if !live_ok(big["key {j}"] ?? item(-1, "x"), "g {j}") {
+            bad += 1
+        }
+    }
+    expect bad == 0
+    // хвост новых массивов — нули
+    var dirty = 0
+    for i in __map_entries(h)..__map_cap(h) {
+        if load64(load64(load64(h)) + i * 8) != 0 || load64(load64(load64(h + 16)) + i * 8) != 0 {
+            dirty += 1
+        }
+    }
+    expect dirty == 0
+    __map_grow_budget(0, 0)
+}
+
+// шаг — 48 записей: меньше нельзя, иначе рост не кончится раньше, чем старые
+// массивы заполнятся (место — 1/32 ёмкости, обычный шаг — 64)
+test "between growth steps a store map answers from the old arrays" {
+    __map_grow_budget(48, 0)
+    var keys: [int] = []
+    var names: [str] = []
+    var k = 0
+    while __map_cap(mi(byid)) < 1024 || !__map_growing(mi(byid)) {
+        byid[k] = item(k, "a")
+        keys.push(k)
+        names.push("a {k}")
+        k += 1
+    }
+    // вставка, которая начала рост, сделала и первый шаг
+    expect __map_grow_moved(mi(byid)) == 48
+    expect same_int(byid, keys, names)
+    // удаление перенесённой записи и ещё не перенесённой
+    expect (byid.remove(0) ?? item(-1, "x")).n == 0
+    expect (byid.remove(k - 2) ?? item(-1, "x")).n == k - 2
+    let i0 = index_of(keys, 0)
+    keys.remove_at(i0)
+    names.remove_at(i0)
+    let i1 = index_of(keys, k - 2)
+    keys.remove_at(i1)
+    names.remove_at(i1)
+    // замена перенесённой записи и ещё не перенесённой
+    byid[1] = item(1, "b")
+    names[index_of(keys, 1)] = "b 1"
+    byid[k - 3] = item(k - 3, "b")
+    names[index_of(keys, k - 3)] = "b {k - 3}"
+    expect __map_grow_moved(mi(byid)) == 48
+    expect same_int(byid, keys, names)
+    // вставки — шаги; между ними всё на месте
+    var steps = 0
+    while __map_growing(mi(byid)) {
+        byid[k] = item(k, "a")
+        keys.push(k)
+        names.push("a {k}")
+        k += 1
+        steps += 1
+        expect same_int(byid, keys, names)
+        if steps == 3 {
+            // ещё раз: удалить и заменить перенесённую, вернуть удалённый ключ
+            expect (byid.remove(5) ?? item(-1, "x")).n == 5
+            let i5 = index_of(keys, 5)
+            keys.remove_at(i5)
+            names.remove_at(i5)
+            byid[6] = item(6, "c")
+            names[index_of(keys, 6)] = "c 6"
+            byid[0] = item(0, "d")
+            keys.push(0)
+            names.push("d 0")
+            expect same_int(byid, keys, names)
+        }
+    }
+    expect steps > 3
+    expect same_int(byid, keys, names)
+    // после переключения: новые записи, удаления и снова рост
+    for j in 0..3 * k {
+        byid[k + j] = item(k + j, "e")
+        keys.push(k + j)
+        names.push("e {k + j}")
+    }
+    expect same_int(byid, keys, names)
+    __map_grow_budget(0, 0)
+}
+
+test "a reader finds every key during growth and changes nothing" {
+    byid.clear()
+    __map_grow_budget(48, 0)
+    var k = 0
+    while __map_cap(mi(byid)) < 1024 || !__map_growing(mi(byid)) {
+        byid[k] = item(k, "r")
+        k += 1
+    }
+    byid[k] = item(k, "r")
+    k += 1
+    let moved = __map_grow_moved(mi(byid))
+    expect moved == 96
+    // перенесённые, ещё не перенесённые, вставленные во время роста
+    for j in [0, 1, moved - 1, moved, k - 3, k - 1] {
+        expect (call GET "/byid/{j}").body == "r {j}"
+    }
+    expect (call GET "/byid/{k}").status == 404
+    expect __map_growing(mi(byid)) && __map_grow_moved(mi(byid)) == moved
+    __map_grow_budget(0, 0)
+}
+
+test "string keys, JSON and to_json during growth keep the insertion order" {
+    __map_grow_budget(48, 0)
+    var keys: [str] = []
+    var names: [str] = []
+    var k = 0
+    while __map_cap(ms(bystr)) < 256 || !__map_growing(ms(bystr)) {
+        bystr["k{k}"] = item(k, "s")
+        keys.push("k{k}")
+        names.push("s {k}")
+        k += 1
+    }
+    expect (bystr.remove("k1") ?? item(-1, "x")).n == 1
+    keys.remove_at(1)
+    names.remove_at(1)
+    bystr["k0"] = item(0, "t")
+    names[0] = "t 0"
+    var want = "\{"
+    for i in 0..keys.len() {
+        if i > 0 {
+            want += ","
+        }
+        want += "\"{keys[i]}\":\{\"name\":\"{names[i]}\",\"n\":{(bystr[keys[i]] ?? item(-1, "x")).n}}"
+    }
+    want += "}"
+    expect __map_growing(ms(bystr))
+    expect to_json(bystr) == want
+    expect (call GET "/bystr").body == want
+    while __map_growing(ms(bystr)) {
+        bystr["k{k}"] = item(k, "s")
+        keys.push("k{k}")
+        names.push("s {k}")
+        k += 1
+        expect same_str(bystr, keys, names)
+    }
+    expect same_str(bystr, keys, names)
+    __map_grow_budget(0, 0)
+}
+
+test "clear during growth drops it" {
+    __map_grow_budget(48, 0)
+    var k = 0
+    while __map_cap(mi(cleared)) < 64 || !__map_growing(mi(cleared)) {
+        cleared[k] = item(k, "c")
+        k += 1
+    }
+    cleared.clear()
+    expect !__map_growing(mi(cleared)) && cleared.len() == 0
+    var keys: [int] = []
+    var names: [str] = []
+    for j in 0..3 * k {
+        cleared[j] = item(j, "n")
+        keys.push(j)
+        names.push("n {j}")
+    }
+    expect same_int(cleared, keys, names)
+    __map_grow_budget(0, 0)
+}
+
+test "a map outside store grows in the same insert" {
+    var m: map[int, Item] = {}
+    var s: map[str, int] = {}
+    var keys: [int] = []
+    var names: [str] = []
+    for j in 0..20000 {
+        m[j * 7] = item(j * 7, "l")
+        s["s{j}"] = j
+        keys.push(j * 7)
+        names.push("l {j * 7}")
+        if j % 3 == 0 {
+            m.remove(j * 7)
+            keys.pop()
+            names.pop()
+        }
+        expect !__map_growing(mi(m))
+    }
+    expect same_ints(m, keys, names, false)
+    expect s.len() == 20000 && (s["s19999"] ?? -1) == 19999
+}
+
+// рост, начатый до разметки и законченный в ней: записи, перенесённые в
+// просмотренную часть новых массивов, держат только старые
+test "growth that started before marking ends during it" {
+    byid.clear()
+    __map_grow_budget(48, 0)
+    var k = 0
+    while __map_cap(mi(byid)) < 1024 || !__map_growing(mi(byid)) {
+        byid[k] = item(k, "m")
+        k += 1
+    }
+    __gc_begin_from_roots()
+    __gc_step(50)
+    while __map_growing(mi(byid)) {
+        byid[k] = item(k, "m")
+        k += 1
+    }
+    __gc_finish()
+    var bad = 0
+    for j in 0..k {
+        if !live_ok(byid[j] ?? item(-1, "x"), "m {j}") {
+            bad += 1
+        }
+    }
+    expect bad == 0
+    __map_grow_budget(0, 0)
+}
+
+// рост целиком посреди разметки: новые массивы выделены чёрными и разметка их
+// не смотрит — записи в них живы только через серые старые массивы
+test "growth that starts and ends during marking" {
+    byid.clear()
+    __map_grow_budget(48, 0)
+    var k = 0
+    while k < 100 {
+        byid[k] = item(k, "w")
+        k += 1
+    }
+    __gc_begin_from_roots()
+    var grew = false
+    while !grew || __map_growing(mi(byid)) {
+        if __map_growing(mi(byid)) {
+            grew = true
+        }
+        byid[k] = item(k, "w")
+        k += 1
+        // замены и удаления перенесённых записей посреди разметки
+        if k % 10 == 0 && byid.has(k / 10) {
+            byid[k / 10] = item(k / 10, "w")
+        }
+    }
+    __gc_finish()
+    var bad = 0
+    for j in 0..k {
+        if !live_ok(byid[j] ?? item(-1, "x"), "w {j}") {
+            bad += 1
+        }
+    }
+    expect bad == 0
+    __map_grow_budget(0, 0)
+}
+
+// то же со строками-ключами: новые ключи держат только новые массивы
+// (чёрные), старые ключи — серый старый массив ключей
+test "growth of a string-keyed map during marking" {
+    var k = 0
+    while k < 100 {
+        bystr["m{k}"] = item(k, "y")
+        k += 1
+    }
+    __map_grow_budget(48, 0)
+    __gc_begin_from_roots()
+    var grew = false
+    while !grew || __map_growing(ms(bystr)) {
+        if __map_growing(ms(bystr)) {
+            grew = true
+        }
+        bystr["m{k}"] = item(k, "y")
+        k += 1
+    }
+    __gc_finish()
+    var bad = 0
+    for key, v in bystr {
+        let a: int = __cast(key)
+        if !__gc_is_allocated(a) || (key.starts_with("m") && !live_ok(v, "y " + key.byte_slice(1, key.byte_len()))) {
+            bad += 1
+        }
+    }
+    expect bad == 0
+    __map_grow_budget(0, 0)
+}
+
+test "clear during growth during marking" {
+    cleared.clear()
+    __map_grow_budget(48, 0)
+    var k = 0
+    while __map_cap(mi(cleared)) < 1024 || !__map_growing(mi(cleared)) {
+        cleared[k] = item(k, "q")
+        k += 1
+    }
+    __gc_begin_from_roots()
+    cleared[k] = item(k, "q")
+    expect __map_growing(mi(cleared))
+    cleared.clear()
+    cleared[1] = item(1, "q")
+    __gc_finish()
+    expect cleared.len() == 1 && live_ok(cleared[1] ?? item(-1, "x"), "q 1")
+    __map_grow_budget(0, 0)
+}
+
+// копия словаря в store (запись, восстановление KHRIP_DATA): массивы на
+// n + n/16 + 2 записи, таблица — степень двойки не меньше 4n. Первый рост
+// удваивает массивы (не больше половины таблицы) и, если половины таблицы
+// хватает, оставляет её: записи переносятся на те же номера
+test "a copied store map grows twofold and keeps a large enough table" {
+    __map_grow_budget(48, 0)
+    var local: map[int, Item] = {}
+    var keys: [int] = []
+    var names: [str] = []
+    for i in 0..1500 {
+        local[i] = item(i, "p")
+        keys.push(i)
+        names.push("p {i}")
+    }
+    copied = local
+    let h = mi(copied)
+    expect __map_cap(h) == 1595 && __map_slots(h) == 8192
+    var k = 1500
+    while !__map_growing(h) {
+        copied[k] = item(k, "p")
+        keys.push(k)
+        names.push("p {k}")
+        k += 1
+    }
+    expect __map_grow_keeps_table(h) == 1 && __map_grow_moved(h) == 48
+    // удаление и замена перенесённой записи и ещё не перенесённой — по тем же
+    // номерам в новых массивах
+    expect (copied.remove(3) ?? item(-1, "x")).n == 3
+    expect (copied.remove(1000) ?? item(-1, "x")).n == 1000
+    let i3 = index_of(keys, 3)
+    keys.remove_at(i3)
+    names.remove_at(i3)
+    let i1000 = index_of(keys, 1000)
+    keys.remove_at(i1000)
+    names.remove_at(i1000)
+    copied[5] = item(5, "q")
+    names[index_of(keys, 5)] = "q 5"
+    copied[1200] = item(1200, "q")
+    names[index_of(keys, 1200)] = "q 1200"
+    expect same_int(copied, keys, names)
+    while __map_growing(h) {
+        copied[k] = item(k, "p")
+        keys.push(k)
+        names.push("p {k}")
+        k += 1
+        expect same_int(copied, keys, names)
+    }
+    // вдвое, а не до половины таблицы (4096), и таблица та же
+    expect __map_cap(h) == 3190 && __map_slots(h) == 8192
+    __gc_collect()
+    expect same_int(copied, keys, names)
+    // следующий рост: мёртвые записи есть — новая таблица, записи сжимаются
+    while !__map_growing(h) {
+        copied[k] = item(k, "p")
+        keys.push(k)
+        names.push("p {k}")
+        k += 1
+    }
+    expect __map_grow_keeps_table(h) == 0
+    while __map_growing(h) {
+        copied[k] = item(k, "p")
+        keys.push(k)
+        names.push("p {k}")
+        k += 1
+    }
+    expect same_int(copied, keys, names)
+    expect __map_cap(h) == 6380 && __map_slots(h) == 16384
+    __map_grow_budget(0, 0)
+}
+
+test "a copied store map whose table is too small gets a new one, arrays twofold" {
+    var local: map[int, Item] = {}
+    var keys: [int] = []
+    var names: [str] = []
+    for i in 0..4000 {
+        local[i] = item(i, "u")
+        keys.push(i)
+        names.push("u {i}")
+    }
+    copied = local
+    let h = mi(copied)
+    expect __map_cap(h) == 4252 && __map_slots(h) == 16384
+    var k = 4000
+    while !__map_growing(h) {
+        copied[k] = item(k, "u")
+        keys.push(k)
+        names.push("u {k}")
+        k += 1
+    }
+    expect __map_grow_keeps_table(h) == 0
+    while __map_growing(h) {
+        copied[k] = item(k, "u")
+        keys.push(k)
+        names.push("u {k}")
+        k += 1
+    }
+    expect __map_cap(h) == 8504 && __map_slots(h) == 32768
+    expect same_int(copied, keys, names)
+}
+
+// подъём порога — только у роста, который выделил не меньше восьмой части
+// кучи, и не выше середины между целью и жёстким пределом: много маленьких
+// ростов сразу его не поднимают
+test "small growths do not hold the trigger, and a hold stops halfway to the hard limit" {
+    for i in 0..8 {
+        var e: map[int, int] = {}
+        inner[i] = e
+    }
+    var hs: [int] = []
+    for i in 0..8 {
+        let im = inner[i] else {
+            return
+        }
+        let ih: int = __cast(im)
+        hs.push(ih)
+        var j = 0
+        while __map_cap(ih) < 1024 || __map_entries(ih) < __map_grow_at(ih) {
+            im[j] = j
+            j += 1
+        }
+    }
+    __gc_collect()
+    let s0 = __gc_stats()
+    // рост каждого: массивы по 16 КБ и таблица 32 КБ — 80 КБ, меньше восьмой
+    // части кучи
+    expect !exact() || s0.heap / 8 > 81920
+    for i in 0..8 {
+        let im = inner[i] else {
+            return
+        }
+        im[-1 - i] = 1
+        expect __map_growing(hs[i]) && __map_grow_held(hs[i]) == 0
+    }
+    expect !exact() || __gc_stats().trigger == s0.trigger
+    // большой рост выделяет больше, чем осталось до цели: порог поднимается
+    // выше цели на всё выделенное
+    var k = 0
+    let hi: int = __cast(ints)
+    while __map_cap(hi) < 16384 || __map_entries(hi) < __map_grow_at(hi) {
+        ints[k] = k
+        k += 1
+    }
+    __gc_collect()
+    let s1 = __gc_stats()
+    // массивы по 256 КБ и таблица 512 КБ
+    let total = 3 * 262144 + 524288
+    let top = s1.goal + (__gc_hard_now() - s1.goal) / 2
+    expect !exact() || (total >= s1.heap / 8 && total > s1.goal - s1.trigger && s1.trigger + total < top)
+    ints[k] = k
+    expect __map_growing(hi)
+    expect !exact() || (__map_grow_held(hi) == total && __gc_stats().trigger == s1.trigger + total)
+    while __map_growing(hi) {
+        k += 1
+        ints[k] = k
+    }
+    expect !exact() || __gc_stats().trigger == s1.trigger
+    // подъём больше, чем до середины: порог — ровно середина
+    let g = __alloc(104)
+    __gc_grow_hold(1 << 40, g)
+    expect !exact() || (load64(g + 96) == top - s1.trigger && __gc_stats().trigger == top)
+    __gc_grow_done(load64(g + 96), load64(g + 80))
+    expect __gc_stats().trigger == s1.trigger
+}
+
+test "no growth had to finish at once" {
+    expect __map_grow_fallbacks() == 0
+}

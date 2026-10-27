@@ -1,0 +1,54 @@
+# cgrun.sh: THREADS=1 под callgrind, wrk -t2 -c64 15 с после заполнения; инструкций пользователя на запрос
+# tree0 = a6176a0, tree1 = 9ea9e57 (пункт 1), tree2 = f6b517d (пункты 1-2), tree3x = c0a762c (пункты 1-3),
+# tree5 = e7fd905 (итог); _A — итог со встроенными взятием и возвратом пары, _B2 — итог, буферы у открытого соединения остаются
+bank_tree0 bank reqs 74395 ir/req 17501
+bank_tree3x bank reqs 72631 ir/req 18301
+bank_tree5 bank reqs 72896 ir/req 18356
+polls_tree0 polls reqs 61367 ir/req 25053
+polls_tree3x polls reqs 59649 ir/req 25521
+polls_tree5 polls reqs 61579 ir/req 25719
+notes_tree0 notes reqs 156735 ir/req 5254
+notes_tree3x notes reqs 155801 ir/req 5438
+notes_tree5 notes reqs 155195 ir/req 5438
+bank_tree0 bank reqs 76307 ir/req 17732
+bank_tree3x bank reqs 73935 ir/req 18263
+bank_tree5 bank reqs 73739 ir/req 18293
+polls_tree0 polls reqs 61674 ir/req 25007
+polls_tree3x polls reqs 63044 ir/req 25367
+polls_tree5 polls reqs 59293 ir/req 25709
+notes_tree0 notes reqs 156119 ir/req 5254
+notes_tree3x notes reqs 155387 ir/req 5438
+notes_tree5 notes reqs 156361 ir/req 5438
+notes_tree1 notes reqs 158609 ir/req 5254
+notes_tree2 notes reqs 155922 ir/req 5251
+notes_tree1 notes reqs 155701 ir/req 5254
+notes_tree2 notes reqs 156561 ir/req 5251
+shortener_tree0 shortener reqs 101684 ir/req 10104
+shortener_tree2 shortener reqs 106032 ir/req 10106
+shortener_tree5 shortener reqs 104137 ir/req 10282
+shortener_tree0 shortener reqs 106982 ir/req 10104
+shortener_tree2 shortener reqs 105958 ir/req 10101
+shortener_tree5 shortener reqs 102129 ir/req 10287
+notes_A notes reqs 153201 ir/req 5394
+shortener_A shortener reqs 101840 ir/req 10248
+notes_A notes reqs 155978 ir/req 5394
+shortener_A shortener reqs 96357 ir/req 10247
+notes_B notes reqs 149775 ir/req 5443
+notes_B notes reqs 144037 ir/req 5443
+notes_B2 notes reqs 148214 ir/req 5283
+notes_B2 notes reqs 149264 ir/req 5283
+bank_tree1 bank reqs 72139 ir/req 18077
+bank_tree1 bank reqs 69978 ir/req 18196
+# пункт 3 в работе: tree3 — 6f46448 (списки буферов), tree3b — стек пар, tree3c — стек пар, буферы у открытого соединения остаются
+bank_tree2 bank reqs 67579 ir/req 18161
+bank_tree2 bank reqs 68107 ir/req 18183
+bank_tree2 bank reqs 69147 ir/req 18183
+bank_tree2 bank reqs 72015 ir/req 18169
+bank_tree3 bank reqs 67419 ir/req 18563
+bank_tree3 bank reqs 73029 ir/req 18563
+bank_tree3b bank reqs 64359 ir/req 18425
+bank_tree3b bank reqs 64942 ir/req 18356
+bank_tree3b bank reqs 66738 ir/req 18369
+bank_tree3b bank reqs 72598 ir/req 18320
+bank_tree3c bank reqs 64511 ir/req 18280
+bank_tree3c bank reqs 71740 ir/req 18174

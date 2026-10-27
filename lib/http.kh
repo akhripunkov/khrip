@@ -35,23 +35,37 @@ const EPOLL_EVENT_SIZE = 12
 
 const HTTP_IN_SIZE = 65536
 const HTTP_OUT_SIZE = 65536
+// Буферы соединения (вход HTTP_IN_SIZE, выход 2 · HTTP_OUT_SIZE) — из запаса
+// потока, пока у соединения есть работа (__conn_bufs, __conn_rest): молчащее
+// соединение keep-alive их не держит. Свободных пар в запасе — не больше
+// CONN_POOL (лишние — системе); пара, занятая дальше CONN_KEEP байт,
+// возвращается в запас с первыми CONN_KEEP байт каждого буфера в памяти.
+const CONN_POOL = 256
+const CONN_KEEP = 16384
 const HTTP_MAX_FD = 65536
 const HTTP_MAX_EVENTS = 512
 const HTTP_DATE_LEN = 29
 
 // Сопрограммы потока: не больше CO_MAX или KHRIP_COROUTINES (дальше запросы
-// ждут в очереди), из свободных CO_KEEP держат память арены; стек запросов —
-// CO_STACK байт.
+// ждут в очереди); стек запросов — CO_STACK байт. Свободные — стек (последняя
+// освободившаяся берёт следующий запрос): CO_WARM верхних тёплые — держат
+// память последнего запроса (арену до ARENA_WARM, буфер ответа до 1 МБ);
+// ушедшая глубже CO_WARM остывает — арена сверх ARENA_KEEP и буферы сверх
+// 4 КБ уходят системе (__co_cool); глубже CO_KEEP — вся арена.
 const CO_MAX = 4096
+const CO_WARM = 2
 const CO_KEEP = 64
 const CO_STACK = 8388608
 
 type __Conn {
+    // буферы (0 — у соединения сейчас нет работы, буферы в запасе потока)
     inp: int
     in_len: int
     out: int
     out_len: int
     out_cap: int
+    // сколько байт буферов занято с тех пор, как они взяты из запаса
+    hw: int
     sent: int
     close: bool
     wait_out: bool
@@ -93,6 +107,12 @@ type __Server {
     starved_head: int
     // сопрограммы, чей срок вышел
     due: [int]
+    // свободные пары буферов соединений (вход, выход: по 16 байт на пару) и
+    // сколько их (__conn_bufs); буфер, куда читается и выбрасывается ввод
+    // после ответа с закрытием
+    pool: int
+    pool_n: int
+    scratch: int
 }
 
 // Задание сопрограммы: запрос в буфере соединения conn (адреса и длины).
@@ -464,7 +484,7 @@ fn __co_new(s: __Server) -> __Co? {
     }
     let w = __worker_new()
     let job = __Job {}
-    let co = __Co { sch: s.sch, jb: __alloc(64), ctx: __alloc(CTX_CO_END), stk: 0, stk_len: 0, stk_cap: 0, started: false, parked: false, done: false, deadline: 0, hidx: -1, revents: 0, w: __cast(w), job: __cast(job) }
+    let co = __Co { sch: s.sch, jb: __alloc(64), ctx: __alloc(CTX_CO_END), stk: 0, stk_len: 0, stk_cap: 0, started: false, parked: false, done: false, deadline: 0, hidx: -1, revents: 0, w: __cast(w), job: __cast(job), kept: 0 }
     let x = co.ctx
     store64(x + CTX_WORKER, co.w)
     store64(x + CTX_SERVER, __cast(s))
@@ -504,12 +524,30 @@ fn __co_put(s: __Server, co: __Co) {
     let w: __Worker = __cast(co.w)
     buf_shrink(w.body, 1048576)
     buf_shrink(w.extra, 65536)
-    if s.free.len() >= CO_KEEP {
-        // лишняя свободная сопрограмма: страницы арены — системе
-        let base = load64(co.ctx + CTX_ARENA)
-        syscall(SYS_MADVISE, base, load64(co.ctx + CTX_ARENA_END) - base, 4)
-    }
     s.free.push(__cast(co))
+    // сопрограмма, которую эта сдвинула на глубину CO_WARM (CO_KEEP), остывает
+    let n = s.free.len()
+    if n > CO_WARM {
+        __co_cool(s.free[n - 1 - CO_WARM], ARENA_KEEP)
+    }
+    if n > CO_KEEP {
+        __co_cool(s.free[n - 1 - CO_KEEP], 0)
+    }
+}
+
+// Свободная сопрограмма cv остыла: в памяти остаются только keep байт её
+// арены (обнулённые: __arena_end обнулил всё, что держит, поэтому отказ
+// madvise здесь безвреден), буферы ответа — системе (свежие по 4 КБ).
+fn __co_cool(cv: int, keep: int) {
+    let co: __Co = __cast(cv)
+    if co.kept > keep {
+        let base = load64(co.ctx + CTX_ARENA)
+        syscall(SYS_MADVISE, base + keep, ((co.kept + 4095) & ~4095) - keep, 4)
+        co.kept = keep
+    }
+    let w: __Worker = __cast(co.w)
+    buf_shrink(w.body, 4096)
+    buf_shrink(w.extra, 4096)
 }
 
 // Кадры сопрограммы, которая ждёт, — со стека запросов в кучу.
@@ -583,6 +621,10 @@ fn __co_job(co: __Co) {
     __serve_one(w, req)
     __write_response(__srv(), c, w)
     __arena_end()
+    let kept = load64(__ctx() + CTX_ARENA_KEPT)
+    if kept > co.kept {
+        co.kept = kept
+    }
 }
 
 fn __co_run(s: __Server, co: __Co) {
@@ -688,6 +730,75 @@ fn __conn_drop(s: __Server, fd: int, c: __Conn) {
         c.open = false
         syscall(SYS_CLOSE, fd)
     }
+    // пара уходит в запас (__conn_give): ответ, который не успел уйти, и
+    // ввод тоже занимали её страницы
+    if c.out_len > c.hw {
+        c.hw = c.out_len
+    }
+    if c.in_len > c.hw {
+        c.hw = c.in_len
+    }
+    c.in_len = 0
+    c.out_len = 0
+    c.sent = 0
+    c.off = 0
+    __conn_rest(s, c)
+}
+
+// Буферы для соединения, у которого появилась работа (пришёл ввод): из запаса
+// потока или новые.
+fn __conn_bufs(s: __Server, c: __Conn) {
+    if c.inp == 0 {
+        __conn_take(s, c)
+    }
+}
+
+fn __conn_take(s: __Server, c: __Conn) {
+    let n = s.pool_n
+    if n > 0 {
+        let e = s.pool + n * 16 - 16
+        c.inp = load64(e)
+        c.out = load64(e + 8)
+        s.pool_n = n - 1
+    } else {
+        c.inp = __mmap(HTTP_IN_SIZE)
+        c.out = __mmap(HTTP_OUT_SIZE * 2)
+    }
+    c.out_cap = HTTP_OUT_SIZE * 2
+    c.hw = 0
+}
+
+// Работы у соединения нет (весь ввод разобран, запрос не выполняется, ответы
+// ушли; после ответа с закрытием ввод выбрасывается через общий буфер потока):
+// буферы — в запас (__conn_give).
+fn __conn_rest(s: __Server, c: __Conn) {
+    if c.inp != 0 && !c.busy && c.out_len == 0 && (c.in_len == 0 || c.linger) {
+        __conn_give(s, c)
+    }
+}
+
+// Пара буферов — в запас; память за первыми CONN_KEEP байт — системе, если её
+// занимали. Выросший выходной буфер (большой ответ) и пары сверх CONN_POOL —
+// системе целиком. Разобранного ввода нет (сдвиг в __process обнулил off).
+fn __conn_give(s: __Server, c: __Conn) {
+    let n = s.pool_n
+    if n < CONN_POOL && c.out_cap == HTTP_OUT_SIZE * 2 {
+        if c.hw > CONN_KEEP {
+            syscall(SYS_MADVISE, c.inp + CONN_KEEP, HTTP_IN_SIZE - CONN_KEEP, 4)
+            syscall(SYS_MADVISE, c.out + CONN_KEEP, c.out_cap - CONN_KEEP, 4)
+        }
+        let e = s.pool + n * 16
+        store64(e, c.inp)
+        store64(e + 8, c.out)
+        s.pool_n = n + 1
+    } else {
+        // запас полон или выход вырос (большой ответ): пара — системе
+        syscall(SYS_MUNMAP, c.inp, HTTP_IN_SIZE)
+        syscall(SYS_MUNMAP, c.out, c.out_cap)
+    }
+    c.inp = 0
+    c.out = 0
+    c.in_len = 0
 }
 
 // Запрос соединения закончился (used — его размер) или получил сопрограмму
@@ -714,6 +825,9 @@ fn __conn_resume(s: __Server, fd: int, c: __Conn, used: int) {
 // Отправляет накопленные ответы. → true, если всё отправлено, соединение живо
 // и можно разбирать следующие запросы.
 fn __flush(s: __Server, fd: int, c: __Conn) -> bool {
+    if c.out_len > c.hw {
+        c.hw = c.out_len
+    }
     while c.sent < c.out_len {
         let w = syscall(SYS_WRITE, fd, c.out + c.sent, c.out_len - c.sent)
         if w == -EAGAIN {
@@ -740,7 +854,8 @@ fn __flush(s: __Server, fd: int, c: __Conn) -> bool {
     return !c.busy
 }
 
-// Все полные запросы из входного буфера, затем отправка ответов.
+// Все полные запросы из входного буфера, затем отправка ответов; если работы
+// не осталось — буферы в запас.
 fn __process(s: __Server, fd: int, c: __Conn) {
     while true {
         var more = false
@@ -773,6 +888,7 @@ fn __process(s: __Server, fd: int, c: __Conn) {
             __http_error(s, c, 431)
         }
         if !__flush(s, fd, c) || !more {
+            __conn_rest(s, c)
             return
         }
     }
@@ -782,7 +898,7 @@ fn __read(s: __Server, fd: int, c: __Conn) {
     if c.linger {
         // выбросить ввод; закрыть, когда клиент закроет своё направление
         while true {
-            let d = syscall(SYS_READ, fd, c.inp, HTTP_IN_SIZE)
+            let d = syscall(SYS_READ, fd, s.scratch, HTTP_IN_SIZE)
             if d == -EAGAIN {
                 return
             }
@@ -792,8 +908,10 @@ fn __read(s: __Server, fd: int, c: __Conn) {
             }
         }
     }
+    __conn_bufs(s, c)
     let n = syscall(SYS_READ, fd, c.inp + c.in_len, HTTP_IN_SIZE - c.in_len)
     if n == -EAGAIN {
+        __conn_rest(s, c)
         return
     }
     if n <= 0 {
@@ -801,6 +919,9 @@ fn __read(s: __Server, fd: int, c: __Conn) {
         return
     }
     c.in_len += n
+    if c.in_len > c.hw {
+        c.hw = c.in_len
+    }
     __process(s, fd, c)
 }
 
@@ -817,7 +938,7 @@ fn __accept(s: __Server) {
         __setsockopt(s.tmp, fd, IPPROTO_TCP, TCP_NODELAY, 1)
         var a = load64(s.conns + fd * 8)
         if a == 0 {
-            let c = __Conn { inp: __mmap(HTTP_IN_SIZE), in_len: 0, out: __mmap(HTTP_OUT_SIZE * 2), out_len: 0, out_cap: HTTP_OUT_SIZE * 2, sent: 0, close: false, wait_out: false, linger: false, off: 0, pend: 0, busy: false, dead: false, open: true, armed: 0 }
+            let c = __Conn { inp: 0, in_len: 0, out: 0, out_len: 0, out_cap: 0, hw: 0, sent: 0, close: false, wait_out: false, linger: false, off: 0, pend: 0, busy: false, dead: false, open: true, armed: 0 }
             a = __cast(c)
             store64(s.conns + fd * 8, a)
         }
@@ -848,8 +969,12 @@ fn __event(s: __Server, fd: int, flags: int) {
         return
     }
     if c.wait_out {
-        if (flags & EPOLLOUT) != 0 && __flush(s, fd, c) {
-            __process(s, fd, c)
+        if (flags & EPOLLOUT) != 0 {
+            if __flush(s, fd, c) {
+                __process(s, fd, c)
+            } else {
+                __conn_rest(s, c)
+            }
         }
         return
     }
@@ -891,7 +1016,10 @@ fn __http_worker(id: int) {
         co_max: co_max,
         starved: [],
         starved_head: 0,
-        due: []
+        due: [],
+        pool: __mmap(CONN_POOL * 16),
+        pool_n: 0,
+        scratch: __mmap(HTTP_IN_SIZE)
     }
     store64(__ctx() + CTX_SERVER, __cast(s))
     __update_date(s)

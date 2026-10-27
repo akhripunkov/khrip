@@ -1,0 +1,39 @@
+store m: map[int, int]
+
+fn h(x: map[int, int]) -> int {
+    let p: int = __cast(x)
+    return p
+}
+
+fn cap(x: map[int, int]) -> int {
+    return load64(load64(h(x)) + 16)
+}
+
+fn slots(x: map[int, int]) -> int {
+    return load64(h(x) + 40) + 1
+}
+
+test "a copied map's first growth" {
+    let n = 1100000
+    var local: map[int, int] = {}
+    for i in 0..n {
+        local[i] = i
+    }
+    m = local
+    __gc_collect()
+    let s0 = __gc_stats()
+    eprint("after copy: entries {m.len()} arrays cap {cap(m)} table {slots(m)} heap {s0.heap / 1048576} MB")
+    var k = n
+    var peak = 0
+    while k < n + n / 8 {
+        m[k] = k
+        k += 1
+        let s = __gc_stats()
+        if s.heap > peak {
+            peak = s.heap
+        }
+    }
+    __gc_collect()
+    let s1 = __gc_stats()
+    eprint("after {n / 8} inserts: entries {m.len()} arrays cap {cap(m)} table {slots(m)} heap {s1.heap / 1048576} MB peak {peak / 1048576} MB")
+}

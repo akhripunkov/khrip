@@ -69,6 +69,21 @@ fn __gc_map_cleared(m: int, n: int) {
 fn __store_panic() {
 }
 
+// Рост словаря по частям (lib/core.kh): словарей store у загрузчика нет.
+fn __gc_lazy_alloc(n: int, h: int) -> int {
+    exit(101)
+    return 0
+}
+
+fn __gc_ptrb_on(p: int, n: int) {
+}
+
+fn __gc_grow_hold(n: int, g: int) {
+}
+
+fn __gc_grow_done(n: int, at: int) {
+}
+
 fn __store_for(h: int) -> bool {
     return false
 }

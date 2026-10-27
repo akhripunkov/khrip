@@ -407,3 +407,59 @@ if "$KHC" -o "$tmp/oom_store" tests/load/oom_store.kh >"$tmp/oom_store.err" 2>&1
 else
 	failed "tests/load/oom_store.kh" "$(cat "$tmp/oom_store.err")"
 fi
+
+# KHRIP_DATA посреди роста словаря (lib/core.kh, этап памяти, часть 2):
+# снимок — по старым массивам (полным и верным), записи — в порядке вставки,
+# с удалениями и заменами перенесённых и ещё не перенесённых записей;
+# восстановленный словарь не растёт, и вставки в него идут как обычно.
+gs_port=$((HTTP_PORT + 11))
+gs_url="http://127.0.0.1:$gs_port"
+gs_start() {
+	PORT=$gs_port THREADS=2 KHRIP_DATA="$tmp/grow.json" "$tmp/grow_store" 2>"$tmp/grow_store.log" &
+	gs_pid=$!
+	for _ in $(seq 600); do
+		curl -s -o /dev/null "$gs_url/dump" && return
+		sleep 0.05
+	done
+}
+gs_stop() {
+	kill -TERM "$gs_pid"
+	wait "$gs_pid" 2>/dev/null
+}
+if "$KHC" -o "$tmp/grow_store" tests/load/grow_store.kh >"$tmp/grow_store.err" 2>&1; then
+	rm -f "$tmp/grow.json"
+	gs_start
+	# массивы на 2048 записей: рост начинается с 1984-й и идёт 64 записи за вставку
+	r1=$(curl -s -X POST "$gs_url/fill/0/1990")
+	curl -s -o /dev/null -X DELETE "$gs_url/k/3"
+	curl -s -o /dev/null -X DELETE "$gs_url/k/1700"
+	curl -s -o /dev/null -X POST "$gs_url/set/5/-5"
+	curl -s -o /dev/null -X POST "$gs_url/set/1750/-1750"
+	curl -s -o /dev/null -X POST "$gs_url/sized/0/1500"
+	d1=$(curl -s "$gs_url/dump")
+	gs_stop
+	gs_start
+	d2=$(curl -s "$gs_url/dump")
+	# восстановленный словарь на 1500 записей: массивы 1595, таблица 8192; рост
+	# с 1546 записей — массивы вдвое, таблица та же
+	s1=$(curl -s -X POST "$gs_url/sized/1500/1550")
+	s2=$(curl -s -X POST "$gs_url/sized/1550/1600")
+	r2=$(curl -s -X POST "$gs_url/fill/1990/5000")
+	d3=$(curl -s "$gs_url/dump")
+	gs_stop
+	want=$(python3 -c '
+order = [i for i in range(1990) if i not in (3, 1700)]
+val = {i: i for i in order}
+val[5] = -5
+val[1750] = -1750
+print("".join(f"k{i}={val[i]}," for i in order))')
+	more=$(python3 -c 'print("".join(f"k{i}={i}," for i in range(1990, 5000)))')
+	if [[ "$r1" == "1990 true" && "$d1" == "1988 true:$want" && "$d2" == "1988 false:$want" && "${r2% *}" == "4998" && "${d3#* }" == "${r2#* }:$want$more" && "$s1" == "1550 1595 8192 keep" && "$s2" == "1600 3190 8192 -" ]]; then
+		http_ok
+	else
+		failed "http: KHRIP_DATA посреди роста словаря" "вставки «$r1», «$r2», рост восстановленного «$s1», «$s2»; до: ${d1:0:80}…; после: ${d2:0:80}…; журнал: $(cat "$tmp/grow_store.log")"
+	fi
+	rm -f "$tmp/grow.json"
+else
+	failed "tests/load/grow_store.kh" "$(cat "$tmp/grow_store.err")"
+fi

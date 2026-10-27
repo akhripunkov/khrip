@@ -8,9 +8,11 @@
 // перешедшие границу, остались бы непомеченными и ушли бы в уборку: с
 // KHRIP_GC_VERIFY это ловит проверка конца разметки, без неё — сам тест
 // (__gc_is_allocated). remove_at серит один элемент на границе; reverse,
-// sort, sort_by и сжатие словаря при перестройке серят всю непросмотренную
-// часть и заканчивают кадр. Кадров не больше восьми: большие массивы,
-// вложенные глубже, ждут в отложенных и тоже размечаются целиком.
+// sort и sort_by серят всю непросмотренную часть и заканчивают кадр. Рост
+// словаря внутри массивов ничего не переставляет: записи переезжают в новые
+// массивы, а старые при переключении серятся целиком. Кадров не больше
+// восьми: большие массивы, вложенные глубже, ждут в отложенных и тоже
+// размечаются целиком.
 
 type Item { name: str, n: int }
 
@@ -126,8 +128,8 @@ test "build big arrays and a big map" {
         rwords.push(wname(N - 1 - i))
     }
     // словарь: 3000 записей, первые 1000 удалены (мёртвые записи в начале
-    // массивов), затем записи до самой перестройки: следующая вставка сожмёт
-    // массивы — каждая живая запись сдвинется на 1000 вниз
+    // массивов), затем записи до самого роста: следующая вставка начнёт его,
+    // и живые записи переедут в новые массивы без мёртвых
     for i in 0..3000 {
         table[i] = Item { name: "t {i}", n: i }
     }
@@ -135,11 +137,8 @@ test "build big arrays and a big map" {
         table.remove(i)
     }
     var k = 3000
-    while true {
-        let h: int = __cast(table)
-        if (load64(load64(h) + 8) + 1) * 2 > load64(h + 40) {
-            break
-        }
+    let h: int = __cast(table)
+    while __map_growing(h) || __map_entries(h) < __map_grow_at(h) {
         table[k] = Item { name: "t {k}", n: k }
         k += 1
     }
@@ -195,24 +194,33 @@ test "sort_by of a partial array" {
     expect byn.len() == N && bad_items(byn, 0) == 0
 }
 
-test "rehash compaction of a partial values array" {
+// рост целиком посреди разметки, массив значений — кадр с границей
+// посередине: записи переезжают в новые массивы (чёрные, разметка их не
+// смотрит), переключение серит старые
+test "growth of a map whose values array is a partial frame" {
     __gc_begin_from_roots()
     let p = frame_mid(data_vals(table), 4096)
     expect p > 0
     let before = table.len()
     let h: int = __cast(table)
     let mask = load64(h + 40)
-    table[1000000] = spare
-    // перестройка была: таблица слотов стала больше
+    var k = 1000000
+    table[k] = spare
+    expect __map_growing(h)
+    while __map_growing(h) {
+        k += 1
+        table[k] = spare
+    }
+    // таблица слотов стала больше
     expect load64(h + 40) > mask
     __gc_finish()
     var bad = 0
-    for k, v in table {
-        if k != 1000000 && !item_ok(v, "t {k}") {
+    for kk, v in table {
+        if kk < 1000000 && !item_ok(v, "t {kk}") {
             bad += 1
         }
     }
-    expect table.len() == before + 1 && bad == 0
+    expect table.len() == before + k - 999999 && bad == 0
 }
 
 fn grow_tree(depth: int, path: str) -> Node {

@@ -1,0 +1,10 @@
+seeded: 1044 KB
+patch soak 60s: Requests/sec:  83853.00, p99 6.17ms, peak 4336 KB, end 4336 KB
+ok
+RSS after 10 s: min 4208 KB, max 4336 KB, slope 0.0024 MB/s
+cycles 191 (191 incremental, 0 whole); heap before 3.0 MB, live 0.6 MB (14566 objects)
+start median 0.004, p99 0.050, max 0.053 ms; max slice median 0.202, p99 0.321, max 0.400 ms; max slice cpu median 0.201, p99 0.254, max 0.288 ms
+termination median 0.003, p99 0.009, max 0.024 ms; sweep median 0.200, p99 0.410, max 0.410 ms; slices per cycle median 5
+longest sweep slice median 0.195, p99 0.214, max 0.229 ms; cpu median 0.192, p99 0.205, max 0.229 ms; writer assists 0
+delete oldest: 200000 -> 20000 products; RSS full 76956 KB, after delete 76956 KB, after 15 s idle 28176 KB; live 14927 KB, heap 14927 KB, 5 cycles; gate 1.5 x live + 6 MB = 28535 KB: ok
+delete random: 200000 -> 20000 products; RSS full 76976 KB, after delete 76976 KB, after 15 s idle 71876 KB; live 14912 KB, heap 14912 KB, 5 cycles; gate 1.5 x live + 6 MB = 28512 KB: over

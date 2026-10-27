@@ -266,8 +266,8 @@ done
 # KHRIP_GC_LIMIT_MB=3 (первый тест сверяет цель с ним) — тот же вывод; на
 # копиях библиотеки без сброса текущих спанов в конце разметки, без номера
 # уборки у нового спана, без доуборки в начале сборки (tests/api/gc_sweep.kh),
-# без удвоения и сброса m, с удвоением m после сборки без выделений, без
-# мягкого предела, без помощи писателя и без помощи по счёту
+# с запасом 100 % вместо 50 % по умолчанию, без мягкого предела, без помощи
+# писателя и без помощи по счёту
 # (tests/api/gc_pace.kh), с записью, которая не копирует место сохранения
 # регистров __pin_publish (tests/api/gc_regs.kh: значение только в r14 —
 # если кодогенерация уведёт его оттуда, тест перестанет что-то проверять, и
@@ -278,7 +278,7 @@ if ! diff -u tests/api/gc_pace.out "$tmp/pace.txt" >"$tmp/pace.diff"; then
 	pace_ok=0
 	failed "tests/api/gc_pace.kh (KHRIP_GC_LIMIT_MB=3)" "$(cat "$tmp/pace.diff")"
 fi
-for cut in "gc_sweep cur" "gc_sweep newgen" "gc_sweep finish" "gc_pace mup" "gc_pace mdown" "gc_pace mhold" "gc_pace soft" "gc_pace assist" "gc_pace credit" "gc_regs savearea"; do
+for cut in "gc_sweep cur" "gc_sweep newgen" "gc_sweep finish" "gc_pace pct" "gc_pace soft" "gc_pace assist" "gc_pace credit" "gc_regs savearea"; do
 	read -r name mut <<<"$cut"
 	rm -rf "${tmp:?}/pacelib"
 	mkdir -p "$tmp/pacelib"
@@ -290,9 +290,7 @@ cuts = {
     "cur": ("        store64(__gc_cur + j * 8, __gc_none)\n        store64(__gc_partial + j * 16, 0)\n", "        store64(__gc_partial + j * 16, 0)\n"),
     "newgen": ("    store64(s + S_SWEEPGEN, __gc_sweepgen)\n    store64(s + S_MAGIC, ((", "    store64(s + S_SWEEPGEN, __gc_sweepgen - 1)\n    store64(s + S_MAGIC, (("),
     "finish": ("    if __gc_phase == GC_PH_SWEEP {\n        __gc_sweep_finish(why)\n    }\n", ""),
-    "mup": ("        if __gc_m < 8 {\n            __gc_m *= 2\n        }\n", ""),
-    "mdown": ("    } else if mb * 2 < b {\n        __gc_m = 1\n    }\n", "    }\n"),
-    "mhold": ("    __gc_m_hold = __heap_live == __gc_swept_heap\n", "    __gc_m_hold = false\n"),
+    "pct": ("    __gc_pct = 50\n", "    __gc_pct = 100\n"),
     "savearea": ("    let sp = load64(rec.regs + 16) - __save_area()\n", "    let sp = load64(rec.regs + 16) + 16\n"),
     "soft": ("        if goal > __gc_soft {\n            goal = __gc_soft\n        }\n", ""),
     "assist": ("        } else if __gc_phase == GC_PH_MARK && __heap_live > __gc_cgoal {\n            __gc_assist()\n        }\n", "        }\n"),
@@ -318,6 +316,64 @@ PY
 	fi
 done
 [[ $pace_ok -eq 1 ]] && pass=$((pass + 1))
+
+# Рост словаря по частям (этап памяти, часть 2) сам по себе: на копиях
+# библиотеки без серения старых массивов ключей, значений и признаков, старой
+# таблицы и G при переключении, без серения G в clear, без битов PTRB и без
+# обнуления новой памяти, без повторения замены и удаления перенесённой записи
+# в новых массивах (и по тому же номеру, если таблица остаётся старой), без
+# подъёма порога сборки на время роста, без его возврата, без предела подъёма
+# (середина между целью и жёстким пределом) и без порога в восьмую часть кучи tests/api/gc_mapgrow.kh с
+# KHRIP_GC_VERIFY=1 падает (серения
+# старой таблицы, признаков и G находит только проверка конца разметки: эти
+# объекты уже мусор, но были достижимы в начале сборки; без серения значений
+# тест падает и без проверок — запись держат только чёрные новые массивы).
+grow_ok=1
+for cut in keys vals alive slots gend gclear ptrb zero set remove keepset hold release goal share; do
+	rm -rf "${tmp:?}/growlib"
+	mkdir -p "$tmp/growlib"
+	cp lib/*.kh "$tmp/growlib/"
+	if ! python3 - "$tmp/growlib" "$cut" <<'PY'
+import sys
+d, m = sys.argv[1], sys.argv[2]
+cuts = {
+    "keys": ("    __gc_old_array(kh)\n    __gc_old_array(vh)\n", "    __gc_old_array(vh)\n"),
+    "vals": ("    __gc_old_array(vh)\n    __gc_old_array(ah)\n", "    __gc_old_array(ah)\n"),
+    "alive": ("    __gc_old_array(ah)\n    __map_adopt(kh", "    __map_adopt(kh"),
+    "slots": ("    if load64(g + 24) != 0 {\n        __gc_old_slots(m)\n", "    if load64(g + 24) != 0 {\n"),
+    "gend": ("        store64(m + 40, load64(g + 32))\n    }\n    __gc_old_at(m, m + 56)\n", "        store64(m + 40, load64(g + 32))\n    }\n"),
+    "gclear": ("        // рост бросается (§7.5: G уходит из заголовка)\n        __gc_old_at(m, m + 56)\n", "        // рост бросается (§7.5: G уходит из заголовка)\n"),
+    "ptrb": ("            __gc_ptrb_on(p + off, n)\n", ""),
+    "zero": ("            __memset(p + off, 0, n)\n", ""),
+    "set": ("        if load64(m + 56) != 0 {\n            __map_grow_set(m, k, idx, v)\n        }\n", ""),
+    "remove": ("    if load64(m + 56) != 0 {\n        __map_grow_remove(m, k, idx)\n    }\n", ""),
+    "keepset": ("        store64(load64(g + 8) + idx * 8, v)\n        return\n", "        return\n"),
+    "hold": ("        __gc_grow_hold(total, g)\n", ""),
+    "release": ("    store64(m + 56, 0)\n    __gc_grow_done(load64(g + 96), load64(g + 80))\n}\n", "    store64(m + 56, 0)\n}\n"),
+    "goal": ("    if __gc_trigger + up > top {\n        up = top - __gc_trigger\n    }\n", "", "gc.kh"),
+    "share": (" || n < __heap_live / 8 {\n", " {\n", "gc.kh"),
+}
+old, new = cuts[m][0], cuts[m][1]
+f = cuts[m][2] if len(cuts[m]) > 2 else "core.kh"
+s = open(f"{d}/{f}").read()
+if s.count(old) != 1:
+    sys.exit(1)
+open(f"{d}/{f}", "w").write(s.replace(old, new))
+PY
+	then
+		grow_ok=0
+		failed "рост словаря ($cut)" "место для подложенной ошибки не найдено в lib/core.kh или lib/gc.kh"
+		continue
+	fi
+	# без механизма тест может и упасть (освобождённый живой объект): строку
+	# оболочки о сигнале — мимо вывода набора
+	{ KHRIP_LIB="$tmp/growlib" KHRIP_GC_VERIFY=1 env -u KHRIP_GC_STRESS timeout 120 "$KHC" test tests/api/gc_mapgrow.kh 2>&1 | grep -v '^khrip: gc verify (boot): ' >"$tmp/grow.txt"; } 2>/dev/null
+	if diff -q tests/api/gc_mapgrow.out "$tmp/grow.txt" >/dev/null; then
+		grow_ok=0
+		failed "рост словаря ($cut)" "tests/api/gc_mapgrow.kh проходит и без проверяемого механизма"
+	fi
+done
+[[ $grow_ok -eq 1 ]] && pass=$((pass + 1))
 
 # Примеры учебника (docs/TUTORIAL.md) и ответы к заданиям: программы
 # выполняются, API проходят свои блоки test.

@@ -1,0 +1,62 @@
+// Сохранение KHRIP_DATA посреди роста словаря (lib/core.kh, этап памяти,
+// часть 2; tests/http.sh): снимок идёт по старым массивам, полным и верным, в
+// порядке вставки, и восстанавливается новым словарём без роста.
+
+store m: map[str, int]
+
+fn growing() -> bool {
+    let h: int = __cast(m)
+    return load64(h + 56) != 0
+}
+
+// вставки ключей k{a}..k{b-1}; → растёт ли словарь после них
+route POST "/fill/{a}/{b}" (a: int, b: int) -> str {
+    for i in a..b {
+        m["k{i}"] = i
+    }
+    return "{m.len()} {growing()}"
+}
+
+route POST "/set/{i}/{v}" (i: int, v: int) -> int {
+    m["k{i}"] = v
+    return m.len()
+}
+
+route DELETE "/k/{i}" (i: int) -> int {
+    m.remove("k{i}")
+    return m.len()
+}
+
+// Восстановленный словарь растёт вдвое: массивы n + n/16 + 2 → удвоенные,
+// таблица остаётся, если её половины хватает (ёмкость, слоты и вид роста:
+// keep — старая таблица, new — новая, «-» — роста нет).
+store sized: map[int, int]
+
+fn shape(h: int) -> str {
+    let g = load64(h + 56)
+    var how = "-"
+    if g != 0 {
+        how = "new"
+        if load64(g + 24) == 0 {
+            how = "keep"
+        }
+    }
+    return "{load64(load64(h) + 16)} {load64(h + 40) + 1} {how}"
+}
+
+route POST "/sized/{a}/{b}" (a: int, b: int) -> str {
+    for i in a..b {
+        sized[i] = i
+    }
+    let h: int = __cast(sized)
+    return "{sized.len()} {shape(h)}"
+}
+
+// записи по порядку обхода и признак роста
+route GET "/dump" -> str {
+    var s = "{m.len()} {growing()}:"
+    for k, v in m {
+        s += "{k}={v},"
+    }
+    return s
+}

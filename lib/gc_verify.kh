@@ -680,6 +680,50 @@ fn __gcv_visit(st: int, when: str, v: int, d: int) {
                 }
             }
         }
+        // рост по частям (lib/core.kh): новые массивы (на c2 записей, слово 88)
+        // и таблица в G (0 — остаётся старая), записи [0, w) уже перенесены;
+        // пока новая память не готова, записей нет, а её свободное место без
+        // PTRB
+        __gcv_slot(st, when, v + 56)
+        let g = load64(v + 56)
+        if g != 0 {
+            __gcv_ptr(st, when, g, "map growth", true)
+            for j in 0..4 {
+                if j < 3 || load64(g + j * 8) != 0 {
+                    __gcv_ptr(st, when, load64(g + j * 8), "map growth arrays", true)
+                }
+                __gcv_slot(st, when, g + j * 8)
+            }
+            let w = load64(g + 48)
+            let cap = load64(g + 88)
+            let ready = load64(g + 64) == 0
+            if w > 0 && !ready {
+                __gcv_fail(st, when, "a growing map at " + __gc_hex(v) + " moved entries before its new arrays were ready")
+            }
+            if w > cap || load64(g + 40) > load64(keys + 8) {
+                __gcv_fail(st, when, "a growing map at " + __gc_hex(v) + " has a broken growth state")
+            }
+            if ready {
+                for i in w..cap {
+                    if !__is_scalar(kd) {
+                        __gcv_slot(st, when, load64(g) + i * 8)
+                    }
+                    if !__is_scalar(vd) {
+                        __gcv_slot(st, when, load64(g + 8) + i * 8)
+                    }
+                }
+            }
+            for i in 0..w {
+                if load64(load64(g + 16) + i * 8) != 0 {
+                    if !__is_scalar(kd) {
+                        __gcv_child(st, when, load64(g) + i * 8, kd)
+                    }
+                    if !__is_scalar(vd) {
+                        __gcv_child(st, when, load64(g + 8) + i * 8, vd)
+                    }
+                }
+            }
+        }
         return
     }
     var sd = t
