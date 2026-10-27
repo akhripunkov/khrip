@@ -1756,7 +1756,7 @@ fn __bson_read_map(r: __BsonRead, p: int, end: int, d: int, depth: int) -> int {
         return 0
     }
     let vd = load64(d + 16)
-    let m = __map_new(1)
+    let m = __map_new(__map_flags(d))
     let body = end - 1
     var at = p + 4
     while at < body {

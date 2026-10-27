@@ -155,11 +155,12 @@ test "large new arrays from reused memory are prepared before entries move" {
     big["key {k}"] = item(k, "g")
     k += 1
     expect __map_growing(h) && !__map_grow_ready(h) && __map_grow_moved(h) == 0
-    // выделенное на рост (массивы по 64 КБ и таблица 128 КБ — больше восьмой
-    // части кучи и меньше, чем осталось до цели) порог сборки не приближает,
-    // пока рост не кончится (lib/gc.kh, __gc_grow_hold)
-    expect !exact() || (s0.heap / 8 <= 20 * 16384 && s0.goal - t0 >= 20 * 16384)
-    expect !exact() || (__map_grow_held(h) == 20 * 16384 && __gc_stats().trigger == t0 + 20 * 16384)
+    // выделенное на рост (ключи и значения по 64 КБ, признаки 8 КБ, таблица
+    // 64 КБ — больше восьмой части кучи и меньше, чем осталось до цели) порог
+    // сборки не приближает, пока рост не кончится (lib/gc.kh, __gc_grow_hold)
+    let grown = 3 * 65536 + 8192
+    expect !exact() || (s0.heap / 8 <= grown && s0.goal - t0 >= grown)
+    expect !exact() || (__map_grow_held(h) == grown && __gc_stats().trigger == t0 + grown)
     // память — из-под мусора (иначе тест не проверял бы обнуление)
     expect __map_grow_dirty(h)
     var preps = 0
@@ -193,7 +194,7 @@ test "large new arrays from reused memory are prepared before entries move" {
     // хвост новых массивов — нули
     var dirty = 0
     for i in __map_entries(h)..__map_cap(h) {
-        if load64(load64(load64(h)) + i * 8) != 0 || load64(load64(load64(h + 16)) + i * 8) != 0 {
+        if load64(load64(h) + i * 8) != 0 || load64(load64(h + 16) + i * 8) != 0 {
             dirty += 1
         }
     }
@@ -602,9 +603,9 @@ test "small growths do not hold the trigger, and a hold stops halfway to the har
     }
     __gc_collect()
     let s0 = __gc_stats()
-    // рост каждого: массивы по 16 КБ и таблица 32 КБ — 80 КБ, меньше восьмой
-    // части кучи
-    expect !exact() || s0.heap / 8 > 81920
+    // рост каждого: ключи и значения по 16 КБ, признаки 2 КБ, таблица 16 КБ —
+    // 50 КБ, меньше восьмой части кучи
+    expect !exact() || s0.heap / 8 > 51200
     for i in 0..8 {
         let im = inner[i] else {
             return
@@ -623,8 +624,8 @@ test "small growths do not hold the trigger, and a hold stops halfway to the har
     }
     __gc_collect()
     let s1 = __gc_stats()
-    // массивы по 256 КБ и таблица 512 КБ
-    let total = 3 * 262144 + 524288
+    // ключи и значения по 256 КБ, признаки 32 КБ, таблица 256 КБ
+    let total = 3 * 262144 + 32768
     let top = s1.goal + (__gc_hard_now() - s1.goal) / 2
     expect !exact() || (total >= s1.heap / 8 && total > s1.goal - s1.trigger && s1.trigger + total < top)
     ints[k] = k

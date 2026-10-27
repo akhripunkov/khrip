@@ -457,17 +457,13 @@ fn __gc_grow_done(n: int, at: int) {
 }
 
 // Большой массив роста словаря store (lib/core.kh, __map_grow_start) вида
-// старого массива списка h (0 — без ссылок): спан без обнуления и без битов
+// kind (K_NOSCAN или K_PTRS): спан без обнуления и без битов
 // PTRB — память готовят шаги роста кусками (__map_prep, __gc_ptrb_on), и
 // разметка не смотрит неготовые (грязные) слова: у них нет PTRB. Обнуление
 // 256 МБ памяти, где уже были объекты, само по себе — десятки миллисекунд под
 // исключительной блокировкой. → адрес | 1, если память грязная (её надо
 // обнулить), | 2, если в массиве будут ссылки (ему нужны биты PTRB).
-fn __gc_lazy_alloc(n: int, h: int) -> int {
-    var kind = K_NOSCAN
-    if h != 0 {
-        kind = __gc_kind_of(load64(h))
-    }
+fn __gc_lazy_alloc(n: int, kind: int) -> int {
     var p = 0
     if __store_on() {
         p = __salloc_big(n, kind, 0, true)
@@ -3076,17 +3072,23 @@ fn __gc_remove_at_now(h: int, v: int, i: int, n: int) {
 }
 
 fn __gc_map_removed_now(m: int, idx: int, v: int) {
-    if load64(m + 48) != 0 {
-        __gc_resolve(__word_at(load64(m), idx))
+    let fl = load32(m + 44)
+    if (fl & MAP_STR) != 0 {
+        __gc_resolve(load64(load64(m) + idx * 8))
     }
-    __gc_resolve(v)
+    if (fl & MAP_BYTES) == 0 {
+        __gc_resolve(v)
+    }
 }
 
 fn __gc_map_cleared_now(m: int, n: int) {
-    if load64(m + 48) != 0 {
-        __gc_shade_words(m, load64(load64(m)), n)
+    let fl = load32(m + 44)
+    if (fl & MAP_STR) != 0 {
+        __gc_shade_words(m, load64(m), n)
     }
-    __gc_shade_words(m, load64(load64(m + 16)), n)
+    if (fl & MAP_BYTES) == 0 {
+        __gc_shade_words(m, load64(m + 16), n)
+    }
 }
 
 // Корень slot (глобальная store, var теста): старое значение серится. Менять

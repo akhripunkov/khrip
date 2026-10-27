@@ -153,20 +153,17 @@ fn __map_grow_dirty(m: int) -> bool {
 fn __map_grow_fresh(m: int) -> bool {
     let g = load64(m + 56)
     for i in 0..4 {
-        var n = load64(g + 88) * 8
-        if i == 3 {
-            n = (load64(g + 32) + 1) * 8
-        }
+        let n = __map_region(m, g, i)
         let p = load64(g + i * 8)
         if p == 0 {
             continue
         }
         var j = 0
         while j < n {
-            if load64(p + j) != 0 {
+            if load8(p + j) != 0 {
                 return false
             }
-            j += 8
+            j += 1
         }
     }
     return true
@@ -200,7 +197,7 @@ fn __gc_hard_now() -> int {
 
 // Слотов в таблице словаря m.
 fn __map_slots(m: int) -> int {
-    return load64(m + 40) + 1
+    return load32(m + 40) + 1
 }
 
 // Ростов, которые пришлось закончить сразу (старые массивы заполнились).
@@ -210,11 +207,27 @@ fn __map_grow_fallbacks() -> int {
 
 // Записей в массивах словаря m (с мёртвыми) и их ёмкость.
 fn __map_entries(m: int) -> int {
-    return load64(load64(m) + 8)
+    return load32(m + 48)
 }
 
 fn __map_cap(m: int) -> int {
-    return load64(load64(m) + 16)
+    return load32(m + 52)
+}
+
+// Признаки словаря m (MAP_STR, MAP_BYTES, MAP_REFS) и размеры слотов его
+// массивов: ключей, значений, признаков, таблицы.
+fn __map_flags_of(m: int) -> int {
+    return load32(m + 44)
+}
+
+fn __map_arr_slot(m: int, i: int) -> int {
+    let offs = [0, 16, 24, 32]
+    let p = load64(m + offs[i])
+    let o = __gc_obj_of(p)
+    if o == 0 {
+        return 0
+    }
+    return __gc_obj_size(o)
 }
 
 // Длина массивов, с которой следующая вставка нового ключа начнёт рост словаря

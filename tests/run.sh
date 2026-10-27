@@ -337,17 +337,17 @@ for cut in keys vals alive slots gend gclear ptrb zero set remove keepset hold r
 import sys
 d, m = sys.argv[1], sys.argv[2]
 cuts = {
-    "keys": ("    __gc_old_array(kh)\n    __gc_old_array(vh)\n", "    __gc_old_array(vh)\n"),
-    "vals": ("    __gc_old_array(vh)\n    __gc_old_array(ah)\n", "    __gc_old_array(ah)\n"),
-    "alive": ("    __gc_old_array(ah)\n    __map_adopt(kh", "    __map_adopt(kh"),
+    "keys": ("    __gc_old_at(m, m)\n    __gc_old_at(m, m + 16)\n", "    __gc_old_at(m, m + 16)\n"),
+    "vals": ("    __gc_old_at(m, m + 16)\n    __gc_old_at(m, m + 24)\n", "    __gc_old_at(m, m + 24)\n"),
+    "alive": ("    __gc_old_at(m, m + 24)\n    store64(m, load64(g))\n", "    store64(m, load64(g))\n"),
     "slots": ("    if load64(g + 24) != 0 {\n        __gc_old_slots(m)\n", "    if load64(g + 24) != 0 {\n"),
-    "gend": ("        store64(m + 40, load64(g + 32))\n    }\n    __gc_old_at(m, m + 56)\n", "        store64(m + 40, load64(g + 32))\n    }\n"),
+    "gend": ("        store32(m + 40, load64(g + 32))\n    }\n    __gc_old_at(m, m + 56)\n", "        store32(m + 40, load64(g + 32))\n    }\n"),
     "gclear": ("        // рост бросается (§7.5: G уходит из заголовка)\n        __gc_old_at(m, m + 56)\n", "        // рост бросается (§7.5: G уходит из заголовка)\n"),
     "ptrb": ("            __gc_ptrb_on(p + off, n)\n", ""),
     "zero": ("            __memset(p + off, 0, n)\n", ""),
-    "set": ("        if load64(m + 56) != 0 {\n            __map_grow_set(m, k, idx, v)\n        }\n", ""),
+    "set": ("    if load64(m + 56) != 0 {\n        __map_grow_set(m, k, idx, v)\n    }\n", ""),
     "remove": ("    if load64(m + 56) != 0 {\n        __map_grow_remove(m, k, idx)\n    }\n", ""),
-    "keepset": ("        store64(load64(g + 8) + idx * 8, v)\n        return\n", "        return\n"),
+    "keepset": ("        // таблица остаётся старой: номер записи тот же\n        return idx\n", "        return -1\n"),
     "hold": ("        __gc_grow_hold(total, g)\n", ""),
     "release": ("    store64(m + 56, 0)\n    __gc_grow_done(load64(g + 96), load64(g + 80))\n}\n", "    store64(m + 56, 0)\n}\n"),
     "goal": ("    if __gc_trigger + up > top {\n        up = top - __gc_trigger\n    }\n", "", "gc.kh"),
@@ -382,7 +382,12 @@ done
 #   keyreplace — ключ копируется и при замене значения (gc_keys, plain);
 #   listptrb — ёмкость списка — весь слот, а биты PTRB — только на cap
 #              элементов (gc_lists, verify: ссылка без бита PTRB);
-#   listcap — ёмкость копии снова от 4 элементов (gc_lists, plain).
+#   listcap — ёмкость копии снова от 4 элементов (gc_lists, plain);
+#   mapvkind — массив значений-ссылок словаря без битов PTRB (gc_maps,
+#              verify: ссылка без бита PTRB);
+#   mapkkind — то же у массива строковых ключей (gc_maps, verify);
+#   mapalive — признак «жива» не снимается при удалении (gc_maps, plain);
+#   mapbytes — копия словаря кладёт значения bool словом (gc_maps, plain).
 mem3_ok=1
 while read -r cut test mode; do
 	[[ -z $cut ]] && continue
@@ -397,6 +402,10 @@ cuts = {
     "keyreplace": ("    __store_mut(m)\n    let idx = __map_find(m, k)\n    if idx >= 0 {\n        __map_update(m, k, idx, v)\n        return\n    }\n    var key = __map_key_share(k, v, vd)\n", "    __store_mut(m)\n    let k2 = __persist_copy(k, kd)\n    let idx = __map_find(m, k)\n    if idx >= 0 {\n        __map_update(m, k2, idx, v)\n        return\n    }\n    var key = __map_key_share(k, v, vd)\n", "api.kh"),
     "listptrb": ("    store64(h, __alloc_k(n, kind, 0))\n    store64(h + 16, n / esize)\n", "    var m = cap * esize\n    if m < 16 {\n        m = 16\n    }\n    store64(h, __alloc_k(m, kind, 0))\n    store64(h + 16, n / esize)\n", "core.kh"),
     "listcap": ("    var n = cap * esize\n    if n < 16 {\n        n = 16\n    }\n", "    var n = cap * esize\n    if n < 32 {\n        n = 32\n    }\n", "core.kh"),
+    "mapvkind": ("fn __map_vkind(flags: int) -> int {\n    if (flags & MAP_REFS) != 0 {\n        return K_PTRS\n", "fn __map_vkind(flags: int) -> int {\n    if false {\n        return K_PTRS\n", "core.kh"),
+    "mapkkind": ("fn __map_kkind(flags: int) -> int {\n    if (flags & MAP_STR) != 0 {\n        return K_PTRS\n", "fn __map_kkind(flags: int) -> int {\n    if false {\n        return K_PTRS\n", "core.kh"),
+    "mapalive": ("    store8(load64(m + 24) + idx, 0)\n    store64(m + 8, load64(m + 8) - 1)\n", "    store64(m + 8, load64(m + 8) - 1)\n", "core.kh"),
+    "mapbytes": ("                __map_val_put(m, vals, w, sv)\n", "                store64(vals + w * 8, sv)\n", "api.kh"),
 }
 old, new, f = cuts[m]
 s = open(f"{d}/{f}").read()
@@ -421,6 +430,10 @@ keyshare gc_keys plain
 keyreplace gc_keys plain
 listptrb gc_lists verify
 listcap gc_lists plain
+mapvkind gc_maps verify
+mapkkind gc_maps verify
+mapalive gc_maps plain
+mapbytes gc_maps plain
 CUTS
 [[ $mem3_ok -eq 1 ]] && pass=$((pass + 1))
 

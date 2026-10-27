@@ -52,10 +52,10 @@ fn data_words(xs: [str]) -> int {
     return load64(h)
 }
 
-// значения словаря: массив списка vals (слово 2 заголовка словаря)
+// значения словаря: массив значений (слово 2 заголовка словаря)
 fn data_vals(m: map[int, Item]) -> int {
     let h: int = __cast(m)
-    return load64(load64(h + 16))
+    return load64(h + 16)
 }
 
 // шаги разметки, пока массив d из n слов не станет кадром с границей
@@ -203,7 +203,7 @@ test "growth of a map whose values array is a partial frame" {
     expect p > 0
     let before = table.len()
     let h: int = __cast(table)
-    let mask = load64(h + 40)
+    let mask = load32(h + 40)
     var k = 1000000
     table[k] = spare
     expect __map_growing(h)
@@ -212,7 +212,7 @@ test "growth of a map whose values array is a partial frame" {
         table[k] = spare
     }
     // таблица слотов стала больше
-    expect load64(h + 40) > mask
+    expect load32(h + 40) > mask
     __gc_finish()
     var bad = 0
     for kk, v in table {

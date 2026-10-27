@@ -359,11 +359,14 @@ fn parse_map_lit(want_ty: int) -> int {
     if known {
         is_str = kt == ty_str
     }
-    if is_str {
-        emit_mov_imm(RDI, 1)
-    } else {
-        emit_mov_imm(RDI, 0)
+    let guess = known
+    var flags = 0
+    if known {
+        flags = map_flags(kt, vt)
+    } else if is_str {
+        flags = 1
     }
+    emit_mov_imm(RDI, flags)
     emit_call(rt_func("__map_new"))
     emit_push(RAX)
     while kind() != '}' && kind() != T_EOF && !panic_mode {
@@ -396,6 +399,16 @@ fn parse_map_lit(want_ty: int) -> int {
             known = true
         } else {
             coerce(v1, vt, vtok)
+        }
+        if !guess && map_flags(kt, vt) != flags {
+            // тип стал известен по первой записи: признаки пустого словаря
+            // (значения bool — байтами, ключ-строка не литерал)
+            emit_push(RAX)
+            emit_load(RDI, RSP, 16)
+            emit_mov_imm(RSI, map_flags(kt, vt))
+            emit_call(rt_func("__map_retag"))
+            emit_pop(RAX)
+            flags = map_flags(kt, vt)
         }
         emit_mov_rr(RDX, RAX)
         emit_pop(RSI)

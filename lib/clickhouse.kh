@@ -3091,11 +3091,8 @@ fn __ch_tread_plan(ty: __ChType, d: int, depth: int, why: Buf) -> __ChTRead? {
         let value = __ch_tread_plan(__cast(ty.inner), load64(d + 16), depth + 1, why) else {
             return none
         }
-        var sk = 0
-        if load64(kd) == D_STR {
-            sk = 1
-        }
-        return __ChTRead { op: CHR_MAP, es: sk, key: __cast(key), item: __cast(value) }
+        // es — признаки словаря (__map_new)
+        return __ChTRead { op: CHR_MAP, es: __map_flags(d), key: __cast(key), item: __cast(value) }
     }
     if k == D_INT {
         if op == CHT_INT && ty.width <= 8 {

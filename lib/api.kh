@@ -451,28 +451,28 @@ fn __dc_copy(st: int, v: int, d: int) -> int {
 fn __dc_map(st: int, v: int, d: int) -> int {
     let kd = load64(d + 8)
     let vd = load64(d + 16)
-    let m = __map_new_k(load64(v + 48), !__is_scalar(vd), load64(v + 8))
+    let m = __map_new_k(__map_flags(d), load64(v + 8))
     __dc_put(st, v, m)
-    let keys = load64(load64(m))
-    let vals = load64(load64(m + 16))
-    let alive = load64(load64(m + 24))
+    let keys = load64(m)
+    let vals = load64(m + 16)
+    let alive = load64(m + 24)
     let refs = !__is_scalar(vd)
-    let n = load64(load64(v) + 8)
+    let n = __map_len(v)
     // строковые ключи и значения-структуры: ключ — та же строка, что равное
     // ему строковое поле значения (__dc_key_share), без второй копии байтов
     let share = load64(kd) == D_STR && load64(vd) == D_STRUCT
     var w = 0
     for i in 0..n {
-        if __word_at(load64(v + 24), i) != 0 {
-            let sk = __word_at(load64(v), i)
-            let sv = __word_at(load64(v + 16), i)
+        if __map_alive(v, i) {
+            let sk = __map_key(v, i)
+            let sv = __map_value(v, i)
             var key = 0
             if share && sv != 0 {
                 let cv = __dc_copy(st, sv, vd)
                 store64(vals + w * 8, cv)
                 key = __dc_key_share(st, sk, cv, vd)
             } else {
-                store64(vals + w * 8, sv)
+                __map_val_put(m, vals, w, sv)
                 if refs {
                     __dc_push(st, vals + w * 8, sv, vd)
                 }
@@ -481,16 +481,32 @@ fn __dc_map(st: int, v: int, d: int) -> int {
                 key = __dc_copy(st, sk, kd)
             }
             store64(keys + w * 8, key)
-            store64(alive + w * 8, 1)
+            store8(alive + w, 1)
             __map_place(m, key, w)
             w += 1
         }
     }
-    store64(load64(m) + 8, w)
-    store64(load64(m + 16) + 8, w)
-    store64(load64(m + 24) + 8, w)
+    store32(m + 48, w)
     store64(m + 8, w)
     return m
+}
+
+// Признаки словаря (lib/core.kh: MAP_STR, MAP_BYTES, MAP_REFS) по описанию
+// типа d = [D_MAP, K, V].
+fn __map_flags(d: int) -> int {
+    let kd = load64(d + 8)
+    let vd = load64(d + 16)
+    var f = 0
+    if load64(kd) == D_STR {
+        f = f | MAP_STR
+    }
+    if load64(vd) == D_BOOL {
+        f = f | MAP_BYTES
+    }
+    if !__is_scalar(vd) {
+        f = f | MAP_REFS
+    }
+    return f
 }
 
 // Ключ sk записи, чьё значение уже скопировано в cv (структура vd): строковое
@@ -840,20 +856,20 @@ fn __json_enc_list(b: Buf, v: int, d: int) {
 
 fn __json_enc_map(b: Buf, v: int, d: int) {
     let vd = load64(d + 16)
-    let str_keys = load64(v + 48) != 0
-    let n = load64(load64(v) + 8)
+    let str_keys = (load32(v + 44) & MAP_STR) != 0
+    let n = __map_len(v)
     __json_in(v, d)
     buf_byte(b, '\{')
     var first = true
     for i in 0..n {
-        if __word_at(load64(v + 24), i) == 0 {
+        if !__map_alive(v, i) {
             continue
         }
         if !first {
             buf_byte(b, ',')
         }
         first = false
-        let key = __word_at(load64(v), i)
+        let key = __map_key(v, i)
         if str_keys {
             __json_str(b, __cast(key))
         } else {
@@ -862,7 +878,7 @@ fn __json_enc_map(b: Buf, v: int, d: int) {
             buf_byte(b, '"')
         }
         buf_byte(b, ':')
-        __json_enc(b, __word_at(load64(v + 16), i), vd)
+        __json_enc(b, __map_value(v, i), vd)
     }
     buf_byte(b, '}')
     __json_out(v, d)
@@ -1328,11 +1344,7 @@ fn __jd(j: __Json, d: int, at: str) -> int {
         let kd = load64(d + 8)
         let vd = load64(d + 16)
         let str_keys = load64(kd) == D_STR
-        var sk = 0
-        if str_keys {
-            sk = 1
-        }
-        let m = __map_new(sk)
+        let m = __map_new(__map_flags(d))
         if c != '\{' {
             __jd_expect(j, at, "an object")
             return m

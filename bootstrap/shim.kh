@@ -11,6 +11,18 @@ fn __ctx() -> int {
     return __boot_ctx
 }
 
+// 32-битные чтение и запись (в khc — встроенные; словари lib/core.kh).
+fn load32(p: int) -> int {
+    return load8(p) | (load8(p + 1) << 8) | (load8(p + 2) << 16) | (load8(p + 3) << 24)
+}
+
+fn store32(p: int, v: int) {
+    store8(p, v & 255)
+    store8(p + 1, (v >> 8) & 255)
+    store8(p + 2, (v >> 16) & 255)
+    store8(p + 3, (v >> 24) & 255)
+}
+
 // Смена типа без изменения значения (в khc — встроенная).
 fn __cast(x: int) -> int {
     return x
@@ -75,7 +87,7 @@ fn __store_panic() {
 }
 
 // Рост словаря по частям (lib/core.kh): словарей store у загрузчика нет.
-fn __gc_lazy_alloc(n: int, h: int) -> int {
+fn __gc_lazy_alloc(n: int, kind: int) -> int {
     exit(101)
     return 0
 }

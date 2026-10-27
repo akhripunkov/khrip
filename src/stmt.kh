@@ -307,11 +307,7 @@ fn zero_value(t: int, at: Token) -> bool {
         return true
     }
     if k == K_MAP {
-        if types[t].a == ty_str {
-            emit_mov_imm(RDI, 1)
-        } else {
-            emit_mov_imm(RDI, 0)
-        }
+        emit_mov_imm(RDI, map_flags(types[t].a, types[t].b))
         emit_call(rt_func("__map_new"))
         return true
     }
@@ -1755,19 +1751,15 @@ fn for_map(n1: Token, n2: Token, two: bool, t: int) {
     } else {
         emit_load(RCX, RBP, il.off)
     }
-    // alive[idx]
+    // признак alive[idx] — байт (lib/core.kh: массивы записей — прямо в
+    // заголовке словаря, слова 0, 16 и 24)
     emit_load_local(m)
     emit_load(RAX, RAX, 24)
-    emit_load(RAX, RAX, 0)
-    emit8(0x48)
-    emit8(0x8B)
-    emit8(0x04)
-    emit8(0xC8)
+    emit_movzx_index()
     emit_test_rax()
     let dead = emit_jcc(CC_E)
     // k = keys[idx]
     emit_load_local(m)
-    emit_load(RAX, RAX, 0)
     emit_load(RAX, RAX, 0)
     emit8(0x48)
     emit8(0x8B)
@@ -1777,11 +1769,15 @@ fn for_map(n1: Token, n2: Token, two: bool, t: int) {
     if two {
         emit_load_local(m)
         emit_load(RAX, RAX, 16)
-        emit_load(RAX, RAX, 0)
-        emit8(0x48)
-        emit8(0x8B)
-        emit8(0x04)
-        emit8(0xC8)
+        if types[t].b == ty_bool {
+            // значения bool — байтами
+            emit_movzx_index()
+        } else {
+            emit8(0x48)
+            emit8(0x8B)
+            emit8(0x04)
+            emit8(0xC8)
+        }
         emit_store_local(v_li)
     }
     let mark = loop_begin()
@@ -1790,14 +1786,15 @@ fn for_map(n1: Token, n2: Token, two: bool, t: int) {
     patch_rel(dead, cont)
     emit_inc_local(idx)
     patch_here(test_at)
+    // idx < записей в массивах (u32 в слове 48)
     emit_load_local(m)
-    emit_load(RCX, RAX, 0)
+    emit_mem_sized(0x8B, RCX, RAX, 48, false)
     if il.reg >= 0 {
         emit_mov_rr(RAX, il.reg)
     } else {
         emit_load(RAX, RBP, il.off)
     }
-    emit_mem(0x3B, RAX, RCX, 8)
+    emit_rr(0x39, RCX, RAX)
     emit_jcc_to(CC_L, top)
     let exit = here()
     loop_end(mark, cont, exit)
