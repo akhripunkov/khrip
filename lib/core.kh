@@ -2597,14 +2597,24 @@ fn __map_set(m: int, k: int, v: int) {
     __store_mut(m)
     let idx = __map_find(m, k)
     if idx >= 0 {
-        let a = load64(load64(m + 16)) + idx * 8
-        __gc_old_at(m, a)
-        store64(a, v)
-        if load64(m + 56) != 0 {
-            __map_grow_set(m, k, idx, v)
-        }
+        __map_update(m, k, idx, v)
         return
     }
+    __map_insert(m, k, v)
+}
+
+// Значение записи idx (ключ k) стало v.
+fn __map_update(m: int, k: int, idx: int, v: int) {
+    let a = load64(load64(m + 16)) + idx * 8
+    __gc_old_at(m, a)
+    store64(a, v)
+    if load64(m + 56) != 0 {
+        __map_grow_set(m, k, idx, v)
+    }
+}
+
+// Новая запись k → v (ключа k в словаре нет).
+fn __map_insert(m: int, k: int, v: int) {
     let len = load64(load64(m) + 8)
     let cap = __map_limit(m)
     let inc = __in_store(m)

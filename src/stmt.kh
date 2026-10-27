@@ -853,19 +853,17 @@ fn assign_index(t: int) {
             compound_value(op, vt, opt)
         }
         emit_barrier(8, vt)
-        if kt == ty_str && barrier_on(kt) {
-            // строковый ключ тоже попадает внутрь словаря
-            emit_push(RAX)
-            emit_load(RSI, RSP, 8)
-            emit_load(RDI, RSP, 16)
-            emit_mov_imm(RDX, type_desc(ty_str))
-            emit_call(rt_func("__barrier"))
-            emit_store(RSP, 8, RAX)
-            emit_pop(RAX)
-        }
         emit_mov_rr(RDX, RAX)
         emit_pop(RSI)
         emit_pop(RDI)
+        if kt == ty_str && barrier_on(kt) {
+            // строковый ключ тоже попадает внутрь словаря: __map_set_sk
+            // копирует его только для новой записи (lib/api.kh)
+            emit_mov_imm(RCX, type_desc(ty_str))
+            emit_mov_imm(R8, type_desc(vt))
+            emit_call(rt_func("__map_set_sk"))
+            return
+        }
         emit_call(rt_func("__map_set"))
         return
     }

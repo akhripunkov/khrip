@@ -375,6 +375,50 @@ PY
 done
 [[ $grow_ok -eq 1 ]] && pass=$((pass + 1))
 
+# Представление данных store (этап памяти, часть 3) само по себе: на копиях
+# библиотеки с подложенной ошибкой тест пункта падает — без проверок (plain)
+# или с KHRIP_GC_VERIFY=1 (verify), как указано у каждой мутации:
+#   keyshare — ключ словаря не берётся из поля значения (gc_keys, plain);
+#   keyreplace — ключ копируется и при замене значения (gc_keys, plain).
+mem3_ok=1
+while read -r cut test mode; do
+	[[ -z $cut ]] && continue
+	rm -rf "${tmp:?}/mem3lib"
+	mkdir -p "$tmp/mem3lib"
+	cp lib/*.kh "$tmp/mem3lib/"
+	if ! python3 - "$tmp/mem3lib" "$cut" <<'PY'
+import sys
+d, m = sys.argv[1], sys.argv[2]
+cuts = {
+    "keyshare": ("    var key = __map_key_share(k, v, vd)\n", "    var key = 0\n", "api.kh"),
+    "keyreplace": ("    __store_mut(m)\n    let idx = __map_find(m, k)\n    if idx >= 0 {\n        __map_update(m, k, idx, v)\n        return\n    }\n    var key = __map_key_share(k, v, vd)\n", "    __store_mut(m)\n    let k2 = __persist_copy(k, kd)\n    let idx = __map_find(m, k)\n    if idx >= 0 {\n        __map_update(m, k2, idx, v)\n        return\n    }\n    var key = __map_key_share(k, v, vd)\n", "api.kh"),
+    "listptrb": ("    store64(h, __alloc_k(n, kind, 0))\n    store64(h + 16, n / esize)\n", "    var m = cap * esize\n    if m < 16 {\n        m = 16\n    }\n    store64(h, __alloc_k(m, kind, 0))\n    store64(h + 16, n / esize)\n", "core.kh"),
+    "listcap": ("    var n = cap * esize\n    if n < 16 {\n        n = 16\n    }\n", "    var n = cap * esize\n    if n < 32 {\n        n = 32\n    }\n", "core.kh"),
+}
+old, new, f = cuts[m]
+s = open(f"{d}/{f}").read()
+if s.count(old) != 1:
+    sys.exit(1)
+open(f"{d}/{f}", "w").write(s.replace(old, new))
+PY
+	then
+		mem3_ok=0
+		failed "представление store ($cut)" "место для подложенной ошибки не найдено в lib/"
+		continue
+	fi
+	venv=(env -u KHRIP_GC_VERIFY -u KHRIP_GC_STRESS)
+	[[ $mode == verify ]] && venv=(env -u KHRIP_GC_STRESS KHRIP_GC_VERIFY=1)
+	{ KHRIP_LIB="$tmp/mem3lib" "${venv[@]}" timeout 120 "$KHC" test "tests/api/$test.kh" 2>&1 | grep -v '^khrip: gc verify (boot): ' >"$tmp/mem3.txt"; } 2>/dev/null
+	if diff -q "tests/api/$test.out" "$tmp/mem3.txt" >/dev/null; then
+		mem3_ok=0
+		failed "представление store ($cut)" "tests/api/$test.kh проходит и без проверяемого механизма"
+	fi
+done <<'CUTS'
+keyshare gc_keys plain
+keyreplace gc_keys plain
+CUTS
+[[ $mem3_ok -eq 1 ]] && pass=$((pass + 1))
+
 # Примеры учебника (docs/TUTORIAL.md) и ответы к заданиям: программы
 # выполняются, API проходят свои блоки test.
 for src in docs/tutorial/*.kh docs/tutorial/answers/*.kh; do

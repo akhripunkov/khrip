@@ -222,6 +222,59 @@ fn __persist_copy(v: int, d: int) -> int {
     return r
 }
 
+// m[k] = v в коде программы со строковым ключом (src/stmt.kh, assign_index):
+// значение v уже прошло барьер, ключ k — нет. Ключ копируется в store (как
+// __barrier с описанием kd) только для новой записи: у замены значения ключ
+// остаётся прежним, и копия была бы мусором. Если значение — структура со
+// строковым полем, равным ключу (links[code] = Link { code, ... }), или само
+// равно ключу, ключом становится эта строка: вторая копия тех же байтов не
+// нужна (этап памяти, часть 3, п. 5).
+fn __map_set_sk(m: int, k: int, v: int, kd: int, vd: int) {
+    if __in_arena(m) || k == 0 || __in_store(k) || __in_data(k) {
+        __map_set(m, k, v)
+        return
+    }
+    __store_mut(m)
+    let idx = __map_find(m, k)
+    if idx >= 0 {
+        __map_update(m, k, idx, v)
+        return
+    }
+    var key = __map_key_share(k, v, vd)
+    if key == 0 {
+        key = __persist_copy(k, kd)
+    }
+    __map_insert(m, key, v)
+}
+
+// Строка в store или DATA с теми же байтами, что ключ k: само значение v
+// (описание vd — строка) или строковое поле структуры v; иначе 0.
+fn __map_key_share(k: int, v: int, vd: int) -> int {
+    if v == 0 || !(__in_store(v) || __in_data(v)) {
+        return 0
+    }
+    let s: str = __cast(k)
+    let dk = load64(vd)
+    if dk == D_STR {
+        if __str_eq(s, __cast(v)) {
+            return v
+        }
+        return 0
+    }
+    if dk != D_STRUCT {
+        return 0
+    }
+    let n = load64(vd + 8)
+    for i in 0..n {
+        let fd = load64(vd + 32 + i * 40 + 16)
+        let f = load64(v + i * 8)
+        if load64(fd) == D_STR && f != 0 && (__in_store(f) || __in_data(f)) && __str_eq(s, __cast(f)) {
+            return f
+        }
+    }
+    return 0
+}
+
 // Память под состояние копии st (st = 0 — под само состояние) в арене, пока
 // выделение идёт из store: через сохранённый курсор CTX_PSAVE_PTR (вне store —
 // обычное выделение). Нулевая, как у __alloc. Если в арене запроса до запаса
@@ -297,7 +350,10 @@ fn __deep_copy(v: int, d: int) -> int {
         store64(st + 32, n)
         let e = load64(st + 24) + n * 24
         let slot = load64(e)
-        store64(slot, __dc_copy(st, load64(e + 8), load64(e + 16)))
+        // слот уже заполнен (ключ словаря, общий с полем значения: __dc_map)
+        if load64(slot) == load64(e + 8) {
+            store64(slot, __dc_copy(st, load64(e + 8), load64(e + 16)))
+        }
     }
     // состояние больше не нужно: арена непрерывна, и место снова свободно (и
     // снова нулевое, как обещает выделитель); куски mmap — системе
@@ -402,17 +458,31 @@ fn __dc_map(st: int, v: int, d: int) -> int {
     let alive = load64(load64(m + 24))
     let refs = !__is_scalar(vd)
     let n = load64(load64(v) + 8)
+    // строковые ключи и значения-структуры: ключ — та же строка, что равное
+    // ему строковое поле значения (__dc_key_share), без второй копии байтов
+    let share = load64(kd) == D_STR && load64(vd) == D_STRUCT
     var w = 0
     for i in 0..n {
         if __word_at(load64(v + 24), i) != 0 {
-            let key = __dc_copy(st, __word_at(load64(v), i), kd)
+            let sk = __word_at(load64(v), i)
+            let sv = __word_at(load64(v + 16), i)
+            var key = 0
+            if share && sv != 0 {
+                let cv = __dc_copy(st, sv, vd)
+                store64(vals + w * 8, cv)
+                key = __dc_key_share(st, sk, cv, vd)
+            } else {
+                store64(vals + w * 8, sv)
+                if refs {
+                    __dc_push(st, vals + w * 8, sv, vd)
+                }
+            }
+            if key == 0 {
+                key = __dc_copy(st, sk, kd)
+            }
             store64(keys + w * 8, key)
-            store64(vals + w * 8, __word_at(load64(v + 16), i))
             store64(alive + w * 8, 1)
             __map_place(m, key, w)
-            if refs {
-                __dc_push(st, vals + w * 8, load64(vals + w * 8), vd)
-            }
             w += 1
         }
     }
@@ -421,6 +491,31 @@ fn __dc_map(st: int, v: int, d: int) -> int {
     store64(load64(m + 24) + 8, w)
     store64(m + 8, w)
     return m
+}
+
+// Ключ sk записи, чьё значение уже скопировано в cv (структура vd): строковое
+// поле cv с теми же байтами — готовая строка store или DATA, или ещё
+// исходная строка, ждущая копии в стеке работы: тогда копия ключа ложится и в
+// поле (стек этот слот пропустит). → ключ или 0, если равного поля нет.
+fn __dc_key_share(st: int, sk: int, cv: int, vd: int) -> int {
+    if sk == 0 || __in_store(sk) || __in_data(sk) || !__in_store(cv) {
+        return 0
+    }
+    let s: str = __cast(sk)
+    let n = load64(vd + 8)
+    for i in 0..n {
+        let fd = __field_desc(vd, i)
+        let f = load64(cv + i * 8)
+        if load64(fd) == D_STR && f != 0 && __str_eq(s, __cast(f)) {
+            if __in_store(f) || __in_data(f) {
+                return f
+            }
+            let key = __dc_copy(st, sk, fd)
+            store64(cv + i * 8, key)
+            return key
+        }
+    }
+    return 0
 }
 
 // Копия src из таблицы пересылки или 0.
