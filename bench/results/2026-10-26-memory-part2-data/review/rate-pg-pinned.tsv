@@ -1,0 +1,5 @@
+variant	scenario	lang	rate	achieved_rps	behind	errors_pct	p50_ms	p90_ms	p99_ms	p999_ms	max_ms	idle_mb	seeded_mb	rss_peak_mb	rss_mean_mb	rss_last_mb	rss_slope_mb_s	hwm_mb	after_mb	cpu_us_per_req	db_cpu_us_per_req	connections	warmup	duration	build_s	size_bytes	invariant
+a6176a0	shop	khrip	900	885	ok	0.0	30.01	592.38	1600.00	1950.00	2080.00	0.7	0.7	38.5	33.9	38.5	0.0294	38.5	38.5	214.8	1633.4	64	60s	60s	0.1	486432	ok
+a6176a0	shop	khrip	1500	924	behind	0.0	10280.00	21320.00	25710.00	26740.00	27330.00	0.7	0.7	43.7	41.7	43.7	0.0488	43.7	43.7	196.6	1883.9	64	60s	60s	0.1	486432	ok
+c39e803	shop	khrip	900	894	ok	0.0	14.32	316.67	616.45	815.61	917.50	0.7	0.8	19.6	5.1	5.0	0.0308	24.2	4.6	221.8	1635.9	64	60s	60s	0.1	490560	ok
+go	shop	go	900	894	ok	0.0	10.22	316.93	607.23	701.44	1260.00	11.1	15.0	18.8	18.2	18.5	0.0075	18.7	18.5	545.4	1446.3	64	60s	60s	17.0	14997540	ok

@@ -1,0 +1,49 @@
+store mm: map[int, map[int, int]]
+store junk: [str]
+
+fn hm(m: map[int, int]) -> int {
+    let h: int = __cast(m)
+    return h
+}
+
+test "many maps growing at once hold the trigger" {
+    let n = 400
+    for i in 0..n {
+        var e: map[int, int] = {}
+        mm[i] = e
+    }
+    // fill every inner map to just below its growth point (cap 2048 -> 1984)
+    for k in 0..1983 {
+        for i in 0..n {
+            let im = mm[i] else {
+                return
+            }
+            im[k] = k
+        }
+    }
+    __gc_collect()
+    let s0 = __gc_stats()
+    eprint("before: heap {s0.heap / 1048576} MB live {s0.live / 1048576} MB goal {s0.goal / 1048576} MB trigger {s0.trigger / 1048576} MB")
+    var growing = 0
+    for i in 0..n {
+        let im = mm[i] else {
+            return
+        }
+        im[1983] = 1
+        im[1984] = 1
+        if __map_growing(hm(im)) {
+            growing += 1
+        }
+    }
+    let s1 = __gc_stats()
+    eprint("{growing} growing: heap {s1.heap / 1048576} MB goal {s1.goal / 1048576} MB trigger {s1.trigger / 1048576} MB cycles {s1.cycles - s0.cycles}")
+    // garbage while the hold is in place
+    for j in 0..200000 {
+        junk.push("garbage string number {j}")
+        if j % 1000 == 999 {
+            junk = []
+        }
+    }
+    let s2 = __gc_stats()
+    eprint("after garbage: heap {s2.heap / 1048576} MB goal {s2.goal / 1048576} MB trigger {s2.trigger / 1048576} MB cycles {s2.cycles - s0.cycles}")
+}

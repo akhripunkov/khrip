@@ -1,0 +1,3 @@
+tree5: before: heap 31 MB live 31 MB goal 46 MB trigger 42 MB 400 growing: heap 93 MB goal 46 MB trigger 104 MB cycles 0 after garbage: heap 106 MB goal 46 MB trigger 104 MB cycles 0 ok    many maps growing at once hold the trigger 
+tree6: before: heap 31 MB live 31 MB goal 46 MB trigger 42 MB 400 growing: heap 93 MB goal 46 MB trigger 42 MB cycles 0 after garbage: heap 106 MB goal 46 MB trigger 42 MB cycles 0 ok    many maps growing at once hold the trigger 
+tree7: before: heap 31 MB live 31 MB goal 46 MB trigger 42 MB 400 growing: heap 93 MB goal 46 MB trigger 42 MB cycles 0 after garbage: heap 106 MB goal 46 MB trigger 42 MB cycles 0 ok    many maps growing at once hold the trigger 

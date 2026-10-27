@@ -1,0 +1,4 @@
+tree5 size 100000: start 328 KB after normal burst 33576 KB after dead-client burst 54576 KB 
+tree5 size 900000: start 328 KB after normal burst 223576 KB after dead-client burst 227180 KB 
+tree6 size 100000: start 328 KB after normal burst 9116 KB after dead-client burst 9116 KB 
+tree6 size 900000: start 328 KB after normal burst 8792 KB after dead-client burst 10188 KB 
