@@ -226,3 +226,27 @@ fn __map_grow_at(m: int) -> int {
     }
     return cap - 1
 }
+
+// ---- Представление данных store (этап памяти, часть 3) ----
+
+// Ёмкость списка h и размер слота его массива (0 — массив не в store).
+fn __list_capacity(h: int) -> int {
+    return load64(h + 16)
+}
+
+fn __list_data_slot(h: int) -> int {
+    let d = load64(h)
+    if !__in_store(d) {
+        return 0
+    }
+    return __gc_obj_size(__gc_obj_of(d))
+}
+
+// Размер слота объекта store, в котором лежит p (0 — p не в объекте store).
+fn __slot_size(p: int) -> int {
+    let o = __gc_obj_of(p)
+    if o == 0 {
+        return 0
+    }
+    return __gc_obj_size(o)
+}

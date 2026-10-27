@@ -379,7 +379,10 @@ done
 # библиотеки с подложенной ошибкой тест пункта падает — без проверок (plain)
 # или с KHRIP_GC_VERIFY=1 (verify), как указано у каждой мутации:
 #   keyshare — ключ словаря не берётся из поля значения (gc_keys, plain);
-#   keyreplace — ключ копируется и при замене значения (gc_keys, plain).
+#   keyreplace — ключ копируется и при замене значения (gc_keys, plain);
+#   listptrb — ёмкость списка — весь слот, а биты PTRB — только на cap
+#              элементов (gc_lists, verify: ссылка без бита PTRB);
+#   listcap — ёмкость копии снова от 4 элементов (gc_lists, plain).
 mem3_ok=1
 while read -r cut test mode; do
 	[[ -z $cut ]] && continue
@@ -416,6 +419,8 @@ PY
 done <<'CUTS'
 keyshare gc_keys plain
 keyreplace gc_keys plain
+listptrb gc_lists verify
+listcap gc_lists plain
 CUTS
 [[ $mem3_ok -eq 1 ]] && pass=$((pass + 1))
 

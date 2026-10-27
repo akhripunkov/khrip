@@ -1,0 +1,4 @@
+ok    a list copied into store has the capacity of its slot
+ok    a copied list grows by pushes and keeps its elements
+ok    a large list copied into store fills its pages
+3 tests: 3 passed, 0 failed

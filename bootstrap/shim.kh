@@ -30,6 +30,11 @@ fn __salloc(n: int, kind: int, mask: int) -> int {
     return 0
 }
 
+// Выделения из store нет: размер — как у __alloc.
+fn __salloc_size(n: int) -> int {
+    return (n + 15) & ~15
+}
+
 fn __salloc_for(h: int, n: int, kind: int, mask: int) -> int {
     exit(101)
     return 0

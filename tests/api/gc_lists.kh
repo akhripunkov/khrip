@@ -1,0 +1,128 @@
+// Списки в store (этап памяти, часть 3, п. 4): копия списка в store получает
+// массив по своей длине — столько элементов, сколько вмещает слот (у пустого и
+// короткого — слот 16 байт), а не от 4 элементов; дальше список растёт вдвое,
+// как обычно.
+
+type Line { sku: str, qty: int }
+
+type Order { id: int, lines: [Line], tags: [str], flags: [bool], nums: [int] }
+
+store orders: map[int, Order]
+store plain: [int]
+
+fn addr(x: [Line]) -> int {
+    let a: int = __cast(x)
+    return a
+}
+
+route POST "/orders/{id}/{n}" (id: int, n: int) -> 201 {
+    var lines: [Line] = []
+    var tags: [str] = []
+    var flags: [bool] = []
+    var nums: [int] = []
+    for i in 0..n {
+        lines.push(Line { sku: "s{i}", qty: i })
+        tags.push("t{i}")
+        flags.push(i % 2 == 0)
+        nums.push(i * 10)
+    }
+    orders[id] = Order { id, lines, tags, flags, nums }
+    return 201
+}
+
+route POST "/orders/{id}/add/{k}" (id: int, k: int) -> 204 | 404 {
+    let o = orders[id] else {
+        return 404
+    }
+    for i in 0..k {
+        o.lines.push(Line { sku: "x{i}", qty: 100 + i })
+        o.tags.push("y{i}")
+        o.flags.push(true)
+        o.nums.push(-i)
+    }
+    return 204
+}
+
+route POST "/plain/{n}" (n: int) -> 201 {
+    var xs: [int] = []
+    for i in 0..n {
+        xs.push(i)
+    }
+    plain = xs
+    return 201
+}
+
+// элементов, которые вмещает слот массива из n элементов размера es (слоты
+// до 256 байт — по 16)
+fn fit(n: int, es: int) -> int {
+    var b = n * es
+    if b < 16 {
+        b = 16
+    }
+    return ((b + 15) / 16 * 16) / es
+}
+
+test "a list copied into store has the capacity of its slot" {
+    for n in [0, 1, 2, 3, 4, 5, 7, 17, 31] {
+        expect (call POST "/orders/{n}/{n}").status == 201
+    }
+    for n in [0, 1, 2, 3, 4, 5, 7, 17, 31] {
+        let o = orders[n] else {
+            expect false
+            return
+        }
+        expect o.lines.len() == n && o.tags.len() == n && o.flags.len() == n && o.nums.len() == n
+        let h: int = __cast(o.lines)
+        let ht: int = __cast(o.tags)
+        let hf: int = __cast(o.flags)
+        let hn: int = __cast(o.nums)
+        expect __list_capacity(h) == fit(n, 8)
+        expect __list_capacity(ht) == fit(n, 8)
+        expect __list_capacity(hf) == fit(n, 1)
+        expect __list_capacity(hn) == fit(n, 8)
+        expect __list_data_slot(h) == fit(n, 8) * 8
+        expect __list_data_slot(hf) == fit(n, 1)
+        for i in 0..n {
+            expect o.lines[i].sku == "s{i}" && o.lines[i].qty == i
+            expect o.tags[i] == "t{i}" && o.flags[i] == (i % 2 == 0) && o.nums[i] == i * 10
+        }
+    }
+}
+
+test "a copied list grows by pushes and keeps its elements" {
+    __gc_collect()
+    for n in [0, 2, 5] {
+        expect (call POST "/orders/{n}/add/9").status == 204
+        let o = orders[n] else {
+            expect false
+            return
+        }
+        expect o.lines.len() == n + 9 && o.flags.len() == n + 9
+        for i in 0..n {
+            expect o.lines[i].sku == "s{i}" && o.flags[i] == (i % 2 == 0) && o.nums[i] == i * 10
+        }
+        for i in 0..9 {
+            expect o.lines[n + i].sku == "x{i}" && o.lines[n + i].qty == 100 + i
+            expect o.tags[n + i] == "y{i}" && o.flags[n + i] && o.nums[n + i] == -i
+        }
+    }
+    __gc_collect()
+    let o = orders[5] else {
+        expect false
+        return
+    }
+    expect o.lines[13].sku == "x8" && o.tags[0] == "t0"
+}
+
+test "a large list copied into store fills its pages" {
+    expect (call POST "/plain/5000").status == 201
+    expect plain.len() == 5000 && plain[4999] == 4999
+    let h: int = __cast(plain)
+    // 40 000 байт — больше 32 КБ: пять страниц, 40 960
+    expect __list_capacity(h) == 5120
+    expect (call POST "/plain/100000").status == 201
+    let h2: int = __cast(plain)
+    // больше 32 КБ — целые страницы: 800 000 байт — 98 страниц
+    expect __list_capacity(h2) == 98 * 8192 / 8
+    expect plain[99999] == 99999
+}

@@ -344,6 +344,16 @@ fn __alloc_k(n: int, kind: int, mask: int) -> int {
     return __alloc(n)
 }
 
+// Сколько байт займёт выделение n байт (__alloc_k): слот кучи store, если
+// выделение идёт из store (__salloc_size, lib/gc.kh), иначе — n с округлением до
+// 16, как у __alloc.
+fn __alloc_round(n: int) -> int {
+    if load64(__ctx() + CTX_PSAVE_PTR) != 0 {
+        return __salloc_size(n)
+    }
+    return (n + 15) & ~15
+}
+
 // Обнулённая память в обычной памяти потока, где бы ни шло выделение сейчас:
 // курсор обычной памяти — в CTX_PTR, пока нет ни арены, ни store; в
 // CTX_SAVE_PTR, пока идёт арена (и store поверх неё); в CTX_PSAVE_PTR, если
@@ -1261,19 +1271,23 @@ fn __list_new(cap: int, esize: int) -> int {
 }
 
 // То же с видами объектов для кучи store: в заголовке ссылка — только data
-// (слово 0); в data ссылки — элементы, если elem_ref.
+// (слово 0); в data ссылки — элементы, если elem_ref. Ёмкость — не меньше cap
+// и сколько вмещает слот массива (__alloc_round): копия списка в store
+// (__deep_copy) получает массив по своей длине, а не от 4 элементов (этап
+// памяти, часть 3, п. 4); слот целиком — с битами PTRB, если elem_ref.
 fn __list_new_k(cap: int, esize: int, elem_ref: bool) -> int {
-    var c = cap
-    if c < 4 {
-        c = 4
-    }
     var kind = K_NOSCAN
     if elem_ref {
         kind = K_PTRS
     }
+    var n = cap * esize
+    if n < 16 {
+        n = 16
+    }
+    n = __alloc_round(n)
     let h = __alloc_k(32, K_MASK, 1)
-    store64(h, __alloc_k(c * esize, kind, 0))
-    store64(h + 16, c)
+    store64(h, __alloc_k(n, kind, 0))
+    store64(h + 16, n / esize)
     store64(h + 24, esize)
     return h
 }

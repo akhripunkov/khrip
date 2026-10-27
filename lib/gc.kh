@@ -302,6 +302,20 @@ fn __salloc(n: int, kind: int, mask: int) -> int {
     return __salloc_slow(n, kind, mask)
 }
 
+// Размер слота, который __salloc отдаст под n байт: класс размеров до
+// GC_SMALL_MAX, дальше — целые страницы.
+fn __salloc_size(n: int) -> int {
+    var c = 0
+    if n <= 1024 {
+        c = load8(__gc_tab + ((n + 15) >> 4))
+    } else if n <= GC_SMALL_MAX {
+        c = load8(__gc_tab + 56 + ((n + 127) >> 7))
+    } else {
+        return (n + GC_PAGE - 1) & ~(GC_PAGE - 1)
+    }
+    return load64(__gc_tab + 1024 + c * 8)
+}
+
 // Общий путь __salloc: любой размер, поиск слота, новый спан, обнуление,
 // разметка, проверки.
 fn __salloc_slow(n: int, kind: int, mask: int) -> int {
