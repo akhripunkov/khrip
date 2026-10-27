@@ -47,9 +47,13 @@ const HTTP_MAX_EVENTS = 512
 const HTTP_DATE_LEN = 29
 
 // Сопрограммы потока: не больше CO_MAX или KHRIP_COROUTINES (дальше запросы
-// ждут в очереди), из свободных CO_KEEP держат память арены; стек запросов —
-// CO_STACK байт.
+// ждут в очереди); стек запросов — CO_STACK байт. Свободные — стек (последняя
+// освободившаяся берёт следующий запрос): CO_WARM верхних тёплые — держат
+// память последнего запроса (арену до ARENA_WARM, буфер ответа до 1 МБ);
+// ушедшая глубже CO_WARM остывает — арена сверх ARENA_KEEP и буферы сверх
+// 4 КБ уходят системе (__co_cool); глубже CO_KEEP — вся арена.
 const CO_MAX = 4096
+const CO_WARM = 2
 const CO_KEEP = 64
 const CO_STACK = 8388608
 
@@ -480,7 +484,7 @@ fn __co_new(s: __Server) -> __Co? {
     }
     let w = __worker_new()
     let job = __Job {}
-    let co = __Co { sch: s.sch, jb: __alloc(64), ctx: __alloc(CTX_CO_END), stk: 0, stk_len: 0, stk_cap: 0, started: false, parked: false, done: false, deadline: 0, hidx: -1, revents: 0, w: __cast(w), job: __cast(job) }
+    let co = __Co { sch: s.sch, jb: __alloc(64), ctx: __alloc(CTX_CO_END), stk: 0, stk_len: 0, stk_cap: 0, started: false, parked: false, done: false, deadline: 0, hidx: -1, revents: 0, w: __cast(w), job: __cast(job), kept: 0 }
     let x = co.ctx
     store64(x + CTX_WORKER, co.w)
     store64(x + CTX_SERVER, __cast(s))
@@ -520,12 +524,30 @@ fn __co_put(s: __Server, co: __Co) {
     let w: __Worker = __cast(co.w)
     buf_shrink(w.body, 1048576)
     buf_shrink(w.extra, 65536)
-    if s.free.len() >= CO_KEEP {
-        // лишняя свободная сопрограмма: страницы арены — системе
-        let base = load64(co.ctx + CTX_ARENA)
-        syscall(SYS_MADVISE, base, load64(co.ctx + CTX_ARENA_END) - base, 4)
-    }
     s.free.push(__cast(co))
+    // сопрограмма, которую эта сдвинула на глубину CO_WARM (CO_KEEP), остывает
+    let n = s.free.len()
+    if n > CO_WARM {
+        __co_cool(s.free[n - 1 - CO_WARM], ARENA_KEEP)
+    }
+    if n > CO_KEEP {
+        __co_cool(s.free[n - 1 - CO_KEEP], 0)
+    }
+}
+
+// Свободная сопрограмма cv остыла: в памяти остаются только keep байт её
+// арены (обнулённые: __arena_end обнулил всё, что держит, поэтому отказ
+// madvise здесь безвреден), буферы ответа — системе (свежие по 4 КБ).
+fn __co_cool(cv: int, keep: int) {
+    let co: __Co = __cast(cv)
+    if co.kept > keep {
+        let base = load64(co.ctx + CTX_ARENA)
+        syscall(SYS_MADVISE, base + keep, ((co.kept + 4095) & ~4095) - keep, 4)
+        co.kept = keep
+    }
+    let w: __Worker = __cast(co.w)
+    buf_shrink(w.body, 4096)
+    buf_shrink(w.extra, 4096)
 }
 
 // Кадры сопрограммы, которая ждёт, — со стека запросов в кучу.
@@ -599,6 +621,10 @@ fn __co_job(co: __Co) {
     __serve_one(w, req)
     __write_response(__srv(), c, w)
     __arena_end()
+    let kept = load64(__ctx() + CTX_ARENA_KEPT)
+    if kept > co.kept {
+        co.kept = kept
+    }
 }
 
 fn __co_run(s: __Server, co: __Co) {
@@ -703,6 +729,14 @@ fn __conn_drop(s: __Server, fd: int, c: __Conn) {
     if c.open {
         c.open = false
         syscall(SYS_CLOSE, fd)
+    }
+    // пара уходит в запас (__conn_give): ответ, который не успел уйти, и
+    // ввод тоже занимали её страницы
+    if c.out_len > c.hw {
+        c.hw = c.out_len
+    }
+    if c.in_len > c.hw {
+        c.hw = c.in_len
     }
     c.in_len = 0
     c.out_len = 0

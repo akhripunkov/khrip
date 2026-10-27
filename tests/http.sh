@@ -435,10 +435,15 @@ if "$KHC" -o "$tmp/grow_store" tests/load/grow_store.kh >"$tmp/grow_store.err" 2
 	curl -s -o /dev/null -X DELETE "$gs_url/k/1700"
 	curl -s -o /dev/null -X POST "$gs_url/set/5/-5"
 	curl -s -o /dev/null -X POST "$gs_url/set/1750/-1750"
+	curl -s -o /dev/null -X POST "$gs_url/sized/0/1500"
 	d1=$(curl -s "$gs_url/dump")
 	gs_stop
 	gs_start
 	d2=$(curl -s "$gs_url/dump")
+	# восстановленный словарь на 1500 записей: массивы 1595, таблица 8192; рост
+	# с 1546 записей — массивы вдвое, таблица та же
+	s1=$(curl -s -X POST "$gs_url/sized/1500/1550")
+	s2=$(curl -s -X POST "$gs_url/sized/1550/1600")
 	r2=$(curl -s -X POST "$gs_url/fill/1990/5000")
 	d3=$(curl -s "$gs_url/dump")
 	gs_stop
@@ -449,10 +454,10 @@ val[5] = -5
 val[1750] = -1750
 print("".join(f"k{i}={val[i]}," for i in order))')
 	more=$(python3 -c 'print("".join(f"k{i}={i}," for i in range(1990, 5000)))')
-	if [[ "$r1" == "1990 true" && "$d1" == "1988 true:$want" && "$d2" == "1988 false:$want" && "${r2% *}" == "4998" && "${d3#* }" == "${r2#* }:$want$more" ]]; then
+	if [[ "$r1" == "1990 true" && "$d1" == "1988 true:$want" && "$d2" == "1988 false:$want" && "${r2% *}" == "4998" && "${d3#* }" == "${r2#* }:$want$more" && "$s1" == "1550 1595 8192 keep" && "$s2" == "1600 3190 8192 -" ]]; then
 		http_ok
 	else
-		failed "http: KHRIP_DATA посреди роста словаря" "вставки «$r1», «$r2»; до: ${d1:0:80}…; после: ${d2:0:80}…; журнал: $(cat "$tmp/grow_store.log")"
+		failed "http: KHRIP_DATA посреди роста словаря" "вставки «$r1», «$r2», рост восстановленного «$s1», «$s2»; до: ${d1:0:80}…; после: ${d2:0:80}…; журнал: $(cat "$tmp/grow_store.log")"
 	fi
 	rm -f "$tmp/grow.json"
 else

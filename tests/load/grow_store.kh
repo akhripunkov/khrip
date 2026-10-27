@@ -27,6 +27,31 @@ route DELETE "/k/{i}" (i: int) -> int {
     return m.len()
 }
 
+// Восстановленный словарь растёт вдвое: массивы n + n/16 + 2 → удвоенные,
+// таблица остаётся, если её половины хватает (ёмкость, слоты и вид роста:
+// keep — старая таблица, new — новая, «-» — роста нет).
+store sized: map[int, int]
+
+fn shape(h: int) -> str {
+    let g = load64(h + 56)
+    var how = "-"
+    if g != 0 {
+        how = "new"
+        if load64(g + 24) == 0 {
+            how = "keep"
+        }
+    }
+    return "{load64(load64(h) + 16)} {load64(h + 40) + 1} {how}"
+}
+
+route POST "/sized/{a}/{b}" (a: int, b: int) -> str {
+    for i in a..b {
+        sized[i] = i
+    }
+    let h: int = __cast(sized)
+    return "{sized.len()} {shape(h)}"
+}
+
 // записи по порядку обхода и признак роста
 route GET "/dump" -> str {
     var s = "{m.len()} {growing()}:"
