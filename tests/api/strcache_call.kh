@@ -28,11 +28,10 @@ test "call rewinds memory, the string cache starts over" {
         let at = parts[0].to_int() ?? 0
         let free = load64(__ctx() + 8)
         expect at >= free
-        if at > free {
-            __alloc(at - free)
-        }
-        let q = __alloc(601)
-        expect q == at
+        // до байтов строки может лежать её заголовок (короткая строка,
+        // KHRIP_STR_COMPACT=1, lib/core.kh): занять всё до них и их место
+        __alloc(at - free + 601)
+        let q = at
         for i in 0..300 {
             store8(q + 2 * i, 97 + i % 26)
             store8(q + 2 * i + 1, 65 + i % 26)

@@ -23,6 +23,19 @@ fn store32(p: int, v: int) {
     store8(p + 3, (v >> 24) & 255)
 }
 
+// Адрес байтов и длина строки (в khc — встроенные; два вида строк, lib/core.kh).
+fn __str_ptrw(s: int) -> int {
+    return load64(s) & 0xFFFFFFFFFFFF
+}
+
+fn __str_lenw(s: int) -> int {
+    let n = (load64(s) >> 48) & 0xFFFF
+    if n != 0 {
+        return n
+    }
+    return load64(s + 8)
+}
+
 // Смена типа без изменения значения (в khc — встроенная).
 fn __cast(x: int) -> int {
     return x
@@ -58,6 +71,11 @@ fn __salloc_list_inplace(h: int, cap: int, es: int) -> bool {
 
 fn __store_room(p: int) -> int {
     return 0
+}
+
+// Кучи store нет: ни один адрес не в ней.
+fn __in_store(p: int) -> bool {
+    return false
 }
 
 fn __store_on() -> bool {

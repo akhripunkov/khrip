@@ -388,7 +388,8 @@ fn __dc_copy(st: int, v: int, d: int) -> int {
         return v
     }
     if k == D_STR {
-        let s = __str_copy_store(load64(v), load64(v + 8))
+        let src: str = __cast(v)
+        let s = __str_copy_store(__str_ptr(src), __str_len(src))
         return __cast(s)
     }
     if k == D_OPT {
@@ -1728,10 +1729,11 @@ fn __reply_json_error() {
 fn __path_segs(p: str) -> [str] {
     var segs: [str] = []
     let n = p.byte_len()
+    let q = __str_ptr(p)
     var start = 1
     var i = 1
     while i <= n {
-        if i == n || p.byte(i) == '/' {
+        if i == n || load8(q + i) == '/' {
             segs.push(p.byte_slice(start, i))
             start = i + 1
         }
@@ -1758,9 +1760,10 @@ fn url_encode(s: str) -> str {
 
 fn __url_decode(s: str) -> str {
     let n = s.byte_len()
+    let q = __str_ptr(s)
     var plain = true
     for i in 0..n {
-        let c = s.byte(i)
+        let c = load8(q + i)
         if c == '%' || c == '+' {
             plain = false
             break

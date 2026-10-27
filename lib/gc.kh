@@ -781,6 +781,10 @@ fn __struct_salloc(d: int, n: int, tag: int) -> int {
     return p + 8
 }
 
+fn __in_store(p: int) -> bool {
+    return (p >> 40) == (STORE_REGION >> 40)
+}
+
 // Идёт ли выделение из store (__pmode_on).
 fn __store_on() -> bool {
     return load64(__ctx() + CTX_PSAVE_PTR) != 0

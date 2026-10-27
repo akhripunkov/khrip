@@ -1,0 +1,145 @@
+// Строки store с заголовком 8 байт (этап памяти, часть 3, п. 1; lib/core.kh):
+// короткая строка store — один объект [len << 48 | ptr][байты][0] без ссылок,
+// строка от 64 КБ — прежний [ptr][len][байты][0], пустая — литерал "". Срезы,
+// части и символы такой строки — обычные строки {ptr, len} с байтами внутри
+// неё: сборщик держит её по указателю внутрь. Все операции читают оба вида.
+
+type Note { id: int, title: str, text: str, tags: [str] }
+
+store notes: map[int, Note]
+store words: [str]
+store big: str
+store index: map[str, int]
+
+fn addr(s: str) -> int {
+    let a: int = __cast(s)
+    return a
+}
+
+// слот объекта store строки s (0 — не в store)
+fn slot(s: str) -> int {
+    return __slot_size(addr(s))
+}
+
+route POST "/notes/{id}" (id: int) -> 201 {
+    notes[id] = Note { id, title: "title {id}", text: "текст заметки {id} — с кириллицей", tags: ["t{id}", "", "общий"] }
+    return 201
+}
+
+route POST "/words/{n}" (n: int) -> int {
+    for i in 0..n {
+        words.push("w" + "x".repeat(i))
+        index["key-{i}"] = i
+    }
+    return words.len()
+}
+
+route POST "/big/{n}" (n: int) -> int {
+    big = "Ж".repeat(n)
+    return big.len()
+}
+
+test "short store strings take an 8-byte header" {
+    expect (call POST "/notes/1").status == 201
+    let n = notes[1] else {
+        expect false
+        return
+    }
+    // «title 1»: 7 байт — слот 16 (было 32: заголовок 16 + 7 + 0)
+    expect n.title == "title 1" && slot(n.title) == 16
+    expect n.tags[0] == "t1" && slot(n.tags[0]) == 16
+    // пустая строка — литерал, не объект store
+    expect n.tags[1] == "" && slot(n.tags[1]) == 0
+    expect n.text.len() == 30 && n.text.byte_len() == 55 && slot(n.text) == 64
+    let h: int = __cast(n.title)
+    // слово 0 — длина в старших 16 битах и адрес байтов сразу за словом
+    expect (load64(h) >> 48) == 7 && (load64(h) & 0xFFFFFFFFFFFF) == h + 8 && __str_ptr(n.title) == h + 8
+}
+
+test "every string operation reads both kinds" {
+    let n = notes[1] else {
+        expect false
+        return
+    }
+    let t = n.title
+    let x = n.text
+    // сравнения, порядок, хеш словаря, поиск
+    expect t == "title 1" && t != "title 2" && t < "title 2" && t > "tit" && "title 1" == t
+    expect t.starts_with("tit") && t.ends_with(" 1") && t.contains("le") && (t.find("e") ?? -1) == 4
+    expect x.starts_with("текст") && x.contains("заметки") && (x.find("—") ?? -1) > 0
+    // символы, срезы, обход, длина в символах
+    expect t[0] == "t" && t[6] == "1" && t[1..5] == "itle" && t[..5] == "title" && t[6..] == "1"
+    expect x[0] == "т" && x[x.len() - 1] == "й" && x[6..13] == "заметки"
+    var chars = 0
+    var cyr = 0
+    for c in x {
+        chars += 1
+        if c >= "а" && c <= "я" {
+            cyr += 1
+        }
+    }
+    expect chars == 30 && cyr > 10
+    expect t.byte(0) == 't' && t.byte_slice(0, 5) == "title" && x.byte(0) == 0xD1
+    // склейка, интерполяция, замена, регистр, разбиение, обрезка, числа
+    expect t + "!" == "title 1!" && "{t}/{x[0]}" == "title 1/т"
+    expect t.replace("1", "one") == "title one" && t.upper() == "TITLE 1" && x.upper().starts_with("ТЕКСТ")
+    let parts = x.split(" ")
+    expect parts.len() == 6 && parts[1] == "заметки" && parts[2] == "1"
+    expect (" " + t + " ").trim() == t && (parts[2].to_int() ?? 0) == 1
+    expect t.matches("title [0-9]+") && !t.matches("[0-9]+")
+    // JSON: значение store целиком и строки внутри
+    expect to_json(n).starts_with("\{\"id\":1,\"title\":\"title 1\",\"text\":\"текст")
+    expect to_json(n.tags) == "[\"t1\",\"\",\"общий\"]"
+    // ключ словаря — строка store; поиск строкой арены
+    expect (call POST "/words/40").body == "40"
+    expect (index["key-17"] ?? -1) == 17 && index.has("key-0") && !index.has("key-40")
+    expect words[39].byte_len() == 40 && words[0] == "w" && slot(words[0]) == 16
+}
+
+test "slices and parts of a store string keep it alive" {
+    let n = notes[1] else {
+        expect false
+        return
+    }
+    // срез, часть split и символ — внутри объекта строки store; сама строка
+    // уходит из store (замена заметки), а куски держат её
+    let piece = n.text[6..13]
+    let parts = n.text.split(" ")
+    let ch = n.title[2]
+    let bs = n.title.byte_slice(1, 4)
+    expect (call POST "/notes/1").status == 201
+    notes.remove(1)
+    __gc_collect()
+    __gc_collect()
+    expect piece == "заметки" && parts[3] == "—" && ch == "t" && bs == "itl"
+    expect __gc_is_allocated(__str_ptr(piece)) && __gc_is_allocated(__str_ptr(bs))
+}
+
+test "long store strings keep the two-word header" {
+    expect (call POST "/big/40000").body == "40000"
+    let h: int = __cast(big)
+    // 80 000 байт: не короткая строка — {ptr = h + 16, len}
+    expect load64(h) == h + 16 && load64(h + 8) == 80000 && big.byte_len() == 80000
+    expect big.len() == 40000 && big[39999] == "Ж" && big[1..3] == "ЖЖ"
+    expect (call POST "/big/32767").body == "32767"
+    let h2: int = __cast(big)
+    // 65 534 байта — ещё короткая
+    expect ((load64(h2) >> 48) & 0xFFFF) == 65534 && big.byte_len() == 65534 && big[32766] == "Ж"
+    __gc_collect()
+    expect big.len() == 32767
+}
+
+test "a stored string round-trips through JSON and copies" {
+    let words2 = words.copy()
+    var s = 0
+    for w in words2 {
+        s += w.byte_len()
+    }
+    expect s == 40 * 41 / 2
+    let got: [str]? = from_json(to_json(words))
+    let back = got else {
+        expect false
+        return
+    }
+    expect back.len() == 40 && back[39] == words[39] && back[0] == "w"
+}

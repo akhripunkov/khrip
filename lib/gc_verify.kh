@@ -602,12 +602,20 @@ fn __gcv_visit(st: int, when: str, v: int, d: int) {
         return
     }
     if k == D_STR {
-        let len = load64(v + 8)
+        // два вида строк (lib/core.kh): короткая строка store — в спане без
+        // ссылок, её байты — в ней самой за словом 0
+        let s: str = __cast(v)
+        let len = __str_len(s)
+        let p = __str_ptr(s)
+        if __in_store(v) && (load64(v) >> 48) != 0 && (p != v + 8 || len >= STR_SHORT || ((load64(__gc_span_of(v) + S_INFO) >> 48) & F_NOSCAN) == 0) {
+            __gcv_fail(st, when, "a short store string at " + __gc_hex(v) + " has a broken header or is not in a NOSCAN span")
+        }
         if len > 0 {
-            let p = load64(v)
             __gcv_ptr(st, when, p, "string bytes", false)
-            __gcv_word(st, when, v)
-            if __in_store(p) && __gc_obj_of(p) + __gc_obj_size(__gc_obj_of(p)) < p + len {
+            if (load64(v) >> 48) == 0 {
+                __gcv_word(st, when, v)
+            }
+            if __in_store(p) && __gc_obj_of(p) + __gc_obj_size(__gc_obj_of(p)) < p + len + 1 {
                 __gcv_fail(st, when, "string bytes at " + __gc_hex(p) + " run past their object")
             }
         }

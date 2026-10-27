@@ -1,0 +1,6 @@
+ok    short store strings take an 8-byte header
+ok    every string operation reads both kinds
+ok    slices and parts of a store string keep it alive
+ok    long store strings keep the two-word header
+ok    a stored string round-trips through JSON and copies
+5 tests: 5 passed, 0 failed

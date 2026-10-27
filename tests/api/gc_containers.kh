@@ -107,7 +107,9 @@ test "clear frees the strings" {
 
 test "after clear the strings are gone" {
     let now = live()
-    expect live_before - now >= 49800 * 32 + 20000 * 48
+    // строки store с заголовком 8 байт: «word 100» и длиннее — слот 32,
+    // Entry — 16 и ключ «k…» — 16
+    expect live_before - now >= 49000 * 32 + 20000 * 32
     expect words.len() == 0 && entries.len() == 0
     words.push("again")
     expect words[0] == "again"

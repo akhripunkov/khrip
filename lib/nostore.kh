@@ -58,6 +58,11 @@ fn __gc_grow_done(n: int, at: int) {
 }
 
 // Выделения из store нет, объектов в store тоже.
+// Кучи store нет: ни один адрес не в ней.
+fn __in_store(p: int) -> bool {
+    return false
+}
+
 fn __store_on() -> bool {
     return false
 }
