@@ -1,0 +1,29 @@
+// Анонимные структуры (A1–A3) в настоящем сервере (tests/http.sh): store с
+// вложенными анонимными типами переживает перезапуск через KHRIP_DATA (снимок
+// и загрузка — по описаниям типов, проверка графа — с KHRIP_GC_VERIFY), а
+// литерал без типа (A3) уходит телом fetch как JSON (эхо-сервер на ECHO_PORT).
+
+store sessions: map[str, { user: str, hist: [{ at: int, note: str? }], tags: map[str, { n: int }] }]
+store meta: { count: int, last: str? } = { count: 0 }
+
+route POST "/s/{id}/{n}" (id: str, n: int) -> int {
+    var s = sessions[id] ?? { user: "u-" + id, hist: [], tags: {} }
+    for i in 0..n {
+        s.hist.push({ at: i, note: if i % 2 == 0 { "even {i}" } else { none } })
+        s.tags["t{i % 3}"] = { n: (s.tags["t{i % 3}"] ?? { n: 0 }).n + 1 }
+    }
+    sessions[id] = s
+    meta = { count: meta.count + n, last: id }
+    return s.hist.len()
+}
+
+route GET "/dump" -> { sessions: int, count: int, last: str?, json: str } {
+    return { sessions: sessions.len(), count: meta.count, last: meta.last, json: to_json(sessions) }
+}
+
+// A3: тело fetch — анонимный литерал; эхо отвечает телом и Content-Type
+route POST "/send" -> str {
+    let port = env("ECHO_PORT") ?? "0"
+    let r = fetch POST "http://127.0.0.1:{port}/echo" { model: "m", stream: true, messages: [{ role: "user", content: "привет" }], n: meta.count }
+    return "{r.status} {r.body}"
+}

@@ -29,6 +29,9 @@ check() {
 	code=${out##*$'\n'}
 	body=$(printf '%s' "${out%$'\n'*}" | compact)
 	LAST=$body
+	# EVAL_LOG=файл — журнал ответов (название, код, тело) для сравнения двух
+	# версий решения
+	[[ -n ${EVAL_LOG:-} ]] && printf '%s\t%s\t%s\n' "$name" "$code" "$body" >>"$EVAL_LOG"
 	[[ "$code" == $want ]] || ok=0
 	rest=$pattern
 	while [[ -n "$rest" ]]; do

@@ -20,30 +20,27 @@ CREATE TABLE issues (
 );
 `
 
-type NewUser { email: str, name: str }
 type User { id: int, email: str, name: str }
-type NewProject { key: str, name: str, owner_id: int }
 type Project { key: str, name: str, owner_id: int }
 type Status = open | in_progress | done
 type Priority = low | medium | high
 type NewIssue { title: str, priority: Priority = medium, assignee_id: int? }
 type Issue { key: str, project: str, number: int, title: str, status: Status, priority: Priority, assignee_id: int?, created_at: str, updated_at: str }
 type IssuePatch { title: str?, status: Status?, priority: Priority?, assignee_id: int? }
-type Active { id: int, name: str, active: int }
-type Summary { total: int, open: int, in_progress: int, done: int, assignees: [Active] }
+type Summary { total: int, open: int, in_progress: int, done: int, assignees: [{ id: int, name: str, active: int }] }
 
 fn title_ok(t: str) -> bool {
     return t.trim() != "" && t.len() <= 200
 }
 
-route POST "/users" (body: NewUser) -> 201 User | 400 str {
+route POST "/users" (body: { email: str, name: str }) -> 201 User | 400 str {
     if !body.email.matches(`[^@\s]+@[^@\s]+`) || body.name.trim() == "" {
         return 400 "invalid user"
     }
     return 201 sql "INSERT INTO users (email, name) VALUES ({body.email.lower()}, {body.name}) RETURNING *"
 }
 
-route POST "/projects" (body: NewProject) -> 201 Project | 400 str {
+route POST "/projects" (body: { key: str, name: str, owner_id: int }) -> 201 Project | 400 str {
     if !body.key.matches(`[A-Z]{2,5}`) || body.name.trim() == "" {
         return 400 "invalid project"
     }

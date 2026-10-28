@@ -1,0 +1,17 @@
+# eval/run.sh <задача> khrip для решения e1203ad (old) и переписанного (new),
+# khc ветки, EVAL_LOG — журнал ответов check() (название, код, тело); затем
+# сравнение журналов после замены времени (TIME), токенов (32 знака) и
+# случайных кодов (shortener) — t/evalnorm.py ниже. ratelimit проверяет
+# Python-сценарий без check(): его ответы (ping, time, limits, 429 с
+# заголовками) сравнены отдельно запросами curl — совпали байт в байт.
+bank old exit=0 29 checks, 0 FAIL | new exit=0 29 checks, 0 FAIL | identical after normalization
+bookings old exit=0 32 checks, 0 FAIL | new exit=0 32 checks, 0 FAIL | identical after normalization
+catalog old exit=0 36 checks, 0 FAIL | new exit=0 36 checks, 0 FAIL | identical after normalization
+inventory old exit=0 32 checks, 0 FAIL | new exit=0 32 checks, 0 FAIL | identical after normalization
+ledger old exit=0 53 checks, 0 FAIL | new exit=0 53 checks, 0 FAIL | identical after normalization
+notes old exit=0 34 checks, 0 FAIL | new exit=0 34 checks, 0 FAIL | identical after normalization
+polls old exit=0 29 checks, 0 FAIL | new exit=0 29 checks, 0 FAIL | identical after normalization
+ratelimit old exit=0 passed 16/16 | new exit=0 passed 16/16 | curl: identical
+shop old exit=0 61 checks, 0 FAIL | new exit=0 61 checks, 0 FAIL | identical after normalization
+shortener old exit=0 26 checks, 0 FAIL | new exit=0 26 checks, 0 FAIL | identical after normalization
+tracker old exit=0 60 checks, 0 FAIL | new exit=0 60 checks, 0 FAIL | identical after normalization

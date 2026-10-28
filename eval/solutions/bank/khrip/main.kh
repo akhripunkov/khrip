@@ -1,8 +1,4 @@
-type NewAccount { owner: str }
-
 type Account { id: int, owner: str, balance: int = 0 }
-
-type Amount { amount: int }
 
 type NewTransfer { from_id: int, to_id: int, amount: int }
 
@@ -11,7 +7,7 @@ type Transfer { id: int, ...NewTransfer, created_at: str }
 store accounts: map[int, Account]
 store transfers: [Transfer]
 
-route POST "/accounts" (body: NewAccount) -> 201 Account | 400 str {
+route POST "/accounts" (body: { owner: str }) -> 201 Account | 400 str {
     if body.owner.trim() == "" {
         return 400 "owner is required"
     }
@@ -24,7 +20,7 @@ route GET "/accounts/{id}" (id: int) -> Account | 404 {
     return accounts[id] ?? 404
 }
 
-route POST "/accounts/{id}/deposit" (id: int, body: Amount) -> Account | 400 str | 404 {
+route POST "/accounts/{id}/deposit" (id: int, body: { amount: int }) -> Account | 400 str | 404 {
     let acc = accounts[id] else {
         return 404
     }

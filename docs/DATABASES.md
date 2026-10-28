@@ -89,8 +89,9 @@ if saved.error != "" {
   `mongo_delete` отвергают фильтр, из которого `to_bson` выбросил `none` (и
   вложенный в него через `to_bson` или построитель): `mongo_delete filter field
   'owner' is none, ...`. Разверните значение (`let o = owner else { return 400 }`)
-  или ищите null через `bson_null`. Явно пустой фильтр (`to_bson({})`,
-  `bson_finish(bson_new())`) по-прежнему меняет все документы. В `mongo_find` и
+  или ищите null через `bson_null`. Явно пустой фильтр (`to_bson(all)` у
+  `let all: map[str, int] = {}`, `bson_finish(bson_new())`) по-прежнему меняет
+  все документы. В `mongo_find` и
   `mongo_cursor` пропуск остаётся: это необязательные условия поиска, но
   фильтр по владельцу из необязательного значения там тоже вернёт всё —
   проверяйте такие значения до запроса.

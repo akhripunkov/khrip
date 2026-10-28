@@ -228,6 +228,27 @@ fn ty_name(t: int) -> str {
     return "?"
 }
 
+// Тип в сгенерированном исходном тексте (src/api.kh): как ty_name, но
+// анонимная структура — __anon<номер> (parse_type узнаёт это имя только в
+// библиотеке и сгенерированном коде): запись типа со значениями по умолчанию
+// разбиралась бы заново.
+fn ty_src(t: int) -> str {
+    let k = tkind(t)
+    if k == K_STRUCT && structs[types[t].a].name.byte(0) == '\{' {
+        return "__anon" + types[t].a.to_str()
+    }
+    if k == K_LIST {
+        return "[" + ty_src(types[t].a) + "]"
+    }
+    if k == K_MAP {
+        return "map[" + ty_src(types[t].a) + ", " + ty_src(types[t].b) + "]"
+    }
+    if k == K_OPT {
+        return ty_src(types[t].a) + "?"
+    }
+    return ty_name(t)
+}
+
 // Можно ли значение типа from использовать там, где ожидается to.
 // Единственное неявное преобразование — T в T? (и none в T?).
 fn assignable(from: int, to: int) -> bool {

@@ -29,19 +29,14 @@ CREATE VIEW order_view AS SELECT o.*, coalesce((SELECT jsonb_agg(jsonb_build_obj
     'qty', qty, 'price', price) ORDER BY line) FROM order_lines WHERE order_id = o.id), '[]') AS lines FROM orders o;
 `
 
-type NewCategory { name: str }
 type Category { id: int, name: str }
 type NewProduct { name: str, category_id: int, price: int, stock: int, tags: [str] = [] }
 type Product { id: int, ...NewProduct }
 type ProductPatch { name: str?, price: int?, stock: int?, tags: [str]? }
-type Page { items: [Product], total: int }
 type Line { product_id: int, qty: int }
 type PricedLine { product_id: int, qty: int, price: int }
-type NewOrder { customer: str, lines: [Line] }
 type OrderHead { id: int, customer: str, status: str, total: int, created_at: str }
 type Order { ...OrderHead, lines: [PricedLine] }
-type OrderLine { order_id: int, line: int, product_id: int, qty: int, price: int }
-type CategoryStats { category: str, products: int, units_sold: int, revenue: int }
 
 fn tags_ok(tags: [str]) -> bool {
     return tags.len() <= 5 && tags.all(t => t.matches(`[a-z0-9]{1,20}`))
@@ -62,7 +57,7 @@ fn email_ok(s: str) -> bool {
     return parts.len() == 2 && parts[0] != "" && parts[1] != "" && !s.contains(" ")
 }
 
-route POST "/categories" (body: NewCategory) -> 201 Category | 400 str {
+route POST "/categories" (body: { name: str }) -> 201 Category | 400 str {
     let name = body.name.trim()
     if name.len() < 1 || name.len() > 50 {
         return 400 "name must be 1-50 characters"
@@ -97,7 +92,7 @@ route PATCH "/products/{id}" (id: int, body: ProductPatch) -> Product | 400 str 
     return sql "UPDATE products SET {patch} WHERE id = {id} RETURNING *"
 }
 
-route GET "/products" (category_id: int?, tag: str?, q: str?, min_price: int?, max_price: int?, in_stock: bool = false, sort: str = "", page: int = 1, per_page: int = 10) -> Page | 400 str {
+route GET "/products" (category_id: int?, tag: str?, q: str?, min_price: int?, max_price: int?, in_stock: bool = false, sort: str = "", page: int = 1, per_page: int = 10) -> { items: [Product], total: int } | 400 str {
     if page < 1 || page > 2147483647 || per_page < 1 || per_page > 50 {
         return 400 "bad query"
     }
@@ -123,10 +118,10 @@ route GET "/products" (category_id: int?, tag: str?, q: str?, min_price: int?, m
           AND ({max_price} IS NULL OR price <= {max_price})
           AND (NOT {in_stock} OR stock > 0)
         ORDER BY {o} LIMIT {per_page} OFFSET {(page - 1) * per_page}`
-    return Page { items, total }
+    return { items, total }
 }
 
-route POST "/orders" (body: NewOrder) -> 201 Order | 400 str | 404 | 409 str {
+route POST "/orders" (body: { customer: str, lines: [Line] }) -> 201 Order | 400 str | 404 | 409 str {
     if !email_ok(body.customer) || body.lines.len() == 0 || body.lines.any(l => l.qty <= 0) {
         return 400 "invalid order"
     }
@@ -135,7 +130,7 @@ route POST "/orders" (body: NewOrder) -> 201 Order | 400 str | 404 | 409 str {
         if let m = lines.find(x => x.product_id == l.product_id) {
             m.qty += l.qty
         } else {
-            lines.push(Line { ...l })
+            lines.push({ ...l })
         }
     }
     tx {
@@ -145,19 +140,19 @@ route POST "/orders" (body: NewOrder) -> 201 Order | 400 str | 404 | 409 str {
             if p.stock < l.qty {
                 return 409 "not enough stock for product {p.id}"
             }
-            priced.push(PricedLine { ...l, price: p.price })
+            priced.push({ ...l, price: p.price })
         }
         for l in lines {
             sql "UPDATE products SET stock = stock - {l.qty} WHERE id = {l.product_id}"
         }
         let total = priced.map(l => l.qty * l.price).sum()
         let o: OrderHead = sql "INSERT INTO orders (customer, total) VALUES ({body.customer.lower()}, {total}) RETURNING *"
-        var rows: [OrderLine] = []
+        var rows: [{ order_id: int, line: int, product_id: int, qty: int, price: int }] = []
         for i, l in priced {
-            rows.push(OrderLine { order_id: o.id, line: i + 1, ...l })
+            rows.push({ order_id: o.id, line: i + 1, ...l })
         }
         sql "INSERT INTO order_lines {rows}"
-        return 201 Order { ...o, lines: priced }
+        return 201 { ...o, lines: priced }
     }
 }
 
@@ -171,7 +166,7 @@ route POST "/orders/{id}/cancel" (id: int) -> Order | 404 | 409 str {
             sql "UPDATE products SET stock = stock + {l.qty} WHERE id = {l.product_id}"
         }
         sql "UPDATE orders SET status = 'cancelled' WHERE id = {id}"
-        return Order { ...o, status: "cancelled" }
+        return { ...o, status: "cancelled" }
     }
 }
 
@@ -179,7 +174,7 @@ route GET "/customers/{email}/orders" (email: str) -> [Order] {
     return sql "SELECT * FROM order_view WHERE customer = {email.lower()} ORDER BY id DESC"
 }
 
-route GET "/stats/categories" -> [CategoryStats] {
+route GET "/stats/categories" -> [{ category: str, products: int, units_sold: int, revenue: int }] {
     return sql `SELECT c.name AS category, count(p.id) AS products,
             coalesce(sum(s.units), 0) AS units_sold, coalesce(sum(s.revenue), 0) AS revenue
         FROM categories c

@@ -1,0 +1,17 @@
+// Тело call с путём-литералом, который попадает ровно в один маршрут с телом,
+// получает тип тела этого маршрута: опечатка в поле — ошибка, а не молчаливое
+// значение по умолчанию у маршрута.
+route POST "/x" (body: { a: int, b: str = "d" }) -> str {
+    return body.b
+}
+
+route PUT "/items/{id}" (id: int, body: { name: str }) -> int {
+    return id
+}
+
+test "typos in call bodies" {
+    let r = call POST "/x" { a: 4, bb: "oops" }
+    let s = call PUT "/items/7?dry=1" { nmae: "x" }
+    let t = call POST "/x" { a: 1 }
+    expect r.status + s.status + t.status > 0
+}

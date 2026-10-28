@@ -1,0 +1,16 @@
+// То же в параметрах sql (jsonb): {field: value} с переменной field раньше был
+// словарём {"<значение field>": value}, теперь — структура с полем "field".
+migration 1 `
+CREATE TABLE docs (id bigserial PRIMARY KEY, body jsonb NOT NULL);
+`
+
+route POST "/docs/{field}" (field: str, value: int) -> 204 {
+    let doc = {field: value}
+    sql "INSERT INTO docs (body) VALUES ({doc})"
+    return 204
+}
+
+route POST "/docs2/{field}" (field: str, value: int) -> 204 {
+    sql "INSERT INTO docs (body) VALUES ({to_json({field: value})}::jsonb)"
+    return 204
+}

@@ -1,0 +1,23 @@
+// В условии, у значения match и в заголовке for { начинает блок: литерал
+// структуры там — только в скобках (в for — подсказка про словарь). Структура
+// без кавычек у ключей — не словарь: подсказка у индекса, цикла и методов
+// словаря; голое имя ключом словаря — ошибка.
+fn main() {
+    if { a: 1 }.a == 1 {
+        print("one")
+    }
+    if ({ a: 1 }).a == 1 {
+        print("ok")
+    }
+    let x = "x"
+    for key in {x: 1} {
+    }
+    let m = {a: 1}
+    print((m["a"] ?? 0).to_str())
+    for key in m {
+    }
+    print(m.len().to_str())
+    let typed: map[str, int] = {"a": 1, x: 2}
+    let typed2: map[str, int] = {x: 2}
+    print(typed.len().to_str() + typed2.len().to_str())
+}

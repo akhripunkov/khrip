@@ -1,0 +1,9 @@
+tests/errors/anon_call_typo.kh:13:36: error: { a: int, b: str = "d" } has no field 'bb'
+        let r = call POST "/x" { a: 4, bb: "oops" }
+                                       ^
+    hint: did you mean 'b'?
+tests/errors/anon_call_typo.kh:14:41: error: { name: str } has no field 'nmae'
+        let s = call PUT "/items/7?dry=1" { nmae: "x" }
+                                            ^
+    hint: did you mean 'name'?
+2 errors

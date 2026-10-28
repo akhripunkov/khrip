@@ -1,0 +1,17 @@
+# Бинарники решений eval. old — исходник e1203ad, new — переписанный; khc ветки, кроме столбца base_khc.
+# Все из одного пути (p/main.kh), чтобы имена файлов в таблице мест паник совпадали; отличия кода — codecmp.py.
+# задача | base_khc(old) == khc(old) | размер old | размер new | код old → new (--sizes) | данные old → new | отличия кода new от old
+bank | identical | 164944 | 164952 | 150659 → 150659 | 13392 → 13400 | 150675 code bytes; 10 data addresses moved; 5 panic line numbers; 0 other differences; размеры функций те же
+bookings | identical | 173424 | 173424 | 156371 → 156371 | 13680 → 13680 | 156387 code bytes; 0 data addresses moved; 0 panic line numbers; 0 other differences; размеры функций те же
+catalog | identical | 195232 | 195232 | 170626 → 170626 | 23200 → 23200 | 170642 code bytes; 0 data addresses moved; 0 panic line numbers; 0 other differences; размеры функций те же
+inventory | identical | 208376 | 208392 | 185091 → 185091 | 19960 → 19976 | 185107 code bytes; 31 data addresses moved; 4 panic line numbers; 0 other differences; размеры функций те же
+ledger | identical | 436584 | 436728 | 387473 → 387473 | 47464 → 47608 | 387489 code bytes; 1285 data addresses moved; 0 panic line numbers; 0 other differences; размеры функций те же
+notes | identical | 199528 | 199528 | 183347 → 183347 | 15208 → 15208 | 183363 code bytes; 136 data addresses moved; 1 panic line numbers; 0 other differences; размеры функций те же
+polls | identical | 182120 | 182192 | 163986 → 163986 | 14184 → 14256 | 164002 code bytes; 442 data addresses moved; 5 panic line numbers; 0 other differences; размеры функций те же
+ratelimit | identical | 168752 | 168816 | 153107 → 153107 | 13104 → 13168 | 153123 code bytes; 418 data addresses moved; 21 panic line numbers; 0 other differences; размеры функций те же
+shop | identical | 513352 | 513504 | 438490 → 438490 | 70984 → 71136 | 438506 code bytes; 1399 data addresses moved; 9 panic line numbers; 0 other differences; размеры функций те же
+shortener | identical | 202944 | 202968 | 183587 → 183587 | 18624 → 18648 | 183603 code bytes; 23 data addresses moved; 1 panic line numbers; 0 other differences; размеры функций те же
+tracker | identical | 489048 | 489096 | 422673 → 422673 | 63064 → 63112 | 422689 code bytes; 300 data addresses moved; 0 panic line numbers; 0 other differences; размеры функций те же
+
+# khc: e1203ad 1363472 Б, ветка 1409624 Б; khc ветки собирает исходники компилятора e1203ad в тот же бинарник, что khc e1203ad:
+identical

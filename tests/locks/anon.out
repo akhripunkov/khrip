@@ -1,0 +1,7 @@
+GET /fold: read
+GET /a3: read
+GET /typed: read
+GET /elems: read
+GET /store-in-literal: write
+GET /store-field: write
+GET /spread: write

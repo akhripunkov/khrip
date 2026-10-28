@@ -1,0 +1,13 @@
+tests/errors/anon_variant.kh:11:12: error: this route returns Product | 400 Problem: a struct literal here needs the name of its type
+        return { id, name: "p" }
+               ^
+    hint: return Product { ... } or return Problem { ... }, or give the status: return 200 { ... }
+tests/errors/anon_variant.kh:16:12: error: this route returns Product, found { id: int, name: str }
+        return v
+               ^
+    hint: a value of an anonymous type becomes the route's type only explicitly: return Name { ...value }
+tests/errors/anon_variant.kh:20:20: error: a struct literal for Shape needs the name of its variant
+        let s: Shape = { r: 2 }
+                       ^
+    hint: write it before the brace, e.g. Circle { ... }; variants: Circle, Rect
+3 errors

@@ -363,6 +363,13 @@ fn rw_type_end(j: int, end: int) -> int {
             return -1
         }
         e = t + 1
+    } else if toks[j].kind == '\{' {
+        // анонимная структура { поле: тип [= литерал], ... } — до парной скобки
+        let c = matching_close(j)
+        if c >= end || toks[c].kind != '}' {
+            return -1
+        }
+        e = c + 1
     } else if toks[j].kind == T_IDENT {
         e = j + 1
         if toks[j].text == "map" {
@@ -396,7 +403,16 @@ fn rw_assign_root(i: int, body: int) -> int {
     if toks[i].kind == '=' {
         // let имя = / let имя: тип = — тип разобран так же, как parse_type
         var j = i - 1
-        while j > body && (toks[j].kind == T_IDENT || toks[j].kind == '[' || toks[j].kind == ']' || toks[j].kind == ',' || toks[j].kind == '?' || toks[j].kind == ':') {
+        while j > body && (toks[j].kind == T_IDENT || toks[j].kind == '[' || toks[j].kind == ']' || toks[j].kind == ',' || toks[j].kind == '?' || toks[j].kind == ':' || toks[j].kind == '}') {
+            if toks[j].kind == '}' {
+                // анонимная структура в типе: let x: { a: int } = ...
+                let o = rw_open_of(j, body)
+                if o <= body {
+                    break
+                }
+                j = o - 1
+                continue
+            }
             if toks[j].kind == T_IDENT && (toks[j - 1].kind == T_LET || toks[j - 1].kind == T_VAR) {
                 if rw_decl_eq(j, i + 1) == i {
                     return -2
@@ -652,6 +668,15 @@ fn rw_fresh_local(name: str, at: int, body: int, end: int, depth: int) -> bool {
     return decls == 1
 }
 
+// Двоеточие в i начинает тип объявления let/var имя: тип → лексема после
+// типа (как его читает parse_type), иначе -1.
+fn rw_annot_end(i: int, end: int) -> int {
+    if toks[i].kind != ':' || i < 2 || toks[i - 1].kind != T_IDENT || (toks[i - 2].kind != T_LET && toks[i - 2].kind != T_VAR) {
+        return -1
+    }
+    return rw_type_end(i + 1, end)
+}
+
 // Присваивание с оператором в i (тело [body, end)) меняет что-то кроме
 // локальных функции: цель — глобальная или store, поле или элемент не свежей
 // локальной (на один уровень: xs[i] = ..., s.f = ...) или цель не узнана.
@@ -687,6 +712,12 @@ fn rw_scan(fi: int, callees: [int]) -> bool {
     while i < end {
         let t = toks[i]
         let k = t.kind
+        let te = rw_annot_end(i, end)
+        if te > i {
+            // тип let/var x: тип — не код (= значения по умолчанию в { ... })
+            i = te
+            continue
+        }
         if rw_is_assign(k) {
             if rw_assign_effect(i, body, end) {
                 return true
@@ -812,6 +843,11 @@ fn fx_scan(a: int, b: int, in_fn: bool, body: int, end: int, callees: [int]) -> 
     while i < b {
         let t = toks[i]
         let k = t.kind
+        let te = rw_annot_end(i, b)
+        if te > i {
+            i = te
+            continue
+        }
         if k == T_SQL || k == T_CALL {
             return true
         }

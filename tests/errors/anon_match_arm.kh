@@ -1,0 +1,28 @@
+// E-A1: после => фигурная скобка — блок, поэтому литерал структуры как ветка
+// match пишется в скобках или с именем типа; { имя } — блок со значением имени.
+type Shape = Circle { r: int } | Square { a: int }
+type Area { value: int }
+
+fn area(s: Shape) -> Area {
+    return match s {
+        Circle c => { value: c.r * c.r * 3 }
+        Square q => ({ value: q.a * q.a })
+    }
+}
+
+fn label(s: Shape) -> { text: str } {
+    let text = "shape"
+    return match s {
+        Circle c => { ...c, text: "circle" }
+        Square q => { text }
+    }
+}
+
+fn main() {
+    let s: Shape = Circle { r: 1 }
+    match s {
+        Circle c => { value: c.r }
+        Square q => print("square")
+    }
+    print(area(Circle { r: 1 }).value.to_str() + label(Square { a: 2 }).text)
+}

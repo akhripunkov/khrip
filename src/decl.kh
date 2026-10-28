@@ -222,7 +222,7 @@ fn generic_ok() -> bool {
     return files[tok().file].is_lib
 }
 
-// int | bool | str | Имя | [T] | map[K, V] | T?
+// int | bool | str | Имя | [T] | map[K, V] | T? | { поле: T, ... }
 fn parse_type() -> int {
     var t = ty_err
     let start = tok()
@@ -231,6 +231,8 @@ fn parse_type() -> int {
         let e = parse_type()
         expect_tok(']')
         t = ty_list(e)
+    } else if kind() == '\{' {
+        t = parse_anon_type()
     } else if kind() == T_IDENT {
         let name = start.text
         advance()
@@ -260,6 +262,10 @@ fn parse_type() -> int {
             let u = sum_find(name)
             if s >= 0 {
                 t = ty_struct(s)
+            } else if name.starts_with("__anon") && files[start.file].is_lib {
+                // анонимная структура в сгенерированном коде: __anon<номер>
+                // (ty_src); свой тип программы с таким именем — выше
+                t = ty_struct(anon_index(name))
             } else if u >= 0 {
                 t = ty_sum(u)
             } else {
@@ -267,13 +273,303 @@ fn parse_type() -> int {
             }
         }
     } else {
-        syntax_error(start, "expected a type, found " + tok_show(start), "types are int, bool, str, [T], map[K, V], T? or a type name")
+        syntax_error(start, "expected a type, found " + tok_show(start), "types are int, bool, str, [T], map[K, V], T?, \{ field: T } or a type name")
     }
     if kind() == '?' {
         advance()
         t = ty_opt(t)
     }
     return t
+}
+
+// ---- Анонимные структуры (A1) ----
+// { поле: тип [= литерал], ... } пишется везде, где пишется тип. Тип
+// структурный: те же имена полей с теми же типами и значениями по умолчанию
+// в том же порядке — одна структура (anon_struct). Порядок — часть типа: в
+// нём поля уходят в JSON и BSON (сортировка MongoDB { score: -1, name: 1 } —
+// не то же, что { name: 1, score: -1 }). Именованные типы остаются
+// номинальными: значение анонимного типа становится именованным только
+// литералом или распаковкой (User { ...x }).
+
+fn parse_anon_type() -> int {
+    let open = pos
+    let at = tok()
+    advance()
+    var names: [str] = []
+    var tys: [int] = []
+    var defs: [int] = []
+    var bad = false
+    while kind() != '}' && kind() != T_EOF && !panic_mode {
+        if kind() == T_ELLIPSIS {
+            error_tok(tok(), "an anonymous type cannot copy fields with ...", "name the type: type Name \{ ...Other, field: T }")
+            bad = true
+            advance()
+            if kind() == T_IDENT {
+                advance()
+            }
+        } else {
+            let fname = expect_ident()
+            if panic_mode || !expect_tok(':') {
+                break
+            }
+            let ft = parse_type()
+            var def = -1
+            if kind() == '=' {
+                advance()
+                let dt = tok()
+                def = pos
+                let lt = default_literal(ft)
+                if lt < 0 {
+                    error_tok(dt, "a field default must be a literal: a number, string, true, false, none, [], \{} or a variant without fields", "compute other values in the code that creates the value")
+                    def = -1
+                    bad = true
+                    while kind() != ',' && kind() != '}' && kind() != T_EOF && tok().line == dt.line {
+                        advance()
+                    }
+                } else if !default_fits(lt, ft) && ft != ty_err {
+                    error_tok(dt, "the default does not fit field '" + fname.text + "' of type " + ty_name(ft), "")
+                    bad = true
+                }
+            }
+            if ft == ty_err {
+                bad = true
+            }
+            if list_has(names, fname.text) {
+                error_tok(fname, "field '" + fname.text + "' is declared twice in this type", "remove one of them")
+                bad = true
+            } else {
+                names.push(fname.text)
+                tys.push(ft)
+                defs.push(def)
+            }
+        }
+        if kind() == ',' {
+            advance()
+        }
+    }
+    if panic_mode {
+        // восстановление: за парной скобкой
+        pos = matching_close(open)
+        advance()
+        return ty_err
+    }
+    expect_tok('}')
+    if bad {
+        return ty_err
+    }
+    if names.len() == 0 {
+        error_tok(at, "an anonymous struct type needs at least one field", "write its fields: \{ name: str }")
+        return ty_err
+    }
+    let si = anon_struct(names, tys, defs, open)
+    if !files[at.file].is_lib && quiet == 0 {
+        anon_written(si, open)
+    }
+    return ty_struct(si)
+}
+
+var anon_structs: [int]
+
+// Анонимная структура с полями names (типы tys, значения по умолчанию defs —
+// лексемы литералов или -1): та, что уже есть с теми же полями в том же
+// порядке, или новая. Её имя — запись типа: { a: int, b: str }.
+fn anon_struct(names: [str], tys: [int], defs: [int], open: int) -> int {
+    let n = names.len()
+    for si in anon_structs {
+        let fs = structs[si].fields
+        if fs.len() == n {
+            var same = true
+            var i = 0
+            while i < n && same {
+                same = fs[i].name == names[i] && fs[i].ty == tys[i] && default_key(fs[i].def, fs[i].ty) == default_key(defs[i], tys[i])
+                i += 1
+            }
+            if same {
+                return si
+            }
+        }
+    }
+    var fs: [Field] = []
+    var text = "\{ "
+    var i = 0
+    while i < n {
+        fs.push(Field { name: names[i], ty: tys[i], def: defs[i] })
+        if i > 0 {
+            text += ", "
+        }
+        text += names[i] + ": " + ty_name(tys[i])
+        if defs[i] >= 0 {
+            text += " = " + default_text(defs[i], tys[i])
+        }
+        i += 1
+    }
+    text += " }"
+    structs.push(StructT { name: text, fields: fs, tok: open, sum: -1 })
+    struct_state.push(2)
+    struct_tok.push(open)
+    anon_structs.push(structs.len() - 1)
+    return structs.len() - 1
+}
+
+// Чем отличаются два анонимных типа с одним набором полей (имя и тип): «те
+// же поля в другом порядке» или «значение по умолчанию у поля f»; иначе "".
+fn anon_diff(a: int, b: int) -> str {
+    if !is_anon_ty(a) || !is_anon_ty(b) || a == b {
+        return ""
+    }
+    let fa = structs[types[a].a].fields
+    let fb = structs[types[b].a].fields
+    if fa.len() != fb.len() {
+        return ""
+    }
+    var ordered = true
+    var i = 0
+    while i < fa.len() {
+        let j = field_find(types[b].a, fa[i].name)
+        if j < 0 || fb[j].ty != fa[i].ty {
+            return ""
+        }
+        if j != i {
+            ordered = false
+        }
+        i += 1
+    }
+    if !ordered {
+        return ty_name(a) + " and " + ty_name(b) + " have the same fields in a different order; JSON and BSON keep each type's order: write them in the same order"
+    }
+    i = 0
+    while i < fa.len() {
+        if default_key(fa[i].def, fa[i].ty) != default_key(fb[i].def, fb[i].ty) {
+            return "the types differ only in the default of '" + fa[i].name + "' (" + default_shown(fa[i]) + " and " + default_shown(fb[i]) + "): a default is part of an anonymous type"
+        }
+        i += 1
+    }
+    return ""
+}
+
+fn default_shown(f: Field) -> str {
+    if f.def < 0 {
+        return "no default"
+    }
+    return "= " + default_text(f.def, f.ty)
+}
+
+// Структура si — анонимная (её имя — запись типа).
+fn is_anon(si: int) -> bool {
+    return structs[si].name.byte(0) == '\{'
+}
+
+fn is_anon_ty(t: int) -> bool {
+    return tkind(t) == K_STRUCT && is_anon(types[t].a)
+}
+
+// Номер структуры из имени __anon<номер> сгенерированного кода.
+fn anon_index(name: str) -> int {
+    var v = 0
+    var i = 6
+    while i < name.byte_len() {
+        v = v * 10 + name.byte(i) - '0'
+        i += 1
+    }
+    return v
+}
+
+// Значение по умолчанию поля типа ty (лексема def или -1) для сравнения типов:
+// одно и то же значение, записанное одинаково, — один ключ.
+fn default_key(def: int, ty: int) -> str {
+    if def < 0 {
+        return ""
+    }
+    let t = toks[def]
+    if t.kind == '-' {
+        return "-" + toks[def + 1].kind.to_str() + ":" + toks[def + 1].val.to_str()
+    }
+    if t.kind == T_STR {
+        return "s:" + strlits[t.val]
+    }
+    if t.kind == T_CHAR {
+        // 'x' у поля int или float — код символа, иначе строка из него
+        if ty_inner(ty) == ty_int || ty_inner(ty) == ty_float {
+            return T_INT.to_str() + ":" + t.val.to_str()
+        }
+        return "s:" + char_text(t.val)
+    }
+    if t.kind == T_IDENT {
+        return "e:" + t.text
+    }
+    if t.kind == '[' {
+        return "[]"
+    }
+    if t.kind == '\{' {
+        return "\{}"
+    }
+    return t.kind.to_str() + ":" + t.val.to_str()
+}
+
+// Значение по умолчанию для имени типа: как в исходнике.
+fn default_text(def: int, ty: int) -> str {
+    let k = toks[def].kind
+    if k == '[' {
+        return "[]"
+    }
+    if k == '\{' {
+        return "\{}"
+    }
+    return default_src(def, ty_inner(ty))
+}
+
+// W-A2: одна и та же анонимная структура, записанная как тип в трёх местах
+// программы, — предупреждение «дайте ей имя» (anon_warnings, в конце сборки, —
+// у третьего места по тексту). Места — по лексеме {: повторный разбор того же
+// места (встраивание) не считается.
+var anon_use_si: [int]
+var anon_use_at: [int]
+
+fn anon_written(si: int, open: int) {
+    var i = 0
+    while i < anon_use_si.len() {
+        if anon_use_si[i] == si && anon_use_at[i] == open {
+            return
+        }
+        i += 1
+    }
+    anon_use_si.push(si)
+    anon_use_at.push(open)
+}
+
+fn anon_warnings() {
+    for si in anon_structs {
+        var at: [int] = []
+        var i = 0
+        while i < anon_use_si.len() {
+            if anon_use_si[i] == si {
+                at.push(anon_use_at[i])
+            }
+            i += 1
+        }
+        let n = at.len()
+        if n >= 3 {
+            // третье место по тексту: два раза убрать наименьшее
+            var k = 0
+            while k < 3 {
+                var m = 0
+                var j = 1
+                while j < at.len() {
+                    if at[j] < at[m] {
+                        m = j
+                    }
+                    j += 1
+                }
+                if k < 2 {
+                    at[m] = toks.len()
+                } else {
+                    at[0] = at[m]
+                }
+                k += 1
+            }
+            warn_tok(toks[at[0]], "the anonymous type " + structs[si].name + " is written " + n.to_str() + " times", "name it once: type Name " + structs[si].name + ", then write Name")
+        }
+    }
 }
 
 // ---- Предварительный проход ----
@@ -737,7 +1033,8 @@ fn prescan(pass: int) {
 fn prescan_from(pass: int, from: int) {
     var i = from
     var depth = 0
-    while toks[i].kind != T_EOF {
+    // незакрытая { объявления type доходит до конца файла: за ним — конец
+    while i < toks.len() && toks[i].kind != T_EOF {
         let k = toks[i].kind
         if depth == 0 && k == T_TYPE {
             pos = i
@@ -779,6 +1076,19 @@ fn prescan_from(pass: int, from: int) {
                     continue
                 } else if k != T_TYPE && starts_decl_error(i) {
                     error_tok(toks[i], "expected a declaration (fn, type, var, const, store, route, every, test, migration, table or clickhouse), found " + tok_show(toks[i]), decl_hint(toks[i]))
+                }
+                if (k == T_FN || k == T_ROUTE || k == T_TEST) && pos > i && toks[pos].kind == '\{' {
+                    // заголовок разобран, pos — на { тела: дальше — тело (тип
+                    // результата { поле: T } перед ним — не начало объявления)
+                    i = pos + 1
+                    depth += 1
+                    continue
+                }
+                if (k == T_VAR || k == T_STORE) && pos > i {
+                    // имя и тип разобраны: дальше — начальное значение (= после
+                    // типа { поле: T } — не начало объявления)
+                    i = pos
+                    continue
                 }
             }
         }

@@ -1,0 +1,9 @@
+tests/errors/anon_warn.kh:26:18: error: expected int, found str
+        let n: int = "x"
+                     ^
+    hint: parse with s.to_int() ?? 0
+tests/errors/anon_warn.kh:12:12: warning: the anonymous type { x: int, y: int } is written 3 times
+    fn c() -> [{ x: int, y: int }] {
+               ^
+    hint: name it once: type Name { x: int, y: int }, then write Name
+1 error, 1 warning

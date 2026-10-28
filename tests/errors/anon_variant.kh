@@ -1,0 +1,22 @@
+// Тип литерала без имени — из ожидаемого: у типа-варианта нужен вариант, а
+// return маршрута с двумя разными структурами без статуса — имя типа.
+type Shape = Circle { r: int } | Rect { w: int, h: int }
+type Product { id: int, name: str }
+type Problem { code: int, detail: str }
+
+route GET "/p/{id}" (id: int) -> Product | 400 Problem {
+    if id < 0 {
+        return 400 { code: 1, detail: "negative" }
+    }
+    return { id, name: "p" }
+}
+
+route GET "/q" -> Product {
+    let v = { id: 1, name: "q" }
+    return v
+}
+
+fn unit() -> Shape {
+    let s: Shape = { r: 2 }
+    return s
+}

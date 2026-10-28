@@ -1,0 +1,25 @@
+type Line { user: str, text: str, at: int }
+
+store rooms: map[str, [Line]]
+topic chat: Line
+
+route GET "/rooms/{room}/ws" (room: str, user: str, msgs: stream { text: str }) -> stream Line | 400 str {
+    if user == "" {
+        return 400 "user is required"
+    }
+    subscribe(chat[room], rooms[room] ?? [])
+    for m in msgs {
+        if m.text == "" || m.text.len() > 500 {
+            continue
+        }
+        let line = Line { user, text: m.text, at: now() }
+        var list = rooms[room] ?? []
+        list.push(line)
+        rooms[room] = list[list.len() - 100..]
+        publish(chat[room], line)
+    }
+}
+
+route GET "/rooms/{room}/messages" (room: str) -> [Line] {
+    return rooms[room] ?? []
+}

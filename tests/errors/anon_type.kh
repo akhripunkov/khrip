@@ -1,0 +1,24 @@
+// Анонимный тип: поля через запятую, без ... и повторов, хотя бы одно поле;
+// значение по умолчанию — литерал, как у именованных.
+type Base { id: int }
+
+fn f(a: { ...Base, name: str }) -> int {
+    return 0
+}
+
+fn g(a: { x: int, x: str }) -> int {
+    return 0
+}
+
+fn h(a: {}) -> int {
+    return 0
+}
+
+fn k(a: { n: int = 1 + 2 }) -> int {
+    return a.n
+}
+
+fn main() {
+    let v: { n: int = "x" } = {}
+    print(v.n.to_str())
+}

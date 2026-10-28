@@ -383,9 +383,14 @@ fn main() -> int {
     sql_finish()
     ch_finish()
     resolve_fixups()
-    if diags.len() > 0 {
+    anon_warnings()
+    if nerrors > 0 {
         print_diags()
         return 1
+    }
+    if diags.len() > 0 {
+        // только предупреждения: программа собирается
+        print_diags()
     }
     if check_only {
         return 0

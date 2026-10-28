@@ -1,0 +1,17 @@
+const URL = "https://api.openai.com/v1/chat/completions"
+
+route POST "/chat" (body: { prompt: str }) -> stream { text: str } | 400 str {
+    if body.prompt == "" {
+        return 400 "prompt is required"
+    }
+    let key = env("OPENAI_API_KEY") ?? ""
+    let req = { model: "gpt-4o-mini", messages: [{ role: "user", content: body.prompt }], stream: true }
+    for data in fetch POST URL req headers {"Authorization": "Bearer {key}"} {
+        let c: { choices: [{ delta: { content: str? } }] }? = from_json(data)
+        if c != none && c.choices.len() > 0 {
+            if let t = c.choices[0].delta.content {
+                send({ text: t })
+            }
+        }
+    }
+}

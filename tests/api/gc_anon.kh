@@ -1,0 +1,135 @@
+// Анонимные структуры в store и в маршрутах (A1–A3): описания типов, маски
+// ссылок и проверка графа сборщика (KHRIP_GC_VERIFY, KHRIP_GC_STRESS — в
+// tests/run.sh), снимок KHRIP_DATA (__store_snapshot / __store_restore) с
+// вложенными анонимными списками и словарями; литералы без имени типа в
+// return маршрута (вариант — по статусу или единственной структуре), в теле
+// call (тип — тела маршрута по пути) и в записи в store; порядок полей —
+// часть типа: тип параметра другой функции не меняет порядок ответа.
+
+type Product { id: int, name: str, price: int }
+
+store products: map[int, Product]
+store meta: { count: int, last: str?, tags: [str] = [] } = { count: 0 }
+store log: [{ at: int, ids: [int], extra: map[str, { n: int, words: [str] }] }]
+store byname: map[str, { id: int, hist: [{ v: int, note: str? }] }]
+
+route POST "/products" (body: { name: str, price: int = 100 }) -> 201 Product | 400 { error: str } {
+    if body.name == "" {
+        return 400 { error: "name is required" }
+    }
+    meta.count += 1
+    let p: Product = { id: meta.count, ...body }
+    products[p.id] = p
+    meta = { ...meta, last: p.name, tags: meta.tags }
+    log.push({ at: meta.count, ids: [p.id], extra: {"k": { n: p.price, words: [p.name, "w" + p.id.to_str()] }} })
+    var e = byname[p.name] ?? { id: p.id, hist: [] }
+    e.hist.push({ v: p.price, note: if p.price > 100 { "high" } else { none } })
+    byname[p.name] = e
+    return 201 p
+}
+
+route GET "/products/{id}" (id: int) -> Product | 404 {
+    let p = products[id] else {
+        return 404
+    }
+    // единственная структура среди вариантов — Product
+    return { ...p, name: p.name.upper() }
+}
+
+route GET "/meta" -> { count: int, last: str?, logged: int } {
+    return { count: meta.count, last: meta.last, logged: log.len() }
+}
+
+route GET "/pick" (x: int) -> 200 Product | 400 { code: int, msg: str } | 404 {
+    if x == 0 {
+        return 400 { code: 1, msg: "zero" }
+    }
+    if x < 0 {
+        return 404
+    }
+    return 200 { id: x, name: "pick", price: 2 }
+}
+
+// A3-значение — ответ, если тип маршрута тот же анонимный
+route GET "/token" -> { token: str, n: int } {
+    let r = { token: "t", n: 1 }
+    return r
+}
+
+// те же поля в другом порядке у параметра функции — другой тип: порядок
+// ответа маршрута — его собственный
+fn swapped(p: { b: int, a: int }) -> int {
+    return p.a - p.b
+}
+
+route GET "/order" -> { a: int, b: int } {
+    let d = swapped({ a: 5, b: 3 })
+    return { b: d, a: 1 }
+}
+
+fn churn(n: int) {
+    for i in 0..n {
+        log.push({ at: i, ids: [i, i + 1], extra: {"x{i}": { n: i, words: ["a".repeat(30), "b{i}"] }} })
+        if log.len() > 50 {
+            log = log[25..]
+        }
+    }
+}
+
+test "routes with anonymous bodies and results" {
+    let r = call POST "/products" { name: "lamp", price: 250 }
+    expect r.status == 201
+    expect r.body == `{"id":1,"name":"lamp","price":250}`
+    let d = call POST "/products" { name: "cup" }
+    expect d.body == `{"id":2,"name":"cup","price":100}`
+    let bad = call POST "/products" { name: "" }
+    expect bad.status == 400
+    expect bad.body == `{"error":"name is required"}`
+    expect (call GET "/products/1").body == `{"id":1,"name":"LAMP","price":250}`
+    expect (call GET "/meta").body == `{"count":2,"last":"cup","logged":2}`
+    expect (call GET "/pick?x=0").body == `{"code":1,"msg":"zero"}`
+    expect (call GET "/pick?x=-1").status == 404
+    expect (call GET "/pick?x=3").body == `{"id":3,"name":"pick","price":2}`
+    expect (call GET "/token").body == `{"token":"t","n":1}`
+    expect (call GET "/order").body == `{"a":1,"b":2}`
+}
+
+test "nested anonymous values in store survive collections" {
+    let before = __gc_stats().cycles
+    churn(2000)
+    __gc_collect()
+    churn(2000)
+    __gc_collect()
+    expect __gc_stats().cycles >= before + 2
+    let e = byname["lamp"] else {
+        expect false
+        return
+    }
+    expect e.id == 1 && e.hist.len() == 1 && e.hist[0].v == 250 && (e.hist[0].note ?? "") == "high"
+    expect log.len() > 0 && log[log.len() - 1].ids.len() == 2
+    let last = log[log.len() - 1]
+    expect (last.extra["x1999"] ?? { n: -1, words: [] }).words[1] == "b1999"
+    expect meta.count == 2 && (meta.last ?? "") == "cup"
+}
+
+test "KHRIP_DATA snapshot of anonymous types round-trips" {
+    let text = __store_snapshot()
+    expect text.contains(`"meta":{"count":2,"last":"cup","tags":[]}`)
+    expect text.contains(`"byname":{"lamp":{"id":1,"hist":[{"v":250,"note":"high"}]},"cup":{"id":2,"hist":[{"v":100,"note":null}]}}`)
+    let before = to_json(log)
+    log = []
+    byname = {}
+    meta = { count: 0 }
+    __gc_collect()
+    expect __store_restore(text)
+    expect to_json(log) == before
+    expect meta.count == 2 && (meta.last ?? "") == "cup"
+    let c = byname["cup"] else {
+        expect false
+        return
+    }
+    expect c.hist[0].note == none
+    expect __store_snapshot() == text
+    __gc_collect()
+    expect to_json(byname["lamp"] ?? { id: 0, hist: [] }) == `{"id":1,"hist":[{"v":250,"note":"high"}]}`
+}

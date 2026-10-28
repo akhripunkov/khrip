@@ -151,14 +151,14 @@ for i in range(n):
     try:
         items = json.loads(open(f"{d}/{i}.json", "rb").read().decode("utf-8"))
         assert isinstance(items, list) and items, "an empty list"
-        got = [(e["file"], e["line"], e["col"], e["message"], e["hint"]) for e in items]
+        got = [(e["file"], e["line"], e["col"], e["severity"], e["message"], e["hint"]) for e in items]
     except Exception as e:
         print(f"{src}: not valid --json: {e}")
         bad += 1
         continue
     text = open(f"{d}/{i}.txt", "rb").read().decode("utf-8", "replace")
-    want = [(f, int(l), int(c), m) for f, l, c, m in re.findall(r"^(.*):(\d+):(\d+): error: (.*)$", text, re.M)]
-    if [g[:4] for g in got] != want:
+    want = [(f, int(l), int(c), sev, m) for f, l, c, sev, m in re.findall(r"^(.*):(\d+):(\d+): (error|warning): (.*)$", text, re.M)]
+    if [g[:5] for g in got] != want:
         print(f"{src}: --json differs from the text output:\n  {got}\n  {want}")
         bad += 1
 sys.exit(1 if bad else 0)
@@ -167,6 +167,47 @@ PY
 	else
 		failed "khc check --json" "$(cat "$tmp/json.txt")"
 	fi
+fi
+
+# Предупреждение (W-A2: анонимный тип, записанный трижды) сборку не
+# останавливает: khc check — код 0, одна строка «warning:» и итог «1 warning»,
+# в --json — запись с "severity":"warning"; код программы с предупреждением
+# тот же, что без него (встраивание не выключается: --sizes у main одинаков).
+cat >"$tmp/warn2.kh" <<'KH'
+fn a(p: { x: int }) -> int {
+    return p.x
+}
+fn b(p: { x: int }) -> int {
+    return p.x
+}
+fn add1(x: int) -> int {
+    return x + 1
+}
+fn main() {
+    print((add1(41) + a({ x: 1 }) + b({ x: 2 })).to_str())
+}
+KH
+cp "$tmp/warn2.kh" "$tmp/warn3.kh"
+cat >>"$tmp/warn3.kh" <<'KH'
+fn c(p: { x: int }) -> int {
+    return p.x
+}
+KH
+w_ok=1
+"$KHC" check "$tmp/warn3.kh" >"$tmp/warn.txt" 2>&1 || w_ok=0
+[[ $(grep -c ': warning: the anonymous type { x: int } is written 3 times$' "$tmp/warn.txt") == 1 && $(tail -1 "$tmp/warn.txt") == "1 warning" ]] || w_ok=0
+"$KHC" check --json "$tmp/warn3.kh" >"$tmp/warn.json" 2>&1 || w_ok=0
+grep -q '"severity":"warning"}]$' "$tmp/warn.json" || w_ok=0
+"$KHC" check "$tmp/warn2.kh" >"$tmp/warn2.txt" 2>&1 || w_ok=0
+[[ ! -s "$tmp/warn2.txt" ]] || w_ok=0
+"$KHC" --sizes -o "$tmp/warn2" "$tmp/warn2.kh" 2>/dev/null | grep ' main @' | cut -d' ' -f1 >"$tmp/warn2.size"
+"$KHC" --sizes -o "$tmp/warn3" "$tmp/warn3.kh" 2>/dev/null | grep ' main @' | cut -d' ' -f1 >"$tmp/warn3.size"
+[[ -s "$tmp/warn2.size" ]] && cmp -s "$tmp/warn2.size" "$tmp/warn3.size" || w_ok=0
+[[ $("$tmp/warn3") == 45 ]] || w_ok=0
+if [[ $w_ok -eq 1 ]]; then
+	pass=$((pass + 1))
+else
+	failed "предупреждение W-A2" "$(cat "$tmp/warn.txt" "$tmp/warn.json" "$tmp/warn2.txt" "$tmp/warn2.size" "$tmp/warn3.size")"
 fi
 
 for src in tests/api/*.kh; do
@@ -551,6 +592,43 @@ CUTS
 #   methodallow — в программе можно звать и внутренние __list_*, __int_*
 #                 (xs.slice, n.to_f64_bits);
 #   methodrecv — получатель не сверяется с первым параметром ([1].join).
+# анонимные структуры (этап токенов, часть 1; tests/run/anon_*.kh — run,
+# tests/api/gc_anon.kh — test, tests/locks/anon.kh — locks, tests/errors/anon_*
+# — err: сообщения компилятора отличаются от .err). Выбор литерала у {:
+#   anonmapwant — ждут словарь, а {k: v} всё равно структура;
+#   anonempty — {} не структура и там, где ждут структуру;
+#   anonspread — { ...x } не начинает литерал структуры;
+#   anonshort — { x } (одно сокращение поля) не литерал структуры;
+#   anonnostruct — литерал в условии без скобок не ошибка;
+#   anonea1, anonarmshort — нет ошибки E-A1 (литерал на месте блока ветки,
+#                           в том числе { имя });
+# тип литерала и анонимного типа:
+#   anonopt — у ожидаемого T? литерал не получает T;
+#   anonsum — у типа-варианта литерал без имени варианта не ошибка;
+#   anonroutepick — return маршрута с двумя структурами берёт первую;
+#   anonstatus — литерал после статуса (return 400 { ... }) не значение;
+#   anoncall — литерал после пути call не тело;
+#   anonvariants — тип { поле: T } в результате маршрута не тип;
+#   anonheader, anonglobalhdr — } типа перед телом функции или перед = в
+#                               store/var — «начало объявления»;
+#   anonidentity — порядок полей не часть типа (порядок BSON и ответа
+#                  маршрута — по первой записи);
+#   anondefault — значение по умолчанию не часть типа;
+#   anonordermsg — у типов другого порядка полей — общее сообщение;
+#   anonguard, anonguardmention — {k: v} с переменными k молча структура;
+#                  значение, которое упоминает имя поля, — тоже «словарь»;
+#   anonbarekey — голое имя ключом словаря не ошибка;
+#   anoncalltarget — тело call не получает тип тела маршрута;
+#   anonnewline — { a ⏎ b: 2 } (сокращение, поля через перевод строки) не
+#                 литерал;
+#   anonforhint — у for k in {x: 1} нет подсказки про словарь;
+#   anonspreadlast, anonexplicit — поле из распаковки: не из последней
+#                                  или вместо явного;
+#   anonwarn — W-A2 с четвёртого места, а не с третьего;
+# анализ чтения:
+#   anonrwtype — тип { ... } в let/var x: тип = не разобран (не объявление);
+#   anonrwannot — = значения по умолчанию в таком типе — присваивание;
+#   anonrwroot — объявление let x: { ... } = не узнаётся по =.
 comp_ok=1
 while read -r cut test mode; do
 	[[ -z $cut ]] && continue
@@ -604,6 +682,36 @@ cuts = {
     "rwuserfn": ("rw.kh", "    let f = func_find(name)\n    return f >= 0 && !funcs[f].is_lib", "    return false"),
     "methodallow": ("atom.kh", "    } else if prefix.byte_len() > 0 && (system_code(nt) || builtin_method(k, name)) {", "    } else if prefix.byte_len() > 0 {"),
     "methodrecv": ("atom.kh", "            if !assignable(rt, pt) {\n                var hint = \"\"", "            if false {\n                var hint = \"\""),
+    "anonmapwant": ("atom.kh", "    let t = ty_inner(w)\n    if tkind(t) == K_MAP {\n        return false\n    }\n    if struct_lit_shape(pos) {", "    let t = ty_inner(w)\n    if struct_lit_shape(pos) {"),
+    "anonempty": ("atom.kh", "    return kind_at(pos + 1) == '}' && tkind(t) == K_STRUCT\n", "    return false\n"),
+    "anonspread": ("atom.kh", "    if k1 == T_ELLIPSIS {\n        return true\n    }\n    if keyword_name(k1) {", "    if keyword_name(k1) {"),
+    "anonshort": ("atom.kh", "    if k2 == ':' || k2 == ',' || k2 == '}' {\n", "    if k2 == ':' || k2 == ',' {\n"),
+    "anonopt": ("atom.kh", "    let t = ty_inner(w)\n    let open = pos\n", "    let t = w\n    let open = pos\n"),
+    "anonidentity": ("decl.kh", "                same = fs[i].name == names[i] && fs[i].ty == tys[i] && default_key(fs[i].def, fs[i].ty) == default_key(defs[i], tys[i])\n", "                let j = field_find(si, names[i])\n                same = j >= 0 && fs[j].ty == tys[i] && default_key(fs[j].def, fs[j].ty) == default_key(defs[i], tys[i])\n"),
+    "anondefault": ("decl.kh", "                same = fs[i].name == names[i] && fs[i].ty == tys[i] && default_key(fs[i].def, fs[i].ty) == default_key(defs[i], tys[i])\n", "                same = fs[i].name == names[i] && fs[i].ty == tys[i]\n"),
+    "anonordermsg": ("expr.kh", "    if d.starts_with(\"\\{\") {\n", "    if false {\n"),
+    "anonguard": ("atom.kh", "    if plain && !bad && !panic_mode && n > 0 && reads_as_var_map(inames, itys, ivs, ive) {", "    if false {"),
+    "anonguardmention": ("atom.kh", "            if toks[j].kind == T_IDENT && toks[j].text == names[i] {\n                return false\n            }", "            if false {\n                return false\n            }"),
+    "anonbarekey": ("atom.kh", "        if (kind() == T_IDENT || keyword_name(kind())) && kind_at(pos + 1) == ':' {\n            // ключ — голое имя", "        if false {\n            // ключ — голое имя"),
+    "anoncalltarget": ("api.kh", "        body_ty = call_body_type(method, strlits[pt.val])\n", ""),
+    "anonnewline": ("atom.kh", "    return (k2 == T_IDENT || k2 == T_ELLIPSIS) && toks[i + 2].line > toks[i + 1].line\n", "    return false\n"),
+    "anonforhint": ("atom.kh", "        if for_header && kind_at(pos + 1) == T_IDENT && kind_at(pos + 2) == ':' {", "        if false {"),
+    "anonspreadlast": ("atom.kh", "                    } else {\n                        from_item[j] = i\n                        from_field[j] = m\n                    }\n", "                    }\n"),
+    "anonexplicit": ("atom.kh", "                if !list_has(explicit, f.name) {\n                    var j = 0", "                if true {\n                    var j = 0"),
+    "anonroutepick": ("api.kh", "        if other >= 0 {\n", "        if false {\n"),
+    "anonstatus": ("api.kh", "        if starts_value(pos + 1) || (kind_at(pos + 1) == '\\{' && !ends_stmt(pos + 1)) {", "        if starts_value(pos + 1) {"),
+    "anoncall": ("api.kh", "    var has_body = (starts_value(pos) || (kind() == '\\{' && !saved)) && tok().line == pt.line", "    var has_body = starts_value(pos) && tok().line == pt.line"),
+    "anonvariants": ("api.kh", " || (kind() == '\\{' && kind_at(pos + 1) == T_IDENT && kind_at(pos + 2) == ':')", ""),
+    "anonheader": ("decl.kh", "                if (k == T_FN || k == T_ROUTE || k == T_TEST) && pos > i && toks[pos].kind == '\\{' {", "                if false {"),
+    "anonglobalhdr": ("decl.kh", "                if (k == T_VAR || k == T_STORE) && pos > i {", "                if false {"),
+    "anonea1": ("atom.kh", "    return (k1 == T_IDENT || keyword_name(k1)) && (kind_at(i + 2) == ':' || kind_at(i + 2) == ',')\n", "    return false\n"),
+    "anonarmshort": ("atom.kh", "    return brace_block_is_struct(i) || (kind_at(i + 1) == T_IDENT && kind_at(i + 2) == '}')\n", "    return brace_block_is_struct(i)\n"),
+    "anonnostruct": ("atom.kh", "    if no_struct {\n        // в условии", "    if false {\n        // в условии"),
+    "anonsum": ("atom.kh", "    } else if tkind(t) == K_SUM {\n        let su = types[t].a", "    } else if false {\n        let su = types[t].a"),
+    "anonrwtype": ("rw.kh", "    } else if toks[j].kind == '\\{' {\n        // анонимная структура", "    } else if false {\n        // анонимная структура"),
+    "anonrwannot": ("rw.kh", "        let te = rw_annot_end(i, end)\n", "        let te = -1\n"),
+    "anonrwroot": ("rw.kh", " || toks[j].kind == ':' || toks[j].kind == '}') {", " || toks[j].kind == ':') {"),
+    "anonwarn": ("decl.kh", "        if n >= 3 {", "        if n >= 4 {"),
 }
 f, old, new = cuts[m]
 s = open(f"{d}/{f}").read()
@@ -633,10 +741,15 @@ PY
 		continue
 	elif [[ $mode == test ]]; then
 		{ KHRIP_LIB="$PWD/lib" env -u KHRIP_GC_VERIFY -u KHRIP_GC_STRESS timeout 300 "$tmp/mkhc" test "$test" >"$tmp/mout.txt" 2>&1; } 2>/dev/null
+	elif [[ $mode == err ]]; then
+		# сообщения компилятора (ошибки и предупреждения) должны стать другими
+		{ KHRIP_LIB="$PWD/lib" timeout 120 "$tmp/mkhc" check "$test" >"$tmp/mout.txt" 2>&1; } 2>/dev/null
 	else
 		{ KHRIP_LIB="$PWD/lib" env -u KHRIP_GC_VERIFY -u KHRIP_GC_STRESS timeout 120 "$tmp/mkhc" run "$test" >"$tmp/mout.txt" 2>/dev/null; } 2>/dev/null
 	fi
-	if diff -q "${test%.kh}.out" "$tmp/mout.txt" >/dev/null; then
+	ref="${test%.kh}.out"
+	[[ $mode == err ]] && ref="${test%.kh}.err"
+	if diff -q "$ref" "$tmp/mout.txt" >/dev/null; then
 		comp_ok=0
 		failed "оптимизации компилятора ($cut)" "$test проходит и без проверяемого условия"
 	fi
@@ -689,6 +802,38 @@ rwscanline tests/run/chain_fusion.kh run
 rwuserfn tests/run/chain_fusion.kh run
 methodallow tests/errors/internal_method.kh check
 methodrecv tests/errors/join_not_str.kh check
+anonmapwant tests/errors/anon_cond.kh err
+anonempty tests/run/anon_literals.kh run
+anonspread tests/run/anon_literals.kh run
+anonshort tests/run/anon_literals.kh run
+anonopt tests/run/anon_literals.kh run
+anonidentity tests/run/anon_types.kh run
+anondefault tests/run/anon_types.kh run
+anonidentity tests/run/anon_bson_order.kh run
+anonidentity tests/api/gc_anon.kh test
+anonordermsg tests/errors/anon_order.kh err
+anonguard tests/errors/anon_map_guard.kh err
+anonguardmention tests/run/anon_literals.kh run
+anonbarekey tests/errors/anon_cond.kh err
+anoncalltarget tests/errors/anon_call_typo.kh err
+anonnewline tests/run/anon_literals.kh run
+anonforhint tests/errors/anon_cond.kh err
+anonspreadlast tests/run/anon_literals.kh run
+anonexplicit tests/run/anon_literals.kh run
+anonroutepick tests/errors/anon_variant.kh err
+anonstatus tests/api/gc_anon.kh test
+anoncall tests/api/gc_anon.kh test
+anonvariants tests/api/gc_anon.kh test
+anonheader tests/run/anon_types.kh run
+anonglobalhdr tests/api/gc_anon.kh test
+anonea1 tests/errors/anon_match_arm.kh err
+anonarmshort tests/errors/anon_match_arm.kh err
+anonnostruct tests/errors/anon_cond.kh err
+anonsum tests/errors/anon_variant.kh err
+anonrwtype tests/locks/anon.kh locks
+anonrwannot tests/locks/anon.kh locks
+anonrwroot tests/locks/anon.kh locks
+anonwarn tests/errors/anon_warn.kh err
 CUTS
 [[ $comp_ok -eq 1 ]] && pass=$((pass + 1))
 # Слияние срабатывает: в eval/solutions/bookings все values() — в цепочках

@@ -1,0 +1,19 @@
+tests/errors/anon_type.kh:5:11: error: an anonymous type cannot copy fields with ...
+    fn f(a: { ...Base, name: str }) -> int {
+              ^
+    hint: name the type: type Name { ...Other, field: T }
+tests/errors/anon_type.kh:9:19: error: field 'x' is declared twice in this type
+    fn g(a: { x: int, x: str }) -> int {
+                      ^
+    hint: remove one of them
+tests/errors/anon_type.kh:13:9: error: an anonymous struct type needs at least one field
+    fn h(a: {}) -> int {
+            ^
+    hint: write its fields: { name: str }
+tests/errors/anon_type.kh:17:22: error: expected a name, found '+'
+    fn k(a: { n: int = 1 + 2 }) -> int {
+                         ^
+tests/errors/anon_type.kh:22:23: error: the default does not fit field 'n' of type int
+        let v: { n: int = "x" } = {}
+                          ^
+5 errors

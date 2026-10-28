@@ -1,0 +1,27 @@
+// Литерал без имени типа проверяется как T { ... }: недостающие и лишние поля,
+// типы значений; у пустых {} — список недостающих полей. Без ожидаемого типа
+// (A3) тип поля берётся из значения: none, повтор поля и поле без «:» (кроме
+// сокращения { имя }) — ошибки; ключевое слово именем поля — та же подсказка,
+// что у именованного типа.
+type Point { x: int, y: int }
+type Opts { limit: int = 10, sort: str }
+
+fn main() {
+    let a: Point = { x: 1 }
+    let b: Point = { x: 1, y: 2, color: "red" }
+    let c: Point = { x: "1", y: 2 }
+    let d: Opts = {}
+    let e = { name: none }
+    let f = { n: 1, n: 2 }
+    let g: Point = { x: 1, yy: 2 }
+    let h = { x: 1, f(2) }
+    let i = { type: "text", n: 1 }
+    var j: Point = { x: 1, y: 2 }
+    j.z = 3
+    print(a.x.to_str() + b.x.to_str() + c.x.to_str() + d.sort + f.n.to_str() + g.x.to_str())
+    print(to_json(e) + to_json(h) + to_json(i))
+}
+
+fn f(n: int) -> int {
+    return n
+}

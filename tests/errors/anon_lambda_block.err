@@ -1,0 +1,5 @@
+tests/errors/anon_lambda_block.kh:4:28: error: a brace in a value starts a map or struct literal, not a block
+        let ys = xs.map(x => { let y = x * 2; y + 1 })
+                               ^
+    hint: a lambda body and an argument are one expression; move the statements into a function
+1 error

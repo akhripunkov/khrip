@@ -100,13 +100,19 @@ fn stmt_end(i: int) -> int {
     return j
 }
 
-// Последний оператор блока — выражение: оно и есть значение блока.
+// Последний оператор блока — выражение: оно и есть значение блока. { —
+// вложенный блок, но { имя: ... } в конце блока — литерал без скобок: его
+// разбирает parse_value_block (ошибка и значение, без лишних ошибок дальше).
 fn value_stmt_here() -> bool {
     let k = kind()
-    if k == T_LET || k == T_VAR || k == T_WHILE || k == T_FOR || k == T_RETURN || k == T_BREAK || k == T_CONTINUE || k == T_EXPECT || k == '\{' {
+    if k == T_LET || k == T_VAR || k == T_WHILE || k == T_FOR || k == T_RETURN || k == T_BREAK || k == T_CONTINUE || k == T_EXPECT || (k == '\{' && !brace_block_is_struct(pos)) {
         return false
     }
     if kind_at(stmt_end(pos)) != '}' {
+        return false
+    }
+    if k == T_IDENT && kind_at(pos + 1) == ':' {
+        // «имя:» — ошибка в parse_stmt
         return false
     }
     return !(k == T_IDENT && stmt_has_assign())
@@ -128,6 +134,9 @@ fn parse_value_block(w: int) -> int {
         if value_stmt_here() {
             let vt = tok()
             let vs = pos
+            if kind() == '\{' {
+                brace_block_error(pos, false, w)
+            }
             // вложенные if/match значения отмечают свои ветви, если они и есть значение
             lit_on = on && (kind() == T_IF || kind() == T_MATCH)
             t = parse_expr(w)
@@ -163,6 +172,12 @@ fn parse_value_block(w: int) -> int {
 // Ветка match или if, используемая как значение.
 fn parse_arm_value(w: int) -> int {
     let k = kind()
+    if k == '\{' && arm_brace_is_struct(pos) {
+        // Circle c => { area: 1 }: литерал на месте блока ветки (E-A1); разбор
+        // продолжается, как будто он в скобках
+        brace_block_error(pos, true, w)
+        return parse_expr(w)
+    }
     if k == '\{' {
         return parse_value_block(w)
     }
@@ -403,7 +418,11 @@ fn parse_match(as_value: bool, w: int) -> int {
             }
         } else {
             var div = false
-            if kind() == '\{' {
+            if kind() == '\{' && arm_brace_is_struct(pos) {
+                brace_block_error(pos, true, ty_err)
+                pos = matching_close(pos)
+                advance()
+            } else if kind() == '\{' {
                 div = parse_block()
             } else {
                 div = parse_stmt()

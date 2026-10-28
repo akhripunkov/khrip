@@ -78,7 +78,7 @@ route GET "/products" (q: str = "", category: str?, tag: str?, min_price: float?
 route GET "/categories" -> [Category] {
     var cats: map[str, Category] = {}
     for p in products.values() {
-        let c = cats[p.category] ?? Category { name: p.category, count: 0, avg_price: 0 }
+        let c = cats[p.category] ?? { name: p.category, count: 0, avg_price: 0 }
         c.count += 1
         c.avg_price += p.price
         cats[c.name] = c
