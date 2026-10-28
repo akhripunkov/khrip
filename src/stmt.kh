@@ -326,7 +326,7 @@ fn zero_value(t: int, at: Token) -> bool {
     }
     if t != ty_err {
         var hint = "write = " + ty_name(t) + " \{ ... }"
-        if tkind(t) == K_STRUCT {
+        if tkind(t) == K_STRUCT && structs[types[t].a].fields.len() > 0 {
             hint = "write = \{ " + structs[types[t].a].fields[0].name + ": ... }"
         }
         error_tok(at, "a value of type " + ty_name(t) + " needs an initial value", hint)

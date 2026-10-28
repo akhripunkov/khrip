@@ -988,7 +988,8 @@ fn prescan(pass: int) {
 fn prescan_from(pass: int, from: int) {
     var i = from
     var depth = 0
-    while toks[i].kind != T_EOF {
+    // незакрытая { объявления type доходит до конца файла: за ним — конец
+    while i < toks.len() && toks[i].kind != T_EOF {
         let k = toks[i].kind
         if depth == 0 && k == T_TYPE {
             pos = i
