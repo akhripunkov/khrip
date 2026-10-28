@@ -1,0 +1,73 @@
+// Примеры из текста ядра (не из блоков кода) работают.
+// in: SKILL.md
+// rule: `let s: Shape = Circle { r: 2 }`, `let r = Admin`; enum values compare with `==`, variant fields are read with `match`.
+// rule: `let v = if c { let a = f(); a + 1 } else { 0 }` (a block's value is its last line).
+// rule: `for x in xs` (items, characters), `for i, x in xs`, `for k, v in m`, `for i in 0..n` (`0..=n` includes n).
+// rule: arms may be `200 | 201 => ...`, blocks or `return ...`.
+// rule: Slices `s[a..b]`, `xs[a..]`, `xs[..b]` are clamped to the bounds.
+// rule: `.copy()` copies a list.
+// rule: `header(name)` reads a request header, `set_header(name, value)` adds one to the response; `fail(status[, message])` ends the request from any function.
+// rule: `call METHOD "path?query" [body] [headers map]` returns `Response { status, body, headers }`
+// rule: `from_json(text)` (type from the annotation: `let u: User? = from_json(t)`).
+type Role = Admin | Member | Guest
+type Shape = Circle { r: int } | Rect { w: int, h: int } | Empty
+type User { name: str }
+
+fn f() -> int {
+    return 2
+}
+
+fn need_key(k: str?) -> str {
+    return k ?? fail(401, "no key")
+}
+
+route GET "/who" -> str | 401 {
+    let key = need_key(header("x-key"))
+    set_header("X-Seen", key)
+    return "hi {key}"
+}
+
+test "inline examples of the core" {
+    let s: Shape = Circle { r: 2 }
+    let r = Admin
+    expect r == Admin
+    let area = match s {
+        Circle c => 3 * c.r * c.r
+        _ => 0
+    }
+    expect area == 12
+    let c = true
+    let v = if c { let a = f(); a + 1 } else { 0 }
+    expect v == 3
+    var out = ""
+    for ch in "ab" {
+        out += ch
+    }
+    for i, x in [5, 6] {
+        out += "{i}{x}"
+    }
+    for k, n in {"z": 1} {
+        out += "{k}{n}"
+    }
+    for i in 0..=2 {
+        out += "{i}"
+    }
+    expect out == "ab0516z1012"
+    let kind = match 201 {
+        200 | 201 => "ok"
+        _ => "other"
+    }
+    expect kind == "ok"
+    let xs = [1, 2, 3]
+    expect xs[1..10].len() == 2 && xs[..1].len() == 1 && "abc"[2..9] == "c"
+    let ys = xs.copy()
+    ys.push(4)
+    expect xs.len() == 3
+    let ok = call GET "/who" headers {"X-Key": "k1"}
+    expect ok.status == 200 && ok.body == "hi k1" && ok.headers["x-seen"] == "k1"
+    let no = call GET "/who"
+    expect no.status == 401 && no.body == "no key"
+    let u: User? = from_json(`{"name": "Ann"}`)
+    expect u != none
+    expect u.name == "Ann"
+}

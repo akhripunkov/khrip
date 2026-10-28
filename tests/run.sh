@@ -48,7 +48,9 @@
 #                       node или gpt-tokenizer — строка SKIP); frontmatter
 #                       скилла агента, блоки кода компилируются, примеры глав
 #                       работают на настоящих базах, ключевые правила сходятся
-#                       с компилятором (tests/skill/check.py).
+#                       с компилятором (tests/skill/check.py), и сама проверка
+#                       ловит подложенные ошибки (ограды ~~~ и с отступом,
+#                       правило без проверки, лишняя ошибка в правиле).
 # Компилятор берётся из $KHC (по умолчанию build/khc). С KHRIP_GC_VERIFY=1 в
 # окружении проверки сборщика идут во всех программах набора (tests/api без
 # них — только первый проход); с KHRIP_GC_VERIFY=fast — те же проверки, но
@@ -631,6 +633,27 @@ CUTS
 #   anonspreadlast, anonexplicit — поле из распаковки: не из последней
 #                                  или вместо явного;
 #   anonwarn — W-A2 с четвёртого места, а не с третьего;
+#   anonspreadopt — поле T? из нескольких распаковок A3: последняя, а не
+#                   последняя не none;
+#   spreadsame, spreadoptopt, spreaddefault — T \{ ...old, ...patch }: тот же
+#                   тип не копируется как есть; поле T? заплатки со значением
+#                   none стирает поле T?; значение по умолчанию затирает
+#                   присланное (H1 ревью части 2 этапа токенов);
+#   routeqqvalue — x ?? 404 значение в return маршрута не разбирается;
+#   routeqqint — x ?? 0 в маршруте, который возвращает int, — статус 0;
+#   routestatusbody — return 409 "..." при | 409 без типа молча теряет тело;
+#   qqstatuslet — let x = m[k] ?? 404 без подсказки, что статус — только в return;
+#   sqlinsertrows — INSERT INTO t \{не строка} доходит до базы;
+#   kwfield, kwfielddot — type, in, match, test, call не имена полей
+#                   (в объявлении и литерале; после точки);
+#   kwtypename, kwtestname — type и test не имена (параметр запроса ?type=,
+#                   локальная) там, где за словом нет имени или строки;
+#   kwvariant — поле type у варианта спорит с "type" его JSON;
+#   generatedtk — тип программы T или K в разборе маршрута — параметр
+#                   обобщённой функции;
+#   constsingle — const N = 2 + 3 молча даёт 2;
+#   inoperator, formatspec, mapgetdefault, methodform — привычки других
+#                   языков (in, \{x:.2f}, m.get(k, d), sum(xs)) без подсказки;
 # анализ чтения:
 #   anonrwtype — тип { ... } в let/var x: тип = не разобран (не объявление);
 #   anonrwannot — = значения по умолчанию в таком типе — присваивание;
@@ -702,7 +725,27 @@ cuts = {
     "anoncalltarget": ("api.kh", "        body_ty = call_body_type(method, strlits[pt.val])\n", ""),
     "anonnewline": ("atom.kh", "    return (k2 == T_IDENT || k2 == T_ELLIPSIS) && toks[i + 2].line > toks[i + 1].line\n", "    return false\n"),
     "anonforhint": ("atom.kh", "        if for_header && kind_at(pos + 1) == T_IDENT && kind_at(pos + 2) == ':' {", "        if false {"),
-    "anonspreadlast": ("atom.kh", "                    } else {\n                        from_item[j] = i\n                        from_field[j] = m\n                    }\n", "                    }\n"),
+    "anonspreadlast": ("atom.kh", "                    } else {\n                        if tkind(f.ty) == K_OPT {\n                            earlier_item[j].push(from_item[j])\n                            earlier_field[j].push(from_field[j])\n                        }\n                        from_item[j] = i\n                        from_field[j] = m\n                    }\n", "                    }\n"),
+    "anonspreadopt": ("atom.kh", "                        if tkind(f.ty) == K_OPT {\n                            earlier_item[j].push(from_item[j])\n", "                        if false {\n                            earlier_item[j].push(from_item[j])\n"),
+    "spreadsame": ("atom.kh", "                let same = types[src].a == si\n", "                let same = false\n"),
+    "spreadoptopt": ("atom.kh", "                            let opt = tkind(sf[m].ty) == K_OPT && !same\n", "                            let opt = tkind(sf[m].ty) == K_OPT && !same && tkind(f.ty) != K_OPT\n"),
+    "spreaddefault": ("atom.kh", "                                if !set[j] && fields[j].def >= 0 {\n", "                                if false {\n"),
+    "routeqqvalue": ("api.kh", "    return vi >= 0 && routes[route_ctx].variants[vi].ty >= 0 && (starts_value(pos + 1) || kind_at(pos + 1) == '\\{')\n", "    return false\n"),
+    "routeqqint": ("api.kh", "        return vi >= 0 || !returns_int(routes[route_ctx])\n", "        return true\n"),
+    "qqstatuslet": ("expr.kh", "    } else if rt == ty_int && inner != ty_int && rtok.kind == T_INT && route_ctx >= 0 && find_variant(routes[route_ctx], rtok.val) >= 0 {\n", "    } else if false {\n"),
+    "routestatusbody": ("api.kh", "            if vi >= 0 && r.variants[vi].ty < 0 {\n", "            if false {\n"),
+    "sqlinsertrows": ("sql.kh", "            if sql_insert_target(cur) {\n", "            if false {\n"),
+    "kwfield": ("lex.kh", "    if kw != T_TYPE && kw != T_IN && kw != T_MATCH && kw != T_TEST && kw != T_CALL {\n        return false\n    }\n", "    if true {\n        return false\n    }\n"),
+    "kwfielddot": ("lex.kh", "    if n > 0 && toks[n - 1].kind == '.' {\n        return true\n    }\n    var q = lx_p\n", "    var q = lx_p\n"),
+    "kwtypename": ("lex.kh", "        if !is_alpha(c) {\n            return true\n        }\n        var e = q\n", "        if !is_alpha(c) {\n            return false\n        }\n        var e = q\n"),
+    "kwtestname": ("lex.kh", "            return c != '\"' && c != '`'\n", "            return false\n"),
+    "kwvariant": ("decl.kh", "    if name == \"type\" && structs[s].sum >= 0 {\n", "    if false {\n"),
+    "generatedtk": ("decl.kh", "        return struct_find(at.text) < 0 && sum_find(at.text) < 0\n", "        return true\n"),
+    "constsingle": ("decl.kh", "    if !ends_stmt(pos) && toks[pos].file == v.file {\n", "    if false {\n"),
+    "inoperator": ("expr.kh", "    if kind() == T_IN || (kind() == T_IDENT && tok().text == \"not\" && kind_at(pos + 1) == T_IN) {\n        return in_operator(from)\n    }\n", ""),
+    "formatspec": ("lex.kh", "            if spec > lx_p + 1 {\n", "            if false {\n"),
+    "mapgetdefault": ("atom.kh", "    if name == \"get\" && kind() == ',' {\n", "    if false {\n"),
+    "methodform": ("atom.kh", "        if hint.byte_len() == 0 && builtin_method_any(name) {\n", "        if false {\n"),
     "anonexplicit": ("atom.kh", "                if !list_has(explicit, f.name) {\n                    var j = 0", "                if true {\n                    var j = 0"),
     "anonroutepick": ("api.kh", "        if other >= 0 {\n", "        if false {\n"),
     "anonstatus": ("api.kh", "        if starts_value(pos + 1) || (kind_at(pos + 1) == '\\{' && !ends_stmt(pos + 1)) {", "        if starts_value(pos + 1) {"),
@@ -840,6 +883,26 @@ anonrwtype tests/locks/anon.kh locks
 anonrwannot tests/locks/anon.kh locks
 anonrwroot tests/locks/anon.kh locks
 anonwarn tests/errors/anon_warn.kh err
+anonspreadopt tests/run/spread_patch.kh run
+spreadsame tests/run/spread_patch.kh run
+spreadoptopt tests/run/spread_patch.kh run
+spreaddefault tests/run/spread_patch.kh run
+routeqqvalue tests/api/route_qq_value.kh test
+routeqqint tests/api/route_qq_value.kh test
+routestatusbody tests/errors/route_status_body.kh err
+qqstatuslet tests/errors/route_status_body.kh err
+sqlinsertrows tests/errors/sql_insert_rows.kh err
+kwfield tests/run/keyword_fields.kh run
+kwfielddot tests/run/keyword_fields.kh run
+kwtypename tests/api/keyword_names.kh test
+kwtestname tests/api/keyword_names.kh test
+kwvariant tests/errors/variant_type_field.kh err
+generatedtk tests/api/route_qq_value.kh test
+constsingle tests/errors/const_expr.kh err
+inoperator tests/errors/habit_hints.kh err
+formatspec tests/errors/habit_hints.kh err
+mapgetdefault tests/errors/habit_hints.kh err
+methodform tests/errors/habit_hints.kh err
 CUTS
 [[ $comp_ok -eq 1 ]] && pass=$((pass + 1))
 # Слияние срабатывает: в eval/solutions/bookings все values() — в цепочках
@@ -1241,6 +1304,28 @@ if command -v python3 >/dev/null; then
 	else
 		failed "tests/skill/check.py" "$(cat "$tmp/skill.txt")"
 	fi
+	# Сама проверка ловит то, что раньше проходило мимо: ограду ~~~ и ограду с
+	# отступом (блок не проверялся бы), правило без проверки (пустой успех) и
+	# лишнюю ошибку в «правильной половине» правила (// expect: искал подстроку
+	# где угодно). Каждая подложенная ошибка — в своей копии скилла и правил.
+	khc_abs=$(cd "$(dirname "$KHC")" && pwd)/$(basename "$KHC")
+	for m in tilde indent vacuous narrow; do
+		rm -rf "${tmp:?}/skm"
+		mkdir -p "$tmp/skm/tests" "$tmp/skm/out"
+		cp -r skill "$tmp/skm/"
+		cp -r tests/skill "$tmp/skm/tests/"
+		case $m in
+		tilde) printf '\n~~~khrip\nlet x = 1\n~~~\n' >>"$tmp/skm/skill/khrip/production.md"; want='skill/khrip/production.md:' ;;
+		indent) printf '\n  ```khrip\n  let x = 1\n  ```\n' >>"$tmp/skm/skill/khrip/production.md"; want='skill/khrip/production.md:' ;;
+		vacuous) printf '// in: SKILL.md\n// rule: int and float never mix\nfn main() {\n}\n' >"$tmp/skm/tests/skill/rules/zz_vacuous.kh"; want='tests/skill/rules/zz_vacuous.kh:' ;;
+		narrow) sed -i 's/^    if x != none {$/    if true {/' "$tmp/skm/tests/skill/rules/narrow_if_value.kh"; want='tests/skill/rules/narrow_if_value.kh:' ;;
+		esac
+		if (cd "$tmp/skm" && python3 -I tests/skill/check.py "$khc_abs" out 2>&1) | grep -q "^FAIL $want"; then
+			pass=$((pass + 1))
+		else
+			failed "tests/skill/check.py ($m)" "подложенная ошибка не найдена"
+		fi
+	done
 else
 	echo "SKIP skill/khrip: нет python3 — блоки кода и правила скилла не проверены"
 fi

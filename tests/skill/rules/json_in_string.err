@@ -1,0 +1,4 @@
+tests/skill/rules/json_in_string.kh:5:14: error: unclosed { in string; write \{ for a literal brace
+        let s = "{"id": 1}"
+                 ^
+1 error

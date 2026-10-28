@@ -9,7 +9,7 @@ A compiled, strictly typed language for HTTP APIs. A program is one namespace:
 no imports, declarations in any order. `khc run|test|check app.kh` runs it, runs
 its tests, lists all errors with fixes.
 
-Chapters next to this file; read one only when the task needs it:
+Chapters next to this file (read one only when the task needs it):
 - `postgresql.md`: PostgreSQL (`sql "..."`, `tx`, migrations).
 - `mongodb.md`: MongoDB.
 - `clickhouse.md`: ClickHouse (`ch "..."`, `table`).
@@ -28,7 +28,7 @@ type Point { x: int, y: int }
 type Role = Admin | Member | Guest                     // enum
 type Shape = Circle { r: int } | Rect { w: int, h: int } | Empty
 
-const LIMIT = 10                       // int, str or bool literal
+const LIMIT = 10                       // int, float, str or bool literal
 fn add(a: int, b: int = 1) -> int {    // defaults are literals; no result: no ->
     return a + b
 }
@@ -39,13 +39,12 @@ variant fields are read with `match`. No null (`T?` and `none`), classes,
 generics or exceptions. Implicit conversions: `T` → `T?`, variant → its type, int
 *literal* → float (`t * 2`); otherwise `n.to_float()`, `x.to_int()`, `x.round()`:
 int and float never mix, `7 / 2` is 3. Parameters are read-only, `let` is
-immutable, `var` mutable; local types are inferred. A global `var` is not allowed
-in servers: use `store`.
+immutable, `var` mutable. A global `var` is not allowed in servers: use `store`.
 
 ## Statements
 
-`if a { } else if b { } else { }`; `if` and `match` are values too: `let v =
-if c { let a = f(); a + 1 } else { 0 }` (a block's value is its last line).
+`if`/`else if`/`else` and `match` are values too: `let v = if c { let a = f();
+a + 1 } else { 0 }` (a block's value is its last line).
 `while i < n { i += 1 }` (`-= *= /= %=` too, no `++`), `break`, `continue`; `for x
 in xs` (items, characters), `for i, x in xs`, `for k, v in m`, `for i in 0..n`
 (`0..=n` includes n).
@@ -63,7 +62,7 @@ let area = match s {        // every case, or _ =>
 chain.
 
 `"Hi, {user.name}!"` interpolates an expression that does not start with a quote
-(`{2,5}` stays text). Escapes: `\n \t \r \0 \\ \" \' \{`. Raw strings in
+(`{2,5}` stays text). Escapes: `\n \t \" \\ \{` and more. Raw strings in
 backticks have neither and may span lines; JSON and regexes go there:
 `` `{"id": 1}` ``, `` `\d{4}` ``. `len`, `s[i]` (a str), slices and `find` count
 characters. Slices `s[a..b]`, `xs[a..]`, `xs[..b]` are clamped to the bounds.
@@ -76,40 +75,44 @@ let user = users[id] else {            // unwrap or leave the scope
     return 404
 }
 if let u = users[id] { }
-if role == Admin { }                   // role: Role? compares directly
 if limit != none && n > limit { }      // after the check, limit is an int
 if q == none {
     return 400
 }                                      // from here on q is a str
 ```
 
-Checks against `none` narrow a `let` or a parameter (not a `var`). Narrowing and
-`if let` work in `if` statements, not in an `if` used as a value: unwrap before
-it. `m[k]`, `.get(k)`, `.remove(k)`, `.find(s)`, `.to_int()`, `.to_float()`,
-`.index_of(x)`, `env`, `header`, `parse_time` and `from_json` return `T?`.
+Checks against `none` narrow a `let` or a parameter, not a `var` or a field:
+`if let t = body.title { }`. Narrowing and `if let` work in `if` statements, not
+in an `if` used as a value: unwrap before it. `m[k]`, `.get(k)`, `.remove(k)`,
+`.find(s)`, `.to_int()`, `.to_float()`, `.index_of(x)`, `env`, `header`,
+`parse_time`, `parse_date` and `from_json` return `T?`.
 
 ## Values
 
 ```khrip body
 let p = Point { x: 1, y: 2 }
 let q = Point { x, y }                 // x: x, y: y
-let u = Product { ...old, ...patch }   // patch's T? fields: only if not none
+let u = Product { ...old, ...patch }   // patch's none fields are skipped
 let r: Point = { x, y: 0 }             // the type expected here
 let t = { id: 1, tags: ["a"] }         // else its fields' type
 var m: map[str, int] = {}
 let ages = {"ann": 30, (key): 41}      // map keys: "text" or (expression)
 ```
 
-A type is expected by a typed `let`, assignment, argument, `return`, list item
-or field. `{k: v}` with a variable `k` is an error. At a statement start and in a
-`match` arm `{` opens a block: write `({ ... })`. A named type takes an anonymous
-value only as `T { ...x }`. Structs, lists and maps are references: assigning
-shares (a field changed through `let u = users[id] else {...}` changes the
-store); `.copy()` copies a list.
+`...old` of the same type copies all fields; clear one explicitly: `note:
+patch.note`. A type is expected by a typed `let`, assignment, argument,
+`return`, list item or field. `{k: v}` with a local `k` is an error: give it a
+type or rename `k`. At a statement start and in a `match` arm `{` opens a block:
+write `({ ... })`. A named type takes an anonymous value only as `T { ...x }`.
+Structs, lists and maps are references: assigning shares (a field changed
+through `let u = users[id] else {...}` changes the store); `.copy()` copies a
+list.
 
 ## Methods and functions
 
-Any `f(x, y)` can be written `x.f(y)`: `len(xs)` is `xs.len()`.
+Built-ins are methods (`xs.sum()`, `a.max(b)`; `len(xs)` too); a function you
+declare is also a method of its first argument; `print`, `to_json`,
+`url_encode` and the calls below are functions only.
 
 - `str`: `len contains starts_with ends_with find trim lower upper split replace
   repeat to_int to_float`, `matches(regex)` (whole string; `[a-z] \d \w \s . * +
@@ -125,10 +128,10 @@ Any `f(x, y)` can be written `x.f(y)`: `len(xs)` is `xs.len()`.
   insertion order
 
 `print(s)`, `eprint(s)`, `env(name)`, `sleep(ms)`, `now()` (unix seconds),
-`now_ms()`, `time_iso(t)` → `"2026-10-19T15:04:05Z"`, `parse_time(s)` (ISO 8601),
-`parse_date("2026-10-19")`, `random_str(n)` (A-Za-z0-9), `sha256(s)` (hex),
-`hash_password(p)`, `check_password(p, hash)`, `url_encode(s)`, `to_json(x)`,
-`from_json(text)` (type from the annotation: `let u: User? = from_json(t)`).
+`now_ms()`, `time_iso(t)`, `parse_time(s)` (ISO 8601), `parse_date("2026-10-19")`,
+`random_str(n)`, `sha256(s)` (hex), `hash_password(p)`, `check_password(p,
+hash)`, `url_encode(s)`, `to_json(x)`, `from_json(text)` (type from the
+annotation: `let u: User? = from_json(t)`).
 
 ## HTTP API
 
@@ -159,7 +162,6 @@ route GET "/users" (min_age: int?, page: int = 1) -> { items: [User], total: int
 }
 
 route DELETE "/users/{id}" (id: int) -> 204 | 404 {
-    let key = header("X-Key") ?? fail(401, "no key")
     users.remove(id) else {
         return 404
     }
@@ -169,20 +171,20 @@ route DELETE "/users/{id}" (id: int) -> 204 | 404 {
 test "create and delete" {
     let r = call POST "/users" { name: "Ann", email: "a@x.io", age: 30 }
     expect r.status == 201
-    expect (call DELETE "/users/1" headers {"X-Key": "k"}).status == 204
+    expect (call DELETE "/users/1").status == 204
 }
 ```
 
-- Methods `GET POST PUT PATCH DELETE`; path parameters `{id}` are declared too. A
-  struct, list or map parameter is the JSON body; others come from the query.
-  Missing body fields take their defaults; enums are JSON strings ("Admin"),
-  other variants objects with a "type" field; `none` is `null`. Bad input gets
-  400 with a message, a wrong method 405, an unknown path 404.
+- Path parameters `{id}` are declared too. A struct, list or map parameter is
+  the JSON body; others come from the query. Missing body fields take their
+  defaults; enums are JSON strings ("Admin"), other variants objects with a
+  "type" field; `none` is `null`. Bad input gets 400 with a message.
 - `-> Type` is 200, no `->` is 204; every status returned is listed: `return
-  users[id] ?? 404`. `str` is sent as text, other types as JSON.
-- `header(name)` reads a request header (any case), `set_header(name, value)` adds
-  one to the response. `fail(status)` or `fail(status, message)` ends the request
-  from any function.
+  users[id] ?? 404` (`?? 404 "no user"` with `| 404 str`; a bare `| 409` has no
+  body). Beside a struct or error variant, a literal 200 is `return 200 { ... }`.
+  `str` is sent as text, other types as JSON.
+- `header(name)` reads a request header, `set_header(name, value)` adds one to
+  the response; `fail(status[, message])` ends the request from any function.
 - `store name: T` (or `= value`) outlives requests; handlers see it as if requests
   ran one at a time, so no locks.
 - Tests run in order and share the store. `call METHOD "path?query" [body]
@@ -200,22 +202,22 @@ every 10 min {
 ```
 
 `fetch METHOD url [body] [headers map]` returns a `Response` (header names lower
-case); `status` 0 means unreachable or a TLS error (`body` says why). A body
-value is sent as JSON, a str as text. `fetch`, `sql` and `sleep` are plain calls
-(no async/await): while a request waits, the server runs others, which may change
-the store (so may `hash_password`): read it again after.
+case); `status` 0 means unreachable or a TLS error. A body value is sent as
+JSON, a str as text. `fetch`, `sql`, `sleep` and `hash_password` are plain calls
+(no async/await); while one waits, other requests may change the store: read it
+again after.
 `every N ms|s|min|h|d` runs a block in a background thread.
 
 ## Traps from other languages
 
 - `null nil None` → `none`; `c ? a : b` → `if c { a } else { b }`; `switch` →
-  `match`; `enum E { A, B }` → `type E = A | B`; `range(n)` → `0..n`; `if xs`
-  → `if xs.len() > 0` (conditions are `bool`).
-- `str(n)` → `"{n}"` or `n.to_str()`; `int(s)`, `parseInt` → `s.to_int()`
-  (`int?`); `f"{x}"`, `${x}` → `"{x}"`; `"n=" + n` is an error.
+  `match`; `enum E { A, B }` → `type E = A | B`; `if xs` → `if xs.len() > 0`
+  (conditions are `bool`); `x in xs`, `k in m` → `xs.contains(x)`, `m.has(k)`;
+  `d.get(k, v)` → `m[k] ?? v`.
+- `str(n)`, `int(s)` → `n.to_str()`, `s.to_int()` (`int?`); `f"{x}"`, `${x}` →
+  `"{x}"`; `{x:.2f}` → `{x.round_to(2)}`; `"n=" + n` is an error.
 - `try/catch`, `throw`, `raise HTTPException` → optionals, `else`, `fail`;
   `return 400, "msg"` → `return 400 "msg"`.
 - `lambda x:`, `(x) => {...}` → `x => expr`; sorting with a comparator →
   `sort_by(x => -x.n)` (descending), stable `sort_by` calls for several keys
   (last key first).
-- Printing a list, map or struct: `to_json(x)`.

@@ -60,7 +60,7 @@ route GET "/events" (user: int) -> [Event] {
   `unknown_outcome`: the write may have happened; `document` is the reply
   (`bson_get_int(r.document, "n")`).
 - A cursor has `documents`, `error`, `id`: read `documents`, then `mongo_next(c)`
-  (false at the end or on error); `mongo_close(c)` after an early exit.
+  (false at the end or on error); cursors close when the request ends.
 - `int` is Int64 (Int32 and whole doubles read too); `T?`: null or missing is
   none; a `Bson` field nests a document as is; exact types: `BsonObjectId { hex }`
   (`object_id()` gives a new hex), `BsonDate { milliseconds }`, `BsonBinary`.

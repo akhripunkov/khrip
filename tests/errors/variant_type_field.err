@@ -1,0 +1,5 @@
+tests/errors/variant_type_field.kh:4:23: error: a variant cannot have a field named type
+    type Shape = Circle { type: str, r: int } | Empty
+                          ^
+    hint: JSON names the variant in "type": rename the field, or make Circle a separate type
+1 error

@@ -1,0 +1,13 @@
+// Правильная половина: литерал в скобках — значение и в ветке match, и в начале
+// оператора.
+// in: SKILL.md
+// rule: At a statement start and in a `match` arm `{` opens a block: write `({ ... })`.
+fn main() {
+    let s = "a"
+    let p = match s {
+        "a" => ({ x: 1 })
+        _ => ({ x: 2 })
+    }
+    ({ x: 3 }).x.to_str()
+    print("{p.x}")
+}

@@ -1,7 +1,6 @@
 // Каждый возвращаемый статус объявлен у маршрута.
 // in: SKILL.md
 // rule: every status returned is listed
-// expect: status 404 is not declared by this route
 route GET "/items/{id}" (id: int) -> str {
     if id > 10 {
         return 404

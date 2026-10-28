@@ -1,0 +1,25 @@
+tests/skill/rules/optional_results.kh:6:18: error: expected int, found int?
+        let a: int = m["a"]
+                     ^
+    hint: the value may be none; use x ?? default or let v = x else { return ... }
+tests/skill/rules/optional_results.kh:7:18: error: expected int, found int?
+        let b: int = "5".to_int()
+                     ^
+    hint: the value may be none; use x ?? default or let v = x else { return ... }
+tests/skill/rules/optional_results.kh:8:18: error: expected int, found int?
+        let c: int = [1, 2].index_of(2)
+                     ^
+    hint: the value may be none; use x ?? default or let v = x else { return ... }
+tests/skill/rules/optional_results.kh:9:18: error: expected int, found int?
+        let d: int = parse_date("2026-10-19")
+                     ^
+    hint: the value may be none; use x ?? default or let v = x else { return ... }
+tests/skill/rules/optional_results.kh:10:18: error: expected int, found int?
+        let e: int = parse_time("2026-10-19T15:04:05Z")
+                     ^
+    hint: the value may be none; use x ?? default or let v = x else { return ... }
+tests/skill/rules/optional_results.kh:11:18: error: expected str, found str?
+        let f: str = env("HOME")
+                     ^
+    hint: the value may be none; use x ?? default or let v = x else { return ... }
+6 errors

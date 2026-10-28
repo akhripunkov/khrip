@@ -8,19 +8,22 @@
 #    khc test); «top» — объявления верхнего уровня, «body» — операторы в теле
 #    маршрута: блок встаёт на место строки BLOCK в tests/skill/wrap/<метка>.kh
 #    (у «top» без fn main, route и every добавляется пустой fn main). Блок без
-#    метки khrip или с неизвестной меткой — ошибка: так ни один пример не
-#    уходит из проверки.
+#    метки khrip или с неизвестной меткой — ошибка, как и ограда ~~~ и ограда с
+#    отступом: так ни один пример не уходит из проверки.
 # 2. Примеры глав работают: tests/skill/run/<глава>.kh дописывается к первой
 #    целой программе главы и идёт через khc test на настоящей базе
 #    (PostgreSQL — SKILL_PG, его задаёт tests/run.sh, если база отвечает;
-#    MongoDB — MONGODB_URI; ClickHouse — CLICKHOUSE_URL с CLICKHOUSE_USER и
-#    CLICKHOUSE_PASSWORD); без базы — строка SKIP.
+#    MongoDB — MONGODB_URI, база "app" примера заменяется на khrip_skill_test;
+#    ClickHouse — CLICKHOUSE_URL с CLICKHOUSE_USER и CLICKHOUSE_PASSWORD); без
+#    базы — строка SKIP.
 # 3. Ключевые правила: tests/skill/rules/*.kh. «// in: файл» и «// rule: текст»
 #    — текст правила, который должен быть в этом файле скилла (пробелы и
-#    переводы строк сравниваются как один пробел); дальше «// expect: ...» —
-#    программа не компилируется и вывод содержит каждую строку; «// compiles» —
-#    khc check без ошибок (запросы sql — по миграциям, без базы); файл .out —
-#    вывод khc run совпадает с ним; иначе блоки test проходят (khc test).
+#    переводы строк сравниваются как один пробел); дальше одно из: файл .err —
+#    программа не компилируется, и вывод khc check совпадает с ним целиком (с
+#    местами: так и «правильная половина» правила не уходит из проверки);
+#    «// compiles» — khc check без ошибок (запросы sql — по миграциям, без
+#    базы); файл .out — вывод khc run совпадает с ним; блоки test — проходят
+#    (khc test). Файл без всего этого — ошибка, а не пустой успех.
 #
 # 0. Формат скилла агента: SKILL.md начинается с frontmatter из name (= имя
 #    папки: строчные буквы, цифры, дефис, до 64) и description (до 1024).
@@ -74,6 +77,10 @@ def blocks(md):
     out = []
     i = 0
     while i < len(lines):
+        if re.match(r'^\s*~~~', lines[i]) or re.match(r'^\s+```', lines[i]):
+            fail(f'{skill}/{md}:{i + 1}', 'code fences are ``` at the start of a line (no ~~~, no indent): the block would not be checked')
+            i += 1
+            continue
         m = re.match(r'^```(.*)$', lines[i])
         if not m:
             i += 1
@@ -158,8 +165,12 @@ for f in sorted(os.listdir(f'{here}/run')):
         print(f'SKIP {name}: no {what} (see tests/skill/check.py)')
         continue
     src = f'{tmp}/run_{chapter}.kh'
+    program = first_program[md] + '\n' + open(name, encoding='utf-8').read()
+    if chapter == 'mongodb':
+        # своя база тестов, а не app того, кто задал MONGODB_URI
+        program = program.replace('"app"', '"khrip_skill_test"')
     with open(src, 'w', encoding='utf-8') as out_file:
-        out_file.write(first_program[md] + '\n' + open(name, encoding='utf-8').read())
+        out_file.write(program)
     code, out = run([khc, 'test', src], env)
     if code != 0:
         fail(name, f'khc test:\n{out}')
@@ -175,7 +186,7 @@ for f in sorted(os.listdir(f'{here}/rules')):
     head = open(src, encoding='utf-8').read()
     where = re.findall(r'^// in: *(.+)$', head, re.M)
     rules = re.findall(r'^// rule: *(.+)$', head, re.M)
-    expects = re.findall(r'^// expect: *(.+)$', head, re.M)
+    err = src[:-3] + '.err'
     if len(where) != 1 or where[0] not in texts or not rules:
         fail(src, 'needs one "// in: <skill file>" and at least one "// rule: <text>"')
         continue
@@ -183,11 +194,14 @@ for f in sorted(os.listdir(f'{here}/rules')):
     if missing:
         fail(src, f'{skill}/{where[0]} no longer says: {missing[0]}')
         continue
-    if expects:
+    if re.search(r'^// expect:', head, re.M):
+        fail(src, '"// expect:" matches anywhere in the output: put the whole output in a .err file')
+        continue
+    if os.path.exists(err):
         code, out = run([khc, 'check', src])
-        bad = [e for e in expects if e not in out]
-        if code == 0 or bad:
-            fail(src, f'expected an error with "{bad[0] if bad else expects[0]}", got:\n{out}')
+        want = open(err, encoding='utf-8').read()
+        if code == 0 or out != want:
+            fail(src, f'khc check gave (exit {code}), not {err}:\n{out}')
             continue
     elif re.search(r'^// compiles$', head, re.M):
         code, out = run([khc, 'check', src])
@@ -200,11 +214,14 @@ for f in sorted(os.listdir(f'{here}/rules')):
         if code != 0 or out != want:
             fail(src, f'khc run gave (exit {code}):\n{out}')
             continue
-    else:
+    elif re.search(r'^test "', head, re.M):
         code, out = run([khc, 'test', src])
         if code != 0:
             fail(src, f'khc test:\n{out}')
             continue
+    else:
+        fail(src, 'checks nothing: add a .err or .out file, "// compiles" or test blocks')
+        continue
     ok()
 
 print(f'skill: {passed} {failed}')

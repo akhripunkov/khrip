@@ -1,9 +1,9 @@
 tests/errors/anon_map_guard_sql.kh:8:16: error: ambiguous literal: 'field' is a field name here and also a variable
         let doc = {field: value}
                    ^
-    hint: 'field' is also a variable here; {field: v} is a struct with field "field": write {(field): v} for a map keyed by its value, or {"field": v}
+    hint: for the struct, give it a type (let r: { field: T } = ..., or Name { field: v }) or rename the variable; for a map write {(field): v} (keyed by its value) or {"field": v}
 tests/errors/anon_map_guard_sql.kh:14:52: error: ambiguous literal: 'field' is a field name here and also a variable
         sql "INSERT INTO docs (body) VALUES ({to_json({field: value})}::jsonb)"
                                                        ^
-    hint: 'field' is also a variable here; {field: v} is a struct with field "field": write {(field): v} for a map keyed by its value, or {"field": v}
+    hint: for the struct, give it a type (let r: { field: T } = ..., or Name { field: v }) or rename the variable; for a map write {(field): v} (keyed by its value) or {"field": v}
 2 errors

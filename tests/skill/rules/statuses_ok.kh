@@ -1,0 +1,30 @@
+// Правильная половина: объявленные статусы — с телом и без; x ?? 404 и
+// x ?? 404 "текст".
+// in: SKILL.md
+// rule: every status returned is listed: `return users[id] ?? 404` (`?? 404 "no user"` with `| 404 str`; a bare `| 409` has no body).
+store names: map[int, str]
+
+route GET "/items/{id}" (id: int) -> str | 404 {
+    return names[id] ?? 404
+}
+
+route GET "/named/{id}" (id: int) -> str | 404 str {
+    return names[id] ?? 404 "no item {id}"
+}
+
+route POST "/items/{id}" (id: int, name: str) -> 201 | 409 {
+    if names.has(id) {
+        return 409
+    }
+    names[id] = name
+    return 201
+}
+
+test "declared statuses" {
+    expect (call POST "/items/1?name=pen").status == 201
+    expect (call POST "/items/1?name=pen").status == 409
+    expect (call GET "/items/1").body == "pen"
+    expect (call GET "/items/2").status == 404
+    let r = call GET "/named/2"
+    expect r.status == 404 && r.body == "no item 2"
+}

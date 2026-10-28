@@ -1,0 +1,9 @@
+// Константа float (LOW ревью части 2 этапа токенов), и со знаком минус.
+const RATE = 1.5
+const LOW = -2.25
+
+fn main() {
+    print("{RATE * 2} {LOW} {RATE + LOW}")
+    let price = 10.0
+    print("{(price * RATE).round_to(2)}")
+}

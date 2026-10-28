@@ -34,22 +34,23 @@ route POST "/transfers" (body: { from: int, to: int, amount: int }) -> 204 | 404
   parameter (no `::cast`), never SQL text; `none` is NULL, so compare an optional
   exactly as `({x} IS NULL OR col = {x})`. `IN ({list})` takes a list; `ILIKE
   '%{q}%'` matches q literally; `ORDER BY {o}` takes a local made of string
-  literals (`if`, `match`).
+  literals.
 - The expected type picks the result: `T` one row, none → 404 (the route lists
   `| 404`, or `let r: T = sql "..." else { return 401 }`); `T?` one row or none
-  (add `LIMIT 1`); `[T]` all rows; no type: rows changed. `T` is a struct
-  (columns by name) or one column's type: `let n: int = sql "SELECT count(*) ..."`.
-- timestamptz and date → `str` (as `time_iso`) or `int`; numeric → `float`;
-  json and jsonb → any type; a nullable column → `T?`.
+  (more is a 500: add `LIMIT 1`); `[T]` all rows; no type: rows changed. `T` is
+  a struct (columns by name) or one column's type: `let n: int = sql "SELECT
+  count(*) ..."`.
+- timestamptz → `str` (as `time_iso`) or `int`; date → `"2026-01-02"` or `int`;
+  numeric → `float`; json and jsonb → any type; a nullable column → `T?`.
 - `INSERT INTO t {v}` puts fields into columns of the same name (`none` → the
-  column default), `{[v]}` inserts a list; `SET {patch}` sets only the fields
-  the request sent. A duplicate allowed: `let r: T? = sql "INSERT ... ON CONFLICT
-  DO NOTHING RETURNING *"` (none: it existed).
-- `migration N` runs once, in order, at start (copies starting together take
-  turns); never edit one that ran: add the next number.
+  column default); `{rows}` with a list inserts them all. `SET {patch}` sets only
+  the fields the request sent. A duplicate allowed: `let r: T? = sql "INSERT ...
+  ON CONFLICT DO NOTHING RETURNING *"` (none: it existed).
+- `migration N` runs once, in order, at start; never edit one that ran: add the
+  next number.
 - A failed statement ends the request: duplicate or CHECK 409, missing foreign
   key 404, row still referenced 409, NOT NULL or a bad value 400, database down
-  503.
+  or busy 503.
 - Outside `tx` each statement commits on its own, so in a route a write after
   another statement (or in a loop) is an error: use `tx { }`. `tx` is
   SERIALIZABLE and runs again on a conflict, so inside it no `fetch`, `sleep`,

@@ -1902,6 +1902,16 @@ fn parse_sql(w: int) -> int {
             }
             cur = cur + " " + parts
         } else {
+            if sql_insert_target(cur) {
+                // INSERT INTO t \{x} берёт только строку или список строк:
+                // параметр на месте списка столбцов — синтаксическая ошибка
+                // при запуске сервера
+                var hint = "INSERT INTO t \{row} puts a struct's fields into columns; \{rows} with a list inserts all of them"
+                if vk == K_LIST && tkind(ty_elem(vt)) == K_LIST && tkind(ty_elem(ty_elem(vt))) == K_STRUCT {
+                    hint = "it is a list of lists: a list of structs already inserts all its rows, so drop the brackets"
+                }
+                error_tok(ptoks[i], "INSERT INTO t \{" + vtexts[vi] + "} needs a struct or a list of structs, found " + ty_name(vt), hint)
+            }
             if vk == K_OPT && (sql_ends_cmp(cur) || sql_starts_cmp(next)) && !sql_in_set(cur) {
                 cmp_v.push(vi)
                 cmp_at.push(i)

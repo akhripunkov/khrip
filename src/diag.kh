@@ -439,6 +439,18 @@ fn name_hint(name: str) -> str {
     if name == "self" || name == "this" {
         return "methods take the receiver as the first parameter named self: fn name(self: Type)"
     }
+    if name == "str" || name == "String" || name == "toString" || name == "Itoa" {
+        return "use x.to_str() or interpolation \"\{x}\""
+    }
+    if name == "int" || name == "parseInt" || name == "Number" || name == "Atoi" {
+        return "use s.to_int(), which gives an int? (x.to_int() for a float)"
+    }
+    if name == "float" || name == "parseFloat" || name == "ParseFloat" {
+        return "use s.to_float(), which gives a float? (n.to_float() for an int)"
+    }
+    if name == "range" {
+        return "use a range: for i in 0..n"
+    }
     if name == "ord" || name == "chr" {
         return "compare characters directly: c >= \"a\" && c <= \"z\""
     }
@@ -487,6 +499,9 @@ fn str_method_hint(name: str, bytes: bool) -> str {
 // Подсказка для неизвестного метода по имени. bytes — получатель str в
 // системном коде: там подсказка называет байтовую форму (system_str_method).
 fn method_hint(name: str, bytes: bool) -> str {
+    if name == "to_json" || name == "url_encode" || name == "sha256" || name == "time_iso" || name == "hash_password" || name == "eprint" {
+        return name + " is a function, not a method: write " + name + "(x)"
+    }
     if name == "length" || name == "size" || name == "count" || name == "Count" || name == "Length" || name == "len_" {
         if bytes {
             return "use .byte_len()"

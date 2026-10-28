@@ -1,0 +1,5 @@
+tests/skill/rules/statuses.kh:6:16: error: status 404 is not declared by this route
+            return 404
+                   ^
+    hint: add it to the result: -> str | 404
+1 error

@@ -1,0 +1,17 @@
+// Именованное соединение в сервере (H2 ревью части 2 этапа токенов): скрытая
+// глобальная соединения — не глобальная программы, которую делят запросы.
+clickhouse metrics = env("METRICS_CLICKHOUSE_URL")
+
+migration metrics 1 `CREATE TABLE hits (ts DateTime, page String) ENGINE = MergeTree ORDER BY ts`
+
+type Hit { ts: int, page: str }
+
+table hits: Hit in metrics
+
+route POST "/hits" (body: [Hit]) -> 202 { inserted: int } {
+    return 202 { inserted: hits.insert(body) }
+}
+
+route GET "/hits/count" -> int {
+    return ch metrics "SELECT count() FROM hits"
+}

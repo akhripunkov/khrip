@@ -204,7 +204,7 @@ fn parse_if_expr(w: int) -> int {
     let from = pos
     advance()
     if kind() == T_LET {
-        error_tok(tok(), "if let cannot be used as a value", "use x ?? default or match")
+        error_tok(tok(), "if let cannot be used as a value", "write x ?? default, or unwrap first: let k = x else \{ ... }; or assign a var inside an if let statement")
         sync_stmt()
         return ty_err
     }

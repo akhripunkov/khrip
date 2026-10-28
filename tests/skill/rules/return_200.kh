@@ -1,0 +1,12 @@
+// Рядом с вариантом-структурой (ошибкой) литерал ответа 200 пишется со статусом.
+// in: SKILL.md
+// rule: Beside a struct or error variant, a literal 200 is `return 200 { ... }`.
+type Todo { id: int, title: str }
+type Err { error: str }
+
+route GET "/todos/{id}" (id: int) -> Todo | 404 Err {
+    if id > 10 {
+        return 404 { error: "no todo {id}" }
+    }
+    return { id, title: "t" }
+}

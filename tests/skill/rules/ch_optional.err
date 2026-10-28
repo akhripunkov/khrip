@@ -1,0 +1,5 @@
+tests/skill/rules/ch_optional.kh:7:54: error: {page} may be none, and a comparison with NULL is never true: rows would silently not match
+        return ch "SELECT count() FROM hits WHERE page = {page}"
+                                                         ^
+    hint: write ({page} IS NULL OR column = {page}), or unwrap it first: let v = page else { return 400 }
+1 error

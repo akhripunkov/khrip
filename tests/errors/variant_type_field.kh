@@ -1,0 +1,8 @@
+// В JSON вариант называет себя полем "type": поле type у варианта спорило бы с
+// ним. У обычной структуры type — имя поля, как другие.
+type Part { type: str, text: str }
+type Shape = Circle { type: str, r: int } | Empty
+
+fn main() {
+    print(to_json(Part { type: "text", text: "hi" }))
+}

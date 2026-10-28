@@ -1,0 +1,5 @@
+args true hé 2 3
+2 7 5 -1 16 64
+100 H
+n: expected an integer, found '"x"}'
+Infinity NaN {"x":null}

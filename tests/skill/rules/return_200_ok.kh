@@ -1,0 +1,20 @@
+// Правильная половина: return 200 { ... } и x ?? 404 { ... }.
+// in: SKILL.md
+// rule: Beside a struct or error variant, a literal 200 is `return 200 { ... }`.
+type Todo { id: int, title: str }
+type Err { error: str }
+
+store todos: map[int, Todo]
+
+route GET "/todos/{id}" (id: int) -> Todo | 404 Err {
+    if id == 0 {
+        return 200 { id, title: "zero" }
+    }
+    return todos[id] ?? 404 { error: "no todo {id}" }
+}
+
+test "200 with a literal" {
+    expect (call GET "/todos/0").body == `{"id":0,"title":"zero"}`
+    let r = call GET "/todos/5"
+    expect r.status == 404 && r.body == `{"error":"no todo 5"}`
+}

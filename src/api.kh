@@ -616,7 +616,9 @@ fn check_api() {
         error_tok(toks[funcs[m].tok], "a program with routes or every blocks runs by itself and has no fn main", "remove fn main; the server starts by itself (set the port with PORT)")
     }
     for g in globals {
-        if !g.is_store && !files[toks[g.tok].file].is_lib {
+        // скрытая глобальная соединения clickhouse ИМЯ = ... (prescan_ch_conn)
+        // получает значение один раз при запуске, запросы её только читают
+        if !g.is_store && !files[toks[g.tok].file].is_lib && !g.name.starts_with("__ch_conn_") {
             error_tok(toks[g.tok], "global '" + g.name + "' would be shared by all requests", "declare it with store (or use const for a constant)")
         }
     }
@@ -950,14 +952,30 @@ fn route_return(at: Token, has_value: bool) {
         }
         if starts_value(pos + 1) || (kind_at(pos + 1) == '\{' && !ends_stmt(pos + 1)) {
             advance()
-            if vi < 0 || r.variants[vi].ty < 0 {
+            if vi >= 0 && r.variants[vi].ty < 0 {
+                // | 409 без типа: тело не уходит — сообщение пропало бы молча
+                let t = parse_expr(ty_err)
+                if t != ty_err {
+                    var tn = ty_name(t)
+                    var what = "it"
+                    if t == ty_str {
+                        what = "a message"
+                    }
+                    error_tok(t0, "status " + t0.val.to_str() + " has no body here", "declare | " + t0.val.to_str() + " " + tn + " to send " + what)
+                }
+                route_status_only(t0)
+                return
+            }
+            if vi < 0 {
                 route_status_only(t0)
                 parse_expr(ty_err)
                 return
             }
             let vt = r.variants[vi].ty
             let vtok = tok()
+            route_qq = true
             let t = parse_expr(vt)
+            route_qq = false
             coerce(t, vt, vtok)
             emit_reply(t0.val, vt)
             return
@@ -1100,7 +1118,17 @@ fn route_qq_status(lt: int) -> int {
     let inner = ty_inner(lt)
     emit_test_rax()
     let has = emit_jcc(CC_NE)
-    route_status_only(st)
+    if ends_stmt(pos) {
+        route_status_only(st)
+    } else {
+        // x ?? 404 { error: "..." }, x ?? 404 "text": ответ со значением
+        let r = routes[route_ctx]
+        let vt = r.variants[find_variant(r, st.val)].ty
+        let vtok = tok()
+        let t = parse_expr(vt)
+        coerce(t, vt, vtok)
+        emit_reply(st.val, vt)
+    }
     patch_here(has)
     if !is_ref(inner) {
         emit_load(RAX, RAX, 0)
@@ -1109,7 +1137,16 @@ fn route_qq_status(lt: int) -> int {
 }
 
 fn route_qq_ok() -> bool {
-    return route_ctx >= 0 && inline_depth == 0 && kind() == T_INT && ends_stmt(pos + 1)
+    if route_ctx < 0 || inline_depth > 0 || kind() != T_INT {
+        return false
+    }
+    let vi = find_variant(routes[route_ctx], tok().val)
+    if ends_stmt(pos + 1) {
+        // x ?? 0 в маршруте, который возвращает int, — значение, а не статус
+        return vi >= 0 || !returns_int(routes[route_ctx])
+    }
+    // x ?? 404 значение: статус объявлен со значением
+    return vi >= 0 && routes[route_ctx].variants[vi].ty >= 0 && (starts_value(pos + 1) || kind_at(pos + 1) == '\{')
 }
 
 // ---- store ----

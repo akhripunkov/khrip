@@ -16,18 +16,21 @@ var brks: [int]
 var conts: [int]
 var ret_holes: [int]
 
-// Пропуск до начала следующего оператора после синтаксической ошибки.
+// Пропуск до начала следующего оператора после синтаксической ошибки. Лишняя
+// ) или ] пропускается (глубина не уходит ниже нуля, иначе пропуск дошёл бы до
+// конца всех файлов), и пропуск не переходит в следующий файл — в библиотеку.
 fn sync_stmt() {
     let line = tok().line
+    let file = tok().file
     var depth = 0
-    while kind() != T_EOF {
+    while kind() != T_EOF && tok().file == file {
         let k = kind()
         if depth == 0 && (k == '}' || tok().line != line) {
             break
         }
         if k == '(' || k == '[' || k == '\{' {
             depth += 1
-        } else if k == ')' || k == ']' || k == '}' {
+        } else if (k == ')' || k == ']' || k == '}') && depth > 0 {
             depth -= 1
         }
         advance()
@@ -43,7 +46,10 @@ fn parse_block() -> bool {
     let saved = nlocals
     let nn = narrowed.len()
     var div = false
-    while kind() != '}' && kind() != T_EOF {
+    // блок не продолжается в следующем файле: незакрытая { — ошибка в конце
+    // своего файла, а не разбор библиотеки как тела функции
+    let file = toks[pos - 1].file
+    while kind() != '}' && kind() != T_EOF && tok().file == file {
         let before = pos
         panic_mode = false
         if parse_stmt() {
@@ -1150,8 +1156,14 @@ fn cond_cmp(fl: [int]) {
         return
     }
     let at = tok()
+    let from = pos
     want = ty_err
     var lt = parse_add()
+    if kind() == T_IN || (kind() == T_IDENT && tok().text == "not" && kind_at(pos + 1) == T_IN) {
+        lt = in_operator(from)
+        fl.push(emit_jump_bool(false))
+        return
+    }
     if is_cmp_op(kind()) {
         let op = kind()
         advance()
@@ -2201,7 +2213,12 @@ fn compile_main_wrapper(fi: int, test_mode: bool) {
             emit_mov_imm(RAX, 0)
         }
     } else {
-        report_at(files.len() - 1, 1, 1, "the program has no fn main", "add fn main() \{ ... } or declare routes")
+        // место ошибки — в программе, а не в последнем файле библиотеки
+        var uf = 0
+        while uf < files.len() - 1 && files[uf].is_lib {
+            uf += 1
+        }
+        report_at(uf, 1, 1, "the program has no fn main", "add fn main() \{ ... } or declare routes")
     }
     // результат уже в rax
     end_fn(frame_at, true)

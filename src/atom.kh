@@ -563,13 +563,17 @@ fn parse_anon_lit(at: Token) -> int {
         // {k: v}, где k — переменная int или str: раньше это был словарь с
         // ключом — значением k; теперь структура с полем "k" — громко
         let k = inames[0]
-        error_tok(ntoks[0], "ambiguous literal: '" + k + "' is a field name here and also a variable", "'" + k + "' is also a variable here; \{" + k + ": v} is a struct with field \"" + k + "\": write \{(" + k + "): v} for a map keyed by its value, or \{\"" + k + "\": v}")
+        error_tok(ntoks[0], "ambiguous literal: '" + k + "' is a field name here and also a variable", "for the struct, give it a type (let r: \{ " + k + ": T } = ..., or Name \{ " + k + ": v }) or rename the variable; for a map write \{(" + k + "): v} (keyed by its value) or \{\"" + k + "\": v}")
     }
-    // поля типа: имя, тип, откуда значение (запись и номер поля распаковки)
+    // поля типа: имя, тип, откуда значение (запись и номер поля распаковки);
+    // поле T? из нескольких распаковок: earlier_* — прежние, по порядку
+    // (последняя, у которой оно не none, — как Product \{ ...old, ...patch })
     var names: [str] = []
     var tys: [int] = []
     var from_item: [int] = []
     var from_field: [int] = []
+    var earlier_item: [[int]] = []
+    var earlier_field: [[int]] = []
     var i = 0
     while i < n && !bad {
         if inames[i] == "" {
@@ -587,10 +591,16 @@ fn parse_anon_lit(at: Token) -> int {
                         tys.push(f.ty)
                         from_item.push(i)
                         from_field.push(m)
+                        earlier_item.push([])
+                        earlier_field.push([])
                     } else if tys[j] != f.ty {
                         error_tok(at, "field '" + f.name + "' comes from two ... values with different types: " + ty_name(tys[j]) + " and " + ty_name(f.ty), "set it explicitly: " + f.name + ": value")
                         bad = true
                     } else {
+                        if tkind(f.ty) == K_OPT {
+                            earlier_item[j].push(from_item[j])
+                            earlier_field[j].push(from_field[j])
+                        }
                         from_item[j] = i
                         from_field[j] = m
                     }
@@ -602,6 +612,8 @@ fn parse_anon_lit(at: Token) -> int {
             tys.push(itys[i])
             from_item.push(i)
             from_field.push(-1)
+            earlier_item.push([])
+            earlier_field.push([])
         }
         i += 1
     }
@@ -629,11 +641,32 @@ fn parse_anon_lit(at: Token) -> int {
         while names[w] != fs[j].name {
             w += 1
         }
-        emit_load(RCX, RSP, (n - 1 - from_item[w]) * 8)
-        if from_field[w] >= 0 {
+        if earlier_item[w].len() > 0 {
+            // поле T? из нескольких распаковок: по порядку, каждая следующая —
+            // только если не none
+            var e = 0
+            while e < earlier_item[w].len() {
+                emit_load(RCX, RSP, (n - 1 - earlier_item[w][e]) * 8)
+                emit_load(RCX, RCX, earlier_field[w][e] * 8)
+                emit_rr(0x85, RCX, RCX)
+                let skip = emit_jcc(CC_E)
+                emit_store(RAX, j * 8, RCX)
+                patch_here(skip)
+                e += 1
+            }
+            emit_load(RCX, RSP, (n - 1 - from_item[w]) * 8)
             emit_load(RCX, RCX, from_field[w] * 8)
+            emit_rr(0x85, RCX, RCX)
+            let skip = emit_jcc(CC_E)
+            emit_store(RAX, j * 8, RCX)
+            patch_here(skip)
+        } else {
+            emit_load(RCX, RSP, (n - 1 - from_item[w]) * 8)
+            if from_field[w] >= 0 {
+                emit_load(RCX, RCX, from_field[w] * 8)
+            }
+            emit_store(RAX, j * 8, RCX)
         }
-        emit_store(RAX, j * 8, RCX)
         j += 1
     }
     emit_alu_imm(0, RSP, n * 8)
@@ -872,24 +905,49 @@ fn parse_struct_lit(si: int, at: Token) -> int {
                 }
             } else {
                 let sf = structs[types[src].a].fields
+                // распаковка значения того же типа (...old) копирует поля как
+                // есть; другого типа (заплатка, ...patch) — поле T? берётся,
+                // только если оно не none, и в поле T, и в поле T?, как SET
+                // \{patch} и to_bson: Product \{ ...old, ...patch } не стирает
+                // то, чего клиент не прислал
+                let same = types[src].a == si
                 var j = 0
                 while j < nf {
                     let f = fields[j]
                     if !list_has(explicit, f.name) {
                         var m = 0
                         while m < sf.len() {
-                            if sf[m].name == f.name && assignable(sf[m].ty, f.ty) {
+                            let opt = tkind(sf[m].ty) == K_OPT && !same
+                            if sf[m].name == f.name && !opt && assignable(sf[m].ty, f.ty) {
                                 emit_load(RCX, RAX, m * 8)
                                 emit_load(RDX, RSP, 0)
                                 emit_store(RDX, j * 8, RCX)
                                 set[j] = true
-                            } else if sf[m].name == f.name && tkind(sf[m].ty) == K_OPT && assignable(ty_inner(sf[m].ty), f.ty) {
-                                // поле T? в поле T: берётся, только если есть, — как в PATCH:
-                                // Product \{ ...old, ...patch }
+                            } else if sf[m].name == f.name && opt && (assignable(sf[m].ty, f.ty) || assignable(ty_inner(sf[m].ty), f.ty)) {
+                                let into_opt = assignable(sf[m].ty, f.ty)
+                                if !set[j] && fields[j].def >= 0 {
+                                    // значения ещё нет: сначала значение по
+                                    // умолчанию, его заменит присланное
+                                    emit_push(RAX)
+                                    let save = pos
+                                    pos = fields[j].def
+                                    let dt = tok()
+                                    let t = parse_expr(fields[j].ty)
+                                    coerce(t, fields[j].ty, dt)
+                                    pos = save
+                                    emit_load(RCX, RSP, 8)
+                                    emit_store(RCX, j * 8, RAX)
+                                    emit_pop(RAX)
+                                    set[j] = true
+                                } else if !set[j] && tkind(f.ty) == K_OPT {
+                                    // поле T? без значения — none (память
+                                    // литерала обнулена)
+                                    set[j] = true
+                                }
                                 emit_load(RCX, RAX, m * 8)
                                 emit_rr(0x85, RCX, RCX)
                                 let skip = emit_jcc(CC_E)
-                                if !is_ref(f.ty) {
+                                if !into_opt && !is_ref(f.ty) {
                                     emit_load(RCX, RCX, 0)
                                 }
                                 emit_load(RDX, RSP, 0)
@@ -1663,7 +1721,15 @@ fn emit_to_str(t: int, at: Token) -> bool {
         emit_call(rt_func("__float_to_str"))
         return true
     }
-    error_tok(at, "cannot turn " + ty_name(t) + " into text", "interpolate its fields instead")
+    var hint = "interpolate its fields, or write to_json(x)"
+    if tkind(t) == K_OPT {
+        hint = "it may be none: write x ?? \"default\" (\{x ?? 0} for a number), or unwrap it first with if let"
+    } else if tkind(t) == K_LIST || tkind(t) == K_MAP {
+        hint = "write to_json(x); a [str] joins with xs.join(\", \")"
+    } else if tkind(t) == K_SUM {
+        hint = "match on it, or write to_json(x)"
+    }
+    error_tok(at, "cannot turn " + ty_name(t) + " into text", hint)
     return false
 }
 
@@ -2441,6 +2507,59 @@ fn parse_builtin(t: Token, w: int) -> int {
     return -1
 }
 
+// Имя встроенного метода какого-нибудь типа: sum(xs) пишут по привычке
+// других языков, а это метод — xs.sum().
+fn builtin_method_any(name: str) -> bool {
+    if str_method_args(name) >= 0 || name == "trim" {
+        return true
+    }
+    if name == "push" || name == "pop" || name == "last" || name == "insert" || name == "remove_at" || name == "truncate" || name == "copy" || name == "reverse" || name == "join" || name == "sum" {
+        return true
+    }
+    if name == "abs" || name == "min" || name == "max" || name == "round" || name == "floor" || name == "ceil" || name == "round_to" || name == "sqrt" {
+        return true
+    }
+    return name == "index_of" || name == "sort" || name == "sort_by" || name == "map" || name == "filter" || name == "any" || name == "all" || name == "count" || name == "has" || name == "keys" || name == "values"
+}
+
+// Подсказка «это метод»: аргументы — простые имена и литералы, тогда x.имя(y),
+// иначе общий вид. ( за именем — на pos или перед ним (parse_call уже шагнул).
+fn method_form_hint(name: str) -> str {
+    var open = pos
+    if kind_at(open) != '(' {
+        open = pos - 1
+    }
+    if kind_at(open) != '(' {
+        return ""
+    }
+    let close = matching_close(open)
+    var args: [str] = []
+    var i = open + 1
+    var simple = close > open + 1
+    while simple && i < close {
+        let k = toks[i].kind
+        if (k == T_IDENT || k == T_INT || k == T_FLOAT || k == T_STR) && (i + 1 == close || toks[i + 1].kind == ',') {
+            args.push(toks[i].text)
+            i += 2
+        } else {
+            simple = false
+        }
+    }
+    if simple && args.len() > 0 {
+        var rest = ""
+        var j = 1
+        while j < args.len() {
+            if j > 1 {
+                rest += ", "
+            }
+            rest += args[j]
+            j += 1
+        }
+        return name + " is a method: write " + args[0] + "." + name + "(" + rest + ")"
+    }
+    return name + " is a method of its first argument: write x." + name + "(...)"
+}
+
 fn parse_call(t: Token, w: int) -> int {
     if tx_depth > 0 && (t.text == "fetch" || t.text == "sleep" || driver_io(t.text)) && !files[t.file].is_lib {
         error_tok(t, t.text + " inside tx runs again on every retry and holds a database connection", "call it before or after the tx block")
@@ -2455,6 +2574,9 @@ fn parse_call(t: Token, w: int) -> int {
     advance()
     if fi < 0 {
         var hint = name_hint(name)
+        if hint.byte_len() == 0 && builtin_method_any(name) {
+            hint = method_form_hint(name)
+        }
         if hint.byte_len() == 0 {
             let s = similar_name(name)
             if s.byte_len() > 0 {
@@ -2719,6 +2841,12 @@ fn parse_method(rt: int, nt: Token) -> int {
             }
             return parse_lambda_method(rt, nt)
         }
+        if name == "sort" && kind() == '(' && kind_at(pos + 1) != ')' {
+            // компаратор из других языков: сортируют по ключу
+            error_tok(nt, ".sort() takes no comparator", "sort by a key: xs.sort_by(x => x.n); descending: xs.sort_by(x => -x.n); several keys: stable sort_by calls, last key first")
+            skip_call_args()
+            return ty_err
+        }
         if name == "contains" || name == "sort" || name == "index_of" {
             return parse_list_typed_method(rt, nt)
         }
@@ -2930,6 +3058,7 @@ fn parse_map_method(rt: int, nt: Token) -> int {
         }
     }
     emit_push(RAX)
+    let open = pos
     advance()
     var argc = 0
     if name == "has" || name == "get" || name == "remove" || name == "contains" {
@@ -2942,6 +3071,26 @@ fn parse_map_method(rt: int, nt: Token) -> int {
         coerce(t, kt, a)
         emit_push(RAX)
         n = 1
+    }
+    if name == "get" && kind() == ',' {
+        // dict.get(k, default) из Python
+        // простые части (одна лексема) — в подсказку как есть
+        var m = "m"
+        if open >= 3 && toks[open - 2].kind == '.' && toks[open - 3].kind == T_IDENT && !(open >= 4 && (toks[open - 4].kind == '.' || toks[open - 4].kind == ')' || toks[open - 4].kind == ']')) {
+            m = toks[open - 3].text
+        }
+        var k = "k"
+        if pos == open + 2 {
+            k = toks[open + 1].text
+        }
+        var d = "default"
+        if kind_at(pos + 2) == ')' {
+            d = toks[pos + 1].text
+        }
+        error_tok(tok(), ".get() takes only the key", "for a default write " + m + "[" + k + "] ?? " + d)
+        skip_call_args_from_open()
+        emit_alu_imm(0, RSP, (n + 1) * 8)
+        return ty_err
     }
     if !expect_tok(')') {
         emit_alu_imm(0, RSP, (n + 1) * 8)

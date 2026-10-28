@@ -1,0 +1,6 @@
+[{"id":1,"type":"note","test":true}]
+[{"id":1,"type":"note","test":true}]
+[{"id":1,"type":"note","test":true},{"id":2,"type":"task","test":false}]
+{"type":"all","n":3}
+ok    query parameters named type and test
+1 tests: 1 passed, 0 failed

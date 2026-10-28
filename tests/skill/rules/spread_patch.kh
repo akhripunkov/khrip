@@ -1,0 +1,16 @@
+// Распаковка заплатки пропускает её поля none; значение того же типа
+// копируется целиком; стереть поле — явно.
+// in: SKILL.md
+// rule: let u = Product { ...old, ...patch } // patch's none fields are skipped
+// rule: `...old` of the same type copies all fields; clear one explicitly: `note: patch.note`.
+type Product { name: str, price: int, note: str? }
+type ProductPatch { name: str?, price: int?, note: str? }
+
+fn main() {
+    let old = Product { name: "pen", price: 100, note: "blue" }
+    let patch = ProductPatch { price: 120 }
+    print(to_json(Product { ...old, ...patch }))
+    print(to_json(Product { ...old, ...patch, note: patch.note }))
+    let fresh = Product { name: "ink", price: 5 }
+    print(to_json(Product { ...old, ...fresh }))
+}

@@ -1,0 +1,5 @@
+tests/skill/rules/status_body.kh:8:16: error: status 409 has no body here
+            return 409 "taken"
+                   ^
+    hint: declare | 409 str to send a message
+1 error

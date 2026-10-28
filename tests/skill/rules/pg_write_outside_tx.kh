@@ -1,7 +1,6 @@
 // Вне tx каждый оператор фиксируется сам: запись после другого оператора — ошибка.
 // in: postgresql.md
 // rule: Outside `tx` each statement commits on its own, so in a route a write after another statement (or in a loop) is an error
-// expect: this write runs outside tx and another statement runs before it
 migration 1 `CREATE TABLE accounts (id bigserial PRIMARY KEY, balance bigint NOT NULL DEFAULT 0)`
 
 type Account { id: int, balance: int }

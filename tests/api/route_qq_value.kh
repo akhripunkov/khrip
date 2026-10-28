@@ -1,0 +1,70 @@
+// x ?? 404 значение в return маршрута: ответ со значением объявленного типа,
+// и после статуса (return 200 x ?? 404 { ... }) (M6 ревью части 2 этапа
+// токенов). Типы программы T и K — тела маршрутов (сгенерированный разбор их
+// не путает с параметрами обобщённых функций библиотеки). Поля type и in
+// идут через JSON тела и ответа. В маршруте, который возвращает int, x ?? 0 —
+// значение, а не статус 0.
+type Todo {
+    id: int
+    title: str
+}
+
+type Err { error: str }
+
+type T { a: int }
+
+type K { type: str, in: int }
+
+store todos: map[int, Todo]
+
+store counts: map[str, int]
+
+route POST "/todos" (body: Todo) -> 201 Todo {
+    todos[body.id] = body
+    return 201 body
+}
+
+route GET "/todos/{id}" (id: int) -> Todo | 404 Err {
+    return todos[id] ?? 404 { error: "no todo {id}" }
+}
+
+route GET "/text/{id}" (id: int) -> Todo | 404 str {
+    return todos[id] ?? 404 "no todo"
+}
+
+route GET "/after/{id}" (id: int) -> 200 Todo | 404 Err {
+    return 200 todos[id] ?? 404 { error: "no" }
+}
+
+route GET "/count/{k}" (k: str) -> int {
+    return counts[k] ?? 0
+}
+
+route POST "/t" (body: T) -> T {
+    return T { a: body.a + 1 }
+}
+
+route POST "/k" (body: K) -> K {
+    return { type: body.type + "!", in: body.in }
+}
+
+test "?? status with a value" {
+    expect (call POST "/todos" { id: 1, title: "a" }).status == 201
+    let a = call GET "/todos/1"
+    print("{a.status} {a.body}")
+    let b = call GET "/todos/2"
+    print("{b.status} {b.body}")
+    let c = call GET "/text/2"
+    print("{c.status} {c.body}")
+    let d = call GET "/after/2"
+    print("{d.status} {d.body}")
+    let e = call GET "/after/1"
+    print("{e.status} {e.body}")
+    let f = call GET "/count/x"
+    print("{f.status} {f.body}")
+}
+
+test "types named T and K, fields type and in" {
+    print((call POST "/t" { a: 1 }).body)
+    print((call POST "/k" { type: "x", in: 2 }).body)
+}

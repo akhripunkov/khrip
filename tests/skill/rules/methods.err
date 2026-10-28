@@ -1,0 +1,17 @@
+tests/skill/rules/methods.kh:7:13: error: unknown function 'sum'
+        let s = sum(xs)
+                ^
+    hint: sum is a method: write xs.sum()
+tests/skill/rules/methods.kh:8:13: error: unknown function 'max'
+        let m = max(a, 2)
+                ^
+    hint: max is a method: write a.max(2)
+tests/skill/rules/methods.kh:9:13: error: unknown function 'trim'
+        let t = trim(" x ")
+                ^
+    hint: trim is a method: write " x ".trim()
+tests/skill/rules/methods.kh:10:16: error: [int] has no method 'to_json'
+        let j = xs.to_json()
+                   ^
+    hint: to_json is a function, not a method: write to_json(x)
+4 errors

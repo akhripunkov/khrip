@@ -1,0 +1,30 @@
+// Привычки других языков получают подсказку с формой Khrip, а не голую или
+// каскадную ошибку (M4, M5 и LOW ревью части 2 этапа токенов): in, get с
+// умолчанием, сортировка с компаратором, форматы в интерполяции, встроенные
+// функции, которые в Khrip — методы, и наоборот, optional в тексте, int * float,
+// if let как значение.
+type P { name: str? }
+
+fn main() {
+    let xs = [1, 2]
+    let m = {"a": 1}
+    let x = 1
+    if x in xs {
+        print("y")
+    }
+    let has = "a" in m
+    let miss = x not in xs
+    let v = m.get("b", 0)
+    xs.sort((a, b) => a - b)
+    let f = 1.2345
+    print("{f:.2f} {x:>4}")
+    let s = sum(xs)
+    let big = max(x, 2)
+    let t = trim(" a ")
+    let j = xs.to_json()
+    let p = P { name: "a" }
+    print(p.name)
+    print("{x * f}")
+    let o: int? = 3
+    let w = if let k = o { k } else { 0 }
+}

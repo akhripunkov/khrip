@@ -1,0 +1,27 @@
+// Правильная половина: let и параметр сужаются, var и поле — через if let.
+// in: SKILL.md
+// rule: Checks against `none` narrow a `let` or a parameter, not a `var` or a field: `if let t = body.title { }`.
+type Body { title: str? }
+
+fn twice(n: int?) -> int {
+    if n == none {
+        return 0
+    }
+    return n * 2
+}
+
+fn main() {
+    var x: int? = 3
+    if let v = x {
+        print("{v + 1}")
+    }
+    let y: int? = 4
+    if y != none {
+        print("{y + 1}")
+    }
+    let body = Body { title: "a" }
+    if let t = body.title {
+        print(t.upper())
+    }
+    print("{twice(5)} {twice(none)}")
+}

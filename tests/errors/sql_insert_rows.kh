@@ -1,0 +1,23 @@
+// INSERT INTO t {x} берёт строку или список строк; список списков и простое
+// значение — ошибки компиляции, а не синтаксическая ошибка базы при запуске
+// (M1 ревью части 2 этапа токенов).
+// expect: sql_insert_rows.kh:14:39: error: INSERT INTO t {[body]} needs a struct or a list of structs, found [[NewItem]]
+// expect: hint: it is a list of lists: a list of structs already inserts all its rows, so drop the brackets
+// expect: sql_insert_rows.kh:18:39: error: INSERT INTO t {name} needs a struct or a list of structs, found str
+migration 1 `CREATE TABLE items (id bigserial PRIMARY KEY, name text NOT NULL)`
+
+type NewItem { name: str }
+
+type Item { id: int, name: str }
+
+route POST "/items" (body: [NewItem]) -> 201 [Item] {
+    return 201 sql "INSERT INTO items {[body]} RETURNING *"
+}
+
+route POST "/items/one" (name: str) -> 201 Item {
+    return 201 sql "INSERT INTO items {name} RETURNING *"
+}
+
+route POST "/items/all" (body: [NewItem]) -> 201 [Item] {
+    return 201 sql "INSERT INTO items {body} RETURNING *"
+}

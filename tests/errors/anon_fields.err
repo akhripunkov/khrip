@@ -30,10 +30,10 @@ tests/errors/anon_fields.kh:17:22: error: expected ':' after field 'f', found '(
         let h = { x: 1, f(2) }
                          ^
     hint: { name: value } or { name } for a variable of that name
-tests/errors/anon_fields.kh:18:15: error: expected a name, found 'type'
-        let i = { type: "text", n: 1 }
+tests/errors/anon_fields.kh:18:15: error: expected a name, found 'while'
+        let i = { while: "text", n: 1 }
                   ^
-    hint: 'type' is a keyword and cannot be used as a name
+    hint: 'while' is a keyword and cannot be used as a name
 tests/errors/anon_fields.kh:20:7: error: type 'Point' has no field 'z'
         j.z = 3
           ^
