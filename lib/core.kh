@@ -564,14 +564,24 @@ fn __memset(dst: int, b: int, n: int) {
     }
 }
 
+// Равны ли n байт с адресов a и b. Хвост короче 8 байт — последним словом
+// внахлёст с уже равными байтами; меньше 8 байт — двумя кусками по 4 байта
+// (тоже внахлёст) или по байту: чтения не выходят за [a, a + n) и [b, b + n).
 fn __memeq(a: int, b: int, n: int) -> bool {
-    var i = 0
-    while i + 8 <= n {
-        if load64(a + i) != load64(b + i) {
-            return false
+    if n >= 8 {
+        var i = 0
+        while i + 8 <= n {
+            if load64(a + i) != load64(b + i) {
+                return false
+            }
+            i += 8
         }
-        i += 8
+        return i == n || load64(a + n - 8) == load64(b + n - 8)
     }
+    if n >= 4 {
+        return load32(a) == load32(b) && load32(a + n - 4) == load32(b + n - 4)
+    }
+    var i = 0
     while i < n {
         if load8(a + i) != load8(b + i) {
             return false
@@ -737,17 +747,35 @@ fn __str_cmp(a: str, b: str) -> int {
     if bn < n {
         n = bn
     }
-    // равные куски по 8 байт пропускаются целиком
+    // равные куски по 8 байт пропускаются целиком; в первом неравном первый
+    // отличающийся байт — по младшему единичному биту xor (байты в слове — от
+    // младшего): без побайтового цикла, выход из которого зависит от данных
     var i = 0
-    while i + 8 <= n && load64(ap + i) == load64(bp + i) {
+    while i + 8 <= n {
+        let d = load64(ap + i) ^ load64(bp + i)
+        if d != 0 {
+            let k = i + (__ctz(d) >> 3)
+            return load8(ap + k) - load8(bp + k)
+        }
         i += 8
     }
-    while i < n {
-        let d = load8(ap + i) - load8(bp + i)
-        if d != 0 {
-            return d
+    if i < n {
+        if n >= 8 {
+            // хвост — последним словом общей части, внахлёст с равными байтами
+            let d = load64(ap + n - 8) ^ load64(bp + n - 8)
+            if d != 0 {
+                let k = n - 8 + (__ctz(d) >> 3)
+                return load8(ap + k) - load8(bp + k)
+            }
+        } else {
+            while i < n {
+                let d = load8(ap + i) - load8(bp + i)
+                if d != 0 {
+                    return d
+                }
+                i += 1
+            }
         }
-        i += 1
     }
     return an - bn
 }
@@ -2439,18 +2467,42 @@ fn __map_alive(m: int, i: int) -> bool {
     return load8(load64(m + 24) + i) != 0
 }
 
+// Хеш строкового ключа: по 8 байт за шаг — xor, умножение и сдвиг (старшие
+// биты произведения — в младшие: номер слота — младшие биты хеша); хвост —
+// последним словом внахлёст, строка короче 8 байт — словом из двух кусков по 4
+// байта или из трёх байтов; длина — в начальном значении; в конце —
+// перемешивание, как у splitmix64. Сдвиги вправо в библиотеке знаковые —
+// отсюда маски. Прежний хеш (h · 33 + байт) шёл по байту и у похожих ключей
+// давал длинные цепочки проб (номера-строки "1".."100000" — 4,4 пробы на
+// поиск в среднем, двухбайтовые ключи — тысячи). Хеш живёт только в процессе:
+// таблицы нигде не сохраняются (снимок KHRIP_DATA — JSON, при загрузке словари
+// строятся заново), а порядок записей — порядок вставки и от хеша не зависит.
 fn __map_hash(m: int, k: int) -> int {
     if (load32(m + 44) & MAP_STR) != 0 {
         let s: str = __cast(k)
         let p = __str_ptr(s)
         let n = __str_len(s)
-        var h = 5381
+        var h = n
         var i = 0
-        while i < n {
-            h = (h * 33 + load8(p + i)) & 0xFFFFFFFFFFFF
-            i += 1
+        while i + 8 <= n {
+            h = (h ^ load64(p + i)) * -0x40A7B892E31B1A47
+            h = h ^ ((h >> 29) & 0x7FFFFFFFF)
+            i += 8
         }
-        return h
+        if i < n {
+            var w = 0
+            if n >= 8 {
+                w = load64(p + n - 8)
+            } else if n >= 4 {
+                w = load32(p) | (load32(p + n - 4) << 32)
+            } else {
+                w = load8(p) | (load8(p + (n >> 1)) << 8) | (load8(p + n - 1) << 16)
+            }
+            h = (h ^ w) * -0x40A7B892E31B1A47
+            h = h ^ ((h >> 29) & 0x7FFFFFFFF)
+        }
+        h = h * -0x6B2FB644ECCEEE15
+        return (h ^ ((h >> 32) & 0xFFFFFFFF)) & 0xFFFFFFFFFFFF
     }
     let lo = k & 0xFFFFFFF
     let hi = (k >> 28) & 0xFFFFFFF

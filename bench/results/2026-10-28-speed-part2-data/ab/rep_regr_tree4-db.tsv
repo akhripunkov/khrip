@@ -1,0 +1,7 @@
+scenario	lang	rps	p50_ms	p99_ms	errors_pct	idle_mb	seeded_mb	peak_mb	after_mb	cpu_us_per_req	startup_ms	build_s	size_bytes	invariant	db_cpu_us_per_req
+shop	khrip	2559	23.19	69.14	0.0	0.7	0.8	7.2	5.0	184.4	62	0.1	515304	ok	1053.8
+shop	khrip	2480	23.83	143.26	0.0	0.7	0.7	14.3	4.8	183.3	79	0.1	515304	ok	1122.0
+shop	khrip	2833	21.18	56.30	0.0	0.7	0.7	6.5	4.5	166.8	56	0.1	515304	ok	976.3
+shop	khrip	2862	20.51	62.00	0.0	0.7	0.7	5.4	4.7	174.1	63	0.1	515304	ok	928.7
+shop	khrip	2832	21.34	51.79	0.0	0.7	0.7	5.6	4.7	180.7	64	0.1	515304	ok	934.2
+shop	khrip	2457	24.23	80.14	0.0	0.7	0.7	7.6	4.7	191.5	63	0.1	515304	ok	1099.0

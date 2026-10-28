@@ -1,0 +1,15 @@
+GET /fold: read
+GET /counts: read
+GET /lists: read
+GET /deep: write
+GET /store-fold: write
+GET /store-value-in: write
+GET /alias: write
+GET /literal: write
+GET /loop-var-in: write
+GET /nested-qq: write
+GET /qq-copy/{k}: write
+GET /lambda-same-name: write
+GET /reassigned: write
+GET /get: write
+GET /if-let: write

@@ -1,0 +1,274 @@
+// Слияние цепочек над словарями store (этап скорости, часть 2, п. 3):
+// values().filter/map/any/all/count/find/sort_by — один проход прямо по
+// массивам словаря. Читающие маршруты (разделяемая блокировка store) и код
+// теста дают то же, что обход for по словарю; пока словарь store растёт по
+// частям (шаг роста маленький, __map_grow_budget), цепочка видит старые
+// массивы — все записи, вставленные и заменённые во время роста, без
+// удалённых, в порядке вставки; то же посреди разметки сборщика и с
+// KHRIP_GC_STRESS=1 (имя gc_*: tests/run.sh гоняет его и так). Паника в слитой
+// цепочке — у первого по порядку обхода элемента, а any после найденного
+// ответа дальше не смотрит (поэлементная семантика, docs/KHRIP.md).
+
+type Booking { id: int, room: int, start: str, end: str, title: str }
+
+store bookings: map[int, Booking]
+store byname: map[str, Booking]
+store flags: map[int, bool]
+
+fn bm(m: map[int, Booking]) -> int {
+    let h: int = __cast(m)
+    return h
+}
+
+fn mk(i: int, tag: str) -> Booking {
+    let day = 1 + (i * 7) % 28
+    let h = (i * 5) % 20
+    var d = "{day}"
+    if day < 10 {
+        d = "0{day}"
+    }
+    var hh = "{h}"
+    if h < 10 {
+        hh = "0{h}"
+    }
+    return Booking { id: i, room: 1 + i % 6, start: "2026-11-{d}T{hh}:30:00Z", end: "2026-11-{d}T{hh}:59:00Z", title: "{tag} {i}" }
+}
+
+// образцы — обход for по словарю, без цепочек
+fn ref_room(id: int, from: str, to: str) -> [Booking] {
+    var out: [Booking] = []
+    for _, b in bookings {
+        if b.room == id && b.start < to && from < b.end {
+            out.push(b)
+        }
+    }
+    out.sort_by(b => b.start)
+    return out
+}
+
+fn ref_titles(room_mod: int) -> [str] {
+    var out: [str] = []
+    for _, b in byname {
+        if b.room % 2 == room_mod {
+            out.push(b.title)
+        }
+    }
+    return out
+}
+
+fn ref_count() -> int {
+    var n = 0
+    for _, b in bookings {
+        if b.title.starts_with("a") {
+            n += 1
+        }
+    }
+    return n
+}
+
+route GET "/rooms/{id}/bookings" (id: int, from: str = "", to: str = "~") -> [Booking] {
+    return bookings.values()
+        .filter(b => b.room == id && b.start < to && from < b.end)
+        .sort_by(b => b.start)
+}
+
+route GET "/busy/{id}" (id: int, at: str) -> bool {
+    return bookings.values().any(b => b.room == id && b.start <= at && at < b.end)
+}
+
+route GET "/count" -> int {
+    return bookings.values().count(b => b.title.starts_with("a"))
+}
+
+route GET "/titles/{r}" (r: int) -> [str] {
+    return byname.values().filter(b => b.room % 2 == r).map(b => b.title)
+}
+
+route GET "/first/{id}" (id: int) -> int {
+    let b = bookings.values().find(b => b.room == id) else {
+        return -1
+    }
+    return b.id
+}
+
+route GET "/flags" -> int {
+    return flags.values().filter(f => f).count(f => f) * 1000 + flags.values().map(f => !f).count(f => f)
+}
+
+// два элемента: у первого паника во втором звене (индекс), у второго — в
+// первом (деление на 0); слитая цепочка дойдёт до первого раньше
+route GET "/panic" -> int {
+    var m: map[int, int] = {}
+    m[1] = 4
+    m[2] = -1
+    let xs = [7, 8]
+    return m.values().filter(v => 100 / (v + 1) >= 0).map(v => xs[v]).len()
+}
+
+// any нашёл ответ на первом элементе — второй (деление на 0) не смотрит
+route GET "/early" -> bool {
+    var m: map[int, int] = {}
+    m[1] = 4
+    m[2] = -1
+    return m.values().filter(v => 100 / (v + 1) >= 0).any(v => v == 4)
+}
+
+// слитые цепочки в коде теста (не в маршруте) — то же, что образцы
+fn same_direct() -> bool {
+    for r in 1..7 {
+        let direct = bookings.values().filter(b => b.room == r).sort_by(b => b.start)
+        if to_json(direct) != to_json(ref_room(r, "", "~")) {
+            return false
+        }
+        let day = bookings.values().filter(b => b.room == r && b.start < "2026-11-15T00:00:00Z" && "2026-11-08T00:00:00Z" < b.end).sort_by(b => b.start)
+        if to_json(day) != to_json(ref_room(r, "2026-11-08T00:00:00Z", "2026-11-15T00:00:00Z")) {
+            return false
+        }
+    }
+    return bookings.values().count(b => b.title.starts_with("a")) == ref_count()
+}
+
+test "fused chains over store maps answer like a for loop" {
+    for i in 0..300 {
+        bookings[i] = mk(i, ["a", "b", "c"][i % 3])
+        byname["k{i}"] = mk(i, "n")
+        flags[i] = i % 4 == 0
+    }
+    for i in [3, 50, 51, 299] {
+        bookings.remove(i)
+        byname.remove("k{i}")
+        flags.remove(i)
+    }
+    for r in 1..7 {
+        expect (call GET "/rooms/{r}/bookings").body == to_json(ref_room(r, "", "~"))
+        expect (call GET "/rooms/{r}/bookings?from=2026-11-08T00:00:00Z&to=2026-11-15T00:00:00Z").body == to_json(ref_room(r, "2026-11-08T00:00:00Z", "2026-11-15T00:00:00Z"))
+    }
+    expect (call GET "/count").body == ref_count().to_str()
+    expect same_direct()
+    expect (call GET "/titles/0").body == to_json(ref_titles(0))
+    expect (call GET "/titles/1").body == to_json(ref_titles(1))
+    expect (call GET "/first/2").body == "1"
+    expect (call GET "/first/9").body == "-1"
+    expect (call GET "/busy/2?at=2026-11-08T05:40:00Z").body == "true"
+    expect (call GET "/busy/2?at=2026-11-08T06:40:00Z").body == "false"
+    var on = 0
+    var off = 0
+    for _, f in flags {
+        if f {
+            on += 1
+        } else {
+            off += 1
+        }
+    }
+    expect on == 75 && off == 221
+    expect (call GET "/flags").body == "{on * 1000 + off}"
+}
+
+test "a panic is reported for the first element in iteration order" {
+    let r = call GET "/panic"
+    expect r.status == 500
+    expect r.body.starts_with("panic: index out of range at tests/api/gc_chains.kh:")
+    let e = call GET "/early"
+    expect e.status == 200
+    expect e.body == "true"
+}
+
+test "fused chains read the old arrays while a store map grows" {
+    bookings.clear()
+    __map_grow_budget(48, 0)
+    var k = 0
+    while __map_cap(bm(bookings)) < 1024 || !__map_growing(bm(bookings)) {
+        bookings[k] = mk(k, "a")
+        k += 1
+    }
+    for r in 1..7 {
+        expect (call GET "/rooms/{r}/bookings").body == to_json(ref_room(r, "", "~"))
+        expect (call GET "/rooms/{r}/bookings?from=2026-11-08T00:00:00Z&to=2026-11-15T00:00:00Z").body == to_json(ref_room(r, "2026-11-08T00:00:00Z", "2026-11-15T00:00:00Z"))
+    }
+    expect (call GET "/count").body == ref_count().to_str()
+    expect same_direct()
+    // удаление и замена — перенесённой записи и ещё не перенесённой
+    bookings.remove(1)
+    bookings.remove(k - 2)
+    bookings[2] = mk(2, "b")
+    bookings[k - 3] = mk(k - 3, "b")
+    expect __map_growing(bm(bookings))
+    for r in 1..7 {
+        expect (call GET "/rooms/{r}/bookings").body == to_json(ref_room(r, "", "~"))
+        expect (call GET "/rooms/{r}/bookings?from=2026-11-08T00:00:00Z&to=2026-11-15T00:00:00Z").body == to_json(ref_room(r, "2026-11-08T00:00:00Z", "2026-11-15T00:00:00Z"))
+    }
+    expect (call GET "/count").body == ref_count().to_str()
+    expect same_direct()
+    var steps = 0
+    while __map_growing(bm(bookings)) {
+        bookings[k] = mk(k, ["a", "c"][k % 2])
+        k += 1
+        steps += 1
+        if steps % 4 == 0 {
+            for r in 1..7 {
+                expect (call GET "/rooms/{r}/bookings").body == to_json(ref_room(r, "", "~"))
+                expect (call GET "/rooms/{r}/bookings?from=2026-11-08T00:00:00Z&to=2026-11-15T00:00:00Z").body == to_json(ref_room(r, "2026-11-08T00:00:00Z", "2026-11-15T00:00:00Z"))
+            }
+            expect (call GET "/count").body == ref_count().to_str()
+            expect same_direct()
+        }
+    }
+    expect steps > 3
+    for r in 1..7 {
+        expect (call GET "/rooms/{r}/bookings").body == to_json(ref_room(r, "", "~"))
+        expect (call GET "/rooms/{r}/bookings?from=2026-11-08T00:00:00Z&to=2026-11-15T00:00:00Z").body == to_json(ref_room(r, "2026-11-08T00:00:00Z", "2026-11-15T00:00:00Z"))
+    }
+    expect (call GET "/count").body == ref_count().to_str()
+    expect same_direct()
+    __map_grow_budget(0, 0)
+}
+
+test "fused chains during marking and growth keep every value alive" {
+    bookings.clear()
+    __map_grow_budget(48, 0)
+    var k = 0
+    while k < 200 {
+        bookings[k] = mk(k, "a")
+        k += 1
+    }
+    __gc_begin_from_roots()
+    __gc_step(20)
+    var grew = false
+    while !grew || __map_growing(bm(bookings)) {
+        if __map_growing(bm(bookings)) {
+            grew = true
+        }
+        bookings[k] = mk(k, "c")
+        k += 1
+        if k % 50 == 0 {
+            for r in 1..7 {
+                expect (call GET "/rooms/{r}/bookings").body == to_json(ref_room(r, "", "~"))
+                expect (call GET "/rooms/{r}/bookings?from=2026-11-08T00:00:00Z&to=2026-11-15T00:00:00Z").body == to_json(ref_room(r, "2026-11-08T00:00:00Z", "2026-11-15T00:00:00Z"))
+            }
+            expect (call GET "/count").body == ref_count().to_str()
+            expect same_direct()
+            __gc_step(5)
+        }
+    }
+    for r in 1..7 {
+        expect (call GET "/rooms/{r}/bookings").body == to_json(ref_room(r, "", "~"))
+        expect (call GET "/rooms/{r}/bookings?from=2026-11-08T00:00:00Z&to=2026-11-15T00:00:00Z").body == to_json(ref_room(r, "2026-11-08T00:00:00Z", "2026-11-15T00:00:00Z"))
+    }
+    expect (call GET "/count").body == ref_count().to_str()
+    expect same_direct()
+    __gc_finish()
+    for r in 1..7 {
+        expect (call GET "/rooms/{r}/bookings").body == to_json(ref_room(r, "", "~"))
+        expect (call GET "/rooms/{r}/bookings?from=2026-11-08T00:00:00Z&to=2026-11-15T00:00:00Z").body == to_json(ref_room(r, "2026-11-08T00:00:00Z", "2026-11-15T00:00:00Z"))
+    }
+    expect (call GET "/count").body == ref_count().to_str()
+    expect same_direct()
+    __gc_collect()
+    for r in 1..7 {
+        expect (call GET "/rooms/{r}/bookings").body == to_json(ref_room(r, "", "~"))
+        expect (call GET "/rooms/{r}/bookings?from=2026-11-08T00:00:00Z&to=2026-11-15T00:00:00Z").body == to_json(ref_room(r, "2026-11-08T00:00:00Z", "2026-11-15T00:00:00Z"))
+    }
+    expect (call GET "/count").body == ref_count().to_str()
+    expect same_direct()
+    __map_grow_budget(0, 0)
+}

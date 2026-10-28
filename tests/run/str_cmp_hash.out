@@ -1,0 +1,3 @@
+compare: 100000 pairs, less 43296, equal 12926, mismatches 0
+sort 2000 strings: out of order 0
+map: 14303 inserts, 14145 keys, 4715 removed and inserted again, len 14145, lookups wrong 0, insertion order true true

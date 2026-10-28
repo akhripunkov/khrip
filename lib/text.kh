@@ -68,6 +68,11 @@ const STRC_MEMO_K = 32
 const STRC_MEMO_W = 56
 // Открытый конец среза: s[a..] передаёт его вместо b.
 const TEXT_END = 0x7FFFFFFFFFFFFFFF
+// lower() и upper() строки ASCII до стольких байт — быстрым путём
+// (__tx_case_ascii); с 32 байт обычный путь идёт блоками по 32 байта
+// (__tx_case_run) и дешевле двух проходов по словам (callgrind: 397 и 402
+// команд на строку в 32 байта, 418 и 626 — в 64)
+const TX_CASE_SHORT = 31
 
 // Число символов, если [p, p + n) — правильный UTF-8, иначе -1.
 fn __utf8_scan(p: int, n: int) -> int {
@@ -1690,6 +1695,15 @@ fn __text_upper(self: str) -> str {
 fn __tx_case(self: str, up: bool) -> str {
     let p = __str_ptr(self)
     let n = __str_len(self)
+    // строка ASCII до TX_CASE_SHORT байт — одним проходом по словам и одним
+    // выделением (__tx_case_ascii); 0 — в ней есть байт ≥ 0x80
+    if n <= TX_CASE_SHORT && __str_compact {
+        let r = __tx_case_ascii(self, p, n, up)
+        if r != 0 {
+            let rs: str = __cast(r)
+            return rs
+        }
+    }
     // буквы lo..lo+25; в каждом байте below = 0x80 − lo, past = 0x80 − lo − 26:
     // старший бит байта в (x + below) & ~(x + past) — буква
     var lo = 'A'
@@ -1945,4 +1959,180 @@ fn __text_cmp1(self: str, c: int) -> int {
         return d
     }
     return n - 1
+}
+
+// Смена регистра строки ASCII из n ≤ TX_CASE_SHORT байт с адреса p (s.lower(),
+// s.upper(): __tx_case) → новая короткая строка, сама строка (менять нечего)
+// или 0 (есть байт ≥ 0x80 — обычный путь). Сначала все байты проверяются
+// словами (последнее слово — внахлёст с предыдущим; строка короче 8 байт —
+// одно слово из её байтов и нулей: ноль — не буква), потом копируются теми же
+// словами: у буквы меняется бит 0x20 (тот же SWAR, что в __tx_case).
+fn __tx_case_ascii(self: str, p: int, n: int, up: bool) -> int {
+    var below = 0x3F3F3F3F3F3F3F3F
+    var past = 0x2525252525252525
+    if up {
+        below = 0x1F1F1F1F1F1F1F1F
+        past = 0x0505050505050505
+    }
+    let high = ~0x7F7F7F7F7F7F7F7F
+    let flip = 0x2020202020202020
+    if n < 8 {
+        var w = 0
+        var i = 0
+        while i < n {
+            w = w | (load8(p + i) << (i * 8))
+            i += 1
+        }
+        if (w & high) != 0 {
+            return 0
+        }
+        let b = (w + below) & ~(w + past) & high
+        if b == 0 {
+            return __cast(self)
+        }
+        // короткая строка: n + 9 ≤ 16 байт; слово байтов — с нулём после них
+        let h = __alloc(n + 9)
+        store64(h, (n << 48) | (h + 8))
+        store64(h + 8, w ^ ((b >> 2) & flip))
+        return h
+    }
+    var hi = 0
+    var bits = 0
+    var i = 0
+    while i < n - 8 {
+        let x = load64(p + i)
+        hi = hi | x
+        bits = bits | ((x + below) & ~(x + past))
+        i += 8
+    }
+    let t = load64(p + n - 8)
+    hi = hi | t
+    bits = bits | ((t + below) & ~(t + past))
+    if (hi & high) != 0 {
+        return 0
+    }
+    if (bits & high) == 0 {
+        return __cast(self)
+    }
+    let h = __alloc(n + 9)
+    store64(h, (n << 48) | (h + 8))
+    i = 0
+    while i < n - 8 {
+        let x = load64(p + i)
+        // сдвиг знаковый: 0x20 — маской после него
+        store64(h + 8 + i, x ^ ((((x + below) & ~(x + past) & high) >> 2) & flip))
+        i += 8
+    }
+    store64(h + n, t ^ ((((t + below) & ~(t + past) & high) >> 2) & flip))
+    return h
+}
+
+// s.lower().contains(sub) без копии (компилятор узнаёт эту форму: src/atom.kh,
+// parse_method). Если s — ASCII, lower меняет только A–Z и не сдвигает байты:
+// sub ищется прямо в s, байты s — в нижнем регистре; первый байт sub — словами
+// по 8 мест. Если в s есть байт ≥ 0x80 — прежний путь, lower и затем поиск:
+// lower не-ASCII символа может дать ASCII (K → k, İ → i̇) и поменять длину.
+// Пустая sub есть в любой строке.
+fn __text_contains_lower(self: str, sub: str) -> bool {
+    let m = __str_len(sub)
+    if m == 0 {
+        return true
+    }
+    let p = __str_ptr(self)
+    let n = __str_len(self)
+    let high = ~0x7F7F7F7F7F7F7F7F
+    var hi = 0
+    var i = 0
+    while i + 8 <= n {
+        hi = hi | load64(p + i)
+        i += 8
+    }
+    if i < n {
+        if n >= 8 {
+            hi = hi | load64(p + n - 8)
+        } else {
+            while i < n {
+                hi = hi | load8(p + i)
+                i += 1
+            }
+        }
+    }
+    if (hi & high) != 0 {
+        return __str_contains(__text_lower(self), sub)
+    }
+    if m > n {
+        return false
+    }
+    let q = __str_ptr(sub)
+    let f = load8(q)
+    // в s.lower() строки ASCII нет заглавных букв и байтов ≥ 0x80
+    if f >= 0x80 || (f >= 'A' && f <= 'Z') {
+        return false
+    }
+    let below = 0x3F3F3F3F3F3F3F3F
+    let past = 0x2525252525252525
+    let flip = 0x2020202020202020
+    let low = 0x7F7F7F7F7F7F7F7F
+    let bf = f * 0x0101010101010101
+    let last = n - m
+    i = 0
+    while i <= last {
+        // байты s с i по i + 7 (за концом s — нули), в нижнем регистре
+        var x = 0
+        if i + 8 <= n {
+            x = load64(p + i)
+        } else if n >= 8 {
+            x = load64(p + n - 8) >> ((i + 8 - n) * 8)
+        } else {
+            var j = i
+            while j < n {
+                x = x | (load8(p + j) << ((j - i) * 8))
+                j += 1
+            }
+        }
+        x = x | ((((x + below) & ~(x + past) & high) >> 2) & flip)
+        // старший бит каждого байта z, равного нулю, — место, где байт s равен
+        // первому байту sub (точно, без переносов между байтами); места дальше
+        // last — мимо
+        let z = x ^ bf
+        var c = ~(((z & low) + low) | z | low)
+        if last - i < 7 {
+            c = c & ((1 << ((last - i + 1) * 8)) - 1)
+        }
+        while c != 0 {
+            let k = i + (__ctz(c) >> 3)
+            if __tx_eq_lower(p + k + 1, q + 1, m - 1) {
+                return true
+            }
+            c = c & (c - 1)
+        }
+        i += 8
+    }
+    return false
+}
+
+// Байты [a, a + r) строки ASCII в нижнем регистре равны байтам [b, b + r).
+fn __tx_eq_lower(a: int, b: int, r: int) -> bool {
+    let below = 0x3F3F3F3F3F3F3F3F
+    let past = 0x2525252525252525
+    let high = ~0x7F7F7F7F7F7F7F7F
+    var j = 0
+    while j + 8 <= r {
+        let x = load64(a + j)
+        if (x | ((((x + below) & ~(x + past) & high) >> 2) & 0x2020202020202020)) != load64(b + j) {
+            return false
+        }
+        j += 8
+    }
+    while j < r {
+        var c = load8(a + j)
+        if c >= 'A' && c <= 'Z' {
+            c += 32
+        }
+        if c != load8(b + j) {
+            return false
+        }
+        j += 1
+    }
+    return true
 }

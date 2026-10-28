@@ -1,0 +1,18 @@
+// expect: [int] has no method 'slice'
+// expect: [int] has no method 'sort_int'
+// expect: hint: list methods: len push pop last insert remove_at clear truncate copy contains index_of sort reverse join sum, and map filter find any all count sort_by
+// expect: [str] has no method 'repeat'
+// expect: int has no method 'to_f64_bits'
+// expect: 4 errors
+// Функции библиотеки с именами __list_*, __int_*, ... — методы только те,
+// что описаны в docs/KHRIP.md; остальные — внутренние, даже если получатель
+// подходит к их первому параметру.
+fn main() {
+    let xs = [3, 1, 2]
+    let a = xs.slice(0, 2)
+    let b = xs.sort_int()
+    let ws = ["a"]
+    let c = ws.repeat(2)
+    let n = 5
+    print("{a.len()} {b.len()} {c.len()} {n.to_f64_bits()}")
+}

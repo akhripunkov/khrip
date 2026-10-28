@@ -1,0 +1,31 @@
+// expect: [int] has no method 'grow'
+// expect: [int] has no method 'vacate'
+// expect: [int] has no method 'cap'
+// expect: hint: list methods: len push pop last insert remove_at clear truncate copy contains index_of sort reverse join sum, and map filter find any all count sort_by
+// expect: int has no method 'to_f64_bits'
+// expect: 4 errors
+// Внутренние функции библиотеки (__list_grow, __list_vacate, __list_cap,
+// __int_to_f64_bits, ...) — не методы в коде программы: xs.vacate(0)
+// обнулял бы память списка store мимо блокировки.
+store lists: map[str, [int]]
+
+route GET "/grow/{k}" (k: str) -> int {
+    let xs = lists[k] else {
+        return 0
+    }
+    xs.grow(1000)
+    return xs.len()
+}
+
+route GET "/vacate/{k}" (k: str) -> int {
+    let xs = lists[k] else {
+        return 0
+    }
+    xs.vacate(0)
+    return xs.cap()
+}
+
+route GET "/bits" -> int {
+    let n = 5
+    return n.to_f64_bits()
+}

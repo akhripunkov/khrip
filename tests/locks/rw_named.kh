@@ -1,0 +1,39 @@
+// Свои функции программы с именами методов, которые возвращают новую
+// коллекцию: shop.values() и c.split() вызывают их, и результат — список из
+// store, а не новый. Оба маршрута меняют store — write.
+
+type Cat { name: str, count: int, ids: [int] }
+type Shop { cats: [Cat], ids: [int] }
+
+store groups: map[str, Cat]
+store shop: Shop = Shop { cats: [], ids: [] }
+
+fn values(s: Shop) -> [Cat] {
+    return s.cats
+}
+
+fn split(c: Cat) -> [int] {
+    return c.ids
+}
+
+route GET "/named-values" -> int {
+    let xs = shop.values()
+    xs.push(Cat { name: "x", count: 0, ids: [] })
+    return xs.len()
+}
+
+route GET "/named-split" -> int {
+    let c = groups["a"] else {
+        return 0
+    }
+    let ids = c.split()
+    ids.push(1)
+    return ids.len()
+}
+
+// список, который вернула своя функция, скопирован — read
+route GET "/named-copy" -> int {
+    let xs = shop.values().copy()
+    xs.push(Cat { name: "x", count: 0, ids: [] })
+    return xs.len()
+}

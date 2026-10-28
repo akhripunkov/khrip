@@ -18,6 +18,8 @@
 #                       ещё раз — с проверками сборщика (KHRIP_GC_VERIFY=1:
 #                       граф и куча store после загрузки и каждого теста);
 #   tests/locks/*.kh  — какие маршруты берут store на чтение (khc check --locks);
+#   tests/rw_gen.py   — то же на сгенерированных маршрутах, которые меняют store
+#                       через псевдонимы: ни одного read;
 #   tests/sqlcheck/   — правильный SQL: khc check без базы не находит ошибок;
 #   tests/chcheck/    — то же для ch "..." и таблиц ClickHouse (PostgreSQL их
 #                       не подтверждает, поэтому отдельно от tests/sqlcheck);
@@ -491,6 +493,212 @@ insertfull gc_insert verify
 CUTS
 [[ $mem3_ok -eq 1 ]] && pass=$((pass + 1))
 
+# Оптимизации компилятора (этап скорости, часть 2) сами по себе: компилятор,
+# собранный из копии src/ с подложенной ошибкой, собирает тест пункта
+# неправильно — вывод программы (run) или блокировки маршрутов (locks) другие:
+#   hoistmut — выносится и изменяемая локальная, которой присваивают в лямбде;
+#   hoistopt — выносится и str? (проверка на none — внутри лямбды);
+#   hoistdecl — без проверки, что имя объявлено в самой лямбде;
+#   hoistparam — то же, но не смотрится параметр лямбды;
+#   hoistfor, hoistlet, hoistbind — не видно for, let и привязки match (имя =>);
+#   hoistend — вынесенные вызовы не забываются после лямбды (встроенная
+#              функция с лямбдой — дважды подряд);
+#   hoistfield — выносится и поле x.name.lower() по имени локальной name;
+#   hoistdedupe — разные методы одного имени — в одной локальной;
+# слияние цепочек (tests/run/chain_fusion.kh, tests/api/gc_chains.kh — test):
+#   fusepure — сливается и цепочка с побочными действиями (порядок печати);
+#   fuseassign — присваивание в блоке лямбды не побочное действие;
+#   fusereturn — return из блока лямбды не побочное действие;
+#   fusecallee — не смотрится, чисты ли вызванные функции программы;
+#   fuselib — любая функция библиотеки чиста (print);
+#   fuseglobal — запись в глобальную в функции программы не побочное действие;
+#   fusemut — изменяющий метод в лямбде не побочное действие;
+#   fusealive — обход словаря без признака «жива» (удалённые записи);
+#   fusecount — обход до числа живых записей, а не до конца массивов;
+#   fuseterm — цепочка не кончается на sort_by (и any, all, count, find);
+#   fuseone — сливается и одно звено у списка (sort_by сортирует копию);
+#   fusebox — find не кладёт значение int в коробку;
+#   fusestr — sort_by по строке сравнивает слова;
+#   fusefloat — ключ float без перевода в порядок целых;
+#   fuseesize — список bool словами;
+# свежие локальные словари в анализе чтения (tests/locks/fresh_maps.kh — locks;
+# ложное read — гонка данных):
+#   rwqqleft — у a ?? b свежей должна быть только правая часть;
+#   rwqqoff — a ?? b по последней лексеме (groups[k] ?? xs.copy() — «свежее»);
+#   rwelemstore — не смотрится, что кладут в словарь;
+#   rwelemescape — словарь можно упоминать как угодно (псевдоним);
+#   rwelemdecl — словарь можно объявить любым литералом;
+#   rwelemstack — без предположения о своих элементах (свёртка — write);
+#   rwlambda — параметр лямбды с тем же именем — всегда другое имя;
+# границы выражений и имён (после ревью; tests/locks/rw_aliases.kh,
+# tests/locks/rw_named.kh — locks):
+#   rwscanline — выражение кончается с концом строки (?? в начале следующей
+#                строки парсер присоединяет);
+#   rwscanpost — постфиксы .имя, [..] на следующей строке не видны;
+#   rwunsafeparam — имя параметра судится по let/var в теле;
+#   rwunsafeglobal — то же для глобальной и store;
+#   rwdecltwice — имя с двумя объявлениями свежее, если свежи оба;
+#   rwrootsemi — присваивание в строке, которая начинается с let (через ;), —
+#                «объявление»;
+#   rwreassign — присваивание имени видно только в начале строки;
+#   rwdecltype — тип в let/var x: тип = — любые имена и скобки до = (var x:
+#                [int]; m[k] = v — «объявление» x);
+#   rwuserfn — x.values() свежее и при своей функции values;
+#   rwunsafeglobal, rwscanline, rwuserfn — и в анализе чистоты
+#   (tests/run/chain_fusion.kh, named_cases — run);
+# методы встроенных типов (tests/errors/internal_method.kh,
+# tests/errors/join_not_str.kh — check):
+#   methodallow — в программе можно звать и внутренние __list_*, __int_*
+#                 (xs.slice, n.to_f64_bits);
+#   methodrecv — получатель не сверяется с первым параметром ([1].join).
+comp_ok=1
+while read -r cut test mode; do
+	[[ -z $cut ]] && continue
+	rm -rf "${tmp:?}/msrc"
+	mkdir -p "$tmp/msrc"
+	cp src/*.kh "$tmp/msrc/"
+	if ! python3 - "$tmp/msrc" "$cut" <<'PY'
+import sys
+d, m = sys.argv[1], sys.argv[2]
+cuts = {
+    "hoistmut": ("variant.kh", "li >= 0 && !locals[li].mutable && locals[li].ty == ty_str", "li >= 0 && locals[li].ty == ty_str"),
+    "hoistopt": ("variant.kh", "li >= 0 && !locals[li].mutable && locals[li].ty == ty_str", "li >= 0 && !locals[li].mutable && (locals[li].ty == ty_str || tkind(locals[li].ty) == K_OPT)"),
+    "hoistdecl": ("variant.kh", " && !declared_in(toks[j].text, from, to) && ", " && "),
+    "hoistparam": ("variant.kh", "!declared_in(toks[j].text, from, to)", "!declared_in(toks[j].text, from + 2, to)"),
+    "hoistfor": ("variant.kh", "            if pk == T_LET || pk == T_VAR || pk == T_FOR || kind_at(j + 1) == T_FATARROW {", "            if pk == T_LET || pk == T_VAR || kind_at(j + 1) == T_FATARROW {"),
+    "hoistlet": ("variant.kh", "            if pk == T_LET || pk == T_VAR || pk == T_FOR || kind_at(j + 1) == T_FATARROW {", "            if pk == T_VAR || pk == T_FOR || kind_at(j + 1) == T_FATARROW {"),
+    "hoistbind": ("variant.kh", "            if pk == T_LET || pk == T_VAR || pk == T_FOR || kind_at(j + 1) == T_FATARROW {", "            if pk == T_LET || pk == T_VAR || pk == T_FOR {"),
+    "hoistend": ("variant.kh", "    while hoist_toks.len() > mark {\n        let h = hoist_locals.pop()", "    while false {\n        let h = hoist_locals.pop()"),
+    "hoistfield": ("variant.kh", "if toks[j].kind == T_IDENT && toks[j - 1].kind != '.' && kind_at(j + 1) == '.'", "if toks[j].kind == T_IDENT && kind_at(j + 1) == '.'"),
+    "hoistdedupe": ("variant.kh", "if toks[o].text == toks[j + 2].text && toks[o - 2].text == toks[j].text {", "if toks[o - 2].text == toks[j].text {"),
+    "fusepure": ("variant.kh", "        if !lambda_pure(l.param + 2, l.close) {\n            return false\n        }\n", ""),
+    "fuseassign": ("rw.kh", "            if !in_fn || fx_assign_effect(i, body, end) {", "            if in_fn && fx_assign_effect(i, body, end) {"),
+    "fusereturn": ("rw.kh", "        if !in_fn && (k == T_RETURN || k == T_BREAK || k == T_CONTINUE) {", "        if false {"),
+    "fusecallee": ("rw.kh", "    for c in cs {\n        if c >= fx_impure.len() || fx_impure[c] == 1 {", "    for c in cs {\n        if false {"),
+    "fuselib": ("rw.kh", "fn fx_pure_lib(name: str) -> bool {\n", "fn fx_pure_lib(name: str) -> bool {\n    return true\n"),
+    "fuseglobal": ("rw.kh", "    if sym >= 0 && sym_kind(sym) == SK_GLOBAL {\n        return true\n    }\n    if root == i - 1 {", "    if root == i - 1 {"),
+    "fusemut": ("rw.kh", "                    if !in_fn || !rw_fresh_at(i - 2, rw_recv_start(i - 2), body, end, 0) {", "                    if in_fn && !rw_fresh_at(i - 2, rw_recv_start(i - 2), body, end, 0) {"),
+    "fusealive": ("variant.kh", "        emit_movzx_index()\n        emit_test_rax()\n        nexts.push(emit_jcc(CC_E))\n        emit_local_to_rcx(idx)\n", "        emit_movzx_index()\n        emit_test_rax()\n        emit_local_to_rcx(idx)\n"),
+    "fusecount": ("variant.kh", "        emit_load_local(src)\n        emit_mem_sized(0x8B, RCX, RAX, 48, false)", "        emit_load_local(src)\n        emit_mem_sized(0x8B, RCX, RAX, 8, false)"),
+    "fuseterm": ("variant.kh", "        if name != \"filter\" && name != \"map\" {\n            break\n        }\n", ""),
+    "fuseone": ("atom.kh", "            if links.len() >= 2 && chain_pure(links) {", "            if links.len() >= 1 && chain_pure(links) {"),
+    "fusebox": ("variant.kh", "                    emit_load_local(cur)\n                    if !is_ref(et) && tkind(et) != K_OPT {\n                        emit_box()\n                    }", "                    emit_load_local(cur)"),
+    "fusestr": ("variant.kh", "        if bt == ty_str {\n            emit_mov_imm(RDX, 1)\n        } else {\n            emit_mov_imm(RDX, 0)\n        }\n        emit_call(rt_func(\"__sort_by\"))\n    } else {\n        emit_load_local(res)\n    }\n    hoist_end(hmark)\n    release_hidden(cur)", "        emit_mov_imm(RDX, 0)\n        emit_call(rt_func(\"__sort_by\"))\n    } else {\n        emit_load_local(res)\n    }\n    hoist_end(hmark)\n    release_hidden(cur)"),
+    "fusefloat": ("variant.kh", "                // биты double → целое того же порядка (как в parse_lambda_method)\n                emit_hex(\"48 89 C1 48 C1 F9 3F 48 D1 E9 48 31 C8\")\n", ""),
+    "fuseesize": ("variant.kh", "    if makes_list {\n        put32_at(code + esize_at, esize_of(et))\n    }\n", ""),
+    "rwqqleft": ("rw.kh", "            return rw_fresh_at(q - 1, a, body, end, depth + 1) && rw_fresh_at(last, q + 1, body, end, depth + 1)", "            return rw_fresh_at(last, q + 1, body, end, depth + 1)"),
+    "rwqqoff": ("rw.kh", "        let q = rw_top_qq(a, last)\n", "        let q = -1\n"),
+    "rwelemstore": ("rw.kh", "                    if !rw_fresh_expr(close + 2, body, end, depth + 1) {\n                        return false\n                    }\n", ""),
+    "rwelemescape": ("rw.kh", "            } else if pk == T_IN && nk == '\\{' {\n            } else {\n                return false\n            }", "            }"),
+    "rwelemdecl": ("rw.kh", "                if found || j < 0 || j + 2 >= end || toks[j + 1].kind != '\\{' || toks[j + 2].kind != '}' || rw_expr_scan(j + 1, end) != j + 3 {", "                if found || j < 0 {"),
+    "rwelemstack": ("rw.kh", "        if s == name {\n            return true\n        }", "        if s == name {\n            return false\n        }"),
+    "rwlambda": ("rw.kh", "            } else if nk == T_FATARROW && pk == '(' && at >= 0 && (at < i || at > matching_close(i - 1)) {", "            } else if nk == T_FATARROW && pk == '(' {"),
+    "rwscanline": ("rw.kh", "        if i < limit && rw_binop(toks[i].kind) {\n            i += 1", "        if i < limit && rw_binop(toks[i].kind) && toks[i].line == toks[i - 1].line {\n            i += 1"),
+    "rwscanpost": ("rw.kh", "        // постфиксы\n        while i < limit {", "        // постфиксы\n        while i < limit && toks[i].line == toks[i - 1].line {"),
+    "rwunsafeparam": ("rw.kh", "            for p in funcs[f].params {\n                if p.name == name {\n                    return true\n                }\n            }\n", ""),
+    "rwunsafeglobal": ("rw.kh", "    let sym = sym_find(name)\n    if sym >= 0 && sym_kind(sym) == SK_GLOBAL {\n        return true\n    }\n    var f = 0", "    var f = 0"),
+    "rwdecltwice": ("rw.kh", "                decls += 1\n                if decls > 1 {\n                    return false\n                }\n", "                decls = 1\n"),
+    "rwrootsemi": ("rw.kh", "    let root = rw_assign_root(i, body)\n    if root == -2 {", "    let root = rw_assign_root(i, body)\n    var s = i\n    while s > body && toks[s - 1].line == toks[i].line {\n        s -= 1\n    }\n    if root == -2 || toks[s].kind == T_LET || toks[s].kind == T_VAR {"),
+    "rwdecltype": ("rw.kh", "        j = rw_type_end(j + 1, end)\n        if j < 0 {\n            return -1\n        }\n", "        j += 1\n        while j < end && (toks[j].kind == T_IDENT || toks[j].kind == '[' || toks[j].kind == ']' || toks[j].kind == ',' || toks[j].kind == '?') {\n            j += 1\n        }\n"),
+    "rwreassign": ("rw.kh", "            } else if nk == '=' {\n                // присваивание имени", "            } else if nk == '=' && toks[i - 1].line != toks[i].line {\n                // присваивание имени"),
+    "rwuserfn": ("rw.kh", "    let f = func_find(name)\n    return f >= 0 && !funcs[f].is_lib", "    return false"),
+    "methodallow": ("atom.kh", "    } else if prefix.byte_len() > 0 && (system_code(nt) || builtin_method(k, name)) {", "    } else if prefix.byte_len() > 0 {"),
+    "methodrecv": ("atom.kh", "            if !assignable(rt, pt) {\n                var hint = \"\"", "            if false {\n                var hint = \"\""),
+}
+f, old, new = cuts[m]
+s = open(f"{d}/{f}").read()
+if s.count(old) != 1:
+    sys.exit(1)
+open(f"{d}/{f}", "w").write(s.replace(old, new))
+PY
+	then
+		comp_ok=0
+		failed "оптимизации компилятора ($cut)" "место для подложенной ошибки не найдено в src/"
+		continue
+	fi
+	if ! KHRIP_LIB="$PWD/lib" "$KHC" --system -o "$tmp/mkhc" "$tmp"/msrc/*.kh >"$tmp/mkhc.txt" 2>&1; then
+		comp_ok=0
+		failed "оптимизации компилятора ($cut)" "компилятор с подложенной ошибкой не собрался: $(cat "$tmp/mkhc.txt")"
+		continue
+	fi
+	if [[ $mode == locks ]]; then
+		{ KHRIP_LIB="$PWD/lib" timeout 120 "$tmp/mkhc" check --locks "$test" >"$tmp/mout.txt" 2>&1; } 2>/dev/null
+	elif [[ $mode == check ]]; then
+		# ошибка компиляции, которой ждёт тест, должна пропасть
+		if KHRIP_LIB="$PWD/lib" timeout 120 "$tmp/mkhc" check "$test" >"$tmp/mout.txt" 2>&1; then
+			continue
+		fi
+		comp_ok=0
+		failed "оптимизации компилятора ($cut)" "$test не компилируется и без проверяемого условия: $(cat "$tmp/mout.txt")"
+		continue
+	elif [[ $mode == test ]]; then
+		{ KHRIP_LIB="$PWD/lib" env -u KHRIP_GC_VERIFY -u KHRIP_GC_STRESS timeout 300 "$tmp/mkhc" test "$test" >"$tmp/mout.txt" 2>&1; } 2>/dev/null
+	else
+		{ KHRIP_LIB="$PWD/lib" env -u KHRIP_GC_VERIFY -u KHRIP_GC_STRESS timeout 120 "$tmp/mkhc" run "$test" >"$tmp/mout.txt" 2>/dev/null; } 2>/dev/null
+	fi
+	if diff -q "${test%.kh}.out" "$tmp/mout.txt" >/dev/null; then
+		comp_ok=0
+		failed "оптимизации компилятора ($cut)" "$test проходит и без проверяемого условия"
+	fi
+done <<'CUTS'
+hoistmut tests/run/lambda_hoist.kh run
+hoistopt tests/run/lambda_hoist.kh run
+hoistdecl tests/run/lambda_hoist.kh run
+hoistparam tests/run/lambda_hoist.kh run
+hoistfor tests/run/lambda_hoist.kh run
+hoistlet tests/run/lambda_hoist.kh run
+hoistbind tests/run/lambda_hoist.kh run
+hoistend tests/run/lambda_hoist.kh run
+hoistfield tests/run/lambda_hoist.kh run
+hoistdedupe tests/run/lambda_hoist.kh run
+fusepure tests/run/chain_fusion.kh run
+fuseassign tests/run/chain_fusion.kh run
+fusereturn tests/run/chain_fusion.kh run
+fusecallee tests/run/chain_fusion.kh run
+fuselib tests/run/chain_fusion.kh run
+fuseglobal tests/run/chain_fusion.kh run
+fusemut tests/run/chain_fusion.kh run
+fusealive tests/run/chain_fusion.kh run
+fusecount tests/run/chain_fusion.kh run
+fuseterm tests/run/chain_fusion.kh run
+fuseone tests/run/chain_fusion.kh run
+fusebox tests/run/chain_fusion.kh run
+fusestr tests/run/chain_fusion.kh run
+fusefloat tests/run/chain_fusion.kh run
+fuseesize tests/run/chain_fusion.kh run
+fusealive tests/api/gc_chains.kh test
+fusecount tests/api/gc_chains.kh test
+rwqqleft tests/locks/fresh_maps.kh locks
+rwqqoff tests/locks/fresh_maps.kh locks
+rwelemstore tests/locks/fresh_maps.kh locks
+rwelemescape tests/locks/fresh_maps.kh locks
+rwelemdecl tests/locks/fresh_maps.kh locks
+rwelemstack tests/locks/fresh_maps.kh locks
+rwlambda tests/locks/fresh_maps.kh locks
+rwscanline tests/locks/rw_aliases.kh locks
+rwscanpost tests/locks/rw_aliases.kh locks
+rwunsafeparam tests/locks/rw_aliases.kh locks
+rwunsafeglobal tests/locks/rw_aliases.kh locks
+rwdecltwice tests/locks/rw_aliases.kh locks
+rwrootsemi tests/locks/rw_aliases.kh locks
+rwreassign tests/locks/rw_aliases.kh locks
+rwdecltype tests/locks/rw_aliases.kh locks
+rwuserfn tests/locks/rw_named.kh locks
+rwunsafeglobal tests/run/chain_fusion.kh run
+rwscanline tests/run/chain_fusion.kh run
+rwuserfn tests/run/chain_fusion.kh run
+methodallow tests/errors/internal_method.kh check
+methodrecv tests/errors/join_not_str.kh check
+CUTS
+[[ $comp_ok -eq 1 ]] && pass=$((pass + 1))
+# Слияние срабатывает: в eval/solutions/bookings все values() — в цепочках
+# лямбд без побочных действий, и списка values() (__map_values) в программе нет.
+if "$KHC" --sizes -o "$tmp/fused" eval/solutions/bookings/khrip/main.kh >"$tmp/fused.txt" 2>&1 && ! grep -q ' __map_values ' "$tmp/fused.txt"; then
+	pass=$((pass + 1))
+else
+	failed "слияние цепочек в bookings" "$(grep ' __map_values ' "$tmp/fused.txt" || cat "$tmp/fused.txt")"
+fi
+
 # Примеры учебника (docs/TUTORIAL.md) и ответы к заданиям: программы
 # выполняются, API проходят свои блоки test.
 for src in docs/tutorial/*.kh docs/tutorial/answers/*.kh; do
@@ -697,6 +905,18 @@ for src in tests/locks/*.kh; do
 		continue
 	fi
 	pass=$((pass + 1))
+done
+# Сгенерированные программы (tests/rw_gen.py): сотни маршрутов, где значение
+# store доходит до локальной через ?? на следующей строке, ;, скобки, if и
+# match, свежие словари, с приманками — локальными с именем store или
+# параметра, вторым объявлением, своей функцией copy. Ни одного ложного read.
+mkdir -p "$tmp/rw_gen"
+for seed in 1 2 3; do
+	if python3 tests/rw_gen.py "$KHC" "$tmp/rw_gen" "$seed" >"$tmp/rw_gen.txt" 2>&1; then
+		pass=$((pass + 1))
+	else
+		failed "tests/rw_gen.py (seed $seed)" "$(tail -20 "$tmp/rw_gen.txt")"
+	fi
 done
 
 # Библиотеки драйверов — только программам, которые пользуются их именами:

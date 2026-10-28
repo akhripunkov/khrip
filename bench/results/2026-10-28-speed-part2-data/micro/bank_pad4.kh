@@ -1,0 +1,72 @@
+fn pad_dummy(x: int) -> int {
+    var s = x
+    s = s * 3 + 1
+    s = s * 3 + 2
+    s = s * 3 + 3
+    s = s * 3 + 4
+    return s
+}
+
+type NewAccount { owner: str }
+
+type Account { id: int, owner: str, balance: int = 0 }
+
+type Amount { amount: int }
+
+type NewTransfer { from_id: int, to_id: int, amount: int }
+
+type Transfer { id: int, ...NewTransfer, created_at: str }
+
+store accounts: map[int, Account]
+store transfers: [Transfer]
+
+route POST "/accounts" (body: NewAccount) -> 201 Account | 400 str {
+    if body.owner.trim() == "" {
+        return 400 "owner is required"
+    }
+    let acc = Account { id: accounts.len() + 1, owner: body.owner }
+    accounts[acc.id] = acc
+    return 201 acc
+}
+
+route GET "/accounts/{id}" (id: int) -> Account | 404 {
+    return accounts[id] ?? 404
+}
+
+route POST "/accounts/{id}/deposit" (id: int, body: Amount) -> Account | 400 str | 404 {
+    let acc = accounts[id] else {
+        return 404
+    }
+    if body.amount <= 0 {
+        return 400 "amount must be positive"
+    }
+    acc.balance += body.amount
+    return acc
+}
+
+route POST "/transfers" (body: NewTransfer) -> 201 Transfer | 400 str | 404 | 409 str {
+    if body.amount <= 0 || body.from_id == body.to_id {
+        return 400 "amount must be positive and accounts different"
+    }
+    let from = accounts[body.from_id] else {
+        return 404
+    }
+    let to = accounts[body.to_id] else {
+        return 404
+    }
+    if from.balance < body.amount {
+        return 409 "insufficient funds"
+    }
+    from.balance -= body.amount
+    to.balance += body.amount
+    let t = Transfer { id: transfers.len() + 1, ...body, created_at: time_iso(now()) }
+    transfers.push(t)
+    return 201 t
+}
+
+route GET "/accounts/{id}/transfers" (id: int) -> [Transfer] | 404 {
+    if !accounts.has(id) {
+        return 404
+    }
+    return transfers.filter(t => t.from_id == id || t.to_id == id).reverse()
+}

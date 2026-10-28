@@ -1,0 +1,12 @@
+// expect: .join() works on [str], not [int]
+// expect: hint: turn the items into text first: xs.map(x => x.to_str()).join(", ")
+// expect: .sum() works on [int], not [str]
+// expect: 2 errors
+// Получатель метода сверяется с первым параметром функции библиотеки: join
+// склеивает строки, а [1, 2].join(",") читал бы числа как адреса строк.
+fn main() {
+    let xs = [1, 2]
+    print(xs.join(","))
+    let ws = ["a", "b"]
+    print(ws.sum())
+}
