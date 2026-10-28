@@ -1,0 +1,14 @@
+    60.78%  [JIT] tid 11808                             
+    27.25%  [kernel.kallsyms]                           
+     8.53%  libcoreclr.so                               
+     1.95%  libc.so.6                                   
+     0.45%  libclrjit.so                                
+     0.30%  libicui18n.so.74.2                          
+     0.30%  ld-linux-x86-64.so.2                        
+     0.19%  libSystem.Native.so                         
+     0.14%  [vdso]                                      
+     0.08%  System.Net.Sockets.dll                      
+     0.02%  [unknown]                                   
+     0.01%  System.Private.CoreLib.dll                  
+     0.00%  Microsoft.AspNetCore.Server.Kestrel.Core.dll
+     0.00%  libstdc++.so.6.0.33                         

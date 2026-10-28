@@ -9,8 +9,12 @@
 # eval/load, сек — длительность (по умолчанию 15). Нагрузка с префиксом «-»
 # (например -book_post:60) — подготовка: её счётчики выбрасываются. Перед
 # каждой измеряемой нагрузкой счётчики обнуляются, после — сбрасываются в
-# <out>/cg.<n>.<lua>; число запросов — в <out>/reqs.tsv (lua, запросов,
-# инструкций на запрос).
+# <out>/cg.<n>.<lua>; число запросов — в <out>/reqs.tsv (lua, запросов по
+# __dispatch, запросов по wrk, инструкций на запрос). Знаменатель — вызовы
+# __dispatch в дампе: перед обнулением и перед дампом скрипт ждёт, пока сервер
+# закончит начатые запросы. Фаза fill:N — bookings до N броней
+# (fill_bookings.py). INSTR_OFF=1 — подготовка без инструментирования
+# (valgrind --instr-atstart=no), оно включается перед первой измеряемой фазой.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
@@ -21,7 +25,9 @@ mkdir -p "$out"
 "$KHC" --sizes -o "$out/server.raw" "$src" >"$out/sizes.txt" || exit 1
 python3 "$here/addsyms.py" "$out/server.raw" "$out/sizes.txt" "$out/server" || exit 1
 rm -f "$out"/cg.* "$out/reqs.tsv"
-PORT=$port THREADS=1 valgrind --tool=callgrind --dump-instr=yes --callgrind-out-file="$out/cg.%p" \
+instr_flag=()
+[[ ${INSTR_OFF:-0} == 1 ]] && instr_flag=(--instr-atstart=no)
+PORT=$port THREADS=1 valgrind --tool=callgrind "${instr_flag[@]}" --dump-instr=yes --compress-strings=no --compress-pos=no --callgrind-out-file="$out/cg.%p" \
 	"$out/server" 2>"$out/valgrind.log" &
 vp=$!
 trap 'kill $vp 2>/dev/null; wait $vp 2>/dev/null' EXIT
@@ -36,25 +42,47 @@ wrk_run() { # lua secs
 	[[ -f $path ]] || path=$root/eval/load/$lua.lua
 	LOAD_DIR=$root/eval/load WINDOW_SECONDS=1 taskset -c 2,3 wrk -t2 -c64 -d"${secs}s" -s "$path" "http://127.0.0.1:$port" 2>&1
 }
+# дождаться, пока сервер закончит начатые запросы (процессор не растёт 0,6 с)
+wait_idle() {
+	local a b quiet=0
+	a=$(awk '{print $14 + $15}' /proc/$vp/stat)
+	while ((quiet < 2)); do
+		sleep 0.3
+		b=$(awk '{print $14 + $15}' /proc/$vp/stat)
+		if ((b - a <= 1)); then quiet=$((quiet + 1)); else quiet=0; fi
+		a=$b
+	done
+}
+# запросов в дампе: вызовы __dispatch
+dispatched() { awk '/^cfn=/ {f = substr($0, 5)} /^calls=/ && f == "__dispatch" {split(substr($0, 7), a, " "); n += a[1]} END {print n + 0}' "$1"; }
 n=0
 for spec in "$@"; do
 	lua=${spec%%:*}
 	secs=15
 	[[ $spec == *:* ]] && secs=${spec#*:}
-	if [[ $lua == -* ]]; then
-		wrk_run "${lua#-}" "$secs" | awk '/requests in/ {print "prep '"${lua#-}"': " $1 " requests"}' >&2
+	if [[ $lua == fill ]]; then
+		echo "fill: $(python3 "$here/fill_bookings.py" "$port" "$secs")" >&2
+		wait_idle
 		continue
 	fi
+	if [[ $lua == -* ]]; then
+		wrk_run "${lua#-}" "$secs" | awk '/requests in/ {print "prep '"${lua#-}"': " $1 " requests"}' >&2
+		wait_idle
+		continue
+	fi
+	[[ ${INSTR_OFF:-0} == 1 && $n == 0 ]] && callgrind_control -i on "$vp" >/dev/null 2>&1
 	callgrind_control -z "$vp" >/dev/null 2>&1
 	o=$(wrk_run "$lua" "$secs")
-	reqs=$(awk '/requests in/ {print $1}' <<<"$o")
+	wrk_reqs=$(awk '/requests in/ {print $1}' <<<"$o")
+	wait_idle
 	callgrind_control -d "$vp" >/dev/null 2>&1
 	n=$((n + 1))
 	sleep 0.5
 	f=$(ls -t "$out"/cg."$vp".* 2>/dev/null | grep -v '\.[a-z_]*$' | head -1)
 	[[ -n $f ]] && mv "$f" "$out/cg.$n.$lua"
 	ir=$(grep -h '^totals:\|^summary:' "$out/cg.$n.$lua" | head -1 | awk '{print $2}')
-	printf '%s\t%s\t%s\n' "$lua" "$reqs" "$((ir / reqs))" | tee -a "$out/reqs.tsv"
+	reqs=$(dispatched "$out/cg.$n.$lua")
+	printf '%s\t%s\t%s\t%s\n' "$lua" "$reqs" "$wrk_reqs" "$((ir / reqs))" | tee -a "$out/reqs.tsv"
 done
 kill $vp 2>/dev/null
 wait $vp 2>/dev/null
