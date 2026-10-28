@@ -59,8 +59,8 @@ let area = match s {        // every case, or _ =>
 ```
 
 `match` also takes int, str and bool; arms may be `200 | 201 => ...`, blocks or
-`return ...`. Operators: `&& || !`, `& | ^ ~ << >>`; `+` also joins strings;
-comparisons do not chain.
+`return ...`. Operators: `&& || !`; `+` also joins strings; comparisons do not
+chain.
 
 `"Hi, {user.name}!"` interpolates an expression that does not start with a quote
 (`{2,5}` stays text). Escapes: `\n \t \r \0 \\ \" \' \{`. Raw strings in
@@ -83,9 +83,11 @@ if q == none {
 }                                      // from here on q is a str
 ```
 
-Checks against `none` narrow a `let` or a parameter, not a `var`. `m[k]`,
-`.get(k)`, `.remove(k)`, `.find(s)`, `.to_int()`, `.to_float()`, `.index_of(x)`,
-`env`, `header`, `parse_time` and `from_json` return `T?`.
+Checks against `none` narrow a `let` or a parameter (not a `var`). Narrowing and
+`if let` work in `if` statements, not in an `if` used as a value: unwrap before
+it. `m[k]`, `.get(k)`, `.remove(k)`,
+`.find(s)`, `.to_int()`, `.to_float()`, `.index_of(x)`, `env`, `header`,
+`parse_time` and `from_json` return `T?`.
 
 ## Values
 
@@ -96,7 +98,6 @@ let u = Product { ...old, ...patch }   // patch's T? fields: only if not none
 let r: Point = { x, y: 0 }             // the type expected here
 let t = { id: 1, tags: ["a"] }         // else its fields' type
 var m: map[str, int] = {}
-let zeros = [0] * 100
 let ages = {"ann": 30, (key): 41}      // map keys: "text" or (expression)
 ```
 

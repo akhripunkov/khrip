@@ -1,8 +1,8 @@
 # Production and other details
 
-`khc -o app app.kh` builds a static Linux x86-64 binary (no libc, a few hundred
-KB); `khc check --json app.kh` reports errors as JSON; `khc check --locks app.kh`
-shows which routes only read the store.
+`khc -o app app.kh` builds a static Linux x86-64 binary (no libc); `khc check
+--json app.kh` reports errors as JSON; `khc check --locks app.kh` shows which
+routes only read the store.
 
 ## Environment
 
@@ -10,17 +10,17 @@ shows which routes only read the store.
 |---|---|
 | `PORT` | port, 8080 |
 | `THREADS` | worker threads, all cores |
-| `KHRIP_DATA=file.json` | the store is loaded at start and saved as JSON a second after changes and on SIGTERM or SIGINT (temporary file, then rename); an unreadable file stops the start |
+| `KHRIP_DATA=file.json` | the store, loaded at start and saved as JSON a second after changes and on SIGTERM or SIGINT (via a temporary file); an unreadable file stops the start |
 | `DATABASE_URL` | PostgreSQL; `sslmode` `disable`, `prefer` (default), `require`, `verify-ca`, `verify-full` |
 | `DATABASE_POOL` | PostgreSQL connections, 4 per thread, at most 32 |
-| `DATABASE_TIMEOUT` | ms per statement or `tx` with waiting and retries, 10000; then 503 |
-| `DATABASE_MIGRATE` | `apply` (default) runs migrations at start; `check` only verifies, and `./app migrate` applies them and exits |
+| `DATABASE_TIMEOUT` | ms per statement or `tx` with retries (10000), then 503 |
+| `DATABASE_MIGRATE` | `apply` (default) runs migrations at start; `check` only verifies (`./app migrate` applies and exits) |
 | `CLICKHOUSE_TIMEOUT`, `CLICKHOUSE_MAX_RESULT`, `CLICKHOUSE_INFLIGHT` | ms per operation (10000), bytes of one result (64 MiB), operations per thread (32) |
 | `SSL_CERT_FILE` | root certificates for https (else the system's) |
-| `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` | used by `fetch` |
+| `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` | for `fetch` |
 | `KHRIP_GC`, `KHRIP_GC_MIN_MB`, `KHRIP_GC_LIMIT_MB` | store collector: headroom % over live data (50), smallest goal (4 MB), soft limit |
 | `KHRIP_GC_LOG=1` | at build time: one stderr line per collection |
-| `KHRIP_COROUTINES` | waiting requests per thread (4096); more wait in a queue |
+| `KHRIP_COROUTINES` | waiting requests per thread (4096), then a queue |
 
 ## Running
 
@@ -50,5 +50,6 @@ command line, `write(s)` prints without a newline, `read_file(path) -> str?`,
   `any`, `all`, `find` stop at the deciding item, and a panic comes from the first
   item that panics. Lambdas with effects (assignments, printing, store writes,
   `fetch`, databases, `fail`, `return`, or calls doing these) are not chained.
-- `matches` runs in linear time. `s.byte_len()` counts UTF-8 bytes; `"\u{48}"`
-  is a code point. `json_error()` says why the last `from_json` gave none.
+- Bit operators `& | ^ ~ << >>`; `[0] * 100` repeats a list. `matches` runs in
+  linear time. `s.byte_len()` counts UTF-8 bytes; `"\u{48}"` is a code point.
+  `json_error()` says why the last `from_json` gave none.

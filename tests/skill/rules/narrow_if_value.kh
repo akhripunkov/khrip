@@ -1,0 +1,16 @@
+// Сужение по проверке на none не действует в if, который даёт значение.
+// in: SKILL.md
+// rule: Checks against `none` narrow a `let` or a parameter (not a `var`). Narrowing and `if let` work in `if` statements, not in an `if` used as a value: unwrap before it.
+// expect: operator + needs int operands, found int?
+// expect: if let cannot be used as a value
+fn next(x: int?) -> int {
+    if x != none {
+        return x + 1
+    }
+    let y = if let v = x { v } else { 0 }
+    return if x != none { x + 1 } else { y }
+}
+
+fn main() {
+    print("{next(1)}")
+}

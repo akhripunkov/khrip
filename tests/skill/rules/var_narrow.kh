@@ -1,6 +1,6 @@
 // Проверка на none сужает let и параметр, но не var.
 // in: SKILL.md
-// rule: Checks against `none` narrow a `let` or a parameter, not a `var`.
+// rule: Checks against `none` narrow a `let` or a parameter (not a `var`).
 // expect: operator + needs int operands, found int?
 fn main() {
     var x: int? = 3
