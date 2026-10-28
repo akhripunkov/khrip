@@ -1,0 +1,153 @@
+// Свежие локальные словари (этап скорости, часть 2, п. 4): элемент словаря,
+// в который кладут только свежие значения, тоже свежий, и a ?? b свежее, если
+// свежи обе части, — свёртка c = cats[k] ?? Cat { ... }; c.count += 1;
+// cats[k] = c только читает store (GET /categories в eval/catalog). Ложное
+// read — гонка данных, поэтому всё сомнительное — write: тот же вид над
+// словарём store, значение store в локальном словаре, псевдоним словаря,
+// литерал со значением store, переменная цикла, вложенный ??, присваивание
+// параметру лямбды с тем же именем, get и if let.
+
+type Item { id: int, name: str, tags: [str] }
+
+type Cat { name: str, count: int, sum: int }
+
+store items: map[int, Item]
+store cats_s: map[str, Cat]
+store groups_s: map[int, [str]]
+
+route GET "/fold" -> [Cat] {
+    var cats: map[str, Cat] = {}
+    for it in items.values() {
+        let c = cats[it.name] ?? Cat { name: it.name, count: 0, sum: 0 }
+        c.count += 1
+        c.sum += it.id
+        cats[c.name] = c
+    }
+    // параметр лямбды c — другое имя
+    return cats.values().map(c => Cat { ...c, sum: c.sum / c.count }).sort_by(c => c.name)
+}
+
+route GET "/counts" -> int {
+    var counts: map[str, int] = {}
+    for it in items.values() {
+        counts[it.name] += 1
+    }
+    return counts.len()
+}
+
+route GET "/lists" -> int {
+    var groups: map[int, [Item]] = {}
+    groups[1] = items.values()
+    let g = groups[1] ?? items.values()
+    g.push(Item { id: 0, name: "", tags: [] })
+    return g.len()
+}
+
+// два словаря через a[k] ?? b[k] ?? ...: проверка глубже, чем смотрит анализ
+// (8 шагов), — write, с запасом
+route GET "/deep" -> int {
+    var a: map[str, Cat] = {}
+    var b: map[str, Cat] = {}
+    for it in items.values() {
+        let c = a[it.name] ?? b[it.name] ?? Cat { name: it.name, count: 0, sum: 0 }
+        c.count += 1
+        a[c.name] = c
+        b[c.name] = c
+    }
+    return a.len()
+}
+
+route GET "/store-fold" -> int {
+    for it in items.values() {
+        let c = cats_s[it.name] ?? Cat { name: it.name, count: 0, sum: 0 }
+        c.count += 1
+    }
+    return 1
+}
+
+route GET "/store-value-in" -> int {
+    var local: map[int, Item] = {}
+    local[1] = items[1] ?? Item { id: 1, name: "", tags: [] }
+    let c = local[1] ?? Item { id: 1, name: "", tags: [] }
+    c.name = "changed"
+    return 1
+}
+
+route GET "/alias" -> int {
+    var local: map[int, Item] = {}
+    let other = local
+    other[1] = items[1] ?? Item { id: 1, name: "", tags: [] }
+    let c = local[1] ?? Item { id: 1, name: "", tags: [] }
+    c.name = "changed"
+    return 1
+}
+
+route GET "/literal" -> int {
+    var local = {"a": items[1] ?? Item { id: 1, name: "", tags: [] }}
+    let c = local["a"] ?? Item { id: 1, name: "", tags: [] }
+    c.name = "changed"
+    return 1
+}
+
+route GET "/loop-var-in" -> int {
+    var local: map[int, Item] = {}
+    for _, it in items {
+        local[it.id] = it
+    }
+    let c = local[1] ?? Item { id: 1, name: "", tags: [] }
+    c.name = "changed"
+    return 1
+}
+
+route GET "/nested-qq" -> int {
+    var local: map[int, Item] = {}
+    let c = local[1] ?? (items[1] ?? Item { id: 1, name: "", tags: [] })
+    c.name = "changed"
+    local[1] = c
+    return 1
+}
+
+route GET "/qq-copy/{k}" (k: int) -> int {
+    let fallback: [str] = []
+    let xs = groups_s[k] ?? fallback.copy()
+    xs.push("leak")
+    return xs.len()
+}
+
+route GET "/lambda-same-name" -> int {
+    let c = Item { id: 0, name: "", tags: [] }
+    c.name = "fresh"
+    return items.values().map(c => if c.id > 0 {
+        c.name = "changed"
+        1
+    } else {
+        0
+    }).len()
+}
+
+route GET "/reassigned" -> int {
+    var local: map[int, Item] = {}
+    var other: map[int, Item] = {}
+    other[1] = items[1] ?? Item { id: 1, name: "", tags: [] }
+    local = other
+    let c = local[1] ?? Item { id: 1, name: "", tags: [] }
+    c.name = "changed"
+    return 1
+}
+
+route GET "/get" -> int {
+    var cats: map[str, Cat] = {}
+    let c = cats.get("a") ?? Cat { name: "a", count: 0, sum: 0 }
+    c.count += 1
+    cats[c.name] = c
+    return 1
+}
+
+route GET "/if-let" -> int {
+    var cats: map[str, Cat] = {}
+    cats["a"] = Cat { name: "a", count: 0, sum: 0 }
+    if let c = cats["a"] {
+        c.count += 1
+    }
+    return 1
+}

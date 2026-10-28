@@ -9,7 +9,9 @@
 //   - изменяющий метод (push, pop, insert, remove_at, clear, truncate, reverse,
 //     sort, sort_by, remove) у значения, которое может быть из store. Свежие
 //     значения — литералы, результаты values, keys, filter, map, copy, split,
-//     срезы и локальные переменные, которым присвоено только свежее;
+//     срезы, a ?? b из свежих частей, элемент m[k] свежего локального словаря,
+//     в который кладут только свежее (rw_fresh_elems), и локальные
+//     переменные, которым присвоено только свежее;
 //   - вызов функции программы, которая пишет, или функции библиотеки не из
 //     списка безопасных;
 //   - вызов функции драйвера, которая меняет свой первый аргумент
@@ -188,6 +190,15 @@ fn rw_fresh_at(last: int, a: int, body: int, end: int, depth: int) -> bool {
     if depth > 8 || last < body {
         return false
     }
+    // a ?? b — свежее, если свежи обе части: значение может быть любой из них
+    // (по одной последней лексеме groups[k] ?? xs.copy() выглядело бы свежим,
+    // хотя бывает списком store)
+    if a >= 0 {
+        let q = rw_top_qq(a, last)
+        if q >= 0 {
+            return rw_fresh_at(q - 1, a, body, end, depth + 1) && rw_fresh_at(last, q + 1, body, end, depth + 1)
+        }
+    }
     let k = toks[last].kind
     if k == ')' {
         let m = rw_open_of(last, body)
@@ -215,6 +226,11 @@ fn rw_fresh_at(last: int, a: int, body: int, end: int, depth: int) -> bool {
         if m == a {
             return true
         }
+        // элемент свежего локального словаря, в который кладут только свежее:
+        // cats[k] у var cats: map[str, Category] = {}
+        if a >= 0 && m == a + 1 && toks[a].kind == T_IDENT && toks[a - 1].kind != '.' && rw_fresh_elems(toks[a].text, body, end, depth + 1) {
+            return true
+        }
         // срез xs[a..b] — копия
         var i = m + 1
         var d = 0
@@ -237,9 +253,104 @@ fn rw_fresh_at(last: int, a: int, body: int, end: int, depth: int) -> bool {
         return m >= 0 && (m == a || (m == a + 1 && toks[a].kind == T_IDENT))
     }
     if k == T_IDENT && last == a {
-        return rw_fresh_local(toks[last].text, body, end, depth + 1)
+        return rw_fresh_local(toks[last].text, last, body, end, depth + 1)
     }
     return false
+}
+
+// Первый ?? между a и last на нулевой глубине скобок или -1.
+fn rw_top_qq(a: int, last: int) -> int {
+    var depth = 0
+    var i = a
+    while i <= last {
+        let k = toks[i].kind
+        if k == '(' || k == '[' || k == '\{' {
+            depth += 1
+        } else if k == ')' || k == ']' || k == '}' {
+            depth -= 1
+        } else if k == T_QQ && depth == 0 {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+// Методы словаря, которые в него ничего не кладут и сам словарь не отдают.
+fn rw_map_read_method(name: str) -> bool {
+    return name == "len" || name == "has" || name == "get" || name == "remove" || name == "keys" || name == "values" || name == "clear" || name == "contains"
+}
+
+// Имена, для которых rw_fresh_elems сейчас проверяет, что в них кладут:
+// внутри проверки их элементы считаются свежими (наименьшее «да»: в пустой
+// словарь кладут только свежее или его же элементы — по индукции по
+// вставкам все его элементы свежие).
+var rw_elem_stack: [str]
+
+// Локальный словарь name — свежий, и всё, что в него кладут, свежее: каждое
+// объявление — var name[: тип] = {}, и каждое упоминание name в теле —
+// name[k] (чтение), name[k] = v со свежим v (или += и т. п.: значения int и
+// str), name.len/has/get/remove/keys/values/clear/contains(...) или
+// for ... in name. Любое другое упоминание (name = ..., передать, вернуть,
+// положить в литерал, let b = name) — и уже не понять, что в него кладут
+// (через b), поэтому нет.
+fn rw_fresh_elems(name: str, body: int, end: int, depth: int) -> bool {
+    if depth > 8 {
+        return false
+    }
+    for s in rw_elem_stack {
+        if s == name {
+            return true
+        }
+    }
+    rw_elem_stack.push(name)
+    let ok = rw_fresh_elems_scan(name, body, end, depth)
+    rw_elem_stack.pop()
+    return ok
+}
+
+fn rw_fresh_elems_scan(name: str, body: int, end: int, depth: int) -> bool {
+    var found = false
+    var i = body
+    while i < end {
+        let t = toks[i]
+        if t.kind == T_IDENT && t.text == name && toks[i - 1].kind != '.' {
+            let pk = toks[i - 1].kind
+            let nk = toks[i + 1].kind
+            if pk == T_LET || pk == T_VAR {
+                if toks[i - 2].kind == T_IF || toks[i - 2].kind == T_WHILE {
+                    return false
+                }
+                // var name[: тип] = {} — и на этом оператор кончается
+                var j = i + 1
+                while j < end && toks[j].kind != '=' && toks[j].line == t.line {
+                    j += 1
+                }
+                if j + 2 >= end || toks[j].kind != '=' || toks[j + 1].kind != '\{' || toks[j + 2].kind != '}' || (toks[j + 3].line == toks[j + 2].line && toks[j + 3].kind != '}') {
+                    return false
+                }
+                found = true
+            } else if nk == '[' {
+                let close = matching_close(i + 1)
+                if close < 0 {
+                    return false
+                }
+                if toks[close + 1].kind == '=' {
+                    // name[k] = v: v свежее (элементы name здесь — свежие)
+                    let e = rw_expr_end(close + 2, end)
+                    if !rw_fresh_at(e - 1, close + 2, body, end, depth + 1) {
+                        return false
+                    }
+                }
+            } else if nk == '.' && kind_at(i + 2) == T_IDENT && kind_at(i + 3) == '(' && rw_map_read_method(toks[i + 2].text) {
+            } else if pk == T_IN && nk == '\{' {
+            } else {
+                return false
+            }
+        }
+        i += 1
+    }
+    return found
 }
 
 // Начало получателя, если он — просто имя (а не поле x.y): иначе -1.
@@ -252,7 +363,9 @@ fn rw_recv_start(last: int) -> int {
 
 // Локальная переменная name свежая: объявлена через let/var, и всё, что ей
 // присваивается, — свежее. Параметры, переменные циклов и лямбд — не свежие.
-fn rw_fresh_local(name: str, body: int, end: int, depth: int) -> bool {
+// at — лексема, где имя упомянуто (или -1): параметр лямбды с тем же именем,
+// в теле которой at нет (xs.map(c => ...) рядом с let c = ...), — другое имя.
+fn rw_fresh_local(name: str, at: int, body: int, end: int, depth: int) -> bool {
     if depth > 8 {
         return false
     }
@@ -280,6 +393,8 @@ fn rw_fresh_local(name: str, body: int, end: int, depth: int) -> bool {
                     return false
                 }
                 found = true
+            } else if nk == T_FATARROW && pk == '(' && at >= 0 && (at < i || at > matching_close(i - 1)) {
+                // параметр другой лямбды
             } else if pk == T_FOR || nk == T_FATARROW || (pk == ',' && toks[i - 2].kind == T_IDENT && toks[i - 3].kind == T_FOR) {
                 return false
             } else if nk == '=' && (pk == '\{' || pk == '}' || toks[i - 1].line != t.line) {
@@ -328,7 +443,7 @@ fn rw_scan(fi: int, callees: [int]) -> bool {
                     if is_global {
                         return true
                     }
-                } else if is_global || !rw_fresh_local(st.text, body, end, 0) {
+                } else if is_global || !rw_fresh_local(st.text, s, body, end, 0) {
                     return true
                 } else {
                     // свежая коллекция: xs[i] = ... или s.f = ... на один уровень
@@ -531,7 +646,7 @@ fn fx_assign_effect(i: int, body: int, end: int) -> bool {
     if i == s + 1 {
         return false
     }
-    if !rw_fresh_local(st.text, body, end, 0) {
+    if !rw_fresh_local(st.text, s, body, end, 0) {
         return true
     }
     return !((toks[s + 1].kind == '[' && matching_close(s + 1) == i - 1) || (toks[s + 1].kind == '.' && i == s + 3))

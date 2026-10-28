@@ -518,7 +518,16 @@ CUTS
 #   fusebox — find не кладёт значение int в коробку;
 #   fusestr — sort_by по строке сравнивает слова;
 #   fusefloat — ключ float без перевода в порядок целых;
-#   fuseesize — список bool словами.
+#   fuseesize — список bool словами;
+# свежие локальные словари в анализе чтения (tests/locks/fresh_maps.kh — locks;
+# ложное read — гонка данных):
+#   rwqqleft — у a ?? b свежей должна быть только правая часть;
+#   rwqqoff — a ?? b по последней лексеме (groups[k] ?? xs.copy() — «свежее»);
+#   rwelemstore — не смотрится, что кладут в словарь;
+#   rwelemescape — словарь можно упоминать как угодно (псевдоним);
+#   rwelemdecl — словарь можно объявить любым литералом;
+#   rwelemstack — без предположения о своих элементах (свёртка — write);
+#   rwlambda — параметр лямбды с тем же именем — всегда другое имя.
 comp_ok=1
 while read -r cut test mode; do
 	[[ -z $cut ]] && continue
@@ -554,6 +563,13 @@ cuts = {
     "fusestr": ("variant.kh", "        if bt == ty_str {\n            emit_mov_imm(RDX, 1)\n        } else {\n            emit_mov_imm(RDX, 0)\n        }\n        emit_call(rt_func(\"__sort_by\"))\n    } else {\n        emit_load_local(res)\n    }\n    hoist_end(hmark)\n    release_hidden(cur)", "        emit_mov_imm(RDX, 0)\n        emit_call(rt_func(\"__sort_by\"))\n    } else {\n        emit_load_local(res)\n    }\n    hoist_end(hmark)\n    release_hidden(cur)"),
     "fusefloat": ("variant.kh", "                // биты double → целое того же порядка (как в parse_lambda_method)\n                emit_hex(\"48 89 C1 48 C1 F9 3F 48 D1 E9 48 31 C8\")\n", ""),
     "fuseesize": ("variant.kh", "    if makes_list {\n        put32_at(code + esize_at, esize_of(et))\n    }\n", ""),
+    "rwqqleft": ("rw.kh", "            return rw_fresh_at(q - 1, a, body, end, depth + 1) && rw_fresh_at(last, q + 1, body, end, depth + 1)", "            return rw_fresh_at(last, q + 1, body, end, depth + 1)"),
+    "rwqqoff": ("rw.kh", "        let q = rw_top_qq(a, last)\n", "        let q = -1\n"),
+    "rwelemstore": ("rw.kh", "                    if !rw_fresh_at(e - 1, close + 2, body, end, depth + 1) {\n                        return false\n                    }\n", ""),
+    "rwelemescape": ("rw.kh", "            } else if pk == T_IN && nk == '\\{' {\n            } else {\n                return false\n            }", "            }"),
+    "rwelemdecl": ("rw.kh", "                if j + 2 >= end || toks[j].kind != '=' || toks[j + 1].kind != '\\{' || toks[j + 2].kind != '}' || (toks[j + 3].line == toks[j + 2].line && toks[j + 3].kind != '}') {", "                if j >= end || toks[j].kind != '=' {"),
+    "rwelemstack": ("rw.kh", "        if s == name {\n            return true\n        }", "        if s == name {\n            return false\n        }"),
+    "rwlambda": ("rw.kh", "            } else if nk == T_FATARROW && pk == '(' && at >= 0 && (at < i || at > matching_close(i - 1)) {", "            } else if nk == T_FATARROW && pk == '(' {"),
 }
 f, old, new = cuts[m]
 s = open(f"{d}/{f}").read()
@@ -610,6 +626,13 @@ fusefloat tests/run/chain_fusion.kh run
 fuseesize tests/run/chain_fusion.kh run
 fusealive tests/api/gc_chains.kh test
 fusecount tests/api/gc_chains.kh test
+rwqqleft tests/locks/fresh_maps.kh locks
+rwqqoff tests/locks/fresh_maps.kh locks
+rwelemstore tests/locks/fresh_maps.kh locks
+rwelemescape tests/locks/fresh_maps.kh locks
+rwelemdecl tests/locks/fresh_maps.kh locks
+rwelemstack tests/locks/fresh_maps.kh locks
+rwlambda tests/locks/fresh_maps.kh locks
 CUTS
 [[ $comp_ok -eq 1 ]] && pass=$((pass + 1))
 # Слияние срабатывает: в eval/solutions/bookings все values() — в цепочках
