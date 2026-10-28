@@ -109,11 +109,16 @@ let p = Point { x: 1, y: 2 }
 let q = Point { x, y }                 // field shorthand: x: x, y: y
 let n = Named { name: "a", ...p }      // spread fields of p
 let u = Product { ...old, ...patch }   // patch's T? fields: only if not none
+let r: Point = { x, y: 0 }             // no name: the type expected here
 let zeros = [0] * 100
 var m: map[str, int] = {}
 let ages = {"ann": 30, "bob": 41}
 ```
 
+`{ x: 1 }` takes the type expected by a typed `let`/`var`, assignment, argument,
+`return`, list or field, else the type of its fields; `{"k": v}` is a map. At a statement start
+and after `=>` write `({ ... })`: `{` there is a block. Types can be inline:
+`-> { token: str }`; a named type takes such a value only as `T { ...x }`.
 Structs, lists and maps are references: assigning shares, `.copy()` copies a list.
 
 ## Methods
