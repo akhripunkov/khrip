@@ -15,6 +15,7 @@
 # закончит начатые запросы. Фаза fill:N — bookings до N броней
 # (fill_bookings.py). INSTR_OFF=1 — подготовка без инструментирования
 # (valgrind --instr-atstart=no), оно включается перед первой измеряемой фазой.
+# CG_FLAGS — ещё флаги callgrind (например --cache-sim=yes).
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
@@ -25,8 +26,8 @@ mkdir -p "$out"
 "$KHC" --sizes -o "$out/server.raw" "$src" >"$out/sizes.txt" || exit 1
 python3 "$here/addsyms.py" "$out/server.raw" "$out/sizes.txt" "$out/server" || exit 1
 rm -f "$out"/cg.* "$out/reqs.tsv"
-instr_flag=()
-[[ ${INSTR_OFF:-0} == 1 ]] && instr_flag=(--instr-atstart=no)
+instr_flag=(${CG_FLAGS:-})
+[[ ${INSTR_OFF:-0} == 1 ]] && instr_flag+=(--instr-atstart=no)
 PORT=$port THREADS=1 valgrind --tool=callgrind "${instr_flag[@]}" --dump-instr=yes --compress-strings=no --compress-pos=no --callgrind-out-file="$out/cg.%p" \
 	"$out/server" 2>"$out/valgrind.log" &
 vp=$!
