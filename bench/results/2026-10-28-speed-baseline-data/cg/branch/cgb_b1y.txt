@@ -1,0 +1,27 @@
+запросов 4817; на запрос: Ir 431,515, Bc 55,707, Bcm 1,283, Bi 1, Bim 0
+-- по Bcm (на запрос):
+     757.2  Ir    260,601  __route_2
+     101.1  Ir     10,344  __json_enc_fields
+      79.5  Ir      7,124  __find_json_hi
+      74.9  Ir      5,929  __sort_by
+      59.8  Ir      9,758  __json_str
+      58.9  Ir      2,179  __json_enc_scalar
+      53.6  Ir      6,218  buf_int
+      37.0  Ir      2,496  __str_concat
+       7.0  Ir      2,412  __write_response
+       6.0  Ir      2,063  __list_push
+       6.0  Ir        975  __list_grow
+       5.0  Ir        783  __co_enter
+-- по Bim (на запрос):
+       0.0  Ir         23  __co_main
+       0.0  Ir        172  __process
+       0.0  Ir        316  __url_decode
+       0.0  Ir        102  __str_byte_find_from
+       0.0  Ir         31  __pin_acquired
+       0.0  Ir        939  __pad
+       0.0  Ir      6,218  buf_int
+       0.0  Ir        334  __barrier
+       0.0  Ir          0  __ph_lower_hw
+       0.0  Ir         49  __list_pop
+       0.0  Ir         83  __serve_one
+       0.0  Ir         35  __store_unlock_raw

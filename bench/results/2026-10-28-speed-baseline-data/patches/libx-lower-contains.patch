@@ -1,0 +1,123 @@
+--- lib/text.kh	2026-10-28 08:46:57.093023739 +0000
++++ libx/text.kh	2026-10-28 09:58:53.513242452 +0000
+@@ -1690,6 +1690,16 @@
+ fn __tx_case(self: str, up: bool) -> str {
+     let p = __str_ptr(self)
+     let n = __str_len(self)
++    // ОПЫТ (этап скорости, часть 1): строка ASCII от 8 до 256 байт — одним
++    // проходом по словам (последнее слово — внахлёст) и одним выделением
++    // (короткая строка); 0 — не ASCII, обычный путь
++    if n >= 8 && n <= 256 && __str_compact {
++        let r = __tx_case_ascii(self, p, n, up)
++        if r != 0 {
++            let rs: str = __cast(r)
++            return rs
++        }
++    }
+     // буквы lo..lo+25; в каждом байте below = 0x80 − lo, past = 0x80 − lo − 26:
+     // старший бит байта в (x + below) & ~(x + past) — буква
+     var lo = 'A'
+@@ -1946,3 +1956,103 @@
+     }
+     return n - 1
+ }
++
++
++// ОПЫТ: смена регистра строки ASCII длиной 8..256 (см. __tx_case). → новая
++// короткая строка, сама строка (если менять нечего) или 0 (есть байт >= 0x80).
++fn __tx_case_ascii(self: str, p: int, n: int, up: bool) -> int {
++    var below = 0x3F3F3F3F3F3F3F3F
++    var past = 0x2525252525252525
++    if up {
++        below = 0x1F1F1F1F1F1F1F1F
++        past = 0x0505050505050505
++    }
++    let high = ~0x7F7F7F7F7F7F7F7F
++    var bits = 0
++    var hi = 0
++    var i = 0
++    while i < n - 8 {
++        let x = load64(p + i)
++        hi = hi | x
++        bits = bits | ((x + below) & ~(x + past))
++        i += 8
++    }
++    let t = load64(p + n - 8)
++    hi = hi | t
++    bits = bits | ((t + below) & ~(t + past))
++    if (hi & high) != 0 {
++        return 0
++    }
++    if (bits & high) == 0 {
++        return __cast(self)
++    }
++    let h = __alloc(n + 9)
++    store64(h, (n << 48) | (h + 8))
++    i = 0
++    while i < n - 8 {
++        let x = load64(p + i)
++        store64(h + 8 + i, x ^ ((((x + below) & ~(x + past) & high) >> 2) & 0x2020202020202020))
++        i += 8
++    }
++    store64(h + n, t ^ ((((t + below) & ~(t + past) & high) >> 2) & 0x2020202020202020))
++    return h
++}
++
++// ОПЫТ: s.lower().contains(sub) без выделения, когда s — ASCII (иначе —
++// как есть: lower, затем поиск). Ответ тот же: у ASCII lower меняет только
++// A–Z, позиции байтов не сдвигаются; не-ASCII байт где угодно в s — обычный путь
++// (lower не-ASCII символа может дать ASCII: K, İ).
++fn __text_contains_lower(self: str, sub: str) -> bool {
++    let p = __str_ptr(self)
++    let n = __str_len(self)
++    let m = __str_len(sub)
++    // пустая подстрока есть в любой строке, в том числе в s.lower()
++    if m == 0 {
++        return true
++    }
++    let high = ~0x7F7F7F7F7F7F7F7F
++    var hi = 0
++    var i = 0
++    while i + 8 <= n {
++        hi = hi | load64(p + i)
++        i += 8
++    }
++    while i < n {
++        hi = hi | load8(p + i)
++        i += 1
++    }
++    if (hi & high) != 0 {
++        return __str_byte_find_from(__text_lower(self), sub, 0) >= 0
++    }
++    if m > n {
++        return false
++    }
++    let q = __str_ptr(sub)
++    let f = load8(q)
++    let last = n - m
++    i = 0
++    while i <= last {
++        var c = load8(p + i)
++        if c >= 'A' && c <= 'Z' {
++            c += 32
++        }
++        if c == f {
++            var j = 1
++            while j < m {
++                var d = load8(p + i + j)
++                if d >= 'A' && d <= 'Z' {
++                    d += 32
++                }
++                if d != load8(q + j) {
++                    break
++                }
++                j += 1
++            }
++            if j == m {
++                return true
++            }
++        }
++        i += 1
++    }
++    return false
++}
