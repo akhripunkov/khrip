@@ -1,0 +1,9 @@
+{
+  "name": "khrip-eval-tokens",
+  "private": true,
+  "type": "module",
+  "description": "o200k tokens of the Khrip eval solutions, before and after a change",
+  "dependencies": {
+    "gpt-tokenizer": "2.9.0"
+  }
+}

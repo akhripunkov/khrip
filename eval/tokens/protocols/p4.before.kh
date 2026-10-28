@@ -1,0 +1,33 @@
+type NewUser { name: str, email: str }
+type User { id: int, ...NewUser }
+
+store users: map[int, User]
+store last_id: int
+
+rpc CreateUser POST "/users" (body: NewUser) -> 201 User | 400 str | 409 str {
+    if !body.email.matches(`[^@\s]+@[^@\s]+`) {
+        return 400 "email is invalid"
+    }
+    if users.values().any(u => u.email == body.email) {
+        return 409 "email is taken"
+    }
+    last_id += 1
+    let user = User { id: last_id, ...body }
+    users[user.id] = user
+    return 201 user
+}
+
+rpc GetUser GET "/users/{id}" (id: int) -> User | 404 {
+    return users[id] ?? 404
+}
+
+rpc ListUsers GET "/users" (limit: int = 20) -> [User] {
+    return users.values()[..limit]
+}
+
+rpc DeleteUser DELETE "/users/{id}" (id: int) -> 204 | 404 {
+    users.remove(id) else {
+        return 404
+    }
+    return 204
+}

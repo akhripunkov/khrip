@@ -2,8 +2,6 @@ type Credentials { username: str, password: str = "" }
 
 type User { id: int, username: str }
 
-type Token { token: str }
-
 type NewNote { title: str, text: str = "" }
 
 type Note { id: int, ...NewNote, created_at: str }
@@ -37,14 +35,14 @@ route POST "/register" (body: Credentials) -> 201 User | 400 str | 409 str {
     return 201 user
 }
 
-route POST "/login" (body: Credentials) -> Token | 401 {
+route POST "/login" (body: Credentials) -> { token: str } | 401 {
     let hash = hashes[body.username] ?? ""
     if !check_password(body.password, hash) {
         return 401
     }
     let token = random_str(32)
     sessions[token] = body.username
-    return Token { token }
+    return { token }
 }
 
 route POST "/notes" (body: NewNote) -> 201 Note | 400 str {

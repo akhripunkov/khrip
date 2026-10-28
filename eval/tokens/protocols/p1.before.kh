@@ -1,0 +1,25 @@
+type Ask { prompt: str }
+type Msg { role: str, content: str }
+type ChatReq { model: str, messages: [Msg], stream: bool }
+type Delta { content: str? }
+type Choice { delta: Delta }
+type Chunk { choices: [Choice] }
+type Token { text: str }
+
+const URL = "https://api.openai.com/v1/chat/completions"
+
+route POST "/chat" (body: Ask) -> stream Token | 400 str {
+    if body.prompt == "" {
+        return 400 "prompt is required"
+    }
+    let key = env("OPENAI_API_KEY") ?? ""
+    let req = ChatReq { model: "gpt-4o-mini", messages: [Msg { role: "user", content: body.prompt }], stream: true }
+    for data in fetch POST URL req headers {"Authorization": "Bearer {key}"} {
+        let c: Chunk? = from_json(data)
+        if c != none && c.choices.len() > 0 {
+            if let t = c.choices[0].delta.content {
+                send(Token { text: t })
+            }
+        }
+    }
+}

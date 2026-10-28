@@ -1,19 +1,13 @@
-type NewPoll { question: str, options: [str] }
-
 type Option { text: str, votes: int = 0 }
 
 type Poll { id: int, question: str, options: [Option], closed: bool = false }
 
-type Vote { option: int }
-
 type Result { text: str, votes: int, percent: float }
-
-type Results { total: int, results: [Result] }
 
 store polls: map[int, Poll]
 store voters: map[str, bool]
 
-route POST "/polls" (body: NewPoll) -> 201 Poll | 400 str {
+route POST "/polls" (body: { question: str, options: [str] }) -> 201 Poll | 400 str {
     let opts = body.options
     let unique = opts.all(o => opts.count(x => x == o) == 1)
     if body.question.trim() == "" || opts.len() < 2 || opts.len() > 10 || opts.any(o => o.trim() == "") || !unique {
@@ -32,7 +26,7 @@ route GET "/polls" (open: bool?) -> [Poll] {
     return polls.values().filter(p => open == none || p.closed != open)
 }
 
-route POST "/polls/{id}/votes" (id: int, body: Vote) -> Poll | 400 str | 401 | 403 | 404 | 409 str {
+route POST "/polls/{id}/votes" (id: int, body: { option: int }) -> Poll | 400 str | 401 | 403 | 404 | 409 str {
     let voter = header("X-Voter-Id") else {
         return 401
     }
@@ -62,7 +56,7 @@ route POST "/polls/{id}/close" (id: int) -> Poll | 404 {
     return poll
 }
 
-route GET "/polls/{id}/results" (id: int) -> Results | 404 {
+route GET "/polls/{id}/results" (id: int) -> { total: int, results: [Result] } | 404 {
     let poll = polls[id] else {
         return 404
     }
@@ -72,5 +66,5 @@ route GET "/polls/{id}/results" (id: int) -> Results | 404 {
         votes: o.votes,
         percent: if total == 0 { 0 } else { (o.votes * 100).to_float() / total.to_float() }.round_to(1),
     })
-    return Results { total, results: results.sort_by(r => -r.votes) }
+    return { total, results: results.sort_by(r => -r.votes) }
 }

@@ -1,10 +1,8 @@
-type NewLink { url: str, code: str = "" }
-
 type Link { code: str, url: str, clicks: int = 0 }
 
 store links: map[str, Link]
 
-route POST "/links" (body: NewLink) -> 201 Link | 400 str | 409 str {
+route POST "/links" (body: { url: str, code: str = "" }) -> 201 Link | 400 str | 409 str {
     if !body.url.starts_with("http://") && !body.url.starts_with("https://") {
         return 400 "url must start with http:// or https://"
     }

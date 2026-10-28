@@ -1,0 +1,25 @@
+migration 1 `
+CREATE TABLE orders (id bigserial PRIMARY KEY, customer text NOT NULL,
+    amount bigint NOT NULL CHECK (amount > 0), status text NOT NULL DEFAULT 'new',
+    created_at timestamptz NOT NULL DEFAULT now());
+CREATE INDEX orders_customer ON orders (customer, id);
+`
+
+type Order { id: int, customer: str, amount: int, status: str, created_at: str }
+
+rpc CreateOrder (body: { customer: str, amount: int }) -> Order | 400 str {
+    if body.customer == "" || body.amount <= 0 {
+        return 400 "customer and a positive amount are required"
+    }
+    return sql "INSERT INTO orders {body} RETURNING *"
+}
+
+rpc GetOrder (id: int) -> Order | 404 {
+    return sql "SELECT * FROM orders WHERE id = {id}"
+}
+
+rpc ListOrders (customer: str) -> stream Order {
+    for o: Order in sql "SELECT * FROM orders WHERE customer = {customer} ORDER BY id" {
+        send(o)
+    }
+}
