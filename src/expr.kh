@@ -1337,17 +1337,18 @@ fn str_lit_compare(op: int, ordered: bool) -> int {
         return -1
     }
     advance()
-    // cmp qword [rax+8], m
-    emit_hex("48 83 78 08")
+    // длина строки (lib/core.kh: два вида) — в rdx; cmp rdx, m
+    emit_str_len(RDX, RAX)
+    emit_hex("48 83 FA")
     emit8(m)
     if m == 0 {
         return cmp_cc(op)
     }
-    // jne — длины разные, флаги уже «не равно»; mov rcx, [rax]
+    // jne — длины разные, флаги уже «не равно»; rcx — адрес байтов
     emit8(0x75)
     let j = code_len
     emit8(0)
-    emit_hex("48 8B 08")
+    emit_str_ptr(RCX, RAX)
     var v = 0
     var i = m - 1
     while i >= 0 {

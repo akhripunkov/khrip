@@ -1,0 +1,359 @@
+// Рост больших массивов store на месте (этап памяти, часть 3, п. 3; lib/gc.kh,
+// __salloc_big_r, __salloc_extend): большой массив, выделенный ростом, берёт
+// за собой запас чистых свободных страниц, и следующие удвоения забирают его
+// без копии и без брошенного старого массива. Массивы словаря без мёртвых
+// записей растут так же: записи остаются на своих номерах, готовится только
+// новый хвост, переносить нечего (кроме новой таблицы). Рост на месте во время
+// разметки: массив — кадр с границей посередине, новые элементы за его
+// старым концом сборщик не смотрит (их значения живы и без этого), старые — на
+// месте. Брошенные ростом массивы будят сборку, когда их — десятая часть
+// живого.
+
+type Item { name: str, n: int }
+
+store nums: [int]
+store items: [Item]
+store flags: [bool]
+store byid: map[int, Item]
+store seen: map[str, bool]
+
+fn exact() -> bool {
+    return (env("KHRIP_GC_STRESS") ?? "") != "1"
+}
+
+fn item_ok(x: Item, name: str) -> bool {
+    let a: int = __cast(x)
+    let s: int = __cast(x.name)
+    return __gc_is_allocated(a) && __gc_is_allocated(s) && x.name == name
+}
+
+route POST "/nums/{a}/{b}" (a: int, b: int) -> int {
+    for i in a..b {
+        nums.push(i * 3)
+        flags.push(i % 5 == 0)
+    }
+    return nums.len()
+}
+
+route POST "/items/{a}/{b}" (a: int, b: int) -> int {
+    for i in a..b {
+        items.push(Item { name: "it {i}", n: i })
+    }
+    return items.len()
+}
+
+fn data(xs: [Item]) -> int {
+    let h: int = __cast(xs)
+    return load64(h)
+}
+
+test "large store lists grow in place after their first move" {
+    let n0 = __gc_inplace_count()
+    expect (call POST "/nums/0/20000").body == "20000"
+    // 20 000 слов — 160 КБ: массив уже большой и с запасом
+    let m1 = __gc_moved_count()
+    let i1 = __gc_inplace_count()
+    expect (call POST "/nums/20000/150000").body == "150000"
+    // три удвоения (до 320 КБ, 640 КБ, 1,25 МБ): два — на месте, одно —
+    // переездом с новым запасом
+    expect __gc_inplace_count() - i1 >= 2
+    expect __gc_moved_count() - m1 <= 1
+    __gc_collect()
+    var bad = 0
+    for i in 0..150000 {
+        if nums[i] != i * 3 || flags[i] != (i % 5 == 0) {
+            bad += 1
+        }
+    }
+    expect bad == 0 && __gc_inplace_count() > n0
+    let h: int = __cast(nums)
+    expect __list_capacity(h) >= 150000 && __list_capacity(h) * 8 == __list_data_slot(h)
+}
+
+test "an array growing in place while it is a partial frame keeps every element" {
+    expect (call POST "/items/0/40000").body == "40000"
+    __gc_collect()
+    var grown = false
+    for round in 0..3 {
+        let before = __gc_inplace_count()
+        let d = data(items)
+        __gc_begin_from_roots()
+        // шаги разметки, пока массив не станет кадром с границей посередине
+        var k = 0
+        while k < 1000000 {
+            let p = __gc_frame_pos(d)
+            if p > 0 && p < items.len() * 8 {
+                break
+            }
+            if __gc_step(1) {
+                break
+            }
+            k += 1
+        }
+        let n = items.len()
+        expect (call POST "/items/{n}/{n * 2}").status == 200
+        if data(items) == d && __gc_inplace_count() > before {
+            grown = true
+        }
+        __gc_finish()
+        var bad = 0
+        for i in 0..items.len() {
+            if !item_ok(items[i], "it {i}") {
+                bad += 1
+            }
+        }
+        expect bad == 0
+    }
+    expect !exact() || grown
+}
+
+route POST "/byid/{a}/{b}" (a: int, b: int) -> int {
+    for i in a..b {
+        byid[i] = Item { name: "id {i}", n: i }
+    }
+    return byid.len()
+}
+
+route DELETE "/byid/{a}/{b}/{step}" (a: int, b: int, step: int) -> int {
+    var i = a
+    while i < b {
+        byid.remove(i)
+        i += step
+    }
+    return byid.len()
+}
+
+route POST "/seen/{a}/{b}" (a: int, b: int) -> int {
+    for i in a..b {
+        seen["s{i}"] = i % 2 == 0
+    }
+    return seen.len()
+}
+
+fn hm(m: map[int, Item]) -> int {
+    let h: int = __cast(m)
+    return h
+}
+
+test "map arrays without dead entries grow in place, entries keep their indices" {
+    __map_grow_budget(48, 8192)
+    expect (call POST "/byid/0/20000").status == 200
+    let h = hm(byid)
+    // ещё ростов: ключи и значения больших массивов растут на месте
+    var shared = 0
+    var k = 20000
+    while k < 140000 {
+        byid[k] = Item { name: "id {k}", n: k }
+        k += 1
+        if __map_growing(h) {
+            shared = shared | __map_grow_shared(h)
+        }
+    }
+    expect (shared & 8) != 0
+    expect !exact() || (shared & 3) == 3
+    __gc_collect()
+    var bad = 0
+    for kk, v in byid {
+        if v.n != kk || !item_ok(v, "id {kk}") {
+            bad += 1
+        }
+    }
+    expect bad == 0 && byid.len() == 140000
+    // удаление во время роста на тех же номерах: удалённые и до переноса, и
+    // после — их нет и в новой таблице
+    while !__map_growing(h) {
+        byid[k] = Item { name: "id {k}", n: k }
+        k += 1
+    }
+    expect (__map_grow_shared(h) & 8) != 0
+    var gone: [int] = []
+    while __map_growing(h) {
+        byid[k] = Item { name: "id {k}", n: k }
+        if k % 3 == 0 {
+            byid.remove(k - 1000)
+            gone.push(k - 1000)
+            byid.remove(k - 120000)
+            gone.push(k - 120000)
+        }
+        k += 1
+    }
+    __gc_collect()
+    bad = 0
+    for g in gone {
+        if byid.has(g) {
+            bad += 1
+        }
+    }
+    var live = 0
+    for kk, v in byid {
+        live += 1
+        if v.n != kk || !item_ok(v, "id {kk}") {
+            bad += 1
+        }
+    }
+    expect bad == 0 && byid.len() == k - gone.len() && live == byid.len()
+    __map_grow_budget(0, 0)
+}
+
+test "clear during an in-place growth, then the map grows again" {
+    __map_grow_budget(48, 4096)
+    expect (call POST "/seen/0/60000").status == 200
+    let h: int = __cast(seen)
+    var k = 60000
+    while !__map_growing(h) {
+        seen["s{k}"] = k % 2 == 0
+        k += 1
+    }
+    seen["s{k}"] = true
+    seen.clear()
+    expect seen.len() == 0 && !__map_growing(h)
+    for i in 0..300000 {
+        seen["t{i}"] = i % 3 == 0
+    }
+    __gc_collect()
+    var yes = 0
+    var bad = 0
+    for kk, v in seen {
+        if v {
+            yes += 1
+        }
+        if !kk.starts_with("t") {
+            bad += 1
+        }
+    }
+    expect seen.len() == 300000 && yes == 100000 && bad == 0
+    expect (seen["t299997"] ?? false) && !(seen["t299998"] ?? true)
+    __map_grow_budget(0, 0)
+}
+
+test "abandoned arrays wake the collector at a tenth of live" {
+    // живого мало: остальные store пусты
+    nums = []
+    flags = []
+    items = []
+    byid.clear()
+    seen.clear()
+    __gc_collect()
+    // копия в store — ровно по длине, без запаса, и за ней другие объекты:
+    // первый же рост — переезд, который бросает массив больше 4 МБ и больше
+    // десятой части живого;
+    // сборка начнётся раньше порога (с потоком сборщика; в тесте его нет —
+    // видно намерение), следующие удвоения — на месте
+    var xs: [int] = []
+    for i in 0..1200000 {
+        xs.push(i)
+    }
+    nums = xs
+    // за массивом — другие объекты: на месте ему не вырасти
+    expect (call POST "/items/40000/41000").status == 200
+    __gc_collect()
+    let a0 = __gc_abandoned_bytes()
+    let i0 = __gc_inplace_count()
+    for i in 0..1200000 {
+        nums.push(i)
+    }
+    expect !exact() || (__gc_abandoned_bytes() - a0 >= 9600000 && __gc_abandon_pending())
+    for i in 0..2400000 {
+        nums.push(i)
+    }
+    expect !exact() || __gc_inplace_count() > i0
+    expect nums.len() == 4800000 && nums[1199999] == 1199999 && nums[1200000] == 0 && nums[4799999] == 2399999
+    __gc_collect()
+    expect !__gc_abandon_pending()
+}
+
+store dm: map[int, bool]
+
+fn dmh() -> int {
+    let h: int = __cast(dm)
+    return h
+}
+
+// словарь с большими массивами роста (ключи 1 МБ, значения и признаки по
+// 128 КБ) и сброшенным грязным запасом: следующий рост — на месте поверх
+// страниц из-под мусора (яд уборки), их надо обнулить, а старые записи — нет
+fn dirty_map() -> int {
+    dm = {}
+    var k = 0
+    while __map_cap(dmh()) < 100000 || __map_growing(dmh()) {
+        dm[k] = k % 7 == 0
+        k += 1
+    }
+    let h = dmh()
+    if __gc_drop_reserve(load64(h)) == 0 || __gc_drop_reserve(load64(h + 16)) == 0 || __gc_drop_reserve(load64(h + 24)) == 0 {
+        return -1
+    }
+    while !__map_growing(h) {
+        dm[k] = k % 7 == 0
+        k += 1
+    }
+    if (__map_grow_shared(h) & 15) != 15 || !__map_grow_dirty(h) {
+        return -2
+    }
+    return k
+}
+
+fn dm_ok(k: int) -> int {
+    var bad = 0
+    for i in 0..k {
+        if (dm[i] ?? (i % 7 != 0)) != (i % 7 == 0) {
+            bad += 1
+        }
+    }
+    return bad
+}
+
+test "a map array grown in place over dirty pages: only the new tail is zeroed" {
+    __map_grow_budget(64, 16384)
+    var k = dirty_map()
+    // под KHRIP_GC_STRESS сборки посреди подготовки могут занять сброшенный
+    // запас: тогда сценария нет
+    if k < 0 && !exact() {
+        __map_grow_budget(0, 0)
+        return
+    }
+    expect k > 0
+    let h = dmh()
+    while __map_growing(h) {
+        dm[k] = k % 7 == 0
+        k += 1
+    }
+    expect dm_ok(k) == 0 && dm.len() == k && __map_tail_zero(h)
+    __gc_collect()
+    expect dm_ok(k) == 0
+    __map_grow_budget(0, 0)
+}
+
+test "clear in the middle of an in-place growth over dirty pages, then growth again" {
+    __map_grow_budget(64, 16384)
+    var k = dirty_map()
+    // под KHRIP_GC_STRESS сборки посреди подготовки могут занять сброшенный
+    // запас: тогда сценария нет
+    if k < 0 && !exact() {
+        __map_grow_budget(0, 0)
+        return
+    }
+    expect k > 0
+    let h = dmh()
+    // подготовка не кончилась: хвосты ещё с ядом
+    expect !__map_grow_ready(h)
+    let cap0 = __map_cap(h)
+    dm.clear()
+    expect !__map_growing(h) && __map_tail_zero(h)
+    // следующий рост — по уже выросшим массивам: их хвост должен быть готов
+    // (clear доготовил его), сразу после переключения за записями — нули
+    k = 0
+    while __map_cap(h) <= cap0 || __map_growing(h) {
+        dm[k] = k % 7 == 0
+        k += 1
+    }
+    expect __map_tail_zero(h)
+    while k < 300000 {
+        dm[k] = k % 7 == 0
+        k += 1
+    }
+    expect dm_ok(k) == 0 && __map_tail_zero(h)
+    __gc_collect()
+    expect dm_ok(k) == 0 && __map_tail_zero(h)
+    __map_grow_budget(0, 0)
+}

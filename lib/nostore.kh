@@ -10,6 +10,24 @@ fn __salloc(n: int, kind: int, mask: int) -> int {
     return 0
 }
 
+// Выделения из store нет: размер — как у __alloc.
+fn __salloc_size(n: int) -> int {
+    return (n + 15) & ~15
+}
+
+// Списков в store нет.
+fn __salloc_list(h: int, cap: int, es: int) -> int {
+    return __salloc(cap * es, 0, 0)
+}
+
+fn __salloc_list_inplace(h: int, cap: int, es: int) -> bool {
+    return false
+}
+
+fn __store_room(p: int) -> int {
+    return 0
+}
+
 fn __salloc_for(h: int, n: int, kind: int, mask: int) -> int {
     return __salloc(n, kind, mask)
 }
@@ -19,8 +37,15 @@ fn __struct_salloc(d: int, n: int, tag: int) -> int {
 }
 
 // Словарей в store нет: роста по частям тоже.
-fn __gc_lazy_alloc(n: int, h: int) -> int {
+fn __gc_lazy_alloc(n: int, kind: int) -> int {
     return __salloc(n, 0, 0)
+}
+
+fn __gc_lazy_extend(p: int, n: int, kind: int) -> int {
+    return 0
+}
+
+fn __gc_abandon(bytes: int) {
 }
 
 fn __gc_ptrb_on(p: int, n: int) {
@@ -33,6 +58,11 @@ fn __gc_grow_done(n: int, at: int) {
 }
 
 // Выделения из store нет, объектов в store тоже.
+// Кучи store нет: ни один адрес не в ней.
+fn __in_store(p: int) -> bool {
+    return false
+}
+
 fn __store_on() -> bool {
     return false
 }
@@ -106,6 +136,9 @@ fn __gc_elem(xs: int, i: int) {
 }
 
 fn __gc_root(slot: int) {
+}
+
+fn __gc_insert_full(h: int, len: int) {
 }
 
 fn __gc_shade(w: int) {

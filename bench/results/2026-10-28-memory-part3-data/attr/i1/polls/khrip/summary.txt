@@ -1,0 +1,5 @@
+== polls / khrip: 27000 запросов/с, seeded 412 KB
+load snapshot: RSS 95700 KB, HWM 95704 KB, live by last GC 91.3 MB
+after run: RSS 98396 KB, HWM 98396 KB; Requests/sec:  26962.47
+idle 15s: RSS 98428 KB, live by GC 95.4 MB; gc 12 (idle): heap 95.4->95.4 MB, live 95.4 MB (1945042 obj, 0 black), pins 0 rec/0 words, arenas 0 (0 KB, 0 handed off), start 7 µs, mark 28.67 ms in 142 slices (max 740 µs, cpu 233 µs) over 127.74 ms, term 3 µs (1 tries), assists 0, sweep 0.94 ms in 5 slices (longest 200 µs, cpu 200 µs), released 0.0 MB in 0.00 ms, rss-store 143.4 MB, arrays grown in place 14 (+17.1 MB), moved 0 (0.0 MB left), next at 128.7 MB
+invariant: ok

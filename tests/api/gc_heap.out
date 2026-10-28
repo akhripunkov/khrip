@@ -1,4 +1,4 @@
-khrip: gc verify (test): 8 roots, 7762 objects in STORE, every pointer in STORE or DATA
+khrip: gc verify (test): 8 roots, 7756 objects in STORE, every pointer in STORE or DATA
 ok    objects of every kind and size live in the store heap
 FAIL  a change of store under the shared lock is an error, not a race
     panic: internal: store changed without the exclusive store lock

@@ -1,0 +1,8 @@
+ok    a key equal to a field of the value is that field's string
+ok    replacing a value keeps the key and copies nothing for it
+ok    a string value equal to the key is shared, a different one is not
+ok    only an equal field is shared
+ok    a whole map copied into store shares its keys too
+ok    int values: a new key is copied once, an old key not again
+ok    replacing an int value allocates nothing in store
+7 tests: 7 passed, 0 failed

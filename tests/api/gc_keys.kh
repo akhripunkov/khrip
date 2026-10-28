@@ -1,0 +1,159 @@
+// Ключ словаря без второй копии (этап памяти, часть 3, п. 5; lib/api.kh,
+// __map_set_sk и __dc_key_share): строковый ключ, равный строковому полю
+// значения, — та же строка store; у замены значения ключ не копируется.
+
+type Link { code: str, url: str, clicks: int = 0 }
+
+type Pair { a: str, b: str }
+
+store links: map[str, Link]
+store names: map[str, str]
+store pairs: map[str, Pair]
+store copied: map[str, Link]
+store hits: map[str, int]
+
+fn addr(s: str) -> int {
+    let a: int = __cast(s)
+    return a
+}
+
+route POST "/links/{code}" (code: str) -> 201 {
+    links[code] = Link { code, url: "https://example.com/{code}" }
+    return 201
+}
+
+route PUT "/links/{code}" (code: str) -> 204 {
+    links[code] = Link { code: "{code}", url: "https://example.org/{code}" }
+    return 204
+}
+
+route POST "/names/{n}" (n: str) -> 201 {
+    names[n] = n
+    names["other-{n}"] = "x{n}"
+    return 201
+}
+
+route POST "/pairs/{k}" (k: str) -> 201 {
+    pairs[k] = Pair { a: "{k}!", b: k }
+    pairs["none-{k}"] = Pair { a: "p", b: "q" }
+    return 201
+}
+
+route POST "/copy/{n}" (n: int) -> 201 {
+    var m: map[str, Link] = {}
+    for i in 0..n {
+        let code = "c{i}"
+        m[code] = Link { code: "c{i}", url: "u{i}" }
+    }
+    // словарь, ключ которого не совпадает с полем
+    m["odd"] = Link { code: "different", url: "u" }
+    copied = m
+    return 201
+}
+
+route POST "/hit/{key}" (key: str) -> 204 {
+    hits[key] = (hits[key] ?? 0) + 1
+    return 204
+}
+
+test "a key equal to a field of the value is that field's string" {
+    for i in 0..300 {
+        expect (call POST "/links/k{i}").status == 201
+    }
+    expect links.len() == 300
+    for k, v in links {
+        expect k == v.code
+        expect addr(k) == addr(v.code)
+    }
+}
+
+test "replacing a value keeps the key and copies nothing for it" {
+    let before = addr(links.keys()[7])
+    expect links.keys()[7] == "k7"
+    __gc_collect()
+    for _ in 0..5 {
+        expect (call PUT "/links/k7").status == 204
+    }
+    expect addr(links.keys()[7]) == before
+    let l = links["k7"] else {
+        expect false
+        return
+    }
+    expect l.url == "https://example.org/k7"
+    // новое значение — своя строка code, ключ остался прежним
+    expect addr(l.code) != before
+    __gc_collect()
+    expect links.keys()[7] == "k7"
+    expect links.len() == 300
+}
+
+test "a string value equal to the key is shared, a different one is not" {
+    expect (call POST "/names/abc").status == 201
+    expect (names["abc"] ?? "") == "abc"
+    for k, v in names {
+        if k == "abc" {
+            expect addr(k) == addr(v)
+        } else {
+            expect k == "other-abc" && v == "xabc"
+            expect addr(k) != addr(v)
+        }
+    }
+}
+
+test "only an equal field is shared" {
+    expect (call POST "/pairs/zz").status == 201
+    for k, v in pairs {
+        if k == "zz" {
+            expect v.a == "zz!" && v.b == "zz"
+            expect addr(k) == addr(v.b) && addr(k) != addr(v.a)
+        } else {
+            expect k == "none-zz" && v.a == "p" && v.b == "q"
+            expect addr(k) != addr(v.a) && addr(k) != addr(v.b)
+        }
+    }
+}
+
+test "a whole map copied into store shares its keys too" {
+    expect (call POST "/copy/40").status == 201
+    expect copied.len() == 41
+    var shared = 0
+    for k, v in copied {
+        if k == "odd" {
+            expect v.code == "different" && addr(k) != addr(v.code)
+        } else {
+            expect k == v.code && v.url == "u" + k[1..]
+            if addr(k) == addr(v.code) {
+                shared += 1
+            }
+        }
+    }
+    expect shared == 40
+    __gc_collect()
+    for k, v in copied {
+        expect k == "odd" || k == v.code
+    }
+}
+
+test "int values: a new key is copied once, an old key not again" {
+    for _ in 0..3 {
+        for i in 0..50 {
+            expect (call POST "/hit/key{i}").status == 204
+        }
+    }
+    expect hits.len() == 50
+    expect (hits["key0"] ?? 0) == 3
+    let a = addr(hits.keys()[0])
+    expect (call POST "/hit/key0").status == 204
+    expect addr(hits.keys()[0]) == a && (hits["key0"] ?? 0) == 4
+}
+
+test "replacing an int value allocates nothing in store" {
+    let key = "long-key-" + "x".repeat(200)
+    expect (call POST "/hit/{key}").status == 204
+    let h0 = __gc_stats().heap
+    for _ in 0..100 {
+        expect (call POST "/hit/{key}").status == 204
+    }
+    expect (hits[key] ?? 0) == 101
+    expect __gc_stats().heap <= h0
+}

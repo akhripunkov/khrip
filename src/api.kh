@@ -152,6 +152,23 @@ fn is_scalar_ty(t: int) -> bool {
     return t == ty_int || t == ty_bool || t == ty_float || t == ty_err || t == ty_void || t == ty_none
 }
 
+// Признаки словаря map[kt, vt] для __map_new (lib/core.kh: MAP_STR,
+// MAP_BYTES, MAP_REFS): строковые ключи, значения bool байтами,
+// значения-ссылки.
+fn map_flags(kt: int, vt: int) -> int {
+    var f = 0
+    if kt == ty_str {
+        f = f | 1
+    }
+    if vt == ty_bool {
+        f = f | 2
+    }
+    if !is_scalar_ty(vt) {
+        f = f | 4
+    }
+    return f
+}
+
 // ---- Предварительный проход: route и test ----
 
 fn prescan_api(k: int) {
@@ -702,11 +719,12 @@ fn type_desc(t: int) -> int {
                     desc_put(off, fo + 4, esize_of(ty_elem(f.ty)))
                 } else if dt.kind == '\{' {
                     desc_put(off, fo + 3, 3)
-                    var sk = 0
-                    if tkind(f.ty) == K_MAP && types[f.ty].a == ty_str {
-                        sk = 1
+                    // признаки пустого словаря (__map_new)
+                    var mf = 0
+                    if tkind(f.ty) == K_MAP {
+                        mf = map_flags(types[f.ty].a, types[f.ty].b)
                     }
-                    desc_put(off, fo + 4, sk)
+                    desc_put(off, fo + 4, mf)
                 } else {
                     desc_put(off, fo + 3, 1)
                     desc_put(off, fo + 4, default_word(f.def, f.ty))

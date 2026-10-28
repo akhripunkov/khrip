@@ -1403,11 +1403,18 @@ fn __bson_out_doc(o: __BsonOut, v: int, d: int, depth: int) {
         __bson_out_fields(o, v, d, depth)
     } else if load64(load64(d + 8)) == D_STR {
         let vd = load64(d + 16)
-        let m: map[str, int] = __cast(v)
-        for key, value in m {
+        // словарь любого типа значений — по записям (lib/core.kh: значения
+        // bool — байтами), как __json_enc_map
+        let n = __map_len(v)
+        for i in 0..n {
             if o.error != "" {
                 break
             }
+            if !__map_alive(v, i) {
+                continue
+            }
+            let key: str = __cast(__map_key(v, i))
+            let value = __map_value(v, i)
             let kp = __str_ptr(key)
             let kn = key.byte_len()
             if __find_byte(kp, kn, 0) < kn {
@@ -1756,7 +1763,7 @@ fn __bson_read_map(r: __BsonRead, p: int, end: int, d: int, depth: int) -> int {
         return 0
     }
     let vd = load64(d + 16)
-    let m = __map_new(1)
+    let m = __map_new(__map_flags(d))
     let body = end - 1
     var at = p + 4
     while at < body {

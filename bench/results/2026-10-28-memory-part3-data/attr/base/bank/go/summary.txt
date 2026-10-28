@@ -1,0 +1,8 @@
+== bank / go: 28000 запросов/с, seeded 8520 KB
+load snapshot: RSS 432112 KB, HWM 590740 KB
+after run: RSS 432116 KB, HWM 590740 KB; Requests/sec:  27963.08
+memstats before heap_alloc=340284248 heap_inuse=345137152 heap_idle=241082368 heap_released=164888576 heap_sys=586219520 heap_objects=3955272 stack_inuse=983040 stack_sys=983040 mspan_inuse=4165920 mcache_inuse=2416 gc_sys=7285680 other_sys=1034069 buck_hash_sys=2995 sys=602297488 num_gc=273 next_gc=413630306
+memstats after-gc heap_alloc=197701568 heap_inuse=199696384 heap_idle=386621440 heap_released=164888576 heap_sys=586317824 heap_objects=2684590 stack_inuse=884736 stack_sys=884736 mspan_inuse=1356000 mcache_inuse=2416 gc_sys=7285680 other_sys=1034069 buck_hash_sys=2995 sys=602297488 num_gc=274 next_gc=395604986
+after GC: RSS 432128 KB
+idle 15s: RSS 432128 KB
+invariant: ok

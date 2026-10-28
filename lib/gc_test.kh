@@ -153,20 +153,17 @@ fn __map_grow_dirty(m: int) -> bool {
 fn __map_grow_fresh(m: int) -> bool {
     let g = load64(m + 56)
     for i in 0..4 {
-        var n = load64(g + 88) * 8
-        if i == 3 {
-            n = (load64(g + 32) + 1) * 8
-        }
+        let n = __map_region(m, g, i)
         let p = load64(g + i * 8)
         if p == 0 {
             continue
         }
         var j = 0
         while j < n {
-            if load64(p + j) != 0 {
+            if load8(p + j) != 0 {
                 return false
             }
-            j += 8
+            j += 1
         }
     }
     return true
@@ -200,7 +197,7 @@ fn __gc_hard_now() -> int {
 
 // Слотов в таблице словаря m.
 fn __map_slots(m: int) -> int {
-    return load64(m + 40) + 1
+    return load32(m + 40) + 1
 }
 
 // Ростов, которые пришлось закончить сразу (старые массивы заполнились).
@@ -210,11 +207,27 @@ fn __map_grow_fallbacks() -> int {
 
 // Записей в массивах словаря m (с мёртвыми) и их ёмкость.
 fn __map_entries(m: int) -> int {
-    return load64(load64(m) + 8)
+    return load32(m + 48)
 }
 
 fn __map_cap(m: int) -> int {
-    return load64(load64(m) + 16)
+    return load32(m + 52)
+}
+
+// Признаки словаря m (MAP_STR, MAP_BYTES, MAP_REFS) и размеры слотов его
+// массивов: ключей, значений, признаков, таблицы.
+fn __map_flags_of(m: int) -> int {
+    return load32(m + 44)
+}
+
+fn __map_arr_slot(m: int, i: int) -> int {
+    let offs = [0, 16, 24, 32]
+    let p = load64(m + offs[i])
+    let o = __gc_obj_of(p)
+    if o == 0 {
+        return 0
+    }
+    return __gc_obj_size(o)
 }
 
 // Длина массивов, с которой следующая вставка нового ключа начнёт рост словаря
@@ -225,4 +238,127 @@ fn __map_grow_at(m: int) -> int {
         return cap - (cap >> 5)
     }
     return cap - 1
+}
+
+// ---- Представление данных store (этап памяти, часть 3) ----
+
+// Ёмкость списка h и размер слота его массива (0 — массив не в store).
+fn __list_capacity(h: int) -> int {
+    return __list_cap(h)
+}
+
+// Размер слота заголовка списка h.
+fn __list_header_slot(h: int) -> int {
+    return __gc_obj_size(__gc_obj_of(h))
+}
+
+fn __list_data_slot(h: int) -> int {
+    let d = load64(h)
+    if !__in_store(d) {
+        return 0
+    }
+    return __gc_obj_size(__gc_obj_of(d))
+}
+
+// Размер слота объекта store, в котором лежит p (0 — p не в объекте store).
+fn __slot_size(p: int) -> int {
+    let o = __gc_obj_of(p)
+    if o == 0 {
+        return 0
+    }
+    return __gc_obj_size(o)
+}
+
+// Рост больших массивов: на месте (раз, байт) и переездом (раз, байт старых).
+fn __gc_inplace_count() -> int {
+    return __gc_inplace_n
+}
+
+fn __gc_inplace_mb() -> int {
+    return __gc_inplace_bytes >> 20
+}
+
+fn __gc_moved_count() -> int {
+    return __gc_moved_n
+}
+
+fn __gc_moved_mb() -> int {
+    return __gc_moved_bytes >> 20
+}
+
+// Какие массивы роста словаря m выросли на месте (биты 0–2) и остаются ли
+// записи на своих номерах (бит 3); −1 — роста нет.
+fn __map_grow_shared(m: int) -> int {
+    let g = load64(m + 56)
+    if g == 0 {
+        return -1
+    }
+    return load64(g + 104)
+}
+
+// Брошенные ростом большие массивы с начала сборки (байт) и ждёт ли из-за них
+// сборка.
+fn __gc_abandoned_bytes() -> int {
+    return __gc_abandoned
+}
+
+fn __gc_abandon_pending() -> bool {
+    return __gc_abandon_due
+}
+
+// Запас за большим спаном объекта p — кучке, грязным и с ядом (как память из-
+// под мусора): следующий рост на месте возьмёт грязные страницы. → страниц
+// запаса было.
+fn __gc_drop_reserve(p: int) -> int {
+    let pg = (p - STORE_REGION) >> GC_PAGE_SHIFT
+    let s = GC_SPANS + (pg << 6)
+    let info = load64(s + S_INFO)
+    let own = info & 0xFFFFFFFF
+    let np = load64(s + S_SIZE) >> GC_PAGE_SHIFT
+    if own <= np {
+        return 0
+    }
+    __memset(STORE_REGION + ((pg + np) << GC_PAGE_SHIFT), 0xDE, (own - np) << GC_PAGE_SHIFT)
+    __gc_pagemap_set(pg + np, own - np, 0)
+    store64(s + S_INFO, np | ((info >> 48) << 48))
+    __ph_free(__gc_ph, pg + np, own - np)
+    return own - np
+}
+
+// За концом записей (до ёмкости) у массивов словаря m — нули.
+fn __map_tail_zero(m: int) -> bool {
+    let n = load32(m + 48)
+    let cap = load32(m + 52)
+    let es = __map_es(m)
+    var i = n
+    while i < cap {
+        if load64(load64(m) + i * 8) != 0 || load8(load64(m + 24) + i) != 0 || __map_val(m, load64(m + 16), i) != 0 {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// Система даёт куче store ещё mb МБ памяти сверх подключённой, дальше
+// отказывает (mprotect, __gc_commit_try); 0 — без предела. → предел в байтах
+// от начала STORE.
+fn __gc_commit_limit(mb: int) -> int {
+    if mb == 0 {
+        __gc_commit_lim = 0
+        return 0
+    }
+    __gc_commit_lim = (__gc_committed + mb * GC_MB + COMMIT - 1) & ~(COMMIT - 1)
+    return __gc_commit_lim
+}
+
+fn __gc_committed_bytes() -> int {
+    return __gc_committed
+}
+
+// Страниц запаса за большим спаном объекта p (сверх страниц объекта).
+fn __gc_reserve_of(p: int) -> int {
+    let pg = (p - STORE_REGION) >> GC_PAGE_SHIFT
+    let s = GC_SPANS + (pg << 6)
+    return (load64(s + S_INFO) & 0xFFFFFFFF) - (load64(s + S_SIZE) >> GC_PAGE_SHIFT)
 }

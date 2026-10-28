@@ -1,0 +1,221 @@
+// Компактные словари (этап памяти, часть 3, п. 2; lib/core.kh): массивы
+// записей прямо в заголовке словаря, признак «жива» — байт, значения bool —
+// байтами, таблица — u32 на слот при загрузке не больше половины. Рост по
+// частям (часть 2) — на тех же массивах: шаги, перенос со сжатием мёртвых
+// записей, разметка посреди роста.
+
+type Item { name: str, n: int }
+
+store voters: map[str, bool]
+store byid: map[int, Item]
+store names: map[str, str]
+store copied: map[int, bool]
+
+fn h_of(m: map[str, bool]) -> int {
+    let h: int = __cast(m)
+    return h
+}
+
+fn h_int(m: map[int, Item]) -> int {
+    let h: int = __cast(m)
+    return h
+}
+
+route POST "/vote/{a}/{b}" (a: int, b: int) -> int {
+    for i in a..b {
+        voters["v{i}-x"] = i % 3 == 0
+    }
+    return voters.len()
+}
+
+route DELETE "/vote/{a}/{b}/{step}" (a: int, b: int, step: int) -> int {
+    var i = a
+    while i < b {
+        voters.remove("v{i}-x")
+        i += step
+    }
+    return voters.len()
+}
+
+// обход маршрутом-читателем: (живых, из них true)
+route GET "/votes" -> str {
+    var n = 0
+    var yes = 0
+    for k, v in voters {
+        n += 1
+        if v {
+            yes += 1
+        }
+    }
+    return "{n} {yes}"
+}
+
+fn model_votes(a: int, b: int, removed: [int]) -> str {
+    var n = 0
+    var yes = 0
+    for i in a..b {
+        if !removed.contains(i) {
+            n += 1
+            if i % 3 == 0 {
+                yes += 1
+            }
+        }
+    }
+    return "{n} {yes}"
+}
+
+test "a store map[str, bool] keeps keys as words and values and flags as bytes" {
+    expect (call POST "/vote/0/1000").body == "1000"
+    let h = h_of(voters)
+    // строковые ключи, значения байтами, значения не ссылки
+    expect __map_flags_of(h) == 3
+    let cap = __map_cap(h)
+    expect cap >= 1000 && __map_entries(h) == 1000
+    expect __map_slots(h) >= 2 * cap
+    // слоты массивов: ключи — слово на запись, значения и признаки — байт,
+    // таблица — 4 байта на слот (массивы больше 32 КБ — целые страницы)
+    expect __map_arr_slot(h, 0) >= cap * 8 && __map_arr_slot(h, 0) < cap * 8 + 8192
+    expect __map_arr_slot(h, 1) >= cap && __map_arr_slot(h, 1) < cap * 2
+    expect __map_arr_slot(h, 2) >= cap && __map_arr_slot(h, 2) < cap * 2
+    expect __map_arr_slot(h, 3) >= __map_slots(h) * 4 && __map_arr_slot(h, 3) < __map_slots(h) * 5
+    expect (voters["v3-x"] ?? false) && !(voters["v4-x"] ?? true) && voters["v9999-x"] == none
+    expect (call GET "/votes").body == model_votes(0, 1000, [])
+    expect voters.values().len() == 1000 && voters.values()[3] && !voters.values()[4]
+    expect voters.keys()[999] == "v999-x"
+}
+
+test "removal, reinsertion and growth of a bool map through collections" {
+    var removed: [int] = []
+    var i = 0
+    while i < 1000 {
+        removed.push(i)
+        i += 7
+    }
+    expect (call DELETE "/vote/0/1000/7").status == 200
+    expect (call GET "/votes").body == model_votes(0, 1000, removed)
+    __gc_collect()
+    // удалённые слоты таблицы занимают снова; рост сжимает мёртвые записи
+    for j in 0..4 {
+        expect (call POST "/vote/{1000 + j * 5000}/{6000 + j * 5000}").status == 200
+        __gc_collect()
+    }
+    expect (call GET "/votes").body == model_votes(0, 21000, removed)
+    expect voters.len() == 21000 - removed.len()
+    let h = h_of(voters)
+    expect !__map_growing(h) || __map_grow_moved(h) >= 0
+    expect to_json(voters).starts_with("\{\"v1-x\":false,\"v2-x\":false,\"v3-x\":true,")
+    expect __map_grow_fallbacks() == 0
+}
+
+test "growth of a bool map with dead entries during marking" {
+    __map_grow_budget(48, 4096)
+    var k = 30000
+    let h = h_of(voters)
+    while !__map_growing(h) {
+        voters["g{k}"] = k % 2 == 0
+        k += 1
+        if k % 5 == 0 {
+            voters.remove("g{k - 3}")
+        }
+    }
+    __gc_begin_from_roots()
+    var steps = 0
+    while __map_growing(h) {
+        voters["g{k}"] = k % 2 == 0
+        k += 1
+        steps += 1
+        if k % 5 == 0 {
+            voters.remove("g{k - 3}")
+        }
+    }
+    __gc_finish()
+    expect steps > 2
+    var bad = 0
+    for j in 30000..k {
+        let want = j % 5 == 2 && j + 3 <= k
+        if want {
+            if voters.has("g{j}") {
+                bad += 1
+            }
+        } else if (voters["g{j}"] ?? (j % 2 != 0)) != (j % 2 == 0) {
+            bad += 1
+        }
+    }
+    expect bad == 0
+    __map_grow_budget(0, 0)
+}
+
+route POST "/items/{a}/{b}" (a: int, b: int) -> int {
+    for i in a..b {
+        byid[i] = Item { name: "item {i}", n: i }
+    }
+    return byid.len()
+}
+
+test "int keys and struct values: references in a words array, u32 slots" {
+    expect (call POST "/items/0/5000").body == "5000"
+    let h = h_int(byid)
+    // значения — ссылки, ключи — числа
+    expect __map_flags_of(h) == 4
+    // удаление и вставка заново: удалённые слоты таблицы занимают снова
+    for r in 0..5 {
+        for i in 0..2500 {
+            byid.remove(i * 2 + r % 2)
+        }
+        for i in 0..2500 {
+            byid[i * 2 + r % 2] = Item { name: "again {r} {i}", n: -i }
+        }
+        __gc_collect()
+    }
+    expect byid.len() == 5000
+    var bad = 0
+    for k, v in byid {
+        if k % 2 == 0 && (v.name != "again 4 {k / 2}" || v.n != -(k / 2)) {
+            bad += 1
+        }
+        if k % 2 == 1 && (v.name != "again 3 {k / 2}" || v.n != -(k / 2)) {
+            bad += 1
+        }
+    }
+    expect bad == 0
+}
+
+route POST "/names/{n}" (n: int) -> int {
+    for i in 0..n {
+        names["n{i}"] = "value {i}"
+    }
+    return names.len()
+}
+
+test "string keys and string values" {
+    expect (call POST "/names/3000").body == "3000"
+    let h: int = __cast(names)
+    expect __map_flags_of(h) == 5
+    __gc_collect()
+    expect (names["n2999"] ?? "") == "value 2999" && names.values()[17] == "value 17"
+}
+
+test "a bool map copied into store and a literal typed by its first entry" {
+    var local: map[int, bool] = {}
+    for i in 0..3000 {
+        local[i] = i % 4 == 1
+    }
+    local.remove(5)
+    copied = local
+    let h: int = __cast(copied)
+    expect __map_flags_of(h) == 2 && copied.len() == 2999 && __map_entries(h) == 2999
+    var yes = 0
+    for k, v in copied {
+        if v {
+            yes += 1
+        }
+    }
+    expect yes == 749 && !copied.has(5) && (copied[9] ?? false)
+    __gc_collect()
+    // литерал без известного типа: ключ — не литерал, значения bool
+    let key = "a" + "b"
+    let lit = {key: true, "c": false}
+    expect (lit["ab"] ?? false) && !(lit["c"] ?? true) && to_json(lit) == "\{\"ab\":true,\"c\":false}"
+    let lh: int = __cast(lit)
+    expect __map_flags_of(lh) == 3
+}

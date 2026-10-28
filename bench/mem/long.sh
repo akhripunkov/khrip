@@ -8,6 +8,7 @@
 # Варианты:
 #   khrip          — обычная сборка (с KHRIP_GC_LOG=1: строка о каждой сборке)
 #   khrip-gcoff    — то же с KHRIP_GC=off
+#   khrip-gc100    — то же с KHRIP_GC=100 (запас до части 2)
 #   khrip-m1       — компилятор KHC_M1: копия библиотеки, где m всегда 1
 #                    (в репозиторий не входит)
 #   khrip-m1-gc50  — то же с KHRIP_GC=50
@@ -79,13 +80,14 @@ for v in $variants; do
 	mkdir -p "$o"
 	envs=(PORT=8080)
 	case $v in
-	khrip | khrip-gcoff | khrip-m1 | khrip-m1-gc50)
+	khrip | khrip-gcoff | khrip-gc100 | khrip-m1 | khrip-m1-gc50)
 		khc=$root/build/khc
 		[[ $v == khrip-m1* ]] && khc=${KHC_M1:?KHC_M1 — компилятор с копией библиотеки, где m = 1}
 		KHRIP_GC_LOG=1 "$khc" -o "$tmp/server" "$ev/solutions/$sc/khrip/main.kh" || exit 1
 		envs+=(KHRIP_GC_LOG=1)
 		[[ $v == khrip-gcoff ]] && envs+=(KHRIP_GC=off)
 		[[ $v == *-gc50 ]] && envs+=(KHRIP_GC=50)
+		[[ $v == khrip-gc100 ]] && envs+=(KHRIP_GC=100)
 		;;
 	go)
 		rm -rf "${tmp:?}/go"
@@ -138,20 +140,23 @@ for v in $variants; do
 		gc_total=$(awk -F'\t' -v t="$t1" '$1 <= t && $2 ~ /^gc [0-9]+ @/' "$o/stderr.log" | wc -l)
 		gc_run=$(awk -F'\t' -v a="$t0" -v t="$t1" '$1 >= a && $1 <= t && $2 ~ /^gc [0-9]+ @/' "$o/stderr.log" | wc -l)
 	else
-		# первая сборка после замера — простоя (через 10 с без выделений store)
-		# или по таймеру (forced: store меняли, а сборки не было 2 минуты); у
-		# большой кучи разметка идёт четвертью времени — ждём её строку
+		# первая сборка простоя после замера (через 10 с без выделений store)
+		# или по таймеру (forced: store меняли, а сборки не было 2 минуты), не
+		# сборка по темпу, начатая ещё под нагрузкой; у большой кучи разметка
+		# идёт четвертью времени — ждём её строку
 		for _ in $(seq $((IDLE_MAX * 5))); do
-			awk -F'\t' -v t="$t1" '$1 > t && $2 ~ /^gc [0-9]+ \(/ {f = 1} END {exit !f}' "$o/stderr.log" && break
+			awk -F'\t' -v t="$t1" '$1 > t && $2 ~ /^gc [0-9]+ \((idle|forced)\)/ {f = 1} END {exit !f}' "$o/stderr.log" && break
 			[[ $v == khrip-gcoff ]] && break
 			sleep 0.2
 		done
-		live=$(awk -F'\t' -v t="$t1" '$1 > t && $2 ~ /^gc [0-9]+ \(/' "$o/stderr.log" | head -1 | grep -o 'live [0-9.]* MB' | awk '{print $2}')
+		live=$(awk -F'\t' -v t="$t1" '$1 > t && $2 ~ /^gc [0-9]+ \((idle|forced)\)/' "$o/stderr.log" | head -1 | grep -o 'live [0-9.]* MB' | awk '{print $2}')
 		gc_total=$(awk -F'\t' -v t="$t1" '$1 <= t && $2 ~ /^gc [0-9]+ \(/' "$o/stderr.log" | wc -l)
 		gc_run=$(awk -F'\t' -v a="$t0" -v t="$t1" '$1 >= a && $1 <= t && $2 ~ /^gc [0-9]+ \(/' "$o/stderr.log" | wc -l)
 	fi
 	echo "idle RSS $(kb VmRSS) KB" >>"$o/run.txt"
-	python3 "$ev/load/seed.py" verify "$sc" >>"$o/run.txt"
+	# ловушка пауз — до проверки инварианта: её запросы (GET всего store)
+	# занимают рабочий поток на секунды, и соединения зонда на том же потоке
+	# ждут их (сопрограммы не вытесняются) — это не пауза сервера
 	if [[ -n $ppid_ ]]; then
 		kill "$ppid_" 2>/dev/null
 		wait "$ppid_" 2>/dev/null
@@ -162,6 +167,7 @@ for v in $variants; do
 		wait "$cpid" 2>/dev/null
 		cpid=
 	fi
+	python3 "$ev/load/seed.py" verify "$sc" >>"$o/run.txt"
 	kill "$pid" 2>/dev/null
 	wait "$pid" 2>/dev/null
 	pid=

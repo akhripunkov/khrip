@@ -1,0 +1,12 @@
+m3base patch reqs 65623 ir/req 18796
+m3s4 patch reqs 61182 ir/req 18980
+m3base bank reqs 67064 ir/req 19177
+m3s4 bank reqs 72189 ir/req 18714
+m3base notes reqs 145412 ir/req 5473
+m3s4 notes reqs 137808 ir/req 5547
+m3base patch reqs 65501 ir/req 18804
+m3s4 patch reqs 60570 ir/req 18982
+m3base bank reqs 65895 ir/req 19224
+m3s4 bank reqs 65991 ir/req 18861
+m3base notes reqs 146235 ir/req 5474
+m3s4 notes reqs 144692 ir/req 5546

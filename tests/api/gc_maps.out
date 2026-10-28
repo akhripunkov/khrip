@@ -1,0 +1,7 @@
+ok    a store map[str, bool] keeps keys as words and values and flags as bytes
+ok    removal, reinsertion and growth of a bool map through collections
+ok    growth of a bool map with dead entries during marking
+ok    int keys and struct values: references in a words array, u32 slots
+ok    string keys and string values
+ok    a bool map copied into store and a literal typed by its first entry
+6 tests: 6 passed, 0 failed

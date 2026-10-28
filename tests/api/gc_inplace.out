@@ -1,0 +1,8 @@
+ok    large store lists grow in place after their first move
+ok    an array growing in place while it is a partial frame keeps every element
+ok    map arrays without dead entries grow in place, entries keep their indices
+ok    clear during an in-place growth, then the map grows again
+ok    abandoned arrays wake the collector at a tenth of live
+ok    a map array grown in place over dirty pages: only the new tail is zeroed
+ok    clear in the middle of an in-place growth over dirty pages, then growth again
+7 tests: 7 passed, 0 failed

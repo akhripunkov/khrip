@@ -205,6 +205,31 @@ fn emit_store(base: int, disp: int, src: int) {
     emit_mem(0x89, src, base, disp)
 }
 
+// Строка в регистре src (lib/core.kh, два вида строк): dst = её длина —
+// старшие 16 бит слова 0, а если они нули — слово 8 (mov dst, [src];
+// shr dst, 48; cmovz dst, [src + 8]); dst ≠ src.
+fn emit_str_len(dst: int, src: int) {
+    emit_load(dst, src, 0)
+    emit_shift_reg(5, dst, 48)
+    emit_mem_sized(0x0F44, dst, src, 8, true)
+}
+
+// dst = адрес байтов строки src: слово 0 без старших 16 бит (mov dst, [src];
+// shl dst, 16; shr dst, 16); dst может совпадать с src.
+fn emit_str_ptr(dst: int, src: int) {
+    emit_load(dst, src, 0)
+    emit_shift_reg(4, dst, 16)
+    emit_shift_reg(5, dst, 16)
+}
+
+// shl (ext 4) или shr (ext 5) регистра r на k: REX.W C1 /ext ib.
+fn emit_shift_reg(ext: int, r: int, k: int) {
+    emit8(0x48 | (r >> 3))
+    emit8(0xC1)
+    emit8(0xC0 | (ext << 3) | (r & 7))
+    emit8(k)
+}
+
 // movzx eax, byte [rax + rcx]: байт строки или bool списка по индексу.
 fn emit_movzx_index() {
     emit8(0x0F)

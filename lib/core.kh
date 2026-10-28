@@ -308,9 +308,9 @@ fn __arena_size(base: int) -> int {
     return ARENA_SIZE
 }
 
-fn __in_store(p: int) -> bool {
-    return (p >> 40) == (STORE_REGION >> 40)
-}
+// __in_store(p) — p в куче store: lib/gc.kh; у программ без store
+// (lib/nostore.kh) — всегда false, и встроенная проверка на пути списков и
+// словарей арены — одна пустая ветка.
 
 // Память для внутренностей объекта h (рост списка, таблица словаря): объект
 // вне арены не должен ссылаться на арену. У объекта в store память — в store,
@@ -342,6 +342,16 @@ fn __alloc_k(n: int, kind: int, mask: int) -> int {
         return __salloc(n, kind, mask)
     }
     return __alloc(n)
+}
+
+// Сколько байт займёт выделение n байт (__alloc_k): слот кучи store, если
+// выделение идёт из store (__salloc_size, lib/gc.kh), иначе — n с округлением до
+// 16, как у __alloc.
+fn __alloc_round(n: int) -> int {
+    if load64(__ctx() + CTX_PSAVE_PTR) != 0 {
+        return __salloc_size(n)
+    }
+    return (n + 15) & ~15
 }
 
 // Обнулённая память в обычной памяти потока, где бы ни шло выделение сейчас:
@@ -635,6 +645,24 @@ fn __panic(kind: int, at: str) {
 }
 
 // ---- Строки ----
+// Строка — один из двух видов (этап памяти, часть 3, п. 1):
+//   обычная — заголовок из двух слов {ptr, len}: срезы и части строк (байты
+//   внутри другой строки), литералы, строки арены и потока;
+//   короткая — один объект [len << 48 | ptr][байты][0] с ptr = адрес строки
+//   + 8: строка store короче STR_SHORT байт и копии строк в арене и куче
+//   потока (__str_copy, __str_concat; с KHRIP_STR_COMPACT=0 — обычные).
+// Адреса памяти программ меньше 2^47, поэтому у обычной строки старшие 16 бит
+// слова 0 — нули. Читается без ветвления на виде: ptr — слово 0 без старших
+// 16 бит (STR_PTR), len — старшие 16 бит слова 0, а если они нули — слово 8
+// (у обычной строки там длина; у короткой строки это бывает только при длине
+// 0, и слово 8 — её нулевой байт и нулевой хвост слота). Компилятор
+// встраивает то же самое (src/emit.kh: emit_str_ptr, emit_str_len).
+const STR_PTR = 0xFFFFFFFFFFFF
+const STR_SHORT = 65536
+
+// копии строк вне store — тоже короткие (lib/rt.kh, __simd_init: так у
+// программ khc; у загрузчика — нет)
+var __str_compact: bool
 
 fn __str_new(ptr: int, len: int) -> str {
     let h = __alloc(16)
@@ -643,18 +671,35 @@ fn __str_new(ptr: int, len: int) -> str {
     return __cast(h)
 }
 
+// Короткая строка из len байт с адреса ptr в памяти h (len + 9 нулевых байт).
+fn __str_short(h: int, ptr: int, len: int) -> str {
+    store64(h, (len << 48) | (h + 8))
+    __memcpy(h + 8, ptr, len)
+    return __cast(h)
+}
+
 // Копия байтов в новую строку.
 fn __str_copy(ptr: int, len: int) -> str {
+    if __str_compact && len < STR_SHORT {
+        return __str_short(__alloc(len + 9), ptr, len)
+    }
     let p = __alloc(len + 1)
     __memcpy(p, ptr, len)
     return __str_new(p, len)
 }
 
-// Копия байтов в новую строку одним объектом: [заголовок {ptr, len}][байты][0],
-// ptr = адрес объекта + 16. Так строки копируются в store (__deep_copy): один
-// объект кучи store без ссылок вместо двух, а срез такой строки (ptr внутри
+// Копия байтов в новую строку одним объектом кучи store без ссылок: короткая
+// ([len << 48 | ptr][байты][0], 8 байт сверх байтов и нуля), длиннее —
+// [ptr][len][байты][0] с ptr = адрес объекта + 16; пустая — литерал "". Так
+// строки копируются в store (__deep_copy), а срез такой строки (ptr внутри
 // объекта) указывает в тот же объект.
 fn __str_copy_store(ptr: int, len: int) -> str {
+    if len == 0 {
+        return ""
+    }
+    if len < STR_SHORT {
+        return __str_short(__alloc_k(len + 9, K_NOSCAN, 0), ptr, len)
+    }
     let h = __alloc_k(len + 17, K_NOSCAN, 0)
     store64(h, h + 16)
     store64(h + 8, len)
@@ -662,14 +707,16 @@ fn __str_copy_store(ptr: int, len: int) -> str {
     return __cast(h)
 }
 
+// Встроенные __str_ptrw и __str_lenw — три команды без ветвления (у
+// загрузчика — функции bootstrap/shim.kh с тем же смыслом).
 fn __str_ptr(s: str) -> int {
     let h: int = __cast(s)
-    return load64(h)
+    return __str_ptrw(h)
 }
 
 fn __str_len(s: str) -> int {
     let h: int = __cast(s)
-    return load64(h + 8)
+    return __str_lenw(h)
 }
 
 fn __str_eq(a: str, b: str) -> bool {
@@ -708,6 +755,14 @@ fn __str_cmp(a: str, b: str) -> int {
 fn __str_concat(a: str, b: str) -> str {
     let an = __str_len(a)
     let bn = __str_len(b)
+    if __str_compact && an + bn < STR_SHORT {
+        let h = __alloc(an + bn + 9)
+        __memcpy(h + 8, __str_ptr(a), an)
+        __memcpy(h + 8 + an, __str_ptr(b), bn)
+        store64(h, ((an + bn) << 48) | (h + 8))
+        let r: str = __cast(h)
+        return r
+    }
     let p = __alloc(an + bn + 1)
     __memcpy(p, __str_ptr(a), an)
     __memcpy(p + an, __str_ptr(b), bn)
@@ -1246,9 +1301,20 @@ fn buf_str(b: Buf) -> str {
 
 // ---- Списки ----
 // Заголовок: [0] data, [8] len, [16] cap, [24] размер элемента — 8 байт,
-// а у [bool] — 1 байт.
+// а у [bool] — 1 байт. Список в store — заголовок 16 байт, только [0] data и
+// [8] len (этап памяти, часть 3, п. 4): размер элемента — по адресу
+// массива (массив [bool] начинается на 8 байт дальше начала своего слота,
+// массив слов — с начала), ёмкость — сколько элементов вмещает слот массива
+// от data до конца (__store_room, lib/gc.kh). Компилятор читает только data и
+// len, у обоих видов они на месте; ёмкость и размер элемента — через
+// __list_cap и __list_es.
 
 fn __list_new(cap: int, esize: int) -> int {
+    if __store_on() {
+        // в режиме store список — только вида store (вид элементов
+        // неизвестен: каждое слово — возможная ссылка)
+        return __list_new_k(cap, esize, true)
+    }
     var c = cap
     if c < 4 {
         c = 4
@@ -1261,32 +1327,68 @@ fn __list_new(cap: int, esize: int) -> int {
 }
 
 // То же с видами объектов для кучи store: в заголовке ссылка — только data
-// (слово 0); в data ссылки — элементы, если elem_ref.
+// (слово 0); в data ссылки — элементы, если elem_ref. В store (копия списка,
+// __deep_copy) массив — по длине списка, а не от 4 элементов: ёмкость —
+// сколько вмещает слот массива (у пустого и короткого — слот 16 байт), слот
+// целиком — с битами PTRB, если elem_ref; вне store — как __list_new.
 fn __list_new_k(cap: int, esize: int, elem_ref: bool) -> int {
-    var c = cap
-    if c < 4 {
-        c = 4
+    if !__store_on() {
+        return __list_new(cap, esize)
     }
     var kind = K_NOSCAN
     if elem_ref {
         kind = K_PTRS
     }
-    let h = __alloc_k(32, K_MASK, 1)
-    store64(h, __alloc_k(c * esize, kind, 0))
-    store64(h + 16, c)
-    store64(h + 24, esize)
+    let h = __salloc(16, K_MASK, 1)
+    store64(h, __list_data_k(cap, esize, kind))
     return h
 }
 
+// Массив списка store на cap элементов размера esize (вида kind; только в
+// режиме store): слот, в котором помещается cap элементов; у [bool] массив —
+// с 8-го байта слота.
+fn __list_data_k(cap: int, esize: int, kind: int) -> int {
+    if esize == 1 {
+        return __salloc(__salloc_size(cap + 8), kind, 0) + 8
+    }
+    var n = cap * 8
+    if n < 16 {
+        n = 16
+    }
+    return __salloc(__salloc_size(n), kind, 0)
+}
+
+// Ёмкость и размер элемента списка h (у списка store — по массиву).
+fn __list_cap(h: int) -> int {
+    if __in_store(h) {
+        let d = load64(h)
+        if (d & 8) != 0 {
+            return __store_room(d)
+        }
+        return __store_room(d) >> 3
+    }
+    return load64(h + 16)
+}
+
+fn __list_es(h: int) -> int {
+    if __in_store(h) {
+        if (load64(h) & 8) != 0 {
+            return 1
+        }
+        return 8
+    }
+    return load64(h + 24)
+}
+
 fn __lget(h: int, i: int) -> int {
-    if load64(h + 24) == 1 {
+    if __list_es(h) == 1 {
         return load8(load64(h) + i)
     }
     return load64(load64(h) + i * 8)
 }
 
 fn __lset(h: int, i: int, v: int) {
-    if load64(h + 24) == 1 {
+    if __list_es(h) == 1 {
         store8(load64(h) + i, v)
         return
     }
@@ -1294,29 +1396,54 @@ fn __lset(h: int, i: int, v: int) {
 }
 
 fn __list_grow(h: int, need: int) {
-    var cap = load64(h + 16) * 2
+    var cap = __list_cap(h) * 2
     while cap < need {
         cap *= 2
     }
-    let es = load64(h + 24)
-    // новый массив списка в store — того же вида, что старый ([int] — без ссылок)
-    let data = __alloc_for_k(h, cap * es, K_LIST_DATA, 0)
+    let es = __list_es(h)
+    if __in_store(h) && __salloc_list_inplace(h, cap, es) {
+        // большой массив вырос на месте (lib/gc.kh): ёмкость — по слоту
+        return
+    }
+    var data = 0
+    if __in_store(h) {
+        // новый массив списка store — того же вида, что старый ([int] — без
+        // ссылок); ёмкость — по его слоту
+        data = __salloc_list(h, cap, es)
+    } else {
+        data = __alloc_for_k(h, cap * es, K_LIST_DATA, 0)
+    }
     __memcpy(data, load64(h), load64(h + 8) * es)
     // SATB (lib/gc.kh, §7.5): заголовок больше не ссылается на старый массив, а
     // новый — чёрный, разметка его не смотрит
     __gc_old_array(h)
     store64(h, data)
-    store64(h + 16, cap)
+    if !__in_store(h) {
+        store64(h + 16, cap)
+    }
 }
 
 fn __list_push(self: [T], v: T) {
     let h: int = __cast(self)
-    __store_mut(h)
     let len = load64(h + 8)
+    if __in_store(h) {
+        __store_mut(h)
+        if len == __list_cap(h) {
+            __list_grow(h, len + 1)
+        }
+        __lset(h, len, __cast(v))
+        store64(h + 8, len + 1)
+        return
+    }
+    // список вне store: ёмкость и размер элемента — в заголовке
     if len == load64(h + 16) {
         __list_grow(h, len + 1)
     }
-    __lset(h, len, __cast(v))
+    if load64(h + 24) == 1 {
+        store8(load64(h) + len, __cast(v))
+    } else {
+        store64(load64(h) + len * 8, __cast(v))
+    }
     store64(h + 8, len + 1)
 }
 
@@ -1328,12 +1455,17 @@ fn __list_pop(self: [T]) -> T {
         __panic(PANIC_EMPTY, "pop")
     }
     store64(h + 8, len - 1)
-    let v = __lget(h, len - 1)
     if __in_store(h) {
+        let v = __lget(h, len - 1)
         __gc_shade(v)
         __lset(h, len - 1, 0)
+        return __cast(v)
     }
-    return __cast(v)
+    // список вне store: размер элемента — в заголовке
+    if load64(h + 24) == 1 {
+        return __cast(load8(load64(h) + len - 1))
+    }
+    return __cast(load64(load64(h) + (len - 1) * 8))
 }
 
 fn __list_last(self: [T]) -> T {
@@ -1365,7 +1497,7 @@ fn __list_truncate(self: [T], n: int) {
 // чтобы в массиве не оставалось ссылок на то, что из него уже убрано.
 fn __list_vacate(h: int, from: int) {
     if __in_store(h) {
-        let es = load64(h + 24)
+        let es = __list_es(h)
         __gc_vacate(h, from)
         __memset(load64(h) + from * es, 0, (load64(h + 8) - from) * es)
     }
@@ -1378,7 +1510,11 @@ fn __list_insert(self: [T], i: int, v: T) {
     if i < 0 || i > len {
         __panic(PANIC_INDEX, "insert")
     }
-    if len == load64(h + 16) {
+    if len == __list_cap(h) {
+        if __in_store(h) {
+            // последний элемент сдвинется за старый конец массива (§7.5)
+            __gc_insert_full(h, len)
+        }
         __list_grow(h, len + 1)
     }
     var j = len
@@ -1432,7 +1568,7 @@ fn __list_reverse(self: [T]) -> [T] {
 fn __list_copy(self: [T]) -> [T] {
     let h: int = __cast(self)
     let len = load64(h + 8)
-    let es = load64(h + 24)
+    let es = __list_es(h)
     let n = __list_new(len, es)
     __memcpy(load64(n), load64(h), len * es)
     store64(n + 8, len)
@@ -1443,7 +1579,7 @@ fn __list_copy(self: [T]) -> [T] {
 fn __list_repeat(self: [T], n: int) -> [T] {
     let h: int = __cast(self)
     let len = load64(h + 8)
-    let es = load64(h + 24)
+    let es = __list_es(h)
     var count = n
     if count < 0 {
         count = 0
@@ -1639,7 +1775,7 @@ fn __list_slice(self: [T], from: int, to: int) -> [T] {
     let h: int = __cast(self)
     let a = __clamp(from, 0, load64(h + 8))
     let b = __clamp(to, a, load64(h + 8))
-    let es = load64(h + 24)
+    let es = __list_es(h)
     let n = __list_new(b - a, es)
     __memcpy(load64(n), load64(h) + a * es, (b - a) * es)
     store64(n + 8, b - a)
@@ -1795,7 +1931,7 @@ fn __sort_by(self: [T], keys: [int], by_str: bool) -> [T] {
         width *= 2
     }
     // переставить элементы по номерам
-    let es = load64(h + 24)
+    let es = __list_es(h)
     let data = load64(h)
     let copy = __alloc(n * es + 8)
     __memcpy(copy, data, n * es)
@@ -2127,13 +2263,22 @@ fn __list_sort_str(self: [str]) -> [str] {
 }
 
 // ---- Словари ----
-// Записи хранятся по порядку вставки в списках keys, vals и alive (1 — жива);
-// slots — открытая адресация: номер записи + 1, 0 — пусто, -1 — удалено.
-// Заголовок: [0] keys, [8] count, [16] vals, [24] alive, [32] slots, [40] mask,
-// [48] строковые ключи, [56] состояние роста или 0.
+// Записи хранятся по порядку вставки в трёх массивах: ключи (слово на
+// запись), значения (слово, а у словаря со значениями bool — байт) и признак
+// «жива» (байт: 1 — жива, 0 — удалена); таблица slots — открытая адресация,
+// u32 на слот: номер записи + 1, 0 — пусто, MAP_DEL — удалено. Загрузка
+// таблицы — не больше половины (записей не больше половины слотов).
+// Заголовок (64 байта; в store ссылки — слова 0, 2, 3, 4 и 7): [0] ключи,
+// [8] живых записей (count, его читает len()), [16] значения, [24] признаки,
+// [32] таблица, [40] u32 маска таблицы, [44] u32 признаки словаря (MAP_STR —
+// строковые ключи, MAP_BYTES — значения байтами, MAP_REFS — значения-ссылки),
+// [48] u32 записей в массивах (с мёртвыми), [52] u32 ёмкость массивов, [56]
+// состояние роста или 0 (этап памяти, часть 3, п. 2: раньше массивы были
+// списками со своими заголовками по 32 байта, признак и значение bool — по
+// слову, слот — 8 байт).
 //
 // Рост по частям (docs/design/v0.13-store-gc.md §14, «As built», этап памяти,
-// часть 2). Вставка нового ключа в словарь, чьи списки заполнены до порога
+// часть 2). Вставка нового ключа в словарь, чьи массивы заполнены до порога
 // (у словаря store — до ёмкости без 1/32, у остальных — до ёмкости),
 // начинает рост: новые массивы записей, новая таблица или старая, если она
 // достаточно велика и мёртвых записей нет (__map_grow_start), и состояние
@@ -2141,27 +2286,40 @@ fn __list_sort_str(self: [str]) -> [str] {
 // (__map_grow_step): готовит до MAP_PREP байт новой памяти, затем переносит
 // до MAP_STEP старых записей — живые по порядку в новые массивы и в новую
 // таблицу (со старой таблицей — все записи на те же номера); когда
-// перенесены все, словарь переключается на новое (__map_grow_end). Всё это время старые таблица и массивы полны и верны: в них
-// идут вставки (их перенесут позже) и каждое изменение, поэтому поиск, обход,
-// keys(), values(), JSON и копия смотрят только их, а читатели ничего не пишут.
+// перенесены все, словарь переключается на новое (__map_grow_end). Всё это
+// время старые таблица и массивы полны и верны: в них идут вставки (их
+// перенесут позже) и каждое изменение, поэтому поиск, обход, keys(),
+// values(), JSON и копия смотрят только их, а читатели ничего не пишут.
 // Изменение и удаление уже перенесённой записи писатель повторяет в новых
 // (__map_grow_set, __map_grow_remove). Словарь вне store проходит рост целиком
 // в той же вставке: его рост задерживает только свой запрос.
-// G (104 байта; в store слова 0–3 — ссылки): [0] keys, [8] vals, [16] alive —
-// новые массивы на c2 записей, [24] slots, [32] mask2 — новая таблица (slots
-// 0 — остаётся старая таблица с маской mask2), [40] r — следующая старая
-// запись, [48] w — записей в новых массивах, [56] сколько байт текущей
-// области уже готово, [64] что ещё готовить: бит i — обнулить область i
-// (грязная память), бит 4 + i — поставить ей PTRB (области 0–3 — слова 0–3 G),
-// [72] что было готовить в начале, [80] номер темпа сборщика, при котором рост
-// поднял порог сборки, или −1, [88] c2, [96] на сколько поднят порог
-// (__gc_grow_hold, lib/gc.kh).
+// G (в store слова 0–3 — ссылки): [0] ключи, [8] значения, [16]
+// признаки — новые массивы на c2 записей, [24] slots, [32] mask2 — новая
+// таблица (slots 0 — остаётся старая таблица с маской mask2), [40] r —
+// следующая старая запись, [48] w — записей в новых массивах, [56] сколько
+// байт текущей области уже готово, [64] что ещё готовить: бит i — обнулить
+// область i (грязная память), бит 4 + i — поставить ей PTRB (области 0–3 —
+// слова 0–3 G), [72] что было готовить в начале, [80] номер темпа сборщика,
+// при котором рост поднял порог сборки, или −1, [88] c2, [96] на сколько
+// поднят порог (__gc_grow_hold, lib/gc.kh), [104] бит i (0–2) — новый массив
+// i — старый, выросший на месте (__gc_lazy_extend; готовится только его
+// хвост), бит 3 — записи остаются на своих номерах (мёртвых записей в начале
+// роста не было: перенос только копирует в невыросшие массивы и кладёт живые
+// в новую таблицу). G — 112 байт.
 
 // старых записей за шаг; байт новой памяти за шаг
 const MAP_STEP = 64
 const MAP_PREP = 32768
 // массив больше — у словаря store без обнуления и PTRB (__gc_lazy_alloc)
 const MAP_LAZY = 32768
+// слот удалённой записи
+const MAP_DEL = 0xFFFFFFFF
+// признаки словаря (u32 в слове 44 заголовка)
+const MAP_STR = 1
+const MAP_BYTES = 2
+const MAP_REFS = 4
+// больше записей словарь не вмещает (номер записи + 1 — в u32 слота)
+const MAP_MAX = 0x80000000
 // для тестов (__map_grow_budget): записей и байт за шаг, 0 — как обычно
 var __map_step_n: int
 var __map_prep_n: int
@@ -2169,60 +2327,123 @@ var __map_prep_n: int
 // чем рост кончился (при обычном шаге этого не бывает)
 var __map_fallbacks: int
 
-fn __map_new(str_keys: int) -> int {
-    let m = __alloc(64)
-    store64(m, __list_new(8, 8))
-    store64(m + 16, __list_new(8, 8))
-    store64(m + 24, __list_new(8, 8))
-    store64(m + 32, __alloc(16 * 8))
-    store64(m + 40, 15)
-    store64(m + 48, str_keys)
-    return m
+// Пустой словарь с признаками flags (MAP_STR | MAP_BYTES | MAP_REFS).
+fn __map_new(flags: int) -> int {
+    return __map_make(flags, 8, 16)
 }
 
-// Пустой словарь на n записей с видами объектов для кучи store: в заголовке
-// ссылки — keys, vals, alive, slots и состояние роста (слова 0, 2, 3, 4, 7); в
-// массивах ссылки — строковые ключи и значения, если vals_ref; alive и slots —
-// числа. Массивы — на n + n/16 + 2 записей: рост копии (запись в store,
-// восстановление KHRIP_DATA) начнётся с местом для вставок во время роста (с
-// массивами ровно на n первая же вставка начала бы рост без места, и его
-// пришлось бы закончить сразу; нетронутый хвост массивов памяти не занимает).
-fn __map_new_k(str_keys: int, vals_ref: bool, n: int) -> int {
+// Пустой словарь на n записей (копия в store, восстановление KHRIP_DATA):
+// массивы — на n + n/16 + 2 записей, чтобы рост копии начался с местом для
+// вставок во время роста (с массивами ровно на n первая же вставка начала бы
+// рост без места, и его пришлось бы закончить сразу; нетронутый хвост
+// массивов памяти не занимает), таблица — не меньше 4n слотов.
+fn __map_new_k(flags: int, n: int) -> int {
     var size = 16
     while size < n * 4 {
         size *= 2
     }
-    let c = n + n / 16 + 2
+    return __map_make(flags, n + n / 16 + 2, size)
+}
+
+// Словарь с массивами не меньше чем на c записей (сколько вмещает слот массива
+// ключей, __alloc_round) и таблицей из z слотов; в store — с видами объектов:
+// ключи — ссылки у строковых ключей, значения — у MAP_REFS, признаки и таблица
+// — числа.
+fn __map_make(flags: int, c: int, z: int) -> int {
+    var n = c
+    if n < 2 {
+        n = 2
+    }
+    let cap = __alloc_round(n * 8) / 8
     let m = __alloc_k(64, K_MASK, 0x9D)
-    store64(m, __list_new_k(c, 8, str_keys != 0))
-    store64(m + 16, __list_new_k(c, 8, vals_ref))
-    store64(m + 24, __list_new_k(c, 8, false))
-    store64(m + 32, __alloc_k(size * 8, K_NOSCAN, 0))
-    store64(m + 40, size - 1)
-    store64(m + 48, str_keys)
+    store64(m, __alloc_k(cap * 8, __map_kkind(flags), 0))
+    store64(m + 16, __alloc_k(cap * __map_esf(flags), __map_vkind(flags), 0))
+    store64(m + 24, __alloc_k(cap, K_NOSCAN, 0))
+    store64(m + 32, __alloc_k(z * 4, K_NOSCAN, 0))
+    store32(m + 40, z - 1)
+    store32(m + 44, flags)
+    store32(m + 48, 0)
+    store32(m + 52, cap)
     return m
 }
 
-// Пустой словарь на n записей: n вставок обходятся без перестройки.
-fn __map_new_cap(str_keys: int, n: int) -> int {
-    var size = 16
-    while size < n * 4 {
-        size *= 2
+// Словарь-литерал, тип которого стал известен по первой записи (src/atom.kh,
+// parse_map_lit): признаки flags; словарь ещё пуст, массив значений —
+// заново, если меняется размер значения.
+fn __map_retag(m: int, flags: int) {
+    if ((flags ^ load32(m + 44)) & MAP_BYTES) != 0 {
+        store64(m + 16, __alloc_k(load32(m + 52) * __map_esf(flags), __map_vkind(flags), 0))
     }
-    let m = __alloc(64)
-    store64(m, __list_new(n, 8))
-    store64(m + 16, __list_new(n, 8))
-    store64(m + 24, __list_new(n, 8))
-    store64(m + 32, __alloc(size * 8))
-    store64(m + 40, size - 1)
-    store64(m + 48, str_keys)
-    return m
+    store32(m + 44, flags)
+}
+
+// Вид массива ключей и значений по признакам словаря.
+fn __map_kkind(flags: int) -> int {
+    if (flags & MAP_STR) != 0 {
+        return K_PTRS
+    }
+    return K_NOSCAN
+}
+
+fn __map_vkind(flags: int) -> int {
+    if (flags & MAP_REFS) != 0 {
+        return K_PTRS
+    }
+    return K_NOSCAN
+}
+
+// Байт на значение: 1 у значений bool (MAP_BYTES), иначе 8.
+fn __map_esf(flags: int) -> int {
+    if (flags & MAP_BYTES) != 0 {
+        return 1
+    }
+    return 8
+}
+
+fn __map_es(m: int) -> int {
+    return __map_esf(load32(m + 44))
+}
+
+// Значение записи i в массиве значений vd словаря m.
+fn __map_val(m: int, vd: int, i: int) -> int {
+    if (load32(m + 44) & MAP_BYTES) != 0 {
+        return load8(vd + i)
+    }
+    return load64(vd + i * 8)
+}
+
+fn __map_val_put(m: int, vd: int, i: int, v: int) {
+    if (load32(m + 44) & MAP_BYTES) != 0 {
+        store8(vd + i, v)
+        return
+    }
+    store64(vd + i * 8, v)
+}
+
+// Значение записи idx.
+fn __map_value(m: int, idx: int) -> int {
+    return __map_val(m, load64(m + 16), idx)
+}
+
+// Записей в массивах (с мёртвыми) и ключ записи i.
+fn __map_len(m: int) -> int {
+    return load32(m + 48)
+}
+
+fn __map_key(m: int, i: int) -> int {
+    return load64(load64(m) + i * 8)
+}
+
+// Жива ли запись i.
+fn __map_alive(m: int, i: int) -> bool {
+    return load8(load64(m + 24) + i) != 0
 }
 
 fn __map_hash(m: int, k: int) -> int {
-    if load64(m + 48) != 0 {
-        let p = load64(k)
-        let n = load64(k + 8)
+    if (load32(m + 44) & MAP_STR) != 0 {
+        let s: str = __cast(k)
+        let p = __str_ptr(s)
+        let n = __str_len(s)
         var h = 5381
         var i = 0
         while i < n {
@@ -2237,64 +2458,45 @@ fn __map_hash(m: int, k: int) -> int {
 }
 
 fn __map_key_eq(m: int, a: int, b: int) -> bool {
-    if load64(m + 48) != 0 {
+    if (load32(m + 44) & MAP_STR) != 0 {
         return __str_eq(__cast(a), __cast(b))
     }
     return a == b
 }
 
-fn __word_at(list: int, i: int) -> int {
-    return load64(load64(list) + i * 8)
-}
-
 // Номер записи с ключом k или -1.
 fn __map_find(m: int, k: int) -> int {
-    let slots = load64(m + 32)
-    let mask = load64(m + 40)
-    var i = __map_hash(m, k) & mask
-    while true {
-        let e = load64(slots + i * 8)
-        if e == 0 {
-            return -1
-        }
-        if e > 0 && __map_key_eq(m, __word_at(load64(m), e - 1), k) {
-            return e - 1
-        }
-        i = (i + 1) & mask
+    let s = __map_probe(m, load64(m + 32), load32(m + 40), load64(m), k)
+    if s < 0 {
+        return -1
     }
-    return -1
+    return load32(load64(m + 32) + s * 4) - 1
 }
 
 // Номер слота, где лежит запись idx.
 fn __map_slot_of(m: int, k: int, idx: int) -> int {
     let slots = load64(m + 32)
-    let mask = load64(m + 40)
+    let mask = load32(m + 40)
     var i = __map_hash(m, k) & mask
-    while load64(slots + i * 8) != idx + 1 {
+    while load32(slots + i * 4) != idx + 1 {
         i = (i + 1) & mask
     }
     return i
 }
 
 fn __map_place(m: int, k: int, idx: int) {
-    let slots = load64(m + 32)
-    let mask = load64(m + 40)
-    var i = __map_hash(m, k) & mask
-    while load64(slots + i * 8) > 0 {
-        i = (i + 1) & mask
-    }
-    store64(slots + i * 8, idx + 1)
+    __map_put(m, load64(m + 32), load32(m + 40), k, idx)
 }
 
 // Слот ключа k в таблице slots (маска mask) с записями в массиве kd или −1.
 fn __map_probe(m: int, slots: int, mask: int, kd: int, k: int) -> int {
     var i = __map_hash(m, k) & mask
     while true {
-        let e = load64(slots + i * 8)
+        let e = load32(slots + i * 4)
         if e == 0 {
             return -1
         }
-        if e > 0 && __map_key_eq(m, load64(kd + (e - 1) * 8), k) {
+        if e != MAP_DEL && __map_key_eq(m, load64(kd + (e - 1) * 8), k) {
             return i
         }
         i = (i + 1) & mask
@@ -2302,39 +2504,69 @@ fn __map_probe(m: int, slots: int, mask: int, kd: int, k: int) -> int {
     return -1
 }
 
-// Запись idx с ключом k — в таблицу slots (маска mask); ключа там нет.
+// Запись idx с ключом k — в таблицу slots (маска mask): в первый пустой или
+// удалённый слот; ключа там нет.
 fn __map_put(m: int, slots: int, mask: int, k: int, idx: int) {
     var i = __map_hash(m, k) & mask
-    while load64(slots + i * 8) > 0 {
+    var e = load32(slots + i * 4)
+    while e != 0 && e != MAP_DEL {
         i = (i + 1) & mask
+        e = load32(slots + i * 4)
     }
-    store64(slots + i * 8, idx + 1)
+    store32(slots + i * 4, idx + 1)
 }
 
-// Массив роста на n байт вида старого массива списка like (0 — без ссылок):
-// до MAP_LAZY байт и у словаря вне store — обычная нулевая память с битами
-// PTRB; больше у словаря store — __gc_lazy_alloc (младшие биты адреса: 1 —
-// обнулить, 2 — поставить PTRB).
-fn __map_arr(m: int, n: int, like: int) -> int {
+// Массив роста на n байт вида kind: до MAP_LAZY байт и у словаря вне store —
+// обычная нулевая память с битами PTRB; больше у словаря store —
+// __gc_lazy_alloc (младшие биты адреса: 1 — обнулить, 2 — поставить PTRB).
+fn __map_arr(m: int, n: int, kind: int) -> int {
     if n > MAP_LAZY && __in_store(m) {
-        return __gc_lazy_alloc(n, like)
+        return __gc_lazy_alloc(n, kind)
     }
-    if like == 0 {
-        return __alloc_for_k(m, n, K_NOSCAN, 0)
+    return __alloc_for_k(m, n, kind, 0)
+}
+
+// С какого байта готовить область i роста g словаря m: у массива, который
+// растёт на месте (G, слово 104: бит i), — с конца старых записей, иначе с 0.
+fn __map_region_start(m: int, g: int, i: int) -> int {
+    if i >= 3 || ((load64(g + 104) >> i) & 1) == 0 {
+        return 0
     }
-    return __alloc_for_k(like, n, K_LIST_DATA, 0)
+    var es = 1
+    if i == 0 {
+        es = 8
+    } else if i == 1 {
+        es = __map_es(m)
+    }
+    return load32(m + 52) * es
 }
 
 // Сколько записей (с мёртвыми) вмещает словарь: ёмкость массивов, но не
 // больше половины таблицы (после clear таблица — 16 слотов, а массивы
 // остаются прежними).
 fn __map_limit(m: int) -> int {
-    let cap = load64(load64(m) + 16)
-    let half = (load64(m + 40) + 1) >> 1
+    let cap = load32(m + 52)
+    let half = (load32(m + 40) + 1) >> 1
     if half < cap {
         return half
     }
     return cap
+}
+
+// Байт области i роста g словаря m (0 — ключи, 1 — значения, 2 — признаки,
+// 3 — таблица).
+fn __map_region(m: int, g: int, i: int) -> int {
+    let c2 = load64(g + 88)
+    if i == 0 {
+        return c2 * 8
+    }
+    if i == 1 {
+        return c2 * __map_es(m)
+    }
+    if i == 2 {
+        return c2
+    }
+    return (load64(g + 32) + 1) * 4
 }
 
 // Начать рост. Новым массивам нужно need = max(2 · live, live + room + 1)
@@ -2348,9 +2580,8 @@ fn __map_limit(m: int) -> int {
 // KHRIP_DATA растут без новой таблицы, если её хватает). Иначе таблица новая —
 // степень двойки не меньше 2 · need, и массивы — не больше её половины.
 fn __map_grow_start(m: int) {
-    let kh = load64(m)
-    let len = load64(kh + 8)
-    let cap = load64(kh + 16)
+    let len = load32(m + 48)
+    let cap = load32(m + 52)
     let live = load64(m + 8)
     let room = __map_limit(m) - len
     var need = live * 2
@@ -2364,7 +2595,7 @@ fn __map_grow_start(m: int) {
             c2 *= 2
         }
     }
-    var z = load64(m + 40) + 1
+    var z = load32(m + 40) + 1
     let keep = live == len && z / 2 >= need
     if !keep {
         z = 16
@@ -2375,12 +2606,16 @@ fn __map_grow_start(m: int) {
     if c2 > z / 2 {
         c2 = z / 2
     }
-    let n = c2 * 8
-    var total = n * 3
-    if !keep {
-        total += z * 8
+    if c2 >= MAP_MAX {
+        __panic_msg("map has too many entries")
     }
-    let g = __alloc_for_k(m, 104, K_MASK, 15)
+    let fl = load32(m + 44)
+    let es = __map_esf(fl)
+    var total = c2 * (9 + es)
+    if !keep {
+        total += z * 4
+    }
+    let g = __alloc_for_k(m, 112, K_MASK, 15)
     // большой рост словаря store не приближает сборку, пока не переключится
     // (lib/gc.kh, __gc_grow_hold: слова 80 и 96 G): иначе она держала бы оба
     // набора живыми
@@ -2390,12 +2625,42 @@ fn __map_grow_start(m: int) {
         __gc_grow_hold(total, g)
     }
     store64(g + 88, c2)
-    let pk = __map_arr(m, n, kh)
-    let pv = __map_arr(m, n, load64(m + 16))
-    let pa = __map_arr(m, n, 0)
+    // мёртвых записей нет: записи остаются на своих номерах, и большой массив
+    // словаря store растёт на месте, если за ним запас (lib/gc.kh,
+    // __gc_lazy_extend; этап памяти, часть 3, п. 3): готовится только его
+    // новый хвост, а переносить в него нечего
+    let same = live == len
+    var pk = 0
+    var pv = 0
+    var pa = 0
+    if same && __in_store(m) && c2 > cap {
+        pk = __gc_lazy_extend(load64(m), c2 * 8, __map_kkind(fl))
+        pv = __gc_lazy_extend(load64(m + 16), c2 * es, __map_vkind(fl))
+        pa = __gc_lazy_extend(load64(m + 24), c2, K_NOSCAN)
+    }
+    var shared = 0
+    if same {
+        shared = 8
+    }
+    if pk != 0 {
+        shared = shared | 1
+    } else {
+        pk = __map_arr(m, c2 * 8, __map_kkind(fl))
+    }
+    if pv != 0 {
+        shared = shared | 2
+    } else {
+        pv = __map_arr(m, c2 * es, __map_vkind(fl))
+    }
+    if pa != 0 {
+        shared = shared | 4
+    } else {
+        pa = __map_arr(m, c2, K_NOSCAN)
+    }
+    store64(g + 104, shared)
     var ps = 0
     if !keep {
-        ps = __map_arr(m, z * 8, 0)
+        ps = __map_arr(m, z * 4, K_NOSCAN)
     }
     store64(g, pk & ~7)
     store64(g + 8, pv & ~7)
@@ -2405,7 +2670,7 @@ fn __map_grow_start(m: int) {
     var flags = (pk & 1) | ((pv & 1) << 1) | ((pa & 1) << 2) | ((ps & 1) << 3)
     flags = flags | (((pk >> 1) & 1) << 4) | (((pv >> 1) & 1) << 5) | (((pa >> 1) & 1) << 6) | (((ps >> 1) & 1) << 7)
     store64(g + 72, flags)
-    if !keep && z * 8 > MAP_LAZY && __in_store(m) {
+    if !keep && z * 4 > MAP_LAZY && __in_store(m) {
         // новая таблица заполняется вразнобой, и первое касание каждой её
         // страницы — отказ (в виртуальной машине — до десятков мкс): шаги
         // переноса задели бы десятки новых страниц каждый; подготовка
@@ -2416,9 +2681,10 @@ fn __map_grow_start(m: int) {
     store64(m + 56, g)
 }
 
-// Подготовить новую память роста g, не больше budget байт: обнулить грязную,
-// поставить PTRB массивам со ссылками. → true, если готово всё.
-fn __map_prep(g: int, budget: int) -> bool {
+// Подготовить новую память роста g словаря m, не больше budget байт:
+// обнулить грязную, поставить PTRB массивам со ссылками. → true, если готово
+// всё.
+fn __map_prep(m: int, g: int, budget: int) -> bool {
     var left = budget
     while load64(g + 64) != 0 {
         let flags = load64(g + 64)
@@ -2427,11 +2693,12 @@ fn __map_prep(g: int, budget: int) -> bool {
             i += 1
         }
         let p = load64(g + i * 8)
-        var size = load64(g + 88) * 8
-        if i == 3 {
-            size = (load64(g + 32) + 1) * 8
+        let size = __map_region(m, g, i)
+        var off = load64(g + 56)
+        let start = __map_region_start(m, g, i)
+        if off < start {
+            off = start
         }
-        let off = load64(g + 56)
         var n = size - off
         if n > left {
             n = left
@@ -2463,14 +2730,14 @@ fn __map_prep(g: int, budget: int) -> bool {
 fn __map_grow_step(m: int, n: int, prep: int) {
     let g = load64(m + 56)
     if load64(g + 64) != 0 {
-        __map_prep(g, prep)
+        __map_prep(m, g, prep)
         return
     }
-    let kh = load64(m)
-    let len = load64(kh + 8)
-    let kd = load64(kh)
-    let vd = load64(load64(m + 16))
-    let ad = load64(load64(m + 24))
+    let len = load32(m + 48)
+    let kd = load64(m)
+    let vd = load64(m + 16)
+    let ad = load64(m + 24)
+    let es = __map_es(m)
     let nk = load64(g)
     let nv = load64(g + 8)
     let na = load64(g + 16)
@@ -2482,21 +2749,40 @@ fn __map_grow_step(m: int, n: int, prep: int) {
     if n < len - r {
         e = r + n
     }
-    if ns == 0 {
-        while r < e {
-            store64(nk + r * 8, load64(kd + r * 8))
-            store64(nv + r * 8, load64(vd + r * 8))
-            store64(na + r * 8, load64(ad + r * 8))
-            r += 1
+    let sh = load64(g + 104)
+    if (sh & 8) != 0 {
+        // записи — на тех же номерах: в новые массивы (кроме выросших на
+        // месте — это те же массивы) и живые — в новую таблицу, если она есть
+        if (sh & 1) == 0 {
+            __memcpy(nk + r * 8, kd + r * 8, (e - r) * 8)
         }
+        if (sh & 2) == 0 {
+            __memcpy(nv + r * es, vd + r * es, (e - r) * es)
+        }
+        if (sh & 4) == 0 {
+            __memcpy(na + r, ad + r, e - r)
+        }
+        if ns != 0 {
+            while r < e {
+                if load8(ad + r) != 0 {
+                    __map_put(m, ns, nm, load64(kd + r * 8), r)
+                }
+                r += 1
+            }
+        }
+        r = e
         w = r
     }
     while r < e {
-        if load64(ad + r * 8) != 0 {
+        if load8(ad + r) != 0 {
             let k = load64(kd + r * 8)
             store64(nk + w * 8, k)
-            store64(nv + w * 8, load64(vd + r * 8))
-            store64(na + w * 8, 1)
+            if es == 1 {
+                store8(nv + w, load8(vd + r))
+            } else {
+                store64(nv + w * 8, load64(vd + r * 8))
+            }
+            store8(na + w, 1)
             __map_put(m, ns, nm, k, w)
             w += 1
         }
@@ -2509,34 +2795,46 @@ fn __map_grow_step(m: int, n: int, prep: int) {
     }
 }
 
-// Список h получает новый массив data (len записей, cap места).
-fn __map_adopt(h: int, data: int, len: int, cap: int) {
-    store64(h, data)
-    store64(h + 8, len)
-    store64(h + 16, cap)
-}
-
 // Всё перенесено: словарь переключается на новые массивы и таблицу. Пока идёт
 // разметка, серится всё, что уходит из заголовка (§7.5): старые массивы, как
 // при росте списка (в них перенесённые записи, если новые выделены чёрными или
 // уже просмотрены), старая таблица и G.
 fn __map_grow_end(m: int) {
     let g = load64(m + 56)
-    let w = load64(g + 48)
-    let cap = load64(g + 88)
-    let kh = load64(m)
-    let vh = load64(m + 16)
-    let ah = load64(m + 24)
-    __gc_old_array(kh)
-    __gc_old_array(vh)
-    __gc_old_array(ah)
-    __map_adopt(kh, load64(g), w, cap)
-    __map_adopt(vh, load64(g + 8), w, cap)
-    __map_adopt(ah, load64(g + 16), w, cap)
+    if __in_store(m) {
+        // большие массивы и таблица, которые не выросли на месте, — мусор
+        // (lib/gc.kh, __gc_abandon: сборка раньше порога, если их много)
+        let sh = load64(g + 104)
+        let cap = load32(m + 52)
+        var gone = 0
+        if (sh & 1) == 0 {
+            gone += cap * 8
+        }
+        if (sh & 2) == 0 {
+            gone += cap * __map_es(m)
+        }
+        if (sh & 4) == 0 {
+            gone += cap
+        }
+        if load64(g + 24) != 0 {
+            gone += (load32(m + 40) + 1) * 4
+        }
+        if gone > MAP_LAZY {
+            __gc_abandon(gone)
+        }
+    }
+    __gc_old_at(m, m)
+    __gc_old_at(m, m + 16)
+    __gc_old_at(m, m + 24)
+    store64(m, load64(g))
+    store64(m + 16, load64(g + 8))
+    store64(m + 24, load64(g + 16))
+    store32(m + 48, load64(g + 48))
+    store32(m + 52, load64(g + 88))
     if load64(g + 24) != 0 {
         __gc_old_slots(m)
         store64(m + 32, load64(g + 24))
-        store64(m + 40, load64(g + 32))
+        store32(m + 40, load64(g + 32))
     }
     __gc_old_at(m, m + 56)
     store64(m + 56, 0)
@@ -2551,21 +2849,32 @@ fn __map_grow_finish(m: int) {
     }
 }
 
+// Номер записи idx (ключ k) в новых массивах роста g или −1, если она ещё не
+// перенесена (или её там нет).
+fn __map_grow_idx(m: int, g: int, k: int, idx: int) -> int {
+    if idx >= load64(g + 40) {
+        return -1
+    }
+    let ns = load64(g + 24)
+    if ns == 0 || (load64(g + 104) & 8) != 0 {
+        // таблица остаётся старой или записи остаются на своих номерах: номер
+        // записи тот же
+        return idx
+    }
+    let s = __map_probe(m, ns, load64(g + 32), load64(g), k)
+    if s < 0 {
+        return -1
+    }
+    return load32(ns + s * 4) - 1
+}
+
 // Идёт рост, и значение записи idx (ключ k) стало v: если запись уже
 // перенесена, то и в новых массивах.
 fn __map_grow_set(m: int, k: int, idx: int, v: int) {
     let g = load64(m + 56)
-    if idx >= load64(g + 40) {
-        return
-    }
-    if load64(g + 24) == 0 {
-        // таблица остаётся старой: номер записи тот же
-        store64(load64(g + 8) + idx * 8, v)
-        return
-    }
-    let s = __map_probe(m, load64(g + 24), load64(g + 32), load64(g), k)
-    if s >= 0 {
-        store64(load64(g + 8) + (load64(load64(g + 24) + s * 8) - 1) * 8, v)
+    let j = __map_grow_idx(m, g, k, idx)
+    if j >= 0 {
+        __map_val_put(m, load64(g + 8), j, v)
     }
 }
 
@@ -2583,13 +2892,13 @@ fn __map_grow_remove(m: int, k: int, idx: int) {
         if s < 0 {
             return
         }
-        j = load64(ns + s * 8) - 1
-        store64(ns + s * 8, -1)
+        j = load32(ns + s * 4) - 1
+        store32(ns + s * 4, MAP_DEL)
     }
-    store64(load64(g + 16) + j * 8, 0)
+    store8(load64(g + 16) + j, 0)
     if __in_store(m) {
         store64(load64(g) + j * 8, 0)
-        store64(load64(g + 8) + j * 8, 0)
+        __map_val_put(m, load64(g + 8), j, 0)
     }
 }
 
@@ -2597,15 +2906,30 @@ fn __map_set(m: int, k: int, v: int) {
     __store_mut(m)
     let idx = __map_find(m, k)
     if idx >= 0 {
-        let a = load64(load64(m + 16)) + idx * 8
-        __gc_old_at(m, a)
-        store64(a, v)
-        if load64(m + 56) != 0 {
-            __map_grow_set(m, k, idx, v)
-        }
+        __map_update(m, k, idx, v)
         return
     }
-    let len = load64(load64(m) + 8)
+    __map_insert(m, k, v)
+}
+
+// Значение записи idx (ключ k) стало v.
+fn __map_update(m: int, k: int, idx: int, v: int) {
+    let vd = load64(m + 16)
+    if (load32(m + 44) & MAP_BYTES) != 0 {
+        store8(vd + idx, v)
+    } else {
+        let a = vd + idx * 8
+        __gc_old_at(m, a)
+        store64(a, v)
+    }
+    if load64(m + 56) != 0 {
+        __map_grow_set(m, k, idx, v)
+    }
+}
+
+// Новая запись k → v (ключа k в словаре нет).
+fn __map_insert(m: int, k: int, v: int) {
+    let len = load32(m + 48)
     let cap = __map_limit(m)
     let inc = __in_store(m)
     if load64(m + 56) == 0 {
@@ -2632,14 +2956,13 @@ fn __map_set(m: int, k: int, v: int) {
         }
         __map_grow_finish(m)
     }
-    let keys: [int] = __cast(load64(m))
-    let vals: [int] = __cast(load64(m + 16))
-    let alive: [int] = __cast(load64(m + 24))
-    keys.push(k)
-    vals.push(v)
-    alive.push(1)
+    let i = load32(m + 48)
+    store64(load64(m) + i * 8, k)
+    __map_val_put(m, load64(m + 16), i, v)
+    store8(load64(m + 24) + i, 1)
+    store32(m + 48, i + 1)
     store64(m + 8, load64(m + 8) + 1)
-    __map_place(m, k, keys.len() - 1)
+    __map_place(m, k, i)
     if load64(m + 56) != 0 {
         var n = __map_step_n
         if n == 0 {
@@ -2658,7 +2981,7 @@ fn __map_get_ref(m: int, k: int) -> int {
     if idx < 0 {
         return 0
     }
-    return __word_at(load64(m + 16), idx)
+    return __map_value(m, idx)
 }
 
 fn __map_get_box(m: int, k: int) -> int {
@@ -2667,7 +2990,7 @@ fn __map_get_box(m: int, k: int) -> int {
         return 0
     }
     let b = __alloc(8)
-    store64(b, __word_at(load64(m + 16), idx))
+    store64(b, __map_value(m, idx))
     return b
 }
 
@@ -2676,7 +2999,7 @@ fn __map_get_or0(m: int, k: int) -> int {
     if idx < 0 {
         return 0
     }
-    return __word_at(load64(m + 16), idx)
+    return __map_value(m, idx)
 }
 
 fn __map_get_or_empty(m: int, k: int) -> int {
@@ -2685,7 +3008,7 @@ fn __map_get_or_empty(m: int, k: int) -> int {
         let e: int = __cast("")
         return e
     }
-    return __word_at(load64(m + 16), idx)
+    return __map_value(m, idx)
 }
 
 fn __map_has(m: int, k: int) -> bool {
@@ -2701,11 +3024,11 @@ fn __map_remove_word(m: int, k: int, found: int) -> int {
         return 0
     }
     let s = __map_slot_of(m, k, idx)
-    store64(load64(m + 32) + s * 8, -1)
-    store64(load64(load64(m + 24)) + idx * 8, 0)
+    store32(load64(m + 32) + s * 4, MAP_DEL)
+    store8(load64(m + 24) + idx, 0)
     store64(m + 8, load64(m + 8) - 1)
     store64(found, 1)
-    let v = __word_at(load64(m + 16), idx)
+    let v = __map_value(m, idx)
     if load64(m + 56) != 0 {
         __map_grow_remove(m, k, idx)
     }
@@ -2713,8 +3036,8 @@ fn __map_remove_word(m: int, k: int, found: int) -> int {
         // SATB (lib/gc.kh, §7.5): ключ-строка и значение уходят
         __gc_map_removed(m, idx, v)
         // мёртвая запись в store не держит ни ключ, ни значение
-        store64(load64(load64(m)) + idx * 8, 0)
-        store64(load64(load64(m + 16)) + idx * 8, 0)
+        store64(load64(m) + idx * 8, 0)
+        __map_val_put(m, load64(m + 16), idx, 0)
     }
     return v
 }
@@ -2735,56 +3058,64 @@ fn __map_remove_box(m: int, k: int) -> int {
     return b
 }
 
-fn __map_collect(m: int, which: int, esize: int) -> int {
-    let src = load64(m + which)
-    let alive = load64(m + 24)
-    let n = load64(src + 8)
-    let out = __list_new(load64(m + 8), esize)
+fn __map_keys(m: int) -> int {
+    let n = load32(m + 48)
+    let ad = load64(m + 24)
+    let out = __list_new(load64(m + 8), 8)
     let outl: [int] = __cast(out)
     var i = 0
     while i < n {
-        if __word_at(alive, i) != 0 {
-            outl.push(__word_at(src, i))
+        if load8(ad + i) != 0 {
+            outl.push(__map_key(m, i))
         }
         i += 1
     }
     return out
 }
 
-fn __map_keys(m: int) -> int {
-    return __map_collect(m, 0, 8)
-}
-
 // esize — размер элемента результата: 1 для словарей с bool-значениями.
 fn __map_values(m: int, esize: int) -> int {
-    return __map_collect(m, 16, esize)
+    let n = load32(m + 48)
+    let ad = load64(m + 24)
+    let out = __list_new(load64(m + 8), esize)
+    let outl: [int] = __cast(out)
+    var i = 0
+    while i < n {
+        if load8(ad + i) != 0 {
+            outl.push(__map_value(m, i))
+        }
+        i += 1
+    }
+    return out
 }
 
 fn __map_clear(m: int) {
     __store_mut(m)
     let g = load64(m + 56)
     if g != 0 {
-        // рост бросается (§7.5: G уходит из заголовка)
+        // рост бросается (§7.5: G уходит из заголовка). Массив, выросший на
+        // месте, может остаться с неготовым хвостом за ёмкостью: его не
+        // использует ничто — разметка смотрит только слова с PTRB, а
+        // следующий рост после clear всегда берёт массивы меньше (записей
+        // мало), и выросшие становятся мусором
         __gc_old_at(m, m + 56)
         store64(m + 56, 0)
         __gc_grow_done(load64(g + 96), load64(g + 80))
     }
     if __in_store(m) {
-        let n = load64(load64(m) + 8)
+        let n = load32(m + 48)
         __gc_map_cleared(m, n)
-        __memset(load64(load64(m)), 0, n * 8)
-        __memset(load64(load64(m + 16)), 0, n * 8)
-        __memset(load64(load64(m + 24)), 0, n * 8)
+        __memset(load64(m), 0, n * 8)
+        __memset(load64(m + 16), 0, n * __map_es(m))
+        __memset(load64(m + 24), 0, n)
     }
-    store64(load64(m) + 8, 0)
-    store64(load64(m + 16) + 8, 0)
-    store64(load64(m + 24) + 8, 0)
+    store32(m + 48, 0)
     store64(m + 8, 0)
     // словарь в store: новая таблица — тоже в постоянной памяти, не в арене
-    let ns = __alloc_for_k(m, 16 * 8, K_NOSCAN, 0)
+    let ns = __alloc_for_k(m, 16 * 4, K_NOSCAN, 0)
     __gc_old_slots(m)
     store64(m + 32, ns)
-    store64(m + 40, 15)
+    store32(m + 40, 15)
 }
 
 fn __list_contains_bool(self: [bool], v: bool) -> bool {

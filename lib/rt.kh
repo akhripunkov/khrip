@@ -42,6 +42,14 @@ fn __simd_init() {
     }
     __simd_level = lvl
     __simd_sha = lvl > 0 && __cpu_sha()
+    // копии строк в арене и куче потока — короткие строки (lib/core.kh): один
+    // объект вместо двух; KHRIP_STR_COMPACT=0 — прежний вид {ptr, len} (так
+    // набор тестов проверяет и его). Загрузчик (bootstrap/shim.kh) сюда не
+    // заходит: его код читает только прежний вид.
+    __str_compact = true
+    if let c = env("KHRIP_STR_COMPACT") {
+        __str_compact = c != "0"
+    }
     // кэш строк (lib/text.kh): off — без него, stress — проверочный режим
     if let m = env("KHRIP_STRCACHE") {
         if m == "off" {

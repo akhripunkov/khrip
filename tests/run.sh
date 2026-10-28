@@ -337,17 +337,17 @@ for cut in keys vals alive slots gend gclear ptrb zero set remove keepset hold r
 import sys
 d, m = sys.argv[1], sys.argv[2]
 cuts = {
-    "keys": ("    __gc_old_array(kh)\n    __gc_old_array(vh)\n", "    __gc_old_array(vh)\n"),
-    "vals": ("    __gc_old_array(vh)\n    __gc_old_array(ah)\n", "    __gc_old_array(ah)\n"),
-    "alive": ("    __gc_old_array(ah)\n    __map_adopt(kh", "    __map_adopt(kh"),
+    "keys": ("    __gc_old_at(m, m)\n    __gc_old_at(m, m + 16)\n", "    __gc_old_at(m, m + 16)\n"),
+    "vals": ("    __gc_old_at(m, m + 16)\n    __gc_old_at(m, m + 24)\n", "    __gc_old_at(m, m + 24)\n"),
+    "alive": ("    __gc_old_at(m, m + 24)\n    store64(m, load64(g))\n", "    store64(m, load64(g))\n"),
     "slots": ("    if load64(g + 24) != 0 {\n        __gc_old_slots(m)\n", "    if load64(g + 24) != 0 {\n"),
-    "gend": ("        store64(m + 40, load64(g + 32))\n    }\n    __gc_old_at(m, m + 56)\n", "        store64(m + 40, load64(g + 32))\n    }\n"),
-    "gclear": ("        // рост бросается (§7.5: G уходит из заголовка)\n        __gc_old_at(m, m + 56)\n", "        // рост бросается (§7.5: G уходит из заголовка)\n"),
+    "gend": ("        store32(m + 40, load64(g + 32))\n    }\n    __gc_old_at(m, m + 56)\n", "        store32(m + 40, load64(g + 32))\n    }\n"),
+    "gclear": ("выросшие становятся мусором\n        __gc_old_at(m, m + 56)\n", "выросшие становятся мусором\n"),
     "ptrb": ("            __gc_ptrb_on(p + off, n)\n", ""),
     "zero": ("            __memset(p + off, 0, n)\n", ""),
-    "set": ("        if load64(m + 56) != 0 {\n            __map_grow_set(m, k, idx, v)\n        }\n", ""),
+    "set": ("    if load64(m + 56) != 0 {\n        __map_grow_set(m, k, idx, v)\n    }\n", ""),
     "remove": ("    if load64(m + 56) != 0 {\n        __map_grow_remove(m, k, idx)\n    }\n", ""),
-    "keepset": ("        store64(load64(g + 8) + idx * 8, v)\n        return\n", "        return\n"),
+    "keepset": ("        // записи тот же\n        return idx\n", "        // записи тот же\n        return -1\n"),
     "hold": ("        __gc_grow_hold(total, g)\n", ""),
     "release": ("    store64(m + 56, 0)\n    __gc_grow_done(load64(g + 96), load64(g + 80))\n}\n", "    store64(m + 56, 0)\n}\n"),
     "goal": ("    if __gc_trigger + up > top {\n        up = top - __gc_trigger\n    }\n", "", "gc.kh"),
@@ -374,6 +374,122 @@ PY
 	fi
 done
 [[ $grow_ok -eq 1 ]] && pass=$((pass + 1))
+
+# Представление данных store (этап памяти, часть 3) само по себе: на копиях
+# библиотеки с подложенной ошибкой тест пункта падает — без проверок (plain),
+# с KHRIP_GC_VERIFY=1 (verify) или с KHRIP_GC_STRESS=1 (stress), как указано
+# у каждой мутации:
+#   keyshare — ключ словаря не берётся из поля значения (gc_keys, plain);
+#   keyreplace — ключ копируется и при замене значения (gc_keys, plain);
+#   listptrb — ёмкость списка — весь слот, а биты PTRB — только на
+#              запрошенные байты (gc_lists, verify: ссылка без бита PTRB);
+#   listcap — ёмкость копии снова от 4 элементов (gc_lists, plain);
+#   mapvkind — массив значений-ссылок словаря без битов PTRB (gc_maps,
+#              verify: ссылка без бита PTRB);
+#   mapkkind — то же у массива строковых ключей (gc_maps, verify);
+#   mapalive — признак «жива» не снимается при удалении (gc_maps, plain);
+#   mapbytes — копия словаря кладёт значения bool словом (gc_maps, plain);
+#   listbool — массив [bool] в store с начала слота: размер элемента по адресу
+#              не узнать (gc_lists, plain);
+#   listroom — ёмкость списка store — весь слот, без сдвига массива [bool]
+#              (gc_lists, verify);
+#   listgrow — рост списка store без вида старого массива: новый массив
+#              ссылок без PTRB (gc_lists, verify);
+#   listvacate — серение ушедших элементов списка store по слову 24 старого
+#              заголовка (gc_satb, verify);
+#   inplaceblack — массив, помеченный разметкой и выросший на месте, — без
+#              новых байтов в живом (gc_inplace, verify: уборка насчитала больше);
+#   inplacekept — то же в уборке, до спана (gc_inplace, stress);
+#   inplaceptrb — новый хвост списка ссылок без PTRB (gc_inplace, verify);
+#   reservefree — запас спана не возвращается кучке (gc_inplace, verify:
+#              занятая страница без спана);
+#   sharedprep — массив словаря, выросший на месте, готовится с начала:
+#              записи стираются (gc_inplace, plain);
+#   reservecommit — система не дала памяти на запас роста: паника посреди
+#              выделения, страницы массива заняты без спана (gc_commit,
+#              plain);
+#   strnoscan — короткая строка store в спане со ссылками (gc_strings,
+#              verify);
+#   strnul — короткая строка store без места на нулевой байт (gc_strings,
+#              verify: байты строки выходят за объект);
+#   insertfull — insert в полный список store во время разметки не помечает
+#              последний элемент, сдвинутый за старые границы выросшего на
+#              месте массива (gc_insert, verify).
+mem3_ok=1
+while read -r cut test mode; do
+	[[ -z $cut ]] && continue
+	rm -rf "${tmp:?}/mem3lib"
+	mkdir -p "$tmp/mem3lib"
+	cp lib/*.kh "$tmp/mem3lib/"
+	if ! python3 - "$tmp/mem3lib" "$cut" <<'PY'
+import sys
+d, m = sys.argv[1], sys.argv[2]
+cuts = {
+    "keyshare": ("    var key = __map_key_share(k, v, vd)\n", "    var key = 0\n", "api.kh"),
+    "keyreplace": ("    __store_mut(m)\n    let idx = __map_find(m, k)\n    if idx >= 0 {\n        __map_update(m, k, idx, v)\n        return\n    }\n    var key = __map_key_share(k, v, vd)\n", "    __store_mut(m)\n    let k2 = __persist_copy(k, kd)\n    let idx = __map_find(m, k)\n    if idx >= 0 {\n        __map_update(m, k2, idx, v)\n        return\n    }\n    var key = __map_key_share(k, v, vd)\n", "api.kh"),
+    "listptrb": ("    return __salloc(__salloc_size(n), kind, 0)\n}\n", "    return __salloc(n, kind, 0)\n}\n", "core.kh"),
+    "listcap": ("    var n = cap * 8\n    if n < 16 {\n        n = 16\n    }\n", "    var n = cap * 8\n    if n < 32 {\n        n = 32\n    }\n", "core.kh"),
+    "mapvkind": ("fn __map_vkind(flags: int) -> int {\n    if (flags & MAP_REFS) != 0 {\n        return K_PTRS\n", "fn __map_vkind(flags: int) -> int {\n    if false {\n        return K_PTRS\n", "core.kh"),
+    "mapkkind": ("fn __map_kkind(flags: int) -> int {\n    if (flags & MAP_STR) != 0 {\n        return K_PTRS\n", "fn __map_kkind(flags: int) -> int {\n    if false {\n        return K_PTRS\n", "core.kh"),
+    "mapalive": ("    store8(load64(m + 24) + idx, 0)\n    store64(m + 8, load64(m + 8) - 1)\n", "    store64(m + 8, load64(m + 8) - 1)\n", "core.kh"),
+    "mapbytes": ("                __map_val_put(m, vals, w, sv)\n", "                store64(vals + w * 8, sv)\n", "api.kh"),
+    "listbool": ("        return __salloc(__salloc_size(cap + 8), kind, 0) + 8\n", "        return __salloc(__salloc_size(cap + 8), kind, 0)\n", "core.kh"),
+    "listroom": ("    return slot + size - p\n", "    return size\n", "gc.kh"),
+    "listgrow": ("fn __salloc_list(h: int, cap: int, es: int) -> int {\n    let kind = __gc_kind_of(load64(h))\n", "fn __salloc_list(h: int, cap: int, es: int) -> int {\n    let kind = K_NOSCAN\n", "gc.kh"),
+    "listvacate": ("    if __gc_marking != 0 && __list_es(h) == 8 {\n", "    if __gc_marking != 0 && load64(h + 24) == 8 {\n", "gc.kh"),
+    "inplaceblack": ("    if __gc_marking != 0 && __gc_bit(GC_MARK, p) {\n        __gc_black_bytes += bytes\n    } else if", "    if false {\n        __gc_black_bytes += bytes\n    } else if", "gc.kh"),
+    "inplacekept": ("        __gc_kept -= bytes\n", "", "gc.kh"),
+    "inplaceptrb": ("    if !lazy && (fl & F_NOSCAN) == 0 {\n        __gc_ptrb_on(q, bytes)\n    }\n", "", "gc.kh"),
+    "reservefree": ("    if np > used {\n        __ph_free_clean(__gc_ph, pg + used, np - used)\n    }\n", "", "gc.kh"),
+    "sharedprep": ("        if off < start {\n            off = start\n        }\n", "", "core.kh"),
+    "reservecommit": ("    let end = (at + n) << GC_PAGE_SHIFT\n    if end > __gc_committed && !__gc_commit_try(end) {\n", "    let end = (at + n) << GC_PAGE_SHIFT\n    if end > __gc_committed {\n        __gc_commit_to(end)\n    }\n    if false {\n", "gc.kh"),
+    "strnoscan": ("        return __str_short(__alloc_k(len + 9, K_NOSCAN, 0), ptr, len)\n", "        return __str_short(__alloc_k(len + 9, K_PTRS, 0), ptr, len)\n", "core.kh"),
+    "strnul": ("        return __str_short(__alloc_k(len + 9, K_NOSCAN, 0), ptr, len)\n", "        return __str_short(__alloc_k(len + 8, K_NOSCAN, 0), ptr, len)\n", "core.kh"),
+    "insertfull": ("            __gc_insert_full(h, len)\n", "", "core.kh"),
+}
+old, new, f = cuts[m]
+s = open(f"{d}/{f}").read()
+if s.count(old) != 1:
+    sys.exit(1)
+open(f"{d}/{f}", "w").write(s.replace(old, new))
+PY
+	then
+		mem3_ok=0
+		failed "представление store ($cut)" "место для подложенной ошибки не найдено в lib/"
+		continue
+	fi
+	venv=(env -u KHRIP_GC_VERIFY -u KHRIP_GC_STRESS)
+	[[ $mode == verify ]] && venv=(env -u KHRIP_GC_STRESS KHRIP_GC_VERIFY=1)
+	[[ $mode == stress ]] && venv=(env -u KHRIP_GC_VERIFY KHRIP_GC_STRESS=1)
+	{ KHRIP_LIB="$tmp/mem3lib" "${venv[@]}" timeout 120 "$KHC" test "tests/api/$test.kh" 2>&1 | grep -v '^khrip: gc verify (boot): ' >"$tmp/mem3.txt"; } 2>/dev/null
+	if diff -q "tests/api/$test.out" "$tmp/mem3.txt" >/dev/null; then
+		mem3_ok=0
+		failed "представление store ($cut)" "tests/api/$test.kh проходит и без проверяемого механизма"
+	fi
+done <<'CUTS'
+keyshare gc_keys plain
+keyreplace gc_keys plain
+listptrb gc_lists verify
+listcap gc_lists plain
+mapvkind gc_maps verify
+mapkkind gc_maps verify
+mapalive gc_maps plain
+mapbytes gc_maps plain
+listbool gc_lists plain
+listroom gc_lists verify
+listgrow gc_lists verify
+listvacate gc_satb verify
+inplaceblack gc_inplace verify
+inplacekept gc_inplace stress
+inplaceptrb gc_inplace verify
+reservefree gc_inplace verify
+sharedprep gc_inplace plain
+reservecommit gc_commit plain
+strnoscan gc_strings verify
+strnul gc_strings verify
+insertfull gc_insert verify
+CUTS
+[[ $mem3_ok -eq 1 ]] && pass=$((pass + 1))
 
 # Примеры учебника (docs/TUTORIAL.md) и ответы к заданиям: программы
 # выполняются, API проходят свои блоки test.

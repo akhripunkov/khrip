@@ -40,6 +40,9 @@ GC_PAGEMAP = 0x180200000000
 GC_SPANS = 0x180240000000
 GC_PHEAP = 0x180300000000
 GC_PH_PART = 0x400000
+META_PARTS = [("START", GC_START, 0x180080000000), ("MARK", 0x180080000000, 0x180100000000),
+              ("PTRB", 0x180100000000, 0x180200000000), ("PAGEMAP", GC_PAGEMAP, GC_SPANS),
+              ("SPANS", GC_SPANS, GC_PHEAP), ("page heap", GC_PHEAP, GCMETA_END)]
 PAGE = 8192
 MB = 1048576.0
 
@@ -221,8 +224,8 @@ def store_heap(proc, vmas):
     start_bits = proc.read(GC_START, (end - STORE) // 128)
     pres = proc.present(STORE, (end - STORE) >> 12)
     r = {"committed": end - STORE, "resident": 0, "inuse_resident": 0, "free_resident": 0,
-         "free_released": 0, "alloc_bytes": 0, "alloc_resident": 0, "free_slot_bytes": 0, "tail_bytes": 0,
-         "spans": 0, "by_class": {}}
+         "free_released": 0, "alloc_bytes": 0, "alloc_resident": 0, "free_slot_bytes": 0, "tail_bytes": 0, "reserve_bytes": 0,
+         "spans": 0, "noscan_bytes": 0, "by_class": {}}
     pg = 0
     while pg < npg:
         res = (pres[2 * pg] + pres[2 * pg + 1]) * 4096
@@ -264,7 +267,16 @@ def store_heap(proc, vmas):
         r["alloc_bytes"] += alloc
         r["alloc_resident"] += alloc_res
         r["free_slot_bytes"] += (ne - n_alloc) * es
-        r["tail_bytes"] += np_ * PAGE - ne * es
+        if (info >> 48) & 4:
+            # большой спан с запасом для роста на месте (этап памяти, часть 3,
+            # п. 3): объект — es байт, остальные страницы спана — запас (не
+            # тронут, в памяти его нет)
+            r["reserve_bytes"] += np_ * PAGE - es
+        else:
+            r["tail_bytes"] += np_ * PAGE - ne * es
+        if (info >> 48) & 2:
+            # спаны без ссылок: у большого — только объект (без запаса роста)
+            r["noscan_bytes"] += es if (info >> 48) & 4 else np_ * PAGE
         c = r["by_class"].setdefault(es, [0, 0, 0])
         c[0] += 1
         c[1] += alloc
@@ -317,6 +329,15 @@ def main():
 
     store_rss = sum(v["rss"] for v in vmas if STORE <= v["start"] < STORE + STORE_SIZE)
     meta_rss = sum(v["rss"] for v in vmas if GCMETA <= v["start"] < GCMETA_END)
+    # части метаданных (lib/gc.kh): START и MARK — бит на 16 байт STORE, PTRB —
+    # бит на слово, PAGEMAP — 4 байта на страницу, SPANS — 64 байта на страницу,
+    # кучка страниц — карты и дерево
+    meta_parts = {}
+    for v in vmas:
+        if GCMETA <= v["start"] < GCMETA_END:
+            for name, lo, hi in META_PARTS:
+                if lo <= v["start"] < hi:
+                    meta_parts[name] = meta_parts.get(name, 0) + v["rss"]
     heap = store_heap(proc, vmas)
     if heap:
         # живое — занятые слоты в памяти (или меньше: по журналу сборщика);
@@ -359,9 +380,12 @@ def main():
     print(f"VmRSS {vmrss / MB:.1f} MB, smaps {total / MB:.1f} MB")
     for k in order:
         print(f"  {k:42s} {cat.get(k, 0) / MB:8.2f}")
+    if meta_parts:
+        print("  GC metadata: " + ", ".join(f"{n} {meta_parts.get(n, 0) / MB:.2f}" for n, _, _ in META_PARTS)
+              + (f"; spans without references {heap['noscan_bytes'] / MB:.1f} MB" if heap else ""))
     if heap:
         print(f"  store: committed {heap['committed'] / MB:.1f}, resident {heap['resident'] / MB:.1f}, in spans {heap['inuse_resident'] / MB:.1f}"
-              f" (allocated slots {heap['alloc_bytes'] / MB:.2f}, resident {heap['alloc_resident'] / MB:.2f}, free slots {heap['free_slot_bytes'] / MB:.2f}, tails {heap['tail_bytes'] / MB:.2f}),"
+              f" (allocated slots {heap['alloc_bytes'] / MB:.2f}, resident {heap['alloc_resident'] / MB:.2f}, free slots {heap['free_slot_bytes'] / MB:.2f}, tails {heap['tail_bytes'] / MB:.2f}, growth reserve {heap['reserve_bytes'] / MB:.2f}),"
               f" free kept {heap['free_resident'] / MB:.2f}, released {heap['free_released'] / MB:.1f}, {heap['spans']} spans")
         top = sorted(heap["by_class"].items(), key=lambda kv: -kv[1][2])[:8]
         print("  classes (slot B: spans, allocated MB / span MB): " + ", ".join(f"{es}: {c[0]}, {c[1] / MB:.1f}/{c[2] / MB:.1f}" for es, c in top))
@@ -371,7 +395,7 @@ def main():
     if labels:
         print("  mmap pieces: " + ", ".join(f"{k} {v / MB:.2f}" for k, v in sorted(labels.items(), key=lambda kv: -kv[1])))
     if out_json:
-        json.dump({"vmrss": vmrss, "smaps": total, "categories": cat, "store": heap and {k: v for k, v in heap.items() if k != "by_class"},
+        json.dump({"vmrss": vmrss, "smaps": total, "categories": cat, "gc_metadata": meta_parts, "store": heap and {k: v for k, v in heap.items() if k != "by_class"},
                    "store_classes": heap and {str(k): v for k, v in heap["by_class"].items()},
                    "arenas": per_arena, "mmap_labels": labels}, open(out_json, "w"), indent=1)
 

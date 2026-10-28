@@ -359,11 +359,14 @@ fn parse_map_lit(want_ty: int) -> int {
     if known {
         is_str = kt == ty_str
     }
-    if is_str {
-        emit_mov_imm(RDI, 1)
-    } else {
-        emit_mov_imm(RDI, 0)
+    let guess = known
+    var flags = 0
+    if known {
+        flags = map_flags(kt, vt)
+    } else if is_str {
+        flags = 1
     }
+    emit_mov_imm(RDI, flags)
     emit_call(rt_func("__map_new"))
     emit_push(RAX)
     while kind() != '}' && kind() != T_EOF && !panic_mode {
@@ -396,6 +399,16 @@ fn parse_map_lit(want_ty: int) -> int {
             known = true
         } else {
             coerce(v1, vt, vtok)
+        }
+        if !guess && map_flags(kt, vt) != flags {
+            // тип стал известен по первой записи: признаки пустого словаря
+            // (значения bool — байтами, ключ-строка не литерал)
+            emit_push(RAX)
+            emit_load(RDI, RSP, 16)
+            emit_mov_imm(RSI, map_flags(kt, vt))
+            emit_call(rt_func("__map_retag"))
+            emit_pop(RAX)
+            flags = map_flags(kt, vt)
         }
         emit_mov_rr(RDX, RAX)
         emit_pop(RSI)
@@ -915,12 +928,12 @@ fn parse_index(t: int) -> int {
         emit_call(rt_func("__text_at"))
         return ty_str
     }
-    emit_bounds_check(at)
-    emit_load(RAX, RAX, 0)
     if k == K_STR {
-        emit_movzx_index()
+        emit_byte_at(at)
         return ty_int
     }
+    emit_bounds_check(at)
+    emit_load(RAX, RAX, 0)
     if k == K_LIST && ty_elem(t) == ty_bool {
         emit_movzx_index()
         return ty_bool
@@ -949,8 +962,12 @@ fn finish_slice(t: int, at: Token, saved: bool) -> int {
         emit_mov_imm(RAX, SLICE_END)
     } else if kind() == ']' {
         // до конца: длина получателя
-        emit_load(RAX, RSP, 8)
-        emit_load(RAX, RAX, 8)
+        emit_load(RDX, RSP, 8)
+        if tkind(t) == K_STR {
+            emit_str_len(RAX, RDX)
+        } else {
+            emit_load(RAX, RDX, 8)
+        }
     } else {
         let et = parse_expr(ty_int)
         if et != ty_int && et != ty_err {
@@ -1559,7 +1576,7 @@ fn parse_builtin(t: Token, w: int) -> int {
         }
         return ty_opt(inner)
     }
-    let lib_only = name == "__fsqrt" || name.starts_with("__simd_") || name == "__sha256_x64" || name == "__sha512_x64" || name == "__cpu_aes" || name == "__aes_ctr" || name == "__ghash" || name == "__chacha_block" || name == "__mp_add" || name == "__mp_sub" || name == "__mont_mul" || name == "__madd" || name == "__msub" || name == "__wmul" || name == "__cpu_avx2" || name == "__cpu_pdep" || name == "__cpu_sha" || name == "__spawn" || name == "__co_call" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset" || name == "__data_end" || name == "__data_hex" || name == "__gc_roots" || name == "__ctz" || name == "__clz" || name == "__sp" || name == "__cpu_pause" || name == "__noinline" || name == "__save_area"
+    let lib_only = name == "__fsqrt" || name.starts_with("__simd_") || name == "__sha256_x64" || name == "__sha512_x64" || name == "__cpu_aes" || name == "__aes_ctr" || name == "__ghash" || name == "__chacha_block" || name == "__mp_add" || name == "__mp_sub" || name == "__mont_mul" || name == "__madd" || name == "__msub" || name == "__wmul" || name == "__cpu_avx2" || name == "__cpu_pdep" || name == "__cpu_sha" || name == "__spawn" || name == "__co_call" || name == "__file_name" || name == "__setjmp" || name == "__longjmp" || name == "__cas" || name == "__xchg" || name == "__xadd" || name == "__memcpy" || name == "__memset" || name == "__data_end" || name == "__data_hex" || name == "__gc_roots" || name == "__ctz" || name == "__clz" || name == "__sp" || name == "__cpu_pause" || name == "__noinline" || name == "__save_area" || name == "__str_ptrw" || name == "__str_lenw"
     if lib_only && !files[t.file].is_lib {
         return -1
     }
@@ -1875,6 +1892,20 @@ fn parse_builtin(t: Token, w: int) -> int {
         }
         return ty_int
     }
+    if name == "__str_ptrw" || name == "__str_lenw" {
+        // адрес байтов и длина строки обоих видов без ветвления (lib/core.kh,
+        // __str_ptr и __str_len; src/emit.kh)
+        advance()
+        builtin_args(1, t, name)
+        emit_pop(RAX)
+        if name == "__str_ptrw" {
+            emit_str_ptr(RAX, RAX)
+        } else {
+            emit_mov_rr(RDX, RAX)
+            emit_str_len(RAX, RDX)
+        }
+        return ty_int
+    }
     if name == "__sp" {
         // указатель стека здесь: mov rax, rsp (вершина стека потока, lib/rt.kh)
         advance()
@@ -1961,7 +1992,12 @@ fn parse_builtin(t: Token, w: int) -> int {
             emit_text_len(lit)
             return ty_int
         }
-        if k == K_STR || k == K_LIST || k == K_MAP {
+        if k == K_STR {
+            emit_mov_rr(RDX, RAX)
+            emit_str_len(RAX, RDX)
+            return ty_int
+        }
+        if k == K_LIST || k == K_MAP {
             emit_load(RAX, RAX, 8)
             return ty_int
         }
@@ -2210,7 +2246,12 @@ fn parse_method(rt: int, nt: Token) -> int {
     if ((name == "len" && (k == K_STR || k == K_LIST || k == K_MAP)) || (name == "byte_len" && k == K_STR)) && kind_at(pos + 1) == ')' {
         advance()
         advance()
-        emit_load(RAX, RAX, 8)
+        if k == K_STR {
+            emit_mov_rr(RDX, RAX)
+            emit_str_len(RAX, RDX)
+        } else {
+            emit_load(RAX, RAX, 8)
+        }
         last_was_call = false
         return ty_int
     }
@@ -2342,10 +2383,13 @@ fn emit_text_len(lit: int) {
     emit_call(rt_func("__text_len"))
 }
 
-// s.byte(i): получатель в rax, индекс в rcx; байт с проверкой границ.
+// s.byte(i): получатель в rax, индекс в rcx; байт с проверкой границ (длина и
+// адрес байтов — по виду строки, lib/core.kh; rdx — длина).
 fn emit_byte_at(at: Token) {
-    emit_bounds_check(at)
-    emit_load(RAX, RAX, 0)
+    emit_str_len(RDX, RAX)
+    emit_rr(0x39, RDX, RCX)
+    emit_panic_jump(CC_AE, PANIC_INDEX, at)
+    emit_str_ptr(RAX, RAX)
     emit_movzx_index()
     last_was_call = false
 }

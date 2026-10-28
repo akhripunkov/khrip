@@ -74,6 +74,10 @@ type CodecOwner {
 type CodecHolder {
     f: Bson
 }
+type CodecFlags {
+    name: str
+    flags: map[str, bool]
+}
 
 var checks: int
 var failures: int
@@ -555,6 +559,37 @@ fn review() {
         let fb = bson_new()
         bson_array(fb, "a", few)
         verify("bson_array size of {n}", bson_finish(fb).data == to_bson({ "a": few }).data)
+    }
+    // map[str, bool]: значения в словаре — байтами (компактные словари), BSON
+    // читает их по записям — и у корня, и у поля
+    let bm: map[str, bool] = {"a": true, "b": false, "c": true, "d": false, "e": true}
+    let bdoc = to_bson(bm)
+    verify("map[str, bool] root encodes", bdoc.error == "" && bson_valid(bdoc))
+    verify("map[str, bool] root values", (bson_get_bool(bdoc, "a") ?? false) && !(bson_get_bool(bdoc, "b") ?? true) && (bson_get_bool(bdoc, "c") ?? false) && !(bson_get_bool(bdoc, "d") ?? true) && (bson_get_bool(bdoc, "e") ?? false))
+    let bback: map[str, bool]? = from_bson(bdoc)
+    if let bb = bback {
+        verify("map[str, bool] root round trip", bb.len() == 5 && (bb["c"] ?? false) && !(bb["d"] ?? true) && (bb["e"] ?? false))
+    } else {
+        verify("map[str, bool] root decodes", false)
+    }
+    var many: map[str, bool] = {}
+    for i in 0..3000 {
+        many["k{i}"] = i % 7 == 0
+    }
+    let mdoc = to_bson(many)
+    var wrong = 0
+    for i in 0..3000 {
+        if (bson_get_bool(mdoc, "k{i}") ?? (i % 7 != 0)) != (i % 7 == 0) {
+            wrong += 1
+        }
+    }
+    verify("map[str, bool] of 3000", mdoc.error == "" && wrong == 0)
+    let fdoc = to_bson(CodecFlags { name: "x", flags: {"on": true, "off": false, "maybe": true} })
+    let fback: CodecFlags? = from_bson(fdoc)
+    if let fb = fback {
+        verify("map[str, bool] field", fdoc.error == "" && fb.flags.len() == 3 && (fb.flags["on"] ?? false) && !(fb.flags["off"] ?? true) && (fb.flags["maybe"] ?? false))
+    } else {
+        verify("map[str, bool] field decodes", false)
     }
     // С14: tlsCAFile с tls=false — противоречие, а не тихий переход на открытый текст.
     for uri in ["tlsCAFile=/x.pem&tls=false", "tls=false&tlsCAFile=/x.pem", "ssl=false&tlsCAFile=/x.pem"] {

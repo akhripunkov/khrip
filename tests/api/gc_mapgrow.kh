@@ -155,11 +155,12 @@ test "large new arrays from reused memory are prepared before entries move" {
     big["key {k}"] = item(k, "g")
     k += 1
     expect __map_growing(h) && !__map_grow_ready(h) && __map_grow_moved(h) == 0
-    // выделенное на рост (массивы по 64 КБ и таблица 128 КБ — больше восьмой
-    // части кучи и меньше, чем осталось до цели) порог сборки не приближает,
-    // пока рост не кончится (lib/gc.kh, __gc_grow_hold)
-    expect !exact() || (s0.heap / 8 <= 20 * 16384 && s0.goal - t0 >= 20 * 16384)
-    expect !exact() || (__map_grow_held(h) == 20 * 16384 && __gc_stats().trigger == t0 + 20 * 16384)
+    // выделенное на рост (ключи и значения по 64 КБ, признаки 8 КБ, таблица
+    // 64 КБ — больше восьмой части кучи и меньше, чем осталось до цели) порог
+    // сборки не приближает, пока рост не кончится (lib/gc.kh, __gc_grow_hold)
+    let grown = 3 * 65536 + 8192
+    expect !exact() || (s0.heap / 8 <= grown && s0.goal - t0 >= grown)
+    expect !exact() || (__map_grow_held(h) == grown && __gc_stats().trigger == t0 + grown)
     // память — из-под мусора (иначе тест не проверял бы обнуление)
     expect __map_grow_dirty(h)
     var preps = 0
@@ -193,7 +194,7 @@ test "large new arrays from reused memory are prepared before entries move" {
     // хвост новых массивов — нули
     var dirty = 0
     for i in __map_entries(h)..__map_cap(h) {
-        if load64(load64(load64(h)) + i * 8) != 0 || load64(load64(load64(h + 16)) + i * 8) != 0 {
+        if load64(load64(h) + i * 8) != 0 || load64(load64(h + 16) + i * 8) != 0 {
             dirty += 1
         }
     }
@@ -478,7 +479,9 @@ test "clear during growth during marking" {
 }
 
 // копия словаря в store (запись, восстановление KHRIP_DATA): массивы на
-// n + n/16 + 2 записи, таблица — степень двойки не меньше 4n. Первый рост
+// n + n/16 + 2 записи (столько, сколько вмещает их слот: 1500 записей —
+// 1595 → 1696, 4000 — 4252 → 5120, пять страниц), таблица — степень двойки не
+// меньше 4n. Первый рост
 // удваивает массивы (не больше половины таблицы) и, если половины таблицы
 // хватает, оставляет её: записи переносятся на те же номера
 test "a copied store map grows twofold and keeps a large enough table" {
@@ -493,7 +496,7 @@ test "a copied store map grows twofold and keeps a large enough table" {
     }
     copied = local
     let h = mi(copied)
-    expect __map_cap(h) == 1595 && __map_slots(h) == 8192
+    expect __map_cap(h) == 1696 && __map_slots(h) == 8192
     var k = 1500
     while !__map_growing(h) {
         copied[k] = item(k, "p")
@@ -525,7 +528,7 @@ test "a copied store map grows twofold and keeps a large enough table" {
         expect same_int(copied, keys, names)
     }
     // вдвое, а не до половины таблицы (4096), и таблица та же
-    expect __map_cap(h) == 3190 && __map_slots(h) == 8192
+    expect __map_cap(h) == 3392 && __map_slots(h) == 8192
     __gc_collect()
     expect same_int(copied, keys, names)
     // следующий рост: мёртвые записи есть — новая таблица, записи сжимаются
@@ -543,7 +546,7 @@ test "a copied store map grows twofold and keeps a large enough table" {
         k += 1
     }
     expect same_int(copied, keys, names)
-    expect __map_cap(h) == 6380 && __map_slots(h) == 16384
+    expect __map_cap(h) == 6784 && __map_slots(h) == 16384
     __map_grow_budget(0, 0)
 }
 
@@ -558,7 +561,7 @@ test "a copied store map whose table is too small gets a new one, arrays twofold
     }
     copied = local
     let h = mi(copied)
-    expect __map_cap(h) == 4252 && __map_slots(h) == 16384
+    expect __map_cap(h) == 5120 && __map_slots(h) == 16384
     var k = 4000
     while !__map_growing(h) {
         copied[k] = item(k, "u")
@@ -573,7 +576,7 @@ test "a copied store map whose table is too small gets a new one, arrays twofold
         names.push("u {k}")
         k += 1
     }
-    expect __map_cap(h) == 8504 && __map_slots(h) == 32768
+    expect __map_cap(h) == 10240 && __map_slots(h) == 32768
     expect same_int(copied, keys, names)
 }
 
@@ -600,9 +603,9 @@ test "small growths do not hold the trigger, and a hold stops halfway to the har
     }
     __gc_collect()
     let s0 = __gc_stats()
-    // рост каждого: массивы по 16 КБ и таблица 32 КБ — 80 КБ, меньше восьмой
-    // части кучи
-    expect !exact() || s0.heap / 8 > 81920
+    // рост каждого: ключи и значения по 16 КБ, признаки 2 КБ, таблица 16 КБ —
+    // 50 КБ, меньше восьмой части кучи
+    expect !exact() || s0.heap / 8 > 51200
     for i in 0..8 {
         let im = inner[i] else {
             return
@@ -621,8 +624,8 @@ test "small growths do not hold the trigger, and a hold stops halfway to the har
     }
     __gc_collect()
     let s1 = __gc_stats()
-    // массивы по 256 КБ и таблица 512 КБ
-    let total = 3 * 262144 + 524288
+    // ключи и значения по 256 КБ, признаки 32 КБ, таблица 256 КБ
+    let total = 3 * 262144 + 32768
     let top = s1.goal + (__gc_hard_now() - s1.goal) / 2
     expect !exact() || (total >= s1.heap / 8 && total > s1.goal - s1.trigger && s1.trigger + total < top)
     ints[k] = k

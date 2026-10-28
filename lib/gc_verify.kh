@@ -546,13 +546,14 @@ fn __gcv_span(st: int, when: str, pg: int) -> int {
         __gcv_fail(st, when, "span at page {pg}: NOSCAN, but pointer bits are set")
     }
     if (fl & F_LARGE) != 0 {
-        if sc != 0 || load64(s + S_SIZE) != np << GC_PAGE_SHIFT || load64(s + S_MAGIC) != 1 << 32 || load64(s + S_FAST) != 0 || bits > 1 || (bits == 1 && !__gc_bit(GC_START, base)) {
+        if sc != 0 || load64(s + S_SIZE) > np << GC_PAGE_SHIFT || load64(s + S_SIZE) == 0 || (load64(s + S_SIZE) & (GC_PAGE - 1)) != 0 || load64(s + S_MAGIC) != 1 << 32 || load64(s + S_FAST) != 0 || bits > 1 || (bits == 1 && !__gc_bit(GC_START, base)) {
             __gcv_fail(st, when, "large span at page {pg}: a broken record")
         }
         if unswept && !__gc_bit(GC_MARK, base) {
             return 0
         }
-        return bits * (np << GC_PAGE_SHIFT)
+        // объект — его страницы (S_SIZE), запас за ним в живое не входит
+        return bits * load64(s + S_SIZE)
     }
     let c = sc >> 1
     let es = load64(s + S_SIZE)
@@ -601,12 +602,20 @@ fn __gcv_visit(st: int, when: str, v: int, d: int) {
         return
     }
     if k == D_STR {
-        let len = load64(v + 8)
+        // два вида строк (lib/core.kh): короткая строка store — в спане без
+        // ссылок, её байты — в ней самой за словом 0
+        let s: str = __cast(v)
+        let len = __str_len(s)
+        let p = __str_ptr(s)
+        if __in_store(v) && (load64(v) >> 48) != 0 && (p != v + 8 || len >= STR_SHORT || ((load64(__gc_span_of(v) + S_INFO) >> 48) & F_NOSCAN) == 0) {
+            __gcv_fail(st, when, "a short store string at " + __gc_hex(v) + " has a broken header or is not in a NOSCAN span")
+        }
         if len > 0 {
-            let p = load64(v)
             __gcv_ptr(st, when, p, "string bytes", false)
-            __gcv_word(st, when, v)
-            if __in_store(p) && __gc_obj_of(p) + __gc_obj_size(__gc_obj_of(p)) < p + len {
+            if (load64(v) >> 48) == 0 {
+                __gcv_word(st, when, v)
+            }
+            if __in_store(p) && __gc_obj_of(p) + __gc_obj_size(__gc_obj_of(p)) < p + len + 1 {
                 __gcv_fail(st, when, "string bytes at " + __gc_hex(p) + " run past their object")
             }
         }
@@ -617,19 +626,33 @@ fn __gcv_visit(st: int, when: str, v: int, d: int) {
         __gcv_ptr(st, when, data, "list data", true)
         __gcv_slot(st, when, v)
         let ed = load64(t + 8)
+        let n = load64(v + 8)
+        let cap = __list_cap(v)
+        if __in_store(v) {
+            // список store: заголовок — слот 16 байт, массив [bool] — с 8-го
+            // байта своего слота, массив слов — с начала (lib/core.kh)
+            let es = __list_es(v)
+            let o = __gc_obj_of(data)
+            if __gc_obj_size(__gc_obj_of(v)) != 16 || (es == 1) != (load64(ed) == D_BOOL) || (es == 1 && data != o + 8) || (es == 8 && data != o) {
+                __gcv_fail(st, when, "a store list at " + __gc_hex(v) + " has a broken header or data at " + __gc_hex(data))
+            }
+        }
+        if n > cap {
+            __gcv_fail(st, when, "a list at " + __gc_hex(v) + " has " + n.to_str() + " elements for room of " + cap.to_str())
+        }
         if !__is_scalar(ed) {
-            let n = load64(v + 8)
             for i in 0..n {
                 __gcv_child(st, when, data + i * 8, ed)
             }
-            for i in n..load64(v + 16) {
+            for i in n..cap {
                 __gcv_slot(st, when, data + i * 8)
             }
         }
         return
     }
     if k == D_MAP {
-        // записи по порядку: keys [0], vals [16], alive [24] — списки; слоты [32]
+        // записи по порядку: ключи [0], значения [16], признаки [24] — массивы
+        // прямо в заголовке, таблица [32]; записей и ёмкость — u32 в слове 48
         let keys = load64(v)
         let vals = load64(v + 16)
         let alive = load64(v + 24)
@@ -637,48 +660,52 @@ fn __gcv_visit(st: int, when: str, v: int, d: int) {
         __gcv_ptr(st, when, vals, "map values", true)
         __gcv_ptr(st, when, alive, "map entries", true)
         __gcv_ptr(st, when, load64(v + 32), "map slots", true)
-        __gcv_ptr(st, when, load64(keys), "map keys data", true)
-        __gcv_ptr(st, when, load64(vals), "map values data", true)
-        __gcv_ptr(st, when, load64(alive), "map entries data", true)
         __gcv_slot(st, when, v)
         __gcv_slot(st, when, v + 16)
         __gcv_slot(st, when, v + 24)
         __gcv_slot(st, when, v + 32)
-        __gcv_slot(st, when, keys)
-        __gcv_slot(st, when, vals)
-        __gcv_slot(st, when, alive)
         let kd = load64(t + 8)
         let vd = load64(t + 16)
-        // записей — по самому короткому из трёх списков: сборка внутри работы
-        // (__gc_hard_check в росте списка) застаёт __map_set между вставкой
-        // ключа и значения
-        var n = load64(keys + 8)
-        if load64(vals + 8) < n {
-            n = load64(vals + 8)
+        let fl = load32(v + 44)
+        let es = __map_esf(fl)
+        if ((fl & MAP_STR) != 0) != (load64(kd) == D_STR) || ((fl & MAP_BYTES) != 0) != (load64(vd) == D_BOOL) {
+            __gcv_fail(st, when, "a map at " + __gc_hex(v) + " has flags " + fl.to_str() + " that do not match its type")
         }
-        if load64(alive + 8) < n {
-            n = load64(alive + 8)
+        let n = load32(v + 48)
+        let cap = load32(v + 52)
+        if n > cap || n > __map_limit(v) {
+            __gcv_fail(st, when, "a map at " + __gc_hex(v) + " has " + n.to_str() + " entries for room of " + cap.to_str())
         }
+        // массивы вмещают ёмкость: ключи и значения — в своих объектах
+        __gcv_room(st, when, keys, cap * 8, "map keys")
+        __gcv_room(st, when, vals, cap * es, "map values")
+        __gcv_room(st, when, alive, cap, "map entries")
+        __gcv_room(st, when, load64(v + 32), (load32(v + 40) + 1) * 4, "map slots")
         // свободное место массивов: туда запишут ключи и значения-ссылки
         if !__is_scalar(kd) {
-            for i in n..load64(keys + 16) {
-                __gcv_slot(st, when, load64(keys) + i * 8)
+            for i in n..cap {
+                __gcv_slot(st, when, keys + i * 8)
             }
         }
         if !__is_scalar(vd) {
-            for i in n..load64(vals + 16) {
-                __gcv_slot(st, when, load64(vals) + i * 8)
+            for i in n..cap {
+                __gcv_slot(st, when, vals + i * 8)
             }
         }
+        var live = 0
         for i in 0..n {
-            if __word_at(alive, i) != 0 {
+            if load8(alive + i) != 0 {
+                live += 1
                 if !__is_scalar(kd) {
-                    __gcv_child(st, when, load64(keys) + i * 8, kd)
+                    __gcv_child(st, when, keys + i * 8, kd)
                 }
                 if !__is_scalar(vd) {
-                    __gcv_child(st, when, load64(vals) + i * 8, vd)
+                    __gcv_child(st, when, vals + i * 8, vd)
                 }
             }
+        }
+        if live != load64(v + 8) {
+            __gcv_fail(st, when, "a map at " + __gc_hex(v) + " counts " + load64(v + 8).to_str() + " live entries, its entries say " + live.to_str())
         }
         // рост по частям (lib/core.kh): новые массивы (на c2 записей, слово 88)
         // и таблица в G (0 — остаётся старая), записи [0, w) уже перенесены;
@@ -695,16 +722,16 @@ fn __gcv_visit(st: int, when: str, v: int, d: int) {
                 __gcv_slot(st, when, g + j * 8)
             }
             let w = load64(g + 48)
-            let cap = load64(g + 88)
+            let c2 = load64(g + 88)
             let ready = load64(g + 64) == 0
             if w > 0 && !ready {
                 __gcv_fail(st, when, "a growing map at " + __gc_hex(v) + " moved entries before its new arrays were ready")
             }
-            if w > cap || load64(g + 40) > load64(keys + 8) {
+            if w > c2 || load64(g + 40) > n {
                 __gcv_fail(st, when, "a growing map at " + __gc_hex(v) + " has a broken growth state")
             }
             if ready {
-                for i in w..cap {
+                for i in w..c2 {
                     if !__is_scalar(kd) {
                         __gcv_slot(st, when, load64(g) + i * 8)
                     }
@@ -714,7 +741,7 @@ fn __gcv_visit(st: int, when: str, v: int, d: int) {
                 }
             }
             for i in 0..w {
-                if load64(load64(g + 16) + i * 8) != 0 {
+                if load8(load64(g + 16) + i) != 0 {
                     if !__is_scalar(kd) {
                         __gcv_child(st, when, load64(g) + i * 8, kd)
                     }
@@ -743,6 +770,17 @@ fn __gcv_visit(st: int, when: str, v: int, d: int) {
         if !__is_scalar(fd) {
             __gcv_child(st, when, v + i * 8, fd)
         }
+    }
+}
+
+// Массив p (начало объекта store) вмещает n байт.
+fn __gcv_room(st: int, when: str, p: int, n: int, what: str) {
+    if !__in_store(p) {
+        return
+    }
+    let o = __gc_obj_of(p)
+    if o != 0 && o + __gc_obj_size(o) < p + n {
+        __gcv_fail(st, when, what + " at " + __gc_hex(p) + " is shorter than " + n.to_str() + " bytes")
     }
 }
 

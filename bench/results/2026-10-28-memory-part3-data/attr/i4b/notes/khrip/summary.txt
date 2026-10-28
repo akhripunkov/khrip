@@ -1,0 +1,5 @@
+== notes / khrip: 33000 запросов/с, seeded 448 KB
+load snapshot: RSS 83620 KB, HWM 83620 KB, live by last GC 64.5 MB
+after run: RSS 86168 KB, HWM 86168 KB; Requests/sec:  32922.14
+idle 15s: RSS 86304 KB, live by GC 85.3 MB; gc 11 (idle): heap 85.3->85.3 MB, live 85.3 MB (1579343 obj, 0 black), pins 0 rec/0 words, arenas 0 (0 KB, 0 handed off), start 10 µs, mark 46.42 ms in 234 slices (max 259 µs, cpu 258 µs) over 209.97 ms, term 3 µs (1 tries), assists 0, sweep 1.07 ms in 6 slices (longest 201 µs, cpu 200 µs), released 0.0 MB in 0.00 ms, rss-store 85.5 MB, next at 115.1 MB
+invariant: ok
