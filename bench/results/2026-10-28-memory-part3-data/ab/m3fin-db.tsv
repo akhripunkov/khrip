@@ -1,0 +1,11 @@
+scenario	lang	rps	p50_ms	p99_ms	errors_pct	idle_mb	seeded_mb	peak_mb	after_mb	cpu_us_per_req	startup_ms	build_s	size_bytes	invariant	db_cpu_us_per_req
+ledger	khrip	3179	18.51	99.95	0.0	0.6	0.6	5.0	4.5	208.7	53	0.1	438504	ok	613.0
+shop	khrip	3271	18.32	47.96	0.0	0.7	0.8	6.4	4.9	153.8	58	0.1	511208	ok	812.3
+tracker	khrip	4427	13.00	34.83	0.0	0.6	0.7	4.3	4.3	94.4	47	0.1	486232	ok	517.2
+ledger	khrip	3592	16.61	37.47	0.0	0.6	0.6	4.9	4.5	195.0	54	0.1	438504	ok	554.9
+shop	khrip	3211	18.67	51.08	0.0	0.7	0.7	5.4	4.4	153.7	60	0.1	511208	ok	826.3
+tracker	khrip	4565	12.52	40.56	0.0	0.6	0.7	4.6	4.6	91.5	42	0.1	486232	ok	511.8
+ledger	khrip	3268	18.16	40.56	0.0	0.6	0.6	4.8	4.4	208.3	45	0.1	438504	ok	613.8
+shop	khrip	2810	21.04	66.93	0.0	0.7	0.8	6.4	4.5	165.9	61	0.1	511208	ok	969.7
+tracker	khrip	4562	12.41	41.42	0.0	0.6	0.7	4.7	4.7	91.9	48	0.1	486232	ok	498.1
+ledger	khrip	3177	18.72	63.45	0.0	0.6	0.6	5.6	5.1	206.6	63	0.1	438504	ok	610.0

@@ -1,0 +1,4 @@
+scenario	variant	rate	achieved_rps	behind	p50_ms	p99_ms	p999_ms	max_ms	rss_peak_mb	rss_mean_last300_mb	rss_last_mb	rss_slope_last300_mb_s	hwm_mb	live_end_mb	gc_total	gc_in_run	cpu_us_per_req	probe_max_ms	warmup_s	duration_s
+bank	khrip	28000	27996	ok	1.52	97.54	210.82	351.74	1527.0	1210.2	1527.0	2.0498	1527.0	1481.1	20	8	21.6	738.0	60	600
+inventory	khrip	14000	13998	ok	1.31	7.28	134.78	277.76	1507.8	1211.7	1507.8	2.0554	1508.0	1504.6	20	7	62.4	5503.6	60	600
+shortener	khrip	30000	29996	ok	1.34	21.06	89.66	173.05	392.0	314.5	392.0	0.4776	392.0	381.9	16	8	19.0	269.3	60	600
