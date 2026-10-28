@@ -642,24 +642,27 @@ fn parse_anon_lit(at: Token) -> int {
             w += 1
         }
         if earlier_item[w].len() > 0 {
-            // поле T? из нескольких распаковок: по порядку, каждая следующая —
-            // только если не none
+            // поле T? из нескольких распаковок: по порядку; значение того же
+            // типа, что литерал, копируется как есть, другого (заплатка) —
+            // только если не none, как T \{ ...old, ...patch }
+            var items = earlier_item[w].copy()
+            var flds = earlier_field[w].copy()
+            items.push(from_item[w])
+            flds.push(from_field[w])
             var e = 0
-            while e < earlier_item[w].len() {
-                emit_load(RCX, RSP, (n - 1 - earlier_item[w][e]) * 8)
-                emit_load(RCX, RCX, earlier_field[w][e] * 8)
-                emit_rr(0x85, RCX, RCX)
-                let skip = emit_jcc(CC_E)
-                emit_store(RAX, j * 8, RCX)
-                patch_here(skip)
+            while e < items.len() {
+                emit_load(RCX, RSP, (n - 1 - items[e]) * 8)
+                emit_load(RCX, RCX, flds[e] * 8)
+                if types[itys[items[e]]].a == si {
+                    emit_store(RAX, j * 8, RCX)
+                } else {
+                    emit_rr(0x85, RCX, RCX)
+                    let skip = emit_jcc(CC_E)
+                    emit_store(RAX, j * 8, RCX)
+                    patch_here(skip)
+                }
                 e += 1
             }
-            emit_load(RCX, RSP, (n - 1 - from_item[w]) * 8)
-            emit_load(RCX, RCX, from_field[w] * 8)
-            emit_rr(0x85, RCX, RCX)
-            let skip = emit_jcc(CC_E)
-            emit_store(RAX, j * 8, RCX)
-            patch_here(skip)
         } else {
             emit_load(RCX, RSP, (n - 1 - from_item[w]) * 8)
             if from_field[w] >= 0 {

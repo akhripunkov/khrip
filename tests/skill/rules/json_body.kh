@@ -1,7 +1,7 @@
 // Тело запроса: недостающие поля — значения по умолчанию, none — null,
 // перечисления — строки, неправильный ввод — 400.
 // in: SKILL.md
-// rule: Missing body fields take their defaults; enums are JSON strings ("Admin"), other variants objects with a "type" field; `none` is `null`. Bad input gets 400 with a message
+// rule: Missing body fields take their defaults; enums are JSON strings ("Admin"), other variants objects with a "type" field; `none` is `null` both ways (not in a typed `call` body). Bad input gets 400 with a message
 type Role = Admin | Member
 type NewUser { name: str, role: Role = Member, tags: [str] = [], note: str? }
 

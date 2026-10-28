@@ -1,0 +1,16 @@
+tests/errors/recover_type.kh:10:1: error: declarations are only allowed at the top level
+    type P { x: int }
+    ^
+    hint: move it outside the function
+tests/errors/recover_type.kh:12:1: error: declarations are only allowed at the top level
+    fn main() {
+    ^
+    hint: move it outside the function
+tests/errors/recover_type.kh:14:2: error: expected '}', found end of file
+    }
+     ^
+tests/errors/recover_type.kh:1:1: error: the program has no fn main
+    // Незакрытая { в функции: объявления ниже с первого столбца — по-прежнему
+    ^
+    hint: add fn main() { ... } or declare routes
+4 errors

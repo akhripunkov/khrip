@@ -4,6 +4,7 @@
 404 {"error":"no"}
 200 {"id":1,"title":"a"}
 200 0
+200 404 200 404
 ok    ?? status with a value
 {"a":2}
 {"type":"x!","in":2}

@@ -8,7 +8,7 @@
  "chapters_read": [
   "postgresql.md"
  ],
- "vendor": "anthropic",
+ "started": 0,
  "prices": {
   "input": 0.2,
   "cache_write": 0.25,
@@ -27,7 +27,7 @@
   "per_call": [
    {
     "input": 3776,
-    "new_input": 3776,
+    "new_input": 713,
     "output": 4
    },
    {
@@ -36,7 +36,8 @@
     "output": 1412
    }
   ],
-  "cost_cached": 2660.8,
-  "cost_uncached": 3106.6
+  "cost_cached": 1956.3,
+  "cost_uncached": 3106.6,
+  "system_first_write": 704.5
  }
 }

@@ -6,7 +6,7 @@
  "attempts": 1,
  "calls": 1,
  "chapters_read": [],
- "vendor": "anthropic",
+ "started": 0,
  "prices": {
   "input": 0.2,
   "cache_write": 0.25,
@@ -25,11 +25,12 @@
   "per_call": [
    {
     "input": 3504,
-    "new_input": 3504,
+    "new_input": 441,
     "output": 635
    }
   ],
-  "cost_cached": 1511.0,
-  "cost_uncached": 1335.8
+  "cost_cached": 806.5,
+  "cost_uncached": 1335.8,
+  "system_first_write": 704.5
  }
 }

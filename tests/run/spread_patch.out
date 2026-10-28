@@ -5,5 +5,7 @@
 {"name":"n","qty":5,"note":null}
 {"name":"n","qty":3,"note":null}
 {"title":"a","body":"x","tag":"t"}
-{"body":"x","tag":"b"}
 {"body":null,"tag":"b"}
+{"body":null,"tag":"b"}
+{"body":"x","tag":"t"}
+{"body":"x","tag":"b"}

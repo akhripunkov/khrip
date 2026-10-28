@@ -6,7 +6,7 @@
 // rule: arms may be `200 | 201 => ...`, blocks or `return ...`.
 // rule: Slices `s[a..b]`, `xs[a..]`, `xs[..b]` are clamped to the bounds.
 // rule: `.copy()` copies a list.
-// rule: `header(name)` reads a request header, `set_header(name, value)` adds one to the response; `fail(status[, message])` ends the request from any function.
+// rule: `header(name)` reads a request header, `set_header(name, value)` adds a response header; `fail(status[, message])` ends the request from anywhere.
 // rule: `call METHOD "path?query" [body] [headers map]` returns `Response { status, body, headers }`
 // rule: `from_json(text)` (type from the annotation: `let u: User? = from_json(t)`).
 type Role = Admin | Member | Guest

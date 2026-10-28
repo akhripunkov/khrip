@@ -29,10 +29,15 @@ fn main() {
     // ожидаемый анонимный тип (A2)
     let a: { title: str, body: str?, tag: str? } = { ...old, ...none_patch }
     print(to_json(a))
-    // без ожидаемого типа (A3): поле T? из нескольких распаковок — последняя
-    // не none
+    // без ожидаемого типа (A3): значение того же типа, что литерал, — как есть
+    // (none стирает), другого типа (заплатка) — только не none
     let x = { body: old.body, tag: old.tag }
     let y = { body: none_patch.body, tag: some.title }
     print(to_json({ ...x, ...y }))
     print(to_json({ ...y }))
+    let z = { body: none_patch.body }
+    print(to_json({ ...x, ...z }))
+    // другой порядок полей — другой анонимный тип: тоже заплатка
+    let t = { tag: some.title, body: none_patch.body }
+    print(to_json({ ...x, ...t }))
 }

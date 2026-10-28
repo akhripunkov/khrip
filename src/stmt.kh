@@ -2100,7 +2100,8 @@ fn compile_fn(fi: int) {
         end_fn(frame_at, true)
         return
     }
-    if !div && f.ret != ty_void {
+    // незакрытая { — уже ошибка «expected '}'»; конец тела — в другом файле
+    if !div && f.ret != ty_void && close.file == toks[f.body].file {
         error_tok(close, "'" + f.name + "' must return a value of type " + ty_name(f.ret) + " on every path", "add a return at the end")
     }
     end_fn(frame_at, div)

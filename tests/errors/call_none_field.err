@@ -1,0 +1,9 @@
+tests/errors/call_none_field.kh:16:50: error: field note: none is not sent in a call body
+        expect (call PATCH "/p/1" { name: "a", note: none }).status == 200
+                                                     ^
+    hint: leave the field out to not send it; use a raw string body for an explicit null: call PATCH "/x" `{"note": null}`
+tests/errors/call_none_field.kh:18:15: error: field note: none is not sent in a call body
+            note: none,
+                  ^
+    hint: leave the field out to not send it; use a raw string body for an explicit null: call PATCH "/x" `{"note": null}`
+2 errors

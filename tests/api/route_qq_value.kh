@@ -40,6 +40,14 @@ route GET "/count/{k}" (k: str) -> int {
     return counts[k] ?? 0
 }
 
+// число 404 в маршруте, который возвращает int, — в скобках
+route GET "/count404/{k}" (k: str) -> int {
+    if k == "z" {
+        return (404)
+    }
+    return counts[k] ?? (404)
+}
+
 route POST "/t" (body: T) -> T {
     return T { a: body.a + 1 }
 }
@@ -62,6 +70,9 @@ test "?? status with a value" {
     print("{e.status} {e.body}")
     let f = call GET "/count/x"
     print("{f.status} {f.body}")
+    let g = call GET "/count404/x"
+    let h = call GET "/count404/z"
+    print("{g.status} {g.body} {h.status} {h.body}")
 }
 
 test "types named T and K, fields type and in" {

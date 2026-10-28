@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Слепая проверка по eval/PROMPT.md: одна задача, один язык, одна модель.
 
-    eval/blind.py run TASK LANG DIR --model-cmd CMD [--model NAME] [--vendor V | --prices JSON]
-    eval/blind.py start TASK LANG DIR [--model NAME] [--vendor V | --prices JSON]
+    eval/blind.py run TASK LANG DIR --model-cmd CMD --prices JSON [--model NAME]
+    eval/blind.py start TASK LANG DIR --prices JSON [--model NAME]
     eval/blind.py reply DIR FILE [--usage JSON]        # ответ модели → следующее сообщение
     eval/blind.py tokens DIR                            # токены и стоимость → DIR/result.json
     eval/blind.py summary DIR...                        # таблицы по result.json
@@ -10,15 +10,24 @@
 LANG — khrip, go, csharp, python. CMD получает на stdin JSON
 {"system": "...", "messages": [{"role": "user" | "assistant", "content": "..."}]}
 и печатает JSON {"text": "ответ модели", "usage": {"input": N, "cache_write": N,
-"cache_read": N, "output": N, "reasoning": N}} — счёт поставщика за этот вызов
-(адаптер поставщика пишет тот, кто запускает проверку). Поля usage не
-пересекаются: input — входные токены без кэша, cache_write — записанные в кэш,
-cache_read — прочитанные из кэша, output — выходные без рассуждений,
+"cache_write_1h": N, "cache_read": N, "output": N, "reasoning": N}} — счёт
+поставщика за этот вызов (адаптер поставщика пишет тот, кто запускает
+проверку). Поля usage не пересекаются: input — входные токены без кэша,
+cache_write — записанные в кэш на короткий срок (5 минут), cache_write_1h — на
+час, cache_read — прочитанные из кэша, output — выходные без рассуждений,
 reasoning — рассуждения (их поставщик берёт как выходные). Например, у
-Anthropic: input_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+Anthropic: input_tokens, cache_creation.ephemeral_5m_input_tokens,
+cache_creation.ephemeral_1h_input_tokens, cache_read_input_tokens,
 output_tokens (с рассуждениями, reasoning — 0); у OpenAI: prompt_tokens −
-cached_tokens, 0, cached_tokens, completion_tokens − reasoning_tokens,
+cached_tokens, 0, 0, cached_tokens, completion_tokens − reasoning_tokens,
 reasoning_tokens.
+
+Цены (--prices, обязательно) — относительно выходного токена той модели, что
+проверяется, со страницы цен поставщика на день прогона, например
+'{"input": 0.2, "cache_write": 0.25, "cache_write_1h": 0.4, "cache_read": 0.02,
+"output": 1, "reasoning": 1}'. Цены по умолчанию нет: у моделей одного
+поставщика они разные (чтение из кэша — 0,1 цены входа, а вход — от 1/4 до 1/8
+цены выхода).
 
 Протокол (eval/PROMPT.md): system — правила языка (у Khrip — ядро скилла
 skill/khrip/SKILL.md и строка о главах), первое сообщение — задача. Ответ —
@@ -28,11 +37,12 @@ skill/khrip/SKILL.md и строка о главах), первое сообще
 строки FAIL. Не больше 5 попыток; проверка дольше 15 минут — неудачная попытка.
 
 Стоимость — в выходных токенах: каждый вызов модели (и READ, и с повторно
-отправленной историей) по usage поставщика × цены его страницы цен
-относительно выходного токена (PRICES, --vendor; --prices — свои). Вторая,
-справочная цифра — токены o200k текстов (eval/tokens/count.mjs --raw): каждый
-вызов — вся история; с кэшем новое (прошлый ответ и новое сообщение) пишется в
-кэш (0,25), прежнее читается из него (0,02), без кэша вход — 0,2.
+отправленной историей) по usage поставщика × --prices. Вторая, справочная
+цифра — токены o200k текстов (eval/tokens/count.mjs --raw): каждый вызов — вся
+история; с кэшем новое (прошлый ответ и новое сообщение) пишется в кэш (0,25),
+прежнее, и system тоже, читается из него (0,02); system записывает в кэш только
+первый прогон языка в пачке (summary добавляет ему разницу, 0,23 × system);
+без кэша вход — 0,2.
 
 Состояние — DIR/state.json, все сообщения — DIR/messages/, попытки —
 DIR/attempt-N/.
@@ -46,24 +56,13 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SKILL = os.path.join(ROOT, 'skill', 'khrip')
 MAX_ATTEMPTS = 5
 CHECK_TIMEOUT = 900
-USAGE = ('input', 'cache_write', 'cache_read', 'output', 'reasoning')
-
-# Цены относительно выходного токена (выходной = 1) по страницам цен
-# поставщиков; у отдельной модели цена может быть своей: тогда --prices.
-# Цены, по которым посчитан прогон, записываются в result.json.
-PRICES = {
-    # вход — 1/5 выхода, запись в кэш (5 минут) — 1,25 × вход, чтение — 0,1 × вход,
-    # рассуждения — как выход
-    'anthropic': {'input': 0.2, 'cache_write': 0.25, 'cache_read': 0.02, 'output': 1, 'reasoning': 1},
-    # вход — 1/8 выхода, кэш пишется без доплаты, чтение — 0,1 × вход,
-    # рассуждения — как выход
-    'openai': {'input': 0.125, 'cache_write': 0.125, 'cache_read': 0.0125, 'output': 1, 'reasoning': 1},
-}
+USAGE = ('input', 'cache_write', 'cache_write_1h', 'cache_read', 'output', 'reasoning')
 # Справочная цифра по o200k: вес входа с кэшем (прочитано, записано) и без
 O200K_CACHED = (0.02, 0.25)
 O200K_UNCACHED = 0.2
@@ -144,20 +143,18 @@ def text_of(d, m):
         return f.read()
 
 
-def prices_of(vendor, prices):
-    if prices:
-        p = json.loads(prices)
-    elif vendor in PRICES:
-        p = PRICES[vendor]
-    else:
-        raise SystemExit(f'unknown vendor {vendor!r}: --vendor {" | ".join(PRICES)} or --prices \'{{"input": ..., "cache_write": ..., "cache_read": ..., "output": 1, "reasoning": 1}}\'')
+def prices_of(prices):
+    """Цены относительно выходного токена: JSON или файл с ним; все поля USAGE."""
+    if not prices:
+        raise SystemExit('--prices is required: the prices of the model under test relative to an output token, from its vendor\'s price page, e.g. \'{"input": 0.2, "cache_write": 0.25, "cache_write_1h": 0.4, "cache_read": 0.02, "output": 1, "reasoning": 1}\'')
+    p = json.loads(open(prices, encoding='utf-8').read() if os.path.isfile(prices) else prices)
     missing = [k for k in USAGE if not isinstance(p.get(k), (int, float))]
     if missing:
         raise SystemExit(f'prices need numbers for {", ".join(missing)}')
     return {k: p[k] for k in USAGE}
 
 
-def start(task, lang, d, model, vendor='anthropic', prices=None):
+def start(task, lang, d, model, prices):
     if lang not in LANGS:
         raise SystemExit(f'unknown language {lang}: {", ".join(LANGS)}')
     if os.path.exists(os.path.join(d, 'state.json')):
@@ -166,7 +163,7 @@ def start(task, lang, d, model, vendor='anthropic', prices=None):
     db = os.path.exists(os.path.join(ROOT, 'eval', 'tasks', task, 'db'))
     st = {'task': task, 'lang': lang, 'model': model, 'db': db, 'attempts': 0,
           'passed': False, 'done': False, 'chapters': [], 'messages': [], 'calls': [],
-          'vendor': vendor if not prices else 'custom', 'prices': prices_of(vendor, prices)}
+          'prices': prices_of(prices), 'started': time.time()}
     with open(os.path.join(d, 'system.txt'), 'w', encoding='utf-8') as f:
         f.write(system_text(lang, db))
     path = add(d, st, 'user', 'task', first_message(lang, task))
@@ -308,14 +305,16 @@ def tokens(d):
     calls = st.get('calls', [])
     part = lambda kind: sum(t for m, t in zip(ms, per) if m['kind'] == kind)
     # каждый вызов: вход — system и вся история до него, выход — его ответ;
-    # новое во входе (ещё не в кэше) — всё после входа прошлого вызова
+    # новое во входе (ещё не в кэше) — всё после входа прошлого вызова; system
+    # уже в кэше (его записал первый прогон языка в пачке — это добавляет
+    # summary: system_first_write)
     cached = uncached = 0.0
     prev = 0
     per_call = []
     for i, c in enumerate(calls):
         sent = c['sent']
         inp = s + sum(per[:sent])
-        new = inp - (s + sum(per[:prev])) if i > 0 else inp
+        new = inp - (s + sum(per[:prev]))
         out = per[sent] if sent < len(per) else 0
         per_call.append({'input': inp, 'new_input': new, 'output': out})
         cached += O200K_CACHED[0] * (inp - new) + O200K_CACHED[1] * new + out
@@ -328,8 +327,8 @@ def tokens(d):
     res = {
         'task': st['task'], 'lang': st['lang'], 'model': st['model'],
         'passed': st['passed'], 'attempts': st['attempts'], 'calls': len(calls),
-        'chapters_read': st['chapters'],
-        'vendor': st.get('vendor'), 'prices': pr,
+        'chapters_read': st['chapters'], 'started': st.get('started', 0),
+        'prices': pr,
         'usage': total,
         # главная цифра: счёт поставщика за все вызовы в выходных токенах
         'cost': round(sum(total[k] * pr[k] for k in USAGE), 1) if have_usage else None,
@@ -338,6 +337,7 @@ def tokens(d):
             'answers': part('answer') + part('read'), 'feedback': part('feedback'),
             'per_call': per_call,
             'cost_cached': round(cached, 1), 'cost_uncached': round(uncached, 1),
+            'system_first_write': round((O200K_CACHED[1] - O200K_CACHED[0]) * s, 1),
         },
     }
     with open(os.path.join(d, 'result.json'), 'w', encoding='utf-8') as f:
@@ -347,22 +347,37 @@ def tokens(d):
 
 def summary(dirs):
     """По задаче и языку — все прогоны (решённые или нет) на число решённых;
-    итог — только по задачам, которые решил каждый язык."""
+    итог — только по задачам, которые решил каждый язык. Прогоны одной модели
+    должны быть посчитаны по одним ценам."""
     rows = []
     for top in dirs:
         for root, _, files in os.walk(top):
             if 'result.json' in files:
                 with open(os.path.join(root, 'result.json'), encoding='utf-8') as f:
                     rows.append(json.load(f))
+    prices = {}
+    for r in rows:
+        key = json.dumps(r.get('prices'), sort_keys=True)
+        prices.setdefault(r['model'], set()).add(key)
+    mixed = {m: ps for m, ps in prices.items() if len(ps) > 1}
+    if mixed:
+        raise SystemExit('runs of one model were priced differently: ' + '; '.join(f'{m}: {" / ".join(sorted(ps))}' for m, ps in mixed.items()))
+    # system в кэш записывает первый прогон языка в пачке
+    first = {}
+    for r in rows:
+        k = (r['model'], r['lang'])
+        if k not in first or r.get('started', 0) < first[k].get('started', 0):
+            first[k] = r
     runs = {}
     for r in rows:
         runs.setdefault((r['model'], r['task'], r['lang']), []).append(r)
     keys = ('cost', 'cached', 'uncached')
     val = {
         'cost': lambda r: r['cost'],
-        'cached': lambda r: r['o200k']['cost_cached'],
+        'cached': lambda r: r['o200k']['cost_cached'] + (r['o200k'].get('system_first_write', 0) if first[(r['model'], r['lang'])] is r else 0),
         'uncached': lambda r: r['o200k']['cost_uncached'],
     }
+    f = lambda x: '—' if x is None else f'{x:.0f}'
     per = {}
     print('| model | task | language | solved | attempts, all runs | cost per solved (usage) | o200k, cached | o200k, uncached |')
     print('|---|---|---|---:|---:|---:|---:|---:|')
@@ -373,14 +388,13 @@ def summary(dirs):
             vs = [val[k](r) for r in rs]
             cell[k] = sum(vs) / ok if ok and all(v is not None for v in vs) else None
         per[(model, task, lang)] = (ok, cell)
-        f = lambda x: '—' if x is None else f'{x:.0f}'
         print(f'| {model} | {task} | {lang} | {ok}/{len(rs)} | {sum(r["attempts"] for r in rs)} | '
               f'{f(cell["cost"])} | {f(cell["cached"])} | {f(cell["uncached"])} |')
     print()
-    print('Headline: tasks that every language solved.')
+    print('Headline: tasks that every language solved; "solved" counts all runs of all tasks.')
     print()
-    print('| model | language | tasks | cost per solved task (usage) | × Khrip | o200k, cached | o200k, uncached |')
-    print('|---|---|---:|---:|---:|---:|---:|')
+    print('| model | language | solved | tasks | cost per solved task (usage) | × Khrip | o200k, cached | o200k, uncached |')
+    print('|---|---|---:|---:|---:|---:|---:|---:|')
     for model in sorted({m for m, _, _ in per}):
         langs = sorted({l for m, _, l in per if m == model})
         tasks = sorted({t for m, t, _ in per if m == model})
@@ -393,14 +407,15 @@ def summary(dirs):
                 tot[l][k] = sum(vs) if common and all(v is not None for v in vs) else None
         base = tot.get('khrip', {}).get('cost')
         for l in langs:
+            rs = [r for (m, _, rl), group in runs.items() if m == model and rl == l for r in group]
+            solved = f'{sum(1 for r in rs if r["passed"])}/{len(rs)}'
             c = tot[l]['cost']
             ratio = f'×{c / base:.2f}' if c is not None and base else '—'
-            f = lambda x: '—' if x is None else f'{x:.0f}'
-            print(f'| {model} | {l} | {len(common)} | {f(c)} | {ratio} | {f(tot[l]["cached"])} | {f(tot[l]["uncached"])} |')
+            print(f'| {model} | {l} | {solved} | {len(common)} | {f(c)} | {ratio} | {f(tot[l]["cached"])} | {f(tot[l]["uncached"])} |')
 
 
-def run(task, lang, d, cmd, model, vendor, prices):
-    start(task, lang, d, model, vendor, prices)
+def run(task, lang, d, cmd, model, prices):
+    start(task, lang, d, model, prices)
     while True:
         st = load(d)
         with open(os.path.join(d, 'system.txt'), encoding='utf-8') as f:
@@ -434,8 +449,7 @@ def main():
         p.add_argument('lang')
         p.add_argument('dir')
         p.add_argument('--model', default='model')
-        p.add_argument('--vendor', default='anthropic', help='prices from PRICES: ' + ', '.join(PRICES))
-        p.add_argument('--prices', help='JSON prices relative to an output token, instead of --vendor')
+        p.add_argument('--prices', required=True, help='prices relative to an output token (JSON or a file): ' + ', '.join(USAGE))
         if name == 'run':
             p.add_argument('--model-cmd', required=True)
     p = sub.add_parser('reply')
@@ -448,9 +462,9 @@ def main():
     p.add_argument('dirs', nargs='+')
     a = ap.parse_args()
     if a.cmd == 'run':
-        run(a.task, a.lang, a.dir, a.model_cmd, a.model, a.vendor, a.prices)
+        run(a.task, a.lang, a.dir, a.model_cmd, a.model, a.prices)
     elif a.cmd == 'start':
-        for path in start(a.task, a.lang, a.dir, a.model, a.vendor, a.prices):
+        for path in start(a.task, a.lang, a.dir, a.model, a.prices):
             print(path)
     elif a.cmd == 'reply':
         usage = None

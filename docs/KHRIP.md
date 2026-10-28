@@ -124,8 +124,8 @@ named type takes such a value only as `T { ...x }`. A spread of the same type
 (`...old`) copies every field; of another type (a patch) it skips `none` fields,
 so clearing a field is explicit: `note: patch.note`. Field names may be `type`,
 `in`, `match`, `test` or `call` (JSON keys), except `type` in a variant; `type`
-and `test` are keywords only before a name and a string, so a query parameter
-or a local may be called `type` too.
+and `test` are keywords only where a top-level declaration starts, so a query
+parameter or a local may be called `type` too.
 Structs, lists and maps are references: assigning shares, `.copy()` copies a list.
 
 ## Methods
@@ -218,8 +218,9 @@ route DELETE "/users/{id}" (id: int) -> 204 | 404 {
   gets 400 with a message, a wrong method 405, an unknown path 404.
 - Results: `-> Type` (200), `-> 201 Type | 400 str | 404`; `return 201 user`,
   `return 404`, `return x ?? 404`, `return x ?? 404 "no user"` (with `| 404
-  str`). A status declared without a type (`| 409`) has no body. `str` is sent as
-  text, other types as JSON. No `->`: 204.
+  str`). A status declared without a type (`| 409`) has no body. In a route
+  that returns `int`, `return 404` and `x ?? 404` are statuses: write `(404)` for
+  the number. `str` is sent as text, other types as JSON. No `->`: 204.
 - `header(name) -> str?` reads a request header (any case); `set_header(name,
   value)` adds one to the response. `fail(status)` or `fail(status, message)`
   ends the request from any function: `let key = header("X-API-Key") else {
@@ -330,7 +331,8 @@ test "create user" {
 
 `call METHOD "path?query" [body] [headers map]` runs a request in-process and
 returns a `Response`; a typed body leaves out `none` fields, as a client that
-did not send them (`null` goes in a raw body: `` `{"note": null}` ``). `expect
+did not send them (`note: none` written there is an error; `null` goes in a raw
+body: `` `{"note": null}` ``). `expect
 cond` records a failure and continues; `a == b`
 failures show both sides; `expect r != none` stops the test when `r` is none, and
 after it `r` is a value: `let u: User? = from_json(r.body)`, `expect u != none`,

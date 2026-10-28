@@ -1,0 +1,22 @@
+// Правильная половина: поле, которого нет в литерале, не отправляется — сервер
+// его не меняет; явный null — телом-строкой.
+// in: SKILL.md
+// rule: a typed body leaves `none` fields unsent (`f: none` is an error; for `null` send a raw string).
+type Note { title: str, note: str? }
+
+store notes: map[int, Note]
+
+route PATCH "/notes/{id}" (id: int, body: { title: str?, note: str? }) -> Note | 404 {
+    let old = notes[id] ?? fail(404)
+    let n = Note { ...old, ...body }
+    notes[id] = n
+    return n
+}
+
+test "a typed body sends only what it names" {
+    notes[1] = { title: "a", note: "keep" }
+    let r = call PATCH "/notes/1" { title: "b" }
+    expect r.body == `{"title":"b","note":"keep"}`
+    let raw = call PATCH "/notes/1" `{"note": null}`
+    expect raw.status == 200
+}

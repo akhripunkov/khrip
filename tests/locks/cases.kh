@@ -64,7 +64,7 @@ route GET "/alias" -> [str] {
     return xs
 }
 
-route GET "/field" -> int {
+route GET "/field" -> int | 404 {
     let i = items[1] else {
         return 404
     }
@@ -105,7 +105,7 @@ route GET "/indirect" -> int {
     return counter
 }
 
-route GET "/method-writer" -> int {
+route GET "/method-writer" -> int | 404 {
     let i = items[1] else {
         return 404
     }

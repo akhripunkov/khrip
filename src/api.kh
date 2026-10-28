@@ -904,11 +904,19 @@ fn emit_reply_status(status: int) {
     ret_holes.push(emit_jmp())
 }
 
+// Число 100–599 после return или ?? в маршруте — статус ответа.
+fn status_like(n: int) -> bool {
+    return n >= 100 && n <= 599
+}
+
 // return СТАТУС без значения: статус должен быть объявлен без типа.
 fn route_status_only(st: Token) {
     let r = routes[route_ctx]
     let vi = find_variant(r, st.val)
-    if vi < 0 {
+    if vi < 0 && returns_int(r) {
+        let n = st.val.to_str()
+        error_tok(st, "status " + n + " is not declared by this route", "declare | " + n + " to answer with that status, or write (" + n + ") for the number")
+    } else if vi < 0 {
         error_tok(st, "status " + st.val.to_str() + " is not declared by this route", "add it to the result: -> " + variants_text(r) + " | " + st.val.to_str())
     } else if r.variants[vi].ty >= 0 {
         error_tok(st, "status " + st.val.to_str() + " needs a value of type " + ty_name(r.variants[vi].ty), "return " + st.val.to_str() + " value")
@@ -945,7 +953,9 @@ fn route_return(at: Token, has_value: bool) {
     let t0 = tok()
     if t0.kind == T_INT {
         let vi = find_variant(r, t0.val)
-        if ends_stmt(pos + 1) && (vi >= 0 || !returns_int(r)) {
+        if ends_stmt(pos + 1) && (vi >= 0 || !returns_int(r) || status_like(t0.val)) {
+            // return 404 в маршруте, который возвращает int: статус (объявленный
+            // или ошибка с подсказкой), а не молча число 404; 0 и 1000 — числа
             advance()
             route_status_only(t0)
             return
@@ -1142,8 +1152,9 @@ fn route_qq_ok() -> bool {
     }
     let vi = find_variant(routes[route_ctx], tok().val)
     if ends_stmt(pos + 1) {
-        // x ?? 0 в маршруте, который возвращает int, — значение, а не статус
-        return vi >= 0 || !returns_int(routes[route_ctx])
+        // x ?? 0 в маршруте, который возвращает int, — значение, а не статус;
+        // x ?? 404 — статус (необъявленный — ошибка, а не молча число)
+        return vi >= 0 || !returns_int(routes[route_ctx]) || status_like(tok().val)
     }
     // x ?? 404 значение: статус объявлен со значением
     return vi >= 0 && routes[route_ctx].variants[vi].ty >= 0 && (starts_value(pos + 1) || kind_at(pos + 1) == '\{')
@@ -1415,6 +1426,7 @@ fn parse_call_expr() -> int {
         has_body = false
     }
     if has_body {
+        call_none_fields(pos)
         let bt = parse_expr(body_ty)
         emit_push(RAX)
         emit_mov_imm(RAX, type_desc(bt))
@@ -1446,6 +1458,31 @@ fn parse_call_expr() -> int {
         return ty_err
     }
     return ty_struct(s)
+}
+
+// Тело call — литерал структуры: поле со значением none не уходит (как у
+// клиента, который его не прислал, lib/api.kh, __json_encode_sent), так что
+// явное поле: none — ошибка, а не молча «не прислано».
+fn call_none_fields(from: int) {
+    var i = from
+    if kind_at(i) == T_IDENT && kind_at(i + 1) == '\{' {
+        i += 1
+    }
+    if kind_at(i) != '\{' {
+        return
+    }
+    let close = matching_close(i)
+    if close < 0 {
+        return
+    }
+    var j = i + 1
+    while j + 2 <= close {
+        let k = kind_at(j)
+        if (k == T_IDENT || keyword_name(k)) && kind_at(j + 1) == ':' && kind_at(j + 2) == T_NONE && (kind_at(j + 3) == ',' || kind_at(j + 3) == '}' || toks[j + 3].line != toks[j + 2].line) && (kind_at(j - 1) == '\{' || kind_at(j - 1) == ',' || toks[j - 1].line != toks[j].line) {
+            error_tok(toks[j + 2], "field " + toks[j].text + ": none is not sent in a call body", "leave the field out to not send it; use a raw string body for an explicit null: call PATCH \"/x\" `\{\"" + toks[j].text + "\": null}`")
+        }
+        j += 1
+    }
 }
 
 // Тип тела маршрута, на который попадёт call METHOD "путь" (строка запроса

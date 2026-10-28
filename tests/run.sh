@@ -646,8 +646,17 @@ CUTS
 #   sqlinsertrows — INSERT INTO t \{не строка} доходит до базы;
 #   kwfield, kwfielddot — type, in, match, test, call не имена полей
 #                   (в объявлении и литерале; после точки);
-#   kwtypename, kwtestname — type и test не имена (параметр запроса ?type=,
-#                   локальная) там, где за словом нет имени или строки;
+#   kwtypename, kwtestname, kwtypedepth — type и test не имена (поле,
+#                   параметр запроса ?type=, локальная) не в начале
+#                   объявления верхнего уровня; kwtyperecover — после
+#                   незакрытой { объявление type с первого столбца — имя;
+#   routeintstatus, routeintreturn — return 404 и x ?? 404 в маршруте, который
+#                   возвращает int, молча число 404;
+#   formatspecraw, formatspecchar — двоеточие в сырой строке или символе
+#                   подстановки — формат;
+#   anonspreadsame — { ...a, ...b } того же типа, что литерал, пропускает none;
+#   callnonefield — поле: none в теле call молча не уходит;
+#   mustreturnfile — «must return» из сгенерированного кода после незакрытой {;
 #   kwvariant — поле type у варианта спорит с "type" его JSON;
 #   generatedtk — тип программы T или K в разборе маршрута — параметр
 #                   обобщённой функции;
@@ -731,14 +740,23 @@ cuts = {
     "spreadoptopt": ("atom.kh", "                            let opt = tkind(sf[m].ty) == K_OPT && !same\n", "                            let opt = tkind(sf[m].ty) == K_OPT && !same && tkind(f.ty) != K_OPT\n"),
     "spreaddefault": ("atom.kh", "                                if !set[j] && fields[j].def >= 0 {\n", "                                if false {\n"),
     "routeqqvalue": ("api.kh", "    return vi >= 0 && routes[route_ctx].variants[vi].ty >= 0 && (starts_value(pos + 1) || kind_at(pos + 1) == '\\{')\n", "    return false\n"),
-    "routeqqint": ("api.kh", "        return vi >= 0 || !returns_int(routes[route_ctx])\n", "        return true\n"),
+    "routeqqint": ("api.kh", "        return vi >= 0 || !returns_int(routes[route_ctx]) || status_like(tok().val)\n", "        return true\n"),
     "qqstatuslet": ("expr.kh", "    } else if rt == ty_int && inner != ty_int && rtok.kind == T_INT && route_ctx >= 0 && find_variant(routes[route_ctx], rtok.val) >= 0 {\n", "    } else if false {\n"),
     "routestatusbody": ("api.kh", "            if vi >= 0 && r.variants[vi].ty < 0 {\n", "            if false {\n"),
     "sqlinsertrows": ("sql.kh", "            if sql_insert_target(cur) {\n", "            if false {\n"),
     "kwfield": ("lex.kh", "    if kw != T_TYPE && kw != T_IN && kw != T_MATCH && kw != T_TEST && kw != T_CALL {\n        return false\n    }\n", "    if true {\n        return false\n    }\n"),
     "kwfielddot": ("lex.kh", "    if n > 0 && toks[n - 1].kind == '.' {\n        return true\n    }\n    var q = lx_p\n", "    var q = lx_p\n"),
-    "kwtypename": ("lex.kh", "        if !is_alpha(c) {\n            return true\n        }\n        var e = q\n", "        if !is_alpha(c) {\n            return false\n        }\n        var e = q\n"),
-    "kwtestname": ("lex.kh", "            return c != '\"' && c != '`'\n", "            return false\n"),
+    "kwtypename": ("lex.kh", "        if !line_start {\n            return true\n        }\n", "        if !line_start {\n            return false\n        }\n"),
+    "kwtestname": ("lex.kh", "    if kw == T_TYPE || kw == T_TEST {\n        let n = toks.len()\n", "    if kw == T_TYPE {\n        let n = toks.len()\n"),
+    "kwtypedepth": ("lex.kh", "        if lx_depth == 0 {\n            return false\n        }\n", "        if lx_depth >= 0 {\n            return false\n        }\n"),
+    "kwtyperecover": ("lex.kh", "        return keyword_kind(lx_text.byte_slice(q, e)) != T_IDENT\n    }\n    return field_keyword_here(kw, end)\n", "        return true\n    }\n    return field_keyword_here(kw, end)\n"),
+    "routeintstatus": ("api.kh", "        return vi >= 0 || !returns_int(routes[route_ctx]) || status_like(tok().val)\n", "        return vi >= 0 || !returns_int(routes[route_ctx])\n"),
+    "routeintreturn": ("api.kh", "        if ends_stmt(pos + 1) && (vi >= 0 || !returns_int(r) || status_like(t0.val)) {\n", "        if ends_stmt(pos + 1) && (vi >= 0 || !returns_int(r)) {\n"),
+    "formatspecraw": ("lex.kh", "        } else if c == '`' {\n", "        } else if false {\n"),
+    "formatspecchar": ("lex.kh", "        if c == '\"' || c == '\\'' {\n", "        if c == '\"' {\n"),
+    "anonspreadsame": ("atom.kh", "                if types[itys[items[e]]].a == si {\n", "                if false {\n"),
+    "callnonefield": ("api.kh", "        call_none_fields(pos)\n", ""),
+    "mustreturnfile": ("stmt.kh", "    if !div && f.ret != ty_void && close.file == toks[f.body].file {\n", "    if !div && f.ret != ty_void {\n"),
     "kwvariant": ("decl.kh", "    if name == \"type\" && structs[s].sum >= 0 {\n", "    if false {\n"),
     "generatedtk": ("decl.kh", "        return struct_find(at.text) < 0 && sum_find(at.text) < 0\n", "        return true\n"),
     "constsingle": ("decl.kh", "    if !ends_stmt(pos) && toks[pos].file == v.file {\n", "    if false {\n"),
@@ -896,6 +914,15 @@ kwfield tests/run/keyword_fields.kh run
 kwfielddot tests/run/keyword_fields.kh run
 kwtypename tests/api/keyword_names.kh test
 kwtestname tests/api/keyword_names.kh test
+kwtypedepth tests/api/keyword_names.kh test
+kwtyperecover tests/errors/recover_type.kh err
+routeintstatus tests/errors/route_int_status.kh err
+routeintreturn tests/errors/route_int_status.kh err
+formatspecraw tests/run/interp_colons.kh run
+formatspecchar tests/run/interp_colons.kh run
+anonspreadsame tests/run/spread_patch.kh run
+callnonefield tests/errors/call_none_field.kh err
+mustreturnfile tests/errors/recover_type.kh err
 kwvariant tests/errors/variant_type_field.kh err
 generatedtk tests/api/route_qq_value.kh test
 constsingle tests/errors/const_expr.kh err

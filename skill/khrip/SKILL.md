@@ -9,7 +9,7 @@ A compiled, strictly typed language for HTTP APIs. A program is one namespace:
 no imports, declarations in any order. `khc run|test|check app.kh` runs it, runs
 its tests, lists all errors with fixes.
 
-Chapters next to this file (read one only when the task needs it):
+Chapters beside this file (read one only when the task needs it):
 - `postgresql.md`: PostgreSQL (`sql "..."`, `tx`, migrations).
 - `mongodb.md`: MongoDB.
 - `clickhouse.md`: ClickHouse (`ch "..."`, `table`).
@@ -17,7 +17,7 @@ Chapters next to this file (read one only when the task needs it):
 
 ## Types and declarations
 
-`int` (64-bit, overflow panics), `float`, `bool`, `str` (immutable UTF-8), `[T]`,
+`int` (64-bit, overflow panics), `float`, `bool`, `str` (UTF-8), `[T]`,
 `map[K, V]` (K is int or str), `T?` (optional), `{ id: int, name: str }`
 (anonymous struct, usable as any type) and named types. In a type, `...Point`
 copies Point's fields, `tags: [str] = []` has a default (a literal, `[]`, `{}` or
@@ -45,8 +45,8 @@ immutable, `var` mutable. A global `var` is not allowed in servers: use `store`.
 
 `if`/`else if`/`else` and `match` are values too: `let v = if c { let a = f();
 a + 1 } else { 0 }` (a block's value is its last line).
-`while i < n { i += 1 }` (`-= *= /= %=` too, no `++`), `break`, `continue`; `for x
-in xs` (items, characters), `for i, x in xs`, `for k, v in m`, `for i in 0..n`
+`while c { }`, `i += 1` (`-= *= /= %=`, no `++`), `break`, `continue`; `for x in
+xs` (items, characters), `for i, x in xs`, `for k, v in m`, `for i in 0..n`
 (`0..=n` includes n).
 
 ```khrip body
@@ -58,8 +58,7 @@ let area = match s {        // every case, or _ =>
 ```
 
 `match` also takes int, str and bool; arms may be `200 | 201 => ...`, blocks or
-`return ...`. Operators: `&& || !`; `+` also joins strings; comparisons do not
-chain.
+`return ...`. `+` also joins strings.
 
 `"Hi, {user.name}!"` interpolates an expression that does not start with a quote
 (`{2,5}` stays text). Escapes: `\n \t \" \\ \{` and more. Raw strings in
@@ -74,7 +73,6 @@ let name = find(id) ?? "nobody"
 let user = users[id] else {            // unwrap or leave the scope
     return 404
 }
-if let u = users[id] { }
 if limit != none && n > limit { }      // after the check, limit is an int
 if q == none {
     return 400
@@ -127,9 +125,9 @@ declare is also a method of its first argument; `print`, `to_json`,
 - `map[K, V]`: `len has get remove keys values clear`, `m[k]` (V?), `m[k] = v`;
   insertion order
 
-`print(s)`, `eprint(s)`, `env(name)`, `sleep(ms)`, `now()` (unix seconds),
+`print(s)`, `eprint(s)`, `env(name)`, `sleep(ms)`, `now()` (Unix seconds),
 `now_ms()`, `time_iso(t)`, `parse_time(s)` (ISO 8601), `parse_date("2026-10-19")`,
-`random_str(n)`, `sha256(s)` (hex), `hash_password(p)`, `check_password(p,
+`random_str(n)`, `sha256(s)`, `hash_password(p)`, `check_password(p,
 hash)`, `url_encode(s)`, `to_json(x)`, `from_json(text)` (type from the
 annotation: `let u: User? = from_json(t)`).
 
@@ -157,7 +155,6 @@ route POST "/users" (body: NewUser) -> 201 User | 400 str {
 route GET "/users" (min_age: int?, page: int = 1) -> { items: [User], total: int } {
     let all = users.values()
         .filter(u => min_age == none || u.age >= min_age)
-        .sort_by(u => u.name)
     return { items: all[(page - 1) * 20..page * 20], total: all.len() }
 }
 
@@ -178,18 +175,21 @@ test "create and delete" {
 - Path parameters `{id}` are declared too. A struct, list or map parameter is
   the JSON body; others come from the query. Missing body fields take their
   defaults; enums are JSON strings ("Admin"), other variants objects with a
-  "type" field; `none` is `null`. Bad input gets 400 with a message.
+  "type" field; `none` is `null` both ways (not in a typed `call` body). Bad
+  input gets 400 with a message.
 - `-> Type` is 200, no `->` is 204; every status returned is listed: `return
   users[id] ?? 404` (`?? 404 "no user"` with `| 404 str`; a bare `| 409` has no
   body). Beside a struct or error variant, a literal 200 is `return 200 { ... }`.
   `str` is sent as text, other types as JSON.
-- `header(name)` reads a request header, `set_header(name, value)` adds one to
-  the response; `fail(status[, message])` ends the request from any function.
-- `store name: T` (or `= value`) outlives requests; handlers see it as if requests
-  ran one at a time, so no locks.
+- `header(name)` reads a request header, `set_header(name, value)` adds a
+  response header; `fail(status[, message])` ends the request from anywhere.
+- `store name: T` (or `= value`) outlives requests; they see it as if run one at
+  a time (no locks).
 - Tests run in order and share the store. `call METHOD "path?query" [body]
-  [headers map]` returns `Response { status, body, headers }`; `expect` records a
-  failure and goes on, `expect x != none` stops on none and narrows `x`.
+  [headers map]` returns `Response { status, body, headers }`; a typed body
+  leaves `none` fields unsent (`f: none` is an error; for `null` send a raw
+  string). `expect` records a failure and goes on, `expect x != none` stops on
+  none and narrows `x`.
 
 ## Other services, background tasks
 
@@ -203,9 +203,8 @@ every 10 min {
 
 `fetch METHOD url [body] [headers map]` returns a `Response` (header names lower
 case); `status` 0 means unreachable or a TLS error. A body value is sent as
-JSON, a str as text. `fetch`, `sql`, `sleep` and `hash_password` are plain calls
-(no async/await); while one waits, other requests may change the store: read it
-again after.
+JSON, a str as text. `fetch`, `sql`, `sleep` and `hash_password` wait without
+async/await; meanwhile other requests may change the store: read it again after.
 `every N ms|s|min|h|d` runs a block in a background thread.
 
 ## Traps from other languages

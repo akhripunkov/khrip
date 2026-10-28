@@ -1,0 +1,5 @@
+tests/skill/rules/call_none.kh:18:55: error: field note: none is not sent in a call body
+        expect (call PATCH "/notes/1" { title: "b", note: none }).status == 200
+                                                          ^
+    hint: leave the field out to not send it; use a raw string body for an explicit null: call PATCH "/x" `{"note": null}`
+1 error
