@@ -1,0 +1,20 @@
+# Публичный токенизатор Anthropic (@anthropic-ai/tokenizer 0.0.4, как в bench/tokens): задача, до (e1203ad), после, разница; код без комментариев
+## 11 решений eval
+bank 509 497 -12
+bookings 610 610 0
+catalog 817 816 -1
+inventory 733 718 -15
+ledger 1074 1044 -30
+notes 646 641 -5
+polls 683 666 -17
+ratelimit 447 422 -25
+shop 2208 2161 -47
+shortener 397 390 -7
+tracker 1322 1302 -20
+total 9446 9267 -179
+## P1–P4
+p1 264 203 -61
+p2 221 216 -5
+p3 239 232 -7
+p4 260 260 0
+total 984 911 -73

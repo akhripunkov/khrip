@@ -1,0 +1,16 @@
+# Время сборки решений eval, мс (среднее из 20 запусков khc -o; машина без
+# других задач): base/old — khc e1203ad и исходник e1203ad, new/old — khc
+# ветки и тот же исходник, new/new — khc ветки и переписанный исходник.
+bank base/old=68ms new/old=62ms new/new=61ms
+bookings base/old=65ms new/old=72ms new/new=64ms
+catalog base/old=66ms new/old=68ms new/new=68ms
+inventory base/old=62ms new/old=62ms new/new=69ms
+ledger base/old=84ms new/old=83ms new/new=90ms
+notes base/old=72ms new/old=75ms new/new=72ms
+polls base/old=68ms new/old=67ms new/new=67ms
+ratelimit base/old=65ms new/old=68ms new/new=70ms
+shop base/old=95ms new/old=91ms new/new=91ms
+shortener base/old=76ms new/old=76ms new/new=69ms
+tracker base/old=92ms new/old=84ms new/new=90ms
+# Самосборка (khc --system src/*.kh, 10 запусков): khc e1203ad на исходниках
+# e1203ad — 170 мс, khc ветки на них же — 166 мс, khc ветки на своих — 175 мс.
