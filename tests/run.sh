@@ -28,7 +28,10 @@
 #                       tests/run/regex_go.kh — ответы Go regexp (если есть go,
 #                       tools/regex_go.go -check сверяет его с генератором);
 #   docs/tutorial/    — примеры учебника выполняются, их тесты проходят;
-#   tests/http.sh     — HTTP-сервер на Khrip отвечает правильно;
+#   bench/**/*.kh     — программы замеров собираются (кроме записей
+#                       bench/results и вариантов синтаксиса в
+#                       bench/tokens/samples/*/variants);
+#   tests/http.sh    — HTTP-сервер на Khrip отвечает правильно;
 #   tests/coro.sh     — запросы, которые ждут (sleep, fetch), не держат поток;
 #   tests/gc.sh       — сборщик store: запросы держат значения через ожидания,
 #                       пока писатели их заменяют, а сборщик собирает;
@@ -389,6 +392,22 @@ for src in docs/tutorial/*.kh docs/tutorial/answers/*.kh; do
 		failed "$src" "$(cat "$tmp/tutorial.out")"
 	fi
 done
+
+# Программы замеров (bench/) собираются с нынешней библиотекой: сценарии
+# замеров собирают их сами, и без этой проверки программа, отставшая от
+# рантайма, видна только при следующем замере. Не проверяются записи прошлых
+# замеров (bench/results) и варианты синтаксиса для подсчёта токенов
+# (bench/tokens/samples/*/variants) — это не программы на нынешнем Khrip.
+# Программа только с блоками test (bench/gc/pinprobe.kh) собирается с --test.
+while IFS= read -r src; do
+	cmd=(-o "$tmp/bench_prog" "$src")
+	grep -q '^test ' "$src" && cmd=(--test "${cmd[@]}")
+	if "$KHC" "${cmd[@]}" >"$tmp/bench.out" 2>&1; then
+		pass=$((pass + 1))
+	else
+		failed "$src" "не скомпилировалось:"$'\n'"$(cat "$tmp/bench.out")"
+	fi
+done < <(find bench -name '*.kh' -not -path 'bench/results/*' -not -path 'bench/tokens/samples/*/variants/*' | sort)
 
 # Системный код: строки в нём — байты (s.byte_len(), s.byte(i), s.byte_slice).
 # --all-lib проверяет все функции библиотеки, а не только вызванные программой:
