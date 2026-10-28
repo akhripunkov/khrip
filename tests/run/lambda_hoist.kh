@@ -1,0 +1,104 @@
+// Вынос неизменных вызовов из лямбд (этап скорости, часть 2, п. 2): q.lower(),
+// q.upper(), q.trim() и q.len() у неизменяемой локальной или параметра str
+// считаются один раз до цикла лямбды. Здесь — случаи, где выносить нельзя или
+// где вынесенное значение легко перепутать: имя объявлено в самой лямбде
+// (параметр, let в блоке-значении, match, for, if let), вложенная лямбда со
+// своим параметром, str? с проверкой на none внутри лямбды, изменяемая
+// локальная, которой присваивают в блоке лямбды, пустой список, вложенные
+// вызовы и цепочки после вынесенного вызова. Ожидаемый вывод — вывод той же
+// программы без выноса.
+
+type Item { name: str, kind: Kind }
+
+type Kind = Fruit { label: str } | Tool | Other
+
+fn upper_count(q: str, xs: [str]) -> int {
+    return xs.count(x => x == q.upper())
+}
+
+fn opt_count(q: str?, xs: [str]) -> int {
+    return xs.count(x => q != none && x.lower() == q.lower())
+}
+
+fn main() {
+    let xs = ["Apple", "pear", "  Kiwi ", "APPLE", "Plum"]
+    let q = "  ApPle "
+    let p = "outer"
+    // параметр лямбды с тем же именем, что и внешняя локальная
+    print(xs.map(q => q.lower()).join(","))
+    print(xs.map(p => p.trim().len().to_str()).join(","))
+    // имя объявлено в блоке-значении лямбды
+    print(xs.map(x => if x.len() > 0 {
+        let q = x
+        q.upper()
+    } else {
+        q.upper()
+    }).join(","))
+    // вынесенное и обычное в одной лямбде, цепочка после вынесенного
+    print(xs.filter(x => x.lower().contains(q.trim().lower()) || q.trim().lower().contains(x.trim().lower())).join(","))
+    print(xs.count(x => q.trim().len() == x.len()))
+    print(xs.map(x => (q.lower().len() + x.len()).to_str()).join(","))
+    // разные вызовы одного имени; поле с именем внешней локальной
+    print(xs.map(x => q.lower() + q.upper() + q.trim() + q.len().to_str()).len())
+    print(xs.map(x => q.upper() + q.lower()).join(","))
+    let name = "Name"
+    let named = [Item { name: "bolt", kind: Tool }]
+    print(named.map(it => it.name.upper() + name.upper()).join(","))
+    // вложенная лямбда: параметр внешней — неизменная внутри внутренней
+    print(xs.map(p => xs.count(y => y.lower() == p.lower()).to_str()).join(","))
+    print(xs.map(x => xs.filter(y => y.trim().upper() == x.trim().upper()).len().to_str()).join(","))
+    // привязка match с тем же именем
+    let items = [Item { name: "a", kind: Fruit { label: "Q" } }, Item { name: "b", kind: Tool }]
+    print(items.map(it => match it.kind {
+        Fruit q => q.label.lower()
+        Tool => q.trim()
+        Other => p.upper()
+    }).join(","))
+    // for и if let с тем же именем внутри блока
+    print(xs.map(x => if x != "" {
+        var acc = ""
+        for q in ["X", "y"] {
+            acc += q.lower()
+        }
+        acc + q.len().to_str()
+    } else {
+        ""
+    }).join(","))
+    let maybe: str? = "PEAR"
+    print(xs.map(x => if x != "" {
+        var r = q.upper()
+        if let q = maybe {
+            r = r + q.lower()
+        }
+        r
+    } else {
+        q
+    }).join(","))
+    // str? — проверка внутри лямбды
+    print(opt_count("apple", xs))
+    print(opt_count(none, xs))
+    // маленькая функция с лямбдой встраивается: дважды подряд — разные q
+    print(upper_count("apple", xs) + upper_count("plum", xs) * 10 + upper_count("PEAR", ["PEAR", "x"]) * 100)
+    // привязка match на str с тем же именем
+    print(xs.map(x => match x.trim() {
+        "Kiwi" q => q.upper()
+        _ => q.lower()
+    }).join(","))
+    // изменяемая локальная, которой присваивают в лямбде
+    var v = "a"
+    print(xs.map(x => if x.len() > 4 {
+        v = v + "b"
+        v.upper()
+    } else {
+        v.upper()
+    }).join(","))
+    print(v)
+    // пустой список
+    let none_xs: [str] = []
+    print(none_xs.count(x => x == q.lower()))
+    print(none_xs.map(x => q.upper()).len())
+    // sort_by и find
+    print(xs.copy().sort_by(x => x.lower() + q.lower()).join(","))
+    print(xs.find(x => x.lower() == q.trim().lower()) ?? "-")
+    print(xs.any(x => x == q.trim()) || xs.all(x => x.len() < q.len()))
+}

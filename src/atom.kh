@@ -2214,6 +2214,11 @@ fn parse_method(rt: int, nt: Token) -> int {
         return ty_err
     }
     if k == K_STR {
+        // вынесен из лямбды (src/variant.kh, hoist_begin)
+        let ht = hoisted_call()
+        if ht >= 0 {
+            return ht
+        }
         if system_code(nt) {
             system_str_method(nt)
         }

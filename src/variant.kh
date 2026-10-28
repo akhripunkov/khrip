@@ -496,10 +496,143 @@ fn emit_call2(f: str, lj: int, li: int) {
     emit_call(rt_func(f))
 }
 
+// ---- Вынос неизменных подвыражений из лямбд ----
+// Тело лямбды компилируется внутрь цикла по элементам, поэтому q.lower() в
+// filter(p => p.name.lower().contains(q.lower())) считался бы на каждом
+// элементе. Перед циклом вычисляются один раз вызовы имя.метод(), где метод —
+// lower, upper, trim или len у str (чистые встроенные: без побочных действий,
+// без паники, ответ зависит только от строки), а имя — неизменяемая локальная
+// или параметр типа str (не str?: сужение бывает внутри самой лямбды),
+// объявленная вне лямбды и не объявленная в ней заново. Строка неизменна, а
+// присвоить такому имени нельзя, поэтому на каждом элементе значение было бы
+// тем же. Если элементов нет, вызов выполняется один лишний раз — у этих
+// методов это ничего не меняет. В теле лямбды вызов (лексема метода из
+// hoist_toks) берёт готовое значение из скрытой локальной.
+var hoist_toks: [int]
+var hoist_locals: [int]
+var hoist_types: [int]
+
+// Чистый встроенный метод str без аргументов, который можно вынести: тип
+// результата или -1.
+fn hoist_method(name: str) -> int {
+    if name == "lower" || name == "upper" || name == "trim" {
+        return ty_str
+    }
+    if name == "len" {
+        return ty_int
+    }
+    return -1
+}
+
+// Имя объявлено внутри [from, to): параметр лямбды, let/var, for, if let,
+// привязка match (имя =>).
+fn declared_in(name: str, from: int, to: int) -> bool {
+    var j = from
+    while j < to {
+        if toks[j].kind == T_IDENT && toks[j].text == name {
+            let pk = toks[j - 1].kind
+            if pk == T_LET || pk == T_VAR || pk == T_FOR || kind_at(j + 1) == T_FATARROW {
+                return true
+            }
+            if pk == ',' && toks[j - 2].kind == T_IDENT && toks[j - 3].kind == T_FOR {
+                return true
+            }
+        }
+        j += 1
+    }
+    return false
+}
+
+// Вынести неизменные вызовы из тела лямбды [from, to) (from — параметр
+// лямбды): вычислить их сейчас, до цикла, в скрытые локальные. → отметка для
+// hoist_end.
+fn hoist_begin(from: int, to: int) -> int {
+    let mark = hoist_toks.len()
+    if system_code(toks[from]) {
+        return mark
+    }
+    var j = from + 2
+    while j + 4 < to {
+        if toks[j].kind == T_IDENT && toks[j - 1].kind != '.' && kind_at(j + 1) == '.' && kind_at(j + 2) == T_IDENT && kind_at(j + 3) == '(' && kind_at(j + 4) == ')' {
+            let rty = hoist_method(toks[j + 2].text)
+            let li = find_local(toks[j].text)
+            if rty >= 0 && li >= 0 && !locals[li].mutable && locals[li].ty == ty_str && !declared_in(toks[j].text, from, to) && hoist_find(j + 2) < 0 {
+                // тот же вызов уже вынесен — та же локальная
+                var h = -1
+                var k = mark
+                while k < hoist_toks.len() {
+                    let o = hoist_toks[k]
+                    if toks[o].text == toks[j + 2].text && toks[o - 2].text == toks[j].text {
+                        h = hoist_locals[k]
+                    }
+                    k += 1
+                }
+                if h < 0 {
+                    emit_load_local(li)
+                    let m = toks[j + 2].text
+                    if m == "len" {
+                        emit_text_len(-1)
+                    } else {
+                        emit_mov_rr(RDI, RAX)
+                        emit_call(rt_func(str_method_fn(m, false)))
+                    }
+                    h = hidden_local(rty)
+                    emit_store_local(h)
+                }
+                hoist_toks.push(j + 2)
+                hoist_locals.push(h)
+                hoist_types.push(rty)
+            }
+        }
+        j += 1
+    }
+    return mark
+}
+
+// Номер вынесенного вызова с лексемой метода i или -1.
+fn hoist_find(i: int) -> int {
+    var k = hoist_toks.len() - 1
+    while k >= 0 {
+        if hoist_toks[k] == i {
+            return k
+        }
+        k -= 1
+    }
+    return -1
+}
+
+// Вынесенные вызовы лямбды — больше не нужны; скрытые локальные свободны.
+fn hoist_end(mark: int) {
+    while hoist_toks.len() > mark {
+        let h = hoist_locals.pop()
+        hoist_toks.pop()
+        hoist_types.pop()
+        // одна локальная на одинаковые вызовы: свободна с последним
+        if !int_in(hoist_locals, h) {
+            release_hidden(h)
+        }
+    }
+}
+
+// Метод с лексемой pos - 1 вынесен из лямбды: значение — из скрытой локальной
+// (получатель в rax больше не нужен). Текущий токен — '('. → тип или -1.
+fn hoisted_call() -> int {
+    let k = hoist_find(pos - 1)
+    if k < 0 {
+        return -1
+    }
+    advance()
+    advance()
+    emit_load_local(hoist_locals[k])
+    last_was_call = true
+    return hoist_types[k]
+}
+
 // список.метод(x => выражение); список в rax, текущий токен — '('.
 fn parse_lambda_method(rt: int, nt: Token) -> int {
     let name = nt.text
     let et = ty_elem(rt)
+    let open = pos
     advance()
     if kind() != T_IDENT || kind_at(pos + 1) != T_FATARROW {
         error_tok(tok(), "." + name + "() takes a lambda", "xs." + name + "(x => ...)")
@@ -511,6 +644,7 @@ fn parse_lambda_method(rt: int, nt: Token) -> int {
     advance()
     let lst = hidden_local(rt)
     emit_store_local(lst)
+    let hmark = hoist_begin(pos - 2, matching_close(open))
     var esize_at = -1
     var init = 0
     if name == "all" {
@@ -650,6 +784,7 @@ fn parse_lambda_method(rt: int, nt: Token) -> int {
     } else {
         emit_load_local(res)
     }
+    hoist_end(hmark)
     release_hidden(idx)
     release_hidden(res)
     release_hidden(lst)

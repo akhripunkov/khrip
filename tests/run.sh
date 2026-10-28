@@ -491,6 +491,78 @@ insertfull gc_insert verify
 CUTS
 [[ $mem3_ok -eq 1 ]] && pass=$((pass + 1))
 
+# Оптимизации компилятора (этап скорости, часть 2) сами по себе: компилятор,
+# собранный из копии src/ с подложенной ошибкой, собирает тест пункта
+# неправильно — вывод программы (run) или блокировки маршрутов (locks) другие:
+#   hoistmut — выносится и изменяемая локальная, которой присваивают в лямбде;
+#   hoistopt — выносится и str? (проверка на none — внутри лямбды);
+#   hoistdecl — без проверки, что имя объявлено в самой лямбде;
+#   hoistparam — то же, но не смотрится параметр лямбды;
+#   hoistfor, hoistlet, hoistbind — не видно for, let и привязки match (имя =>);
+#   hoistend — вынесенные вызовы не забываются после лямбды (встроенная
+#              функция с лямбдой — дважды подряд);
+#   hoistfield — выносится и поле x.name.lower() по имени локальной name;
+#   hoistdedupe — разные методы одного имени — в одной локальной.
+comp_ok=1
+while read -r cut test mode; do
+	[[ -z $cut ]] && continue
+	rm -rf "${tmp:?}/msrc"
+	mkdir -p "$tmp/msrc"
+	cp src/*.kh "$tmp/msrc/"
+	if ! python3 - "$tmp/msrc" "$cut" <<'PY'
+import sys
+d, m = sys.argv[1], sys.argv[2]
+cuts = {
+    "hoistmut": ("variant.kh", "li >= 0 && !locals[li].mutable && locals[li].ty == ty_str", "li >= 0 && locals[li].ty == ty_str"),
+    "hoistopt": ("variant.kh", "li >= 0 && !locals[li].mutable && locals[li].ty == ty_str", "li >= 0 && !locals[li].mutable && (locals[li].ty == ty_str || tkind(locals[li].ty) == K_OPT)"),
+    "hoistdecl": ("variant.kh", " && !declared_in(toks[j].text, from, to) && ", " && "),
+    "hoistparam": ("variant.kh", "!declared_in(toks[j].text, from, to)", "!declared_in(toks[j].text, from + 2, to)"),
+    "hoistfor": ("variant.kh", "            if pk == T_LET || pk == T_VAR || pk == T_FOR || kind_at(j + 1) == T_FATARROW {", "            if pk == T_LET || pk == T_VAR || kind_at(j + 1) == T_FATARROW {"),
+    "hoistlet": ("variant.kh", "            if pk == T_LET || pk == T_VAR || pk == T_FOR || kind_at(j + 1) == T_FATARROW {", "            if pk == T_VAR || pk == T_FOR || kind_at(j + 1) == T_FATARROW {"),
+    "hoistbind": ("variant.kh", "            if pk == T_LET || pk == T_VAR || pk == T_FOR || kind_at(j + 1) == T_FATARROW {", "            if pk == T_LET || pk == T_VAR || pk == T_FOR {"),
+    "hoistend": ("variant.kh", "    while hoist_toks.len() > mark {\n        let h = hoist_locals.pop()", "    while false {\n        let h = hoist_locals.pop()"),
+    "hoistfield": ("variant.kh", "if toks[j].kind == T_IDENT && toks[j - 1].kind != '.' && kind_at(j + 1) == '.'", "if toks[j].kind == T_IDENT && kind_at(j + 1) == '.'"),
+    "hoistdedupe": ("variant.kh", "if toks[o].text == toks[j + 2].text && toks[o - 2].text == toks[j].text {", "if toks[o - 2].text == toks[j].text {"),
+}
+f, old, new = cuts[m]
+s = open(f"{d}/{f}").read()
+if s.count(old) != 1:
+    sys.exit(1)
+open(f"{d}/{f}", "w").write(s.replace(old, new))
+PY
+	then
+		comp_ok=0
+		failed "оптимизации компилятора ($cut)" "место для подложенной ошибки не найдено в src/"
+		continue
+	fi
+	if ! KHRIP_LIB="$PWD/lib" "$KHC" --system -o "$tmp/mkhc" "$tmp"/msrc/*.kh >"$tmp/mkhc.txt" 2>&1; then
+		comp_ok=0
+		failed "оптимизации компилятора ($cut)" "компилятор с подложенной ошибкой не собрался: $(cat "$tmp/mkhc.txt")"
+		continue
+	fi
+	if [[ $mode == locks ]]; then
+		{ KHRIP_LIB="$PWD/lib" timeout 120 "$tmp/mkhc" check --locks "$test" >"$tmp/mout.txt" 2>&1; } 2>/dev/null
+	else
+		{ KHRIP_LIB="$PWD/lib" env -u KHRIP_GC_VERIFY -u KHRIP_GC_STRESS timeout 120 "$tmp/mkhc" run "$test" >"$tmp/mout.txt" 2>/dev/null; } 2>/dev/null
+	fi
+	if diff -q "${test%.kh}.out" "$tmp/mout.txt" >/dev/null; then
+		comp_ok=0
+		failed "оптимизации компилятора ($cut)" "$test проходит и без проверяемого условия"
+	fi
+done <<'CUTS'
+hoistmut tests/run/lambda_hoist.kh run
+hoistopt tests/run/lambda_hoist.kh run
+hoistdecl tests/run/lambda_hoist.kh run
+hoistparam tests/run/lambda_hoist.kh run
+hoistfor tests/run/lambda_hoist.kh run
+hoistlet tests/run/lambda_hoist.kh run
+hoistbind tests/run/lambda_hoist.kh run
+hoistend tests/run/lambda_hoist.kh run
+hoistfield tests/run/lambda_hoist.kh run
+hoistdedupe tests/run/lambda_hoist.kh run
+CUTS
+[[ $comp_ok -eq 1 ]] && pass=$((pass + 1))
+
 # Примеры учебника (docs/TUTORIAL.md) и ответы к заданиям: программы
 # выполняются, API проходят свои блоки test.
 for src in docs/tutorial/*.kh docs/tutorial/answers/*.kh; do
