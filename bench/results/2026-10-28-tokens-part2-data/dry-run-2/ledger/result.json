@@ -1,0 +1,42 @@
+{
+ "task": "ledger",
+ "lang": "khrip",
+ "model": "dry-run",
+ "passed": true,
+ "attempts": 1,
+ "calls": 2,
+ "chapters_read": [
+  "postgresql.md"
+ ],
+ "vendor": "anthropic",
+ "prices": {
+  "input": 0.2,
+  "cache_write": 0.25,
+  "cache_read": 0.02,
+  "output": 1,
+  "reasoning": 1
+ },
+ "usage": null,
+ "cost": null,
+ "o200k": {
+  "system": 3063,
+  "task": 713,
+  "chapters": 897,
+  "answers": 1416,
+  "feedback": 0,
+  "per_call": [
+   {
+    "input": 3776,
+    "new_input": 3776,
+    "output": 4
+   },
+   {
+    "input": 4677,
+    "new_input": 901,
+    "output": 1412
+   }
+  ],
+  "cost_cached": 2660.8,
+  "cost_uncached": 3106.6
+ }
+}

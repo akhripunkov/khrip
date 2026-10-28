@@ -1,0 +1,127 @@
+```khrip
+migration 1 `
+CREATE TABLE accounts (
+    id bigserial PRIMARY KEY,
+    owner text NOT NULL,
+    currency text NOT NULL,
+    balance bigint NOT NULL DEFAULT 0 CHECK (balance >= 0)
+);
+CREATE TABLE transfers (
+    id bigserial PRIMARY KEY,
+    from_id bigint NOT NULL REFERENCES accounts(id),
+    to_id bigint NOT NULL REFERENCES accounts(id),
+    amount bigint NOT NULL CHECK (amount > 0),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    idem_key text UNIQUE,
+    fingerprint text
+);
+CREATE INDEX transfers_from_idx ON transfers (from_id, id);
+CREATE INDEX transfers_to_idx ON transfers (to_id, id);
+`
+
+type Account { id: int, owner: str, currency: str, balance: int }
+type Transfer { id: int, from: int, to: int, amount: int, created_at: str }
+type Fingerprint { fingerprint: str? }
+type Balances { usd: int, eur: int, gbp: int }
+
+route POST "/accounts" (body: { owner: str, currency: str }) -> 201 Account | 400 str {
+    if body.owner.trim().len() == 0 {
+        return 400 "owner is blank"
+    }
+    if body.currency != "USD" && body.currency != "EUR" && body.currency != "GBP" {
+        return 400 "currency must be USD, EUR or GBP"
+    }
+    let owner = body.owner
+    let currency = body.currency
+    let acc: Account = sql "INSERT INTO accounts (owner, currency) VALUES ({owner}, {currency}) RETURNING id, owner, currency, balance"
+    return 201 acc
+}
+
+route GET "/accounts/{id}" (id: int) -> Account | 404 str {
+    let acc: Account = sql "SELECT id, owner, currency, balance FROM accounts WHERE id = {id}" else {
+        return 404 "account not found"
+    }
+    return acc
+}
+
+route POST "/accounts/{id}/deposit" (id: int, body: { amount: int }) -> Account | 400 str | 404 str {
+    if body.amount <= 0 {
+        return 400 "amount must be positive"
+    }
+    let amount = body.amount
+    let acc: Account = sql "UPDATE accounts SET balance = balance + {amount} WHERE id = {id} RETURNING id, owner, currency, balance" else {
+        return 404 "account not found"
+    }
+    return acc
+}
+
+route POST "/transfers" (body: { from: int, to: int, amount: int }) -> 201 Transfer | 400 str | 404 str | 409 str | 422 str {
+    if body.amount <= 0 {
+        return 400 "amount must be positive"
+    }
+    if body.from == body.to {
+        return 400 "from and to must differ"
+    }
+    let key = header("Idempotency-Key")
+    if key != none {
+        if key.len() < 1 || key.len() > 64 {
+            return 400 "Idempotency-Key must be 1-64 characters"
+        }
+    }
+    let src_id = body.from
+    let dst_id = body.to
+    let amount = body.amount
+    let fp = "{src_id}:{dst_id}:{amount}"
+    let t = tx {
+        if let k = key {
+            let prev: Transfer? = sql "SELECT id, from_id AS from, to_id AS to, amount, created_at FROM transfers WHERE idem_key = {k}"
+            if let p = prev {
+                let f: Fingerprint = sql "SELECT fingerprint FROM transfers WHERE id = {p.id}"
+                if (f.fingerprint ?? "") != fp {
+                    return 422 "Idempotency-Key was used with a different body"
+                }
+                return 201 p
+            }
+        }
+        let src: Account = sql "SELECT id, owner, currency, balance FROM accounts WHERE id = {src_id}" else {
+            return 404 "from account not found"
+        }
+        let dst: Account = sql "SELECT id, owner, currency, balance FROM accounts WHERE id = {dst_id}" else {
+            return 404 "to account not found"
+        }
+        if src.currency != dst.currency {
+            return 422 "accounts have different currencies"
+        }
+        if src.balance < amount {
+            return 409 "insufficient funds"
+        }
+        sql "UPDATE accounts SET balance = balance - {amount} WHERE id = {src_id}"
+        sql "UPDATE accounts SET balance = balance + {amount} WHERE id = {dst_id}"
+        let created: Transfer = sql "INSERT INTO transfers (from_id, to_id, amount, idem_key, fingerprint) VALUES ({src_id}, {dst_id}, {amount}, {key}, {fp}) RETURNING id, from_id AS from, to_id AS to, amount, created_at"
+        created
+    }
+    return 201 t
+}
+
+route GET "/accounts/{id}/transfers" (id: int, limit: int = 20, before: int?) -> [Transfer] | 400 str | 404 str {
+    if limit < 1 || limit > 100 {
+        return 400 "limit must be 1-100"
+    }
+    if before != none && before < 1 {
+        return 400 "before must be a transfer id"
+    }
+    let acc: Account? = sql "SELECT id, owner, currency, balance FROM accounts WHERE id = {id}"
+    if acc == none {
+        return 404 "account not found"
+    }
+    let items: [Transfer] = sql "SELECT id, from_id AS from, to_id AS to, amount, created_at FROM transfers WHERE (from_id = {id} OR to_id = {id}) AND ({before} IS NULL OR id < {before}) ORDER BY id DESC LIMIT {limit}"
+    return items
+}
+
+route GET "/stats" () -> { accounts: int, transfers: int, balances: { USD: int, EUR: int, GBP: int } } {
+    let accounts: int = sql "SELECT count(*) FROM accounts"
+    let transfers: int = sql "SELECT count(*) FROM transfers"
+    let b: Balances = sql "SELECT coalesce(sum(balance) FILTER (WHERE currency = 'USD'), 0)::bigint AS usd, coalesce(sum(balance) FILTER (WHERE currency = 'EUR'), 0)::bigint AS eur, coalesce(sum(balance) FILTER (WHERE currency = 'GBP'), 0)::bigint AS gbp FROM accounts"
+    return { accounts, transfers, balances: { USD: b.usd, EUR: b.eur, GBP: b.gbp } }
+}
+```

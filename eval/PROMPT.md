@@ -5,7 +5,13 @@ The same messages go to the model for every language; only `{LANGUAGE}`, `{FILE}
 runs the conversation; this file is its description.
 
 The system prompt is `{RULES}`. It is the same for every task of a language, so
-a model API caches it. The first user message is:
+a model API can cache it, but only above the provider's per-model minimum for a
+cached prefix (1024 to 4096 tokens at the time of writing): the Khrip core
+alone (about 3000 tokens) falls below it on some models, and the one-line rules
+of the other languages always do. In an agent session the core sits inside a
+larger cached prefix (tools, instructions), so it is cached there. The cost
+comes from the provider's usage of every call, not from this assumption
+(`eval/blind.py`). The first user message is:
 
 ---
 
@@ -36,8 +42,10 @@ The line before the skill core:
 > example `READ postgresql.md`) and nothing else; the file comes in the next
 > message. Read a chapter only when the task needs it.
 
-A `READ <file>` answer is not an attempt: the next user message is the text of
-`skill/khrip/<file>` (or the list of chapters, if there is no such file). The
+A `READ <file>` answer is not an attempt, also with several such lines or inside
+a code block: the next user message is the text of the chapters asked for (and
+the list of chapters, for a name that is not one). An attempt that the checks
+do not finish in 15 minutes fails. The
 model reads chapters only by asking; nothing else of the repository is given.
 
 Tasks with a database (`ledger`, `shop`, `tracker`; the task directory has a

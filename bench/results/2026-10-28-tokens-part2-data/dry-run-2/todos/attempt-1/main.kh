@@ -1,0 +1,71 @@
+type NewTodo { title: str, type: str = "task", notes: str?, due: str?, priority: int? }
+type TodoPatch { title: str?, type: str?, notes: str?, due: str?, priority: int?, done: bool? }
+type Todo { id: int, ...NewTodo, done: bool = false }
+
+store todos: map[int, Todo]
+store last_id: int
+
+fn validate(title: str, kind: str, due: str?, priority: int?) -> str? {
+    if title.trim().len() == 0 {
+        return "title is blank"
+    }
+    if kind != "task" && kind != "note" {
+        return "type must be task or note"
+    }
+    if due != none {
+        if !due.matches(`\d{4}-\d{2}-\d{2}`) || parse_date(due) == none {
+            return "due is not a valid date"
+        }
+    }
+    if priority != none {
+        if priority < 1 || priority > 5 {
+            return "priority must be 1..5"
+        }
+    }
+    return none
+}
+
+route POST "/todos" (body: NewTodo) -> 201 Todo | 400 str {
+    if let err = validate(body.title, body.type, body.due, body.priority) {
+        return 400 err
+    }
+    last_id += 1
+    let todo = Todo { id: last_id, ...body, done: false }
+    todos[todo.id] = todo
+    return 201 todo
+}
+
+route GET "/todos/{id}" (id: int) -> Todo | 404 str {
+    return todos[id] ?? 404 "todo not found"
+}
+
+route PATCH "/todos/{id}" (id: int, body: TodoPatch) -> Todo | 400 str | 404 str {
+    let old = todos[id] else {
+        return 404 "todo not found"
+    }
+    let t = Todo { ...old, ...body }
+    if let err = validate(t.title, t.type, t.due, t.priority) {
+        return 400 err
+    }
+    todos[id] = t
+    return t
+}
+
+route DELETE "/todos/{id}" (id: int) -> 204 | 404 str {
+    todos.remove(id) else {
+        return 404 "todo not found"
+    }
+    return 204
+}
+
+route GET "/todos" (done: bool?, type: str?, sort: str = "id") -> [Todo] | 400 str {
+    if sort != "id" && sort != "priority" {
+        return 400 "sort must be id or priority"
+    }
+    let items = todos.values()
+        .filter(t => (done == none || t.done == done) && (type == none || t.type == type))
+    if sort == "priority" {
+        items.sort_by(t => t.priority ?? 6)
+    }
+    return items
+}

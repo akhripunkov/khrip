@@ -1,0 +1,35 @@
+{
+ "task": "todos",
+ "lang": "khrip",
+ "model": "dry-run",
+ "passed": true,
+ "attempts": 1,
+ "calls": 1,
+ "chapters_read": [],
+ "vendor": "anthropic",
+ "prices": {
+  "input": 0.2,
+  "cache_write": 0.25,
+  "cache_read": 0.02,
+  "output": 1,
+  "reasoning": 1
+ },
+ "usage": null,
+ "cost": null,
+ "o200k": {
+  "system": 3063,
+  "task": 441,
+  "chapters": 0,
+  "answers": 635,
+  "feedback": 0,
+  "per_call": [
+   {
+    "input": 3504,
+    "new_input": 3504,
+    "output": 635
+   }
+  ],
+  "cost_cached": 1511.0,
+  "cost_uncached": 1335.8
+ }
+}
