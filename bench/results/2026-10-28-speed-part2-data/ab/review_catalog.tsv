@@ -1,0 +1,5 @@
+round	scenario	variant	rps	p50_ms	p99_ms	cpu_us_per_req	non2xx_pct
+1	catalog	catalog_base	5888	10.36	23.05	294.0	0.0
+1	catalog	catalog_i4	17197	3.45	8.51	113.8	0.0
+1	catalog	catalog_rf	16194	3.75	8.84	122.0	0.0
+1	catalog	csharp	13046	4.30	20.67	135.5	0.0

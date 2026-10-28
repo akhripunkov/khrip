@@ -1,0 +1,5 @@
+round	scenario	variant	rps	p50_ms	p99_ms	cpu_us_per_req	non2xx_pct
+1	bookings	bookings_base	8771	6.81	16.45	178.9	26.2
+1	bookings	bookings_i4	13184	4.28	364.01	115.1	28.0
+1	bookings	bookings_rf	14562	4.14	9.46	112.8	28.4
+1	bookings	csharp	9576	5.74	43.05	167.6	23.1
