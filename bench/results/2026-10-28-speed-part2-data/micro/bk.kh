@@ -1,0 +1,22 @@
+type Booking { id: int, room_id: int, title: str, start: str, end: str }
+fn main() {
+    let reps = (args()[1]).to_int() ?? 10
+    var m: map[int, Booking] = {}
+    for i in 0..11000 {
+        let d = 1 + i % 28
+        var ds = "{d}"
+        if d < 10 { ds = "0{d}" }
+        let h = i % 22
+        var hs = "{h}"
+        if h < 10 { hs = "0{h}" }
+        m[i] = Booking { id: i, room_id: 1 + i % 20, title: "Load", start: "2026-11-{ds}T{hs}:30:00Z", end: "2026-11-{ds}T{hs}:59:00Z" }
+    }
+    var t = 0
+    for r in 0..reps {
+        let id = 1 + r % 20
+        let from = "2026-11-05T00:00:00Z"
+        let to = "2026-11-06T00:00:00Z"
+        t += m.values().filter(b => b.room_id == id && b.start < to && from < b.end).sort_by(b => b.start).len()
+    }
+    print(t)
+}

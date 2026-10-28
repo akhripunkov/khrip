@@ -1,0 +1,11 @@
+Wed Oct 28 11:51:15 UTC 2026
+gc matrix (plain): 42 collections, RSS 12396 KB, boom 148, bump 263, churn 855, feed 119, fx 124, grow 13, hdrs 308, hold 82, login 2, loop 79, map 74, poll 6, resurrect 90, rotate 2, search 77, slice 77, temps 65, transfer 144; mid-marking: fx 46, hold 44, login 1, loop 39, map 28, poll 3, resurrect 36, search 33, slice 36, temps 24, every 13; arenas handed off 140, finished in request 18, writer assists 714, sweep slices 18
+gc matrix (KHRIP_GC_STRESS=1): 41 collections, RSS 12028 KB, boom 122, bump 259, churn 1017, feed 161, fx 179, grow 14, hdrs 109, hold 96, login 2, loop 73, map 63, poll 6, resurrect 74, rotate 2, search 67, slice 82, temps 60, transfer 137; mid-marking: fx 69, hold 47, login 2, loop 38, map 20, poll 3, resurrect 25, search 32, slice 34, temps 34, every 18; arenas handed off 138, finished in request 16, writer assists 589, sweep slices 28
+gc windows by kind (KHRIP_GC_STRESS=1): sleep {"ok": 23, "ok~": 7, "ok+": 0, "bad": []}; reader {"ok": 14, "ok~": 5, "ok+": 11, "bad": []}; fetch {"ok": 21, "ok~": 0, "ok+": 9, "bad": []}; hash {"ok": 7, "ok~": 5, "ok+": 0, "bad": []}; poll {"ok": 2, "ok~": 1, "ok+": 9, "bad": []}; many {"ok": 0, "ok~": 0, "ok+": 12, "bad": []}; 
+gc windows without memory for hbuf (KHRIP_GC_FAULT=hbuf): many {"ok": 3, "ok~": 0, "ok+": 13, "bad": []}; sleep {"ok": 13, "ok~": 3, "ok+": 0, "bad": []}; reader {"ok": 12, "ok~": 4, "ok+": 0, "bad": []}; fetch {"ok": 8, "ok~": 1, "ok+": 23, "bad": []}; 
+gc windows without memory for hbuf (KHRIP_GC_FAULT=hbuf2): many {"ok": 5, "ok~": 0, "ok+": 11, "bad": []}; sleep {"ok": 9, "ok~": 3, "ok+": 4, "bad": []}; reader {"ok": 12, "ok~": 4, "ok+": 0, "bad": []}; fetch {"ok": 16, "ok~": 1, "ok+": 15, "bad": []}; 
+gc driver windows (KHRIP_GC_STRESS=1): mongo {"ok": 10, "ok~": 1, "ok+": 19, "bad": []}; clickhouse {"ok": 14, "ok~": 3, "ok+": 3, "bad": []}; 
+pg race (KHRIP_GC_STRESS=1): 26 collections, 26 with holders in PostgreSQL windows, arenas handed off 15
+тестов пройдено: 541, провалено: 0
+exit 0
+Wed Oct 28 11:56:54 UTC 2026

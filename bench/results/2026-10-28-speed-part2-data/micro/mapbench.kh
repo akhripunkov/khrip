@@ -1,0 +1,20 @@
+type Category { name: str, count: int, avg_price: float }
+
+fn main() {
+    let reps = (args()[1]).to_int() ?? 1000
+    var names: [str] = []
+    for i in 0..2000 {
+        names.push("cat{i % 20}")
+    }
+    var total = 0
+    for r in 0..reps {
+        var cats: map[str, Category] = {}
+        for n in names {
+            let c = cats[n] ?? Category { name: n, count: 0, avg_price: 0 }
+            c.count += 1
+            cats[c.name] = c
+        }
+        total += cats.len()
+    }
+    print(total)
+}

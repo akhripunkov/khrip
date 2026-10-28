@@ -1,0 +1,10 @@
+Wed Oct 28 12:28:03 UTC 2026
+gc matrix (plain): 14 collections, RSS 14500 KB, boom 45, bump 208, churn 811, feed 166, fx 150, grow 14, hdrs 223, hold 62, login 2, loop 57, map 57, poll 6, resurrect 64, rotate 2, search 81, slice 54, temps 54, transfer 172; mid-marking: fx 16, hold 10, loop 15, map 1, resurrect 9, search 6, slice 2, temps 8, every 3; arenas handed off 25, finished in request 0, writer assists 346, sweep slices 33
+gc matrix (KHRIP_GC_STRESS=1): 43 collections, RSS 10768 KB, boom 46, bump 296, churn 855, feed 199, fx 118, grow 15, hdrs 149, hold 58, login 3, loop 68, map 56, poll 6, resurrect 69, rotate 3, search 50, slice 75, temps 75, transfer 226; mid-marking: fx 37, hold 32, login 2, loop 38, map 22, poll 3, resurrect 28, search 20, slice 34, temps 45, every 7; arenas handed off 160, finished in request 17, writer assists 556, sweep slices 20
+gc windows by kind (KHRIP_GC_STRESS=1): sleep {"ok": 22, "ok~": 6, "ok+": 2, "bad": []}; reader {"ok": 22, "ok~": 5, "ok+": 3, "bad": []}; fetch {"ok": 20, "ok~": 2, "ok+": 8, "bad": []}; hash {"ok": 3, "ok~": 3, "ok+": 6, "bad": []}; poll {"ok": 0, "ok~": 1, "ok+": 11, "bad": []}; many {"ok": 0, "ok~": 0, "ok+": 12, "bad": []}; 
+gc windows without memory for hbuf (KHRIP_GC_FAULT=hbuf): many {"ok": 3, "ok~": 0, "ok+": 13, "bad": []}; sleep {"ok": 10, "ok~": 1, "ok+": 5, "bad": []}; reader {"ok": 11, "ok~": 5, "ok+": 0, "bad": []}; fetch {"ok": 22, "ok~": 1, "ok+": 9, "bad": []}; 
+gc windows without memory for hbuf (KHRIP_GC_FAULT=hbuf2): many {"ok": 2, "ok~": 0, "ok+": 14, "bad": []}; sleep {"ok": 7, "ok~": 2, "ok+": 7, "bad": []}; reader {"ok": 12, "ok~": 4, "ok+": 0, "bad": []}; fetch {"ok": 15, "ok~": 2, "ok+": 15, "bad": []}; 
+gc driver windows (KHRIP_GC_STRESS=1): mongo {"ok": 24, "ok~": 2, "ok+": 4, "bad": []}; clickhouse {"ok": 11, "ok~": 4, "ok+": 5, "bad": []}; 
+тестов пройдено: 587, провалено: 0
+exit 0
+Wed Oct 28 12:34:21 UTC 2026
