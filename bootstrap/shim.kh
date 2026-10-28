@@ -36,6 +36,16 @@ fn __str_lenw(s: int) -> int {
     return load64(s + 8)
 }
 
+// Номер младшего единичного бита x ≠ 0 (в khc — встроенная; __str_cmp,
+// lib/core.kh).
+fn __ctz(x: int) -> int {
+    var n = 0
+    while ((x >> n) & 1) == 0 {
+        n += 1
+    }
+    return n
+}
+
 // Смена типа без изменения значения (в khc — встроенная).
 fn __cast(x: int) -> int {
     return x

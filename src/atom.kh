@@ -2220,6 +2220,9 @@ fn parse_method(rt: int, nt: Token) -> int {
         if name == "matches" {
             return parse_matches(nt)
         }
+        if name == "lower" && !system_code(nt) && lower_contains_at(pos) {
+            return parse_lower_contains()
+        }
     }
     if k == K_FLOAT && name == "to_int" && kind_at(pos + 1) == ')' {
         advance()
@@ -2365,6 +2368,32 @@ fn parse_method(rt: int, nt: Token) -> int {
     emit_call_args(fi, n, false)
     last_was_call = true
     return subst(f.ret, tt, ty_err, ty_err)
+}
+
+// s.lower().contains(sub): с позиции i — «( ) . contains (» (i — '(' после
+// lower).
+fn lower_contains_at(i: int) -> bool {
+    return kind_at(i) == '(' && kind_at(i + 1) == ')' && kind_at(i + 2) == '.' && kind_at(i + 3) == T_IDENT && toks[i + 3].text == "contains" && kind_at(i + 4) == '('
+}
+
+// s.lower().contains(sub) → __text_contains_lower(s, sub) (lib/text.kh): тот
+// же ответ без копии s в нижнем регистре. Получатель в rax, текущий токен —
+// '(' после lower.
+fn parse_lower_contains() -> int {
+    let ct = toks[pos + 3]
+    pos += 4
+    let fi = rt_func("__text_contains_lower")
+    let f = funcs[fi]
+    emit_push(RAX)
+    advance()
+    let n = compile_args(f.params, 1, ty_err, ty_err, ty_err, "contains", ct, false) + 1
+    if n != f.params.len() {
+        emit_alu_imm(0, RSP, n * 8)
+        return ty_bool
+    }
+    emit_call_args(fi, n, false)
+    last_was_call = true
+    return ty_bool
 }
 
 // Длина str в rax в символах (lib/text.kh); если получатель — литерал (токен
