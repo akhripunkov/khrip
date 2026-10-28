@@ -1,0 +1,9 @@
+// Обёртка блоков «```khrip top» скилла (skill/khrip/*.md): объявления верхнего
+// уровня. Блок встаёт на место строки BLOCK; если в нём нет fn main, route и
+// every, tests/skill/check.py добавляет пустой fn main. Здесь — только имена,
+// которые блоки берут готовыми.
+type Item { id: int, name: str }
+const q = "books"
+const hook = "http://127.0.0.1:9/hook"
+const key = "secret"
+// BLOCK

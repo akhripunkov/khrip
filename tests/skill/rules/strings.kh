@@ -1,0 +1,12 @@
+// Подстановка в строках, сырые строки, символы.
+// in: SKILL.md
+// rule: `"Hi, {user.name}!"` interpolates an expression that does not start with a quote (`{2,5}` stays text).
+// rule: Raw strings in backticks have neither and may span lines
+// rule: `f"{x}"`, `${x}` → `"{x}"`
+fn main() {
+    let n = 3
+    print("[a-z]{n} x{2,5}y {n * 2}")
+    print(`${n} {n} \d`)
+    let s = "héllo"
+    print("{s.len()} {s[1]} {s[1..3]} {s.byte_len()}")
+}

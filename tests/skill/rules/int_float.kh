@@ -1,0 +1,9 @@
+// int и float не смешиваются.
+// in: SKILL.md
+// rule: int and float never mix
+// expect: operator * needs int operands, found float
+fn main() {
+    let a = 7
+    let t = 1.25
+    print("{a * t}")
+}

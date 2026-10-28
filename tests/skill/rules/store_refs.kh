@@ -1,0 +1,29 @@
+// Структуры — ссылки: поле, изменённое через let, меняет store.
+// in: SKILL.md
+// rule: a field changed through `let u = users[id] else {...}` changes the store
+type Item { sku: str, stock: int }
+
+store items: map[str, Item]
+
+route POST "/items" (body: Item) -> 201 Item {
+    items[body.sku] = body
+    return 201 body
+}
+
+route POST "/items/{sku}/take" (sku: str) -> Item | 404 {
+    let item = items[sku] else {
+        return 404
+    }
+    item.stock -= 1
+    return item
+}
+
+route GET "/items/{sku}" (sku: str) -> Item | 404 {
+    return items[sku] ?? 404
+}
+
+test "a field changed through a let changes the store" {
+    expect (call POST "/items" { sku: "A", stock: 5 }).status == 201
+    expect (call POST "/items/A/take").status == 200
+    expect (call GET "/items/A").body == `{"sku":"A","stock":4}`
+}

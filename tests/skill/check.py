@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+# Скилл Khrip (skill/khrip/*.md) сходится с языком.
+#
+#   python3 -I tests/skill/check.py <khc> <временная папка>
+#
+# 1. Каждый блок кода скилла компилируется. Все блоки — «```khrip» с меткой:
+#    без метки — целая программа (khc check; с блоками test и без баз — ещё и
+#    khc test); «top» — объявления верхнего уровня, «body» — операторы в теле
+#    маршрута: блок встаёт на место строки BLOCK в tests/skill/wrap/<метка>.kh
+#    (у «top» без fn main, route и every добавляется пустой fn main). Блок без
+#    метки khrip или с неизвестной меткой — ошибка: так ни один пример не
+#    уходит из проверки.
+# 2. Примеры глав работают: tests/skill/run/<глава>.kh дописывается к первой
+#    целой программе главы и идёт через khc test на настоящей базе
+#    (PostgreSQL — SKILL_PG, его задаёт tests/run.sh, если база отвечает;
+#    MongoDB — MONGODB_URI; ClickHouse — CLICKHOUSE_URL с CLICKHOUSE_USER и
+#    CLICKHOUSE_PASSWORD); без базы — строка SKIP.
+# 3. Ключевые правила: tests/skill/rules/*.kh. «// in: файл» и «// rule: текст»
+#    — текст правила, который должен быть в этом файле скилла (пробелы и
+#    переводы строк сравниваются как один пробел); дальше «// expect: ...» —
+#    программа не компилируется и вывод содержит каждую строку; файл .out —
+#    вывод khc run совпадает с ним; иначе блоки test проходят (khc test).
+#
+# Печатает FAIL и SKIP, последняя строка — «skill: <прошло> <провалено>».
+import os
+import re
+import subprocess
+import sys
+
+khc, tmp = sys.argv[1], sys.argv[2]
+skill = 'skill/khrip'
+here = 'tests/skill'
+passed = 0
+failed = 0
+db_words = re.compile(r'^\s*(migration|table|clickhouse)\b|\bsql\s*[`"]|\bch\s*[`"]|\bmongo_|\bMongo\b', re.M)
+
+
+def fail(name, why):
+    global failed
+    failed += 1
+    print(f'FAIL {name}: {why}')
+
+
+def ok():
+    global passed
+    passed += 1
+
+
+def run(args, env=None):
+    e = dict(os.environ)
+    if env:
+        e.update(env)
+    p = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=e, timeout=600)
+    return p.returncode, p.stdout.decode('utf-8', 'replace')
+
+
+def wrap(label, block):
+    text = open(f'{here}/wrap/{label}.kh', encoding='utf-8').read()
+    if text.count('// BLOCK\n') != 1:
+        raise SystemExit(f'{here}/wrap/{label}.kh: needs one line "// BLOCK"')
+    text = text.replace('// BLOCK\n', block)
+    if label == 'top' and not re.search(r'^(fn main\b|route |every )', block, re.M):
+        text += 'fn main() {\n}\n'
+    return text
+
+
+def blocks(md):
+    """(строка, метка, текст) каждого блока кода файла."""
+    lines = open(f'{skill}/{md}', encoding='utf-8').read().split('\n')
+    out = []
+    i = 0
+    while i < len(lines):
+        m = re.match(r'^```(.*)$', lines[i])
+        if not m:
+            i += 1
+            continue
+        j = i + 1
+        while j < len(lines) and lines[j] != '```':
+            j += 1
+        if j == len(lines):
+            fail(f'{skill}/{md}:{i + 1}', 'unclosed code block')
+            break
+        out.append((i + 1, m.group(1).strip(), '\n'.join(lines[i + 1:j]) + '\n'))
+        i = j + 1
+    return out
+
+
+# 1. Блоки кода
+first_program = {}
+mds = sorted(f for f in os.listdir(skill) if f.endswith('.md'))
+for md in mds:
+    for line, info, text in blocks(md):
+        name = f'{skill}/{md}:{line}'
+        words = info.split()
+        if not words or words[0] != 'khrip' or len(words) > 2:
+            fail(name, f'a code block must be ```khrip, ```khrip top or ```khrip body, found ```{info}')
+            continue
+        label = words[1] if len(words) == 2 else ''
+        if label not in ('', 'top', 'body'):
+            fail(name, f'unknown label {label}')
+            continue
+        src = f'{tmp}/{md[:-3]}_{line}.kh'
+        program = wrap(label, text) if label else text
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write(program)
+        code, out = run([khc, 'check', src])
+        if code != 0:
+            fail(name, f'khc check:\n{out}')
+            continue
+        if not label:
+            first_program.setdefault(md, text)
+            if re.search(r'^test "', text, re.M) and not db_words.search(text):
+                code, out = run([khc, 'test', src])
+                if code != 0:
+                    fail(name, f'khc test:\n{out}')
+                    continue
+        ok()
+
+# 2. Примеры глав на настоящих базах
+pg = os.environ.get('SKILL_PG', '')
+ch_env = {}
+if os.environ.get('CLICKHOUSE_URL'):
+    ch_env = {'KHRIP_TEST_CLICKHOUSE_URL': os.environ['CLICKHOUSE_URL']}
+    for k in ('USER', 'PASSWORD'):
+        if os.environ.get(f'CLICKHOUSE_{k}'):
+            ch_env[f'KHRIP_TEST_CLICKHOUSE_{k}'] = os.environ[f'CLICKHOUSE_{k}']
+needs = {
+    'postgresql': ('PostgreSQL', {'KHRIP_TEST_DATABASE_URL': pg} if pg else None),
+    'mongodb': ('MongoDB', {} if os.environ.get('MONGODB_URI') else None),
+    'clickhouse': ('ClickHouse', ch_env or None),
+}
+for f in sorted(os.listdir(f'{here}/run')):
+    if not f.endswith('.kh'):
+        continue
+    chapter = f[:-3]
+    name = f'{here}/run/{f}'
+    md = f'{chapter}.md'
+    if md not in first_program:
+        fail(name, f'{skill}/{md} has no whole program to run')
+        continue
+    what, env = needs.get(chapter, ('', {}))
+    if env is None:
+        print(f'SKIP {name}: no {what} (see tests/skill/check.py)')
+        continue
+    src = f'{tmp}/run_{chapter}.kh'
+    with open(src, 'w', encoding='utf-8') as out_file:
+        out_file.write(first_program[md] + '\n' + open(name, encoding='utf-8').read())
+    code, out = run([khc, 'test', src], env)
+    if code != 0:
+        fail(name, f'khc test:\n{out}')
+        continue
+    ok()
+
+# 3. Ключевые правила
+texts = {md: ' '.join(open(f'{skill}/{md}', encoding='utf-8').read().split()) for md in mds}
+for f in sorted(os.listdir(f'{here}/rules')):
+    if not f.endswith('.kh'):
+        continue
+    src = f'{here}/rules/{f}'
+    head = open(src, encoding='utf-8').read()
+    where = re.findall(r'^// in: *(.+)$', head, re.M)
+    rules = re.findall(r'^// rule: *(.+)$', head, re.M)
+    expects = re.findall(r'^// expect: *(.+)$', head, re.M)
+    if len(where) != 1 or where[0] not in texts or not rules:
+        fail(src, 'needs one "// in: <skill file>" and at least one "// rule: <text>"')
+        continue
+    missing = [r for r in rules if ' '.join(r.split()) not in texts[where[0]]]
+    if missing:
+        fail(src, f'{skill}/{where[0]} no longer says: {missing[0]}')
+        continue
+    if expects:
+        code, out = run([khc, 'check', src])
+        bad = [e for e in expects if e not in out]
+        if code == 0 or bad:
+            fail(src, f'expected an error with "{bad[0] if bad else expects[0]}", got:\n{out}')
+            continue
+    elif os.path.exists(src[:-3] + '.out'):
+        code, out = run([khc, 'run', src])
+        want = open(src[:-3] + '.out', encoding='utf-8').read()
+        if code != 0 or out != want:
+            fail(src, f'khc run gave (exit {code}):\n{out}')
+            continue
+    else:
+        code, out = run([khc, 'test', src])
+        if code != 0:
+            fail(src, f'khc test:\n{out}')
+            continue
+    ok()
+
+print(f'skill: {passed} {failed}')

@@ -1,0 +1,27 @@
+// Обёртка блоков «```khrip body» скилла: операторы в теле маршрута. Блок
+// встаёт на место строки BLOCK; локальные и параметры ниже — имена, которые
+// блоки берут готовыми.
+type Point { x: int, y: int }
+type Role = Admin | Member | Guest
+type Shape = Circle { r: int } | Rect { w: int, h: int } | Empty
+type User { id: int, name: str }
+type Product { name: str, price: int }
+type ProductPatch { name: str?, price: int? }
+
+store users: map[int, User]
+
+fn find(id: int) -> str? {
+    return (users[id] ?? fail(404)).name
+}
+
+route POST "/example/{id}" (id: int, role: Role?, limit: int?, q: str?, body: ProductPatch) -> str | 400 | 404 {
+    let x = 1
+    let y = 2
+    let n = 3
+    let s: Shape = Empty
+    let old = Product { name: "pen", price: 100 }
+    let patch = body
+    let key = "bob"
+    // BLOCK
+    return "ok"
+}

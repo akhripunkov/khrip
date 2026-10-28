@@ -1,0 +1,9 @@
+// Необязательное значение в ch — только с IS NULL или в coalesce.
+// in: clickhouse.md
+// rule: A `T?` only in `({x} IS NULL OR col = {x})` or `coalesce`: elsewhere it is a compile error.
+// expect: {page} may be none, and a comparison with NULL is never true
+migration ch 1 `CREATE TABLE hits (ts DateTime, page String) ENGINE = MergeTree ORDER BY ts`
+
+route GET "/hits" (page: str?) -> int {
+    return ch "SELECT count() FROM hits WHERE page = {page}"
+}

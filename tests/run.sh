@@ -42,7 +42,13 @@
 #                       база тестов, по умолчанию khrip_test), mongod с TLS
 #                       запускается в docker; пропуски печатаются строками SKIP;
 #   tests/weather.sh  — погодный бэкенд: fetch, every, сохранение store;
-#   eval/solutions/*/khrip — решения задач проверки проходят eval/run.sh.
+#   eval/solutions/*/khrip — решения задач проверки проходят eval/run.sh;
+#   skill/khrip/      — скилл Khrip: ядро SKILL.md не больше 3000 токенов o200k,
+#                       глава — не больше 900 (eval/tokens/count.mjs --raw; без
+#                       node или gpt-tokenizer — строка SKIP); блоки кода
+#                       компилируются, примеры глав работают на настоящих базах,
+#                       ключевые правила сходятся с компилятором
+#                       (tests/skill/check.py).
 # Компилятор берётся из $KHC (по умолчанию build/khc). С KHRIP_GC_VERIFY=1 в
 # окружении проверки сборщика идут во всех программах набора (tests/api без
 # них — только первый проход); с KHRIP_GC_VERIFY=fast — те же проверки, но
@@ -1194,6 +1200,47 @@ if command -v curl >/dev/null && command -v python3 >/dev/null; then
 			failed "eval/$task" "$(cat "$tmp/eval.txt")"
 		fi
 	done
+fi
+
+# Скилл Khrip (skill/khrip, см. начало файла). Токены — весь текст файла, как
+# его читает модель: ядро SKILL.md грузится всегда, главы — по задаче.
+skill_md=(skill/khrip/*.md)
+if ! command -v node >/dev/null; then
+	echo "SKIP skill/khrip: нет node — бюджеты токенов не проверены"
+elif [[ ! -d eval/tokens/node_modules/gpt-tokenizer ]] && ! npm install --prefix eval/tokens --silent --no-audit --no-fund >/dev/null 2>&1; then
+	echo "SKIP skill/khrip: нет gpt-tokenizer (npm install --prefix eval/tokens) — бюджеты токенов не проверены"
+elif ! node eval/tokens/count.mjs --raw "${skill_md[@]}" >"$tmp/skill_tokens.txt" 2>&1 || [[ $(wc -l <"$tmp/skill_tokens.txt") -ne ${#skill_md[@]} ]]; then
+	failed "skill/khrip" "токены не посчитаны: $(cat "$tmp/skill_tokens.txt")"
+else
+	while IFS=$'\t' read -r n f; do
+		limit=900
+		[[ $(basename "$f") == SKILL.md ]] && limit=3000
+		if [[ $n -le $limit ]]; then
+			pass=$((pass + 1))
+		else
+			failed "$f" "$n токенов o200k, больше $limit"
+		fi
+	done <"$tmp/skill_tokens.txt"
+fi
+if command -v python3 >/dev/null; then
+	. eval/server.sh
+	skill_pg=${KHRIP_TEST_DATABASE_URL:-$EVAL_PG}
+	if [[ -z $PSQL ]] || ! "$PSQL" -q "$skill_pg" -c "select 1" >/dev/null 2>&1; then
+		skill_pg=
+	fi
+	mkdir -p "$tmp/skill"
+	SKILL_PG=$skill_pg python3 -I tests/skill/check.py "$KHC" "$tmp/skill" >"$tmp/skill.txt" 2>&1
+	skill_pass=
+	skill_fail=
+	read -r _ skill_pass skill_fail < <(tail -1 "$tmp/skill.txt")
+	if [[ $skill_pass =~ ^[0-9]+$ && $skill_fail =~ ^[0-9]+$ ]]; then
+		pass=$((pass + skill_pass))
+		fail=$((fail + skill_fail))
+		grep '^SKIP' "$tmp/skill.txt"
+		[[ $skill_fail -gt 0 ]] && sed '$d' "$tmp/skill.txt" | grep -v '^SKIP'
+	else
+		failed "tests/skill/check.py" "$(cat "$tmp/skill.txt")"
+	fi
 fi
 
 echo "тестов пройдено: $pass, провалено: $fail"

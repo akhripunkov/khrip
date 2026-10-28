@@ -1,0 +1,10 @@
+// Литерал без ожидаемого типа получает тип своих полей (A3).
+// in: SKILL.md
+// rule: let t = { id: 1, tags: ["a"] } // else its fields' type
+fn main() {
+    let t = { id: 1, tags: ["a"] }
+    let n: int = t.id + 1
+    t.tags.push("b")
+    print(to_json(t))
+    print("{n}")
+}

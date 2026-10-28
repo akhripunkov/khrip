@@ -1,0 +1,24 @@
+// Тело запроса: недостающие поля — значения по умолчанию, none — null,
+// перечисления — строки, неправильный ввод — 400.
+// in: SKILL.md
+// rule: Missing body fields take their defaults; enums are JSON strings ("Admin"), other variants objects with a "type" field; `none` is `null`. Bad input gets 400 with a message
+type Role = Admin | Member
+type NewUser { name: str, role: Role = Member, tags: [str] = [], note: str? }
+
+route POST "/users" (body: NewUser) -> 201 NewUser {
+    return 201 body
+}
+
+route GET "/users" (role: Role?, page: int = 1) -> str {
+    return "{to_json(role)} {page}"
+}
+
+test "json body and query" {
+    let r = call POST "/users" `{"name": "ann"}`
+    expect r.status == 201
+    expect r.body == `{"name":"ann","role":"Member","tags":[],"note":null}`
+    expect (call POST "/users" `{"name": 5}`).status == 400
+    expect (call GET "/users?role=Admin").body == `"Admin" 1`
+    expect (call GET "/users?role=Boss").status == 400
+    expect (call GET "/users?page=x").status == 400
+}
