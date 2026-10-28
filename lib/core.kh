@@ -1511,6 +1511,10 @@ fn __list_insert(self: [T], i: int, v: T) {
         __panic(PANIC_INDEX, "insert")
     }
     if len == __list_cap(h) {
+        if __in_store(h) {
+            // последний элемент сдвинется за старый конец массива (§7.5)
+            __gc_insert_full(h, len)
+        }
         __list_grow(h, len + 1)
     }
     var j = len

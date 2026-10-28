@@ -140,20 +140,23 @@ for v in $variants; do
 		gc_total=$(awk -F'\t' -v t="$t1" '$1 <= t && $2 ~ /^gc [0-9]+ @/' "$o/stderr.log" | wc -l)
 		gc_run=$(awk -F'\t' -v a="$t0" -v t="$t1" '$1 >= a && $1 <= t && $2 ~ /^gc [0-9]+ @/' "$o/stderr.log" | wc -l)
 	else
-		# первая сборка после замера — простоя (через 10 с без выделений store)
-		# или по таймеру (forced: store меняли, а сборки не было 2 минуты); у
-		# большой кучи разметка идёт четвертью времени — ждём её строку
+		# первая сборка простоя после замера (через 10 с без выделений store)
+		# или по таймеру (forced: store меняли, а сборки не было 2 минуты), не
+		# сборка по темпу, начатая ещё под нагрузкой; у большой кучи разметка
+		# идёт четвертью времени — ждём её строку
 		for _ in $(seq $((IDLE_MAX * 5))); do
-			awk -F'\t' -v t="$t1" '$1 > t && $2 ~ /^gc [0-9]+ \(/ {f = 1} END {exit !f}' "$o/stderr.log" && break
+			awk -F'\t' -v t="$t1" '$1 > t && $2 ~ /^gc [0-9]+ \((idle|forced)\)/ {f = 1} END {exit !f}' "$o/stderr.log" && break
 			[[ $v == khrip-gcoff ]] && break
 			sleep 0.2
 		done
-		live=$(awk -F'\t' -v t="$t1" '$1 > t && $2 ~ /^gc [0-9]+ \(/' "$o/stderr.log" | head -1 | grep -o 'live [0-9.]* MB' | awk '{print $2}')
+		live=$(awk -F'\t' -v t="$t1" '$1 > t && $2 ~ /^gc [0-9]+ \((idle|forced)\)/' "$o/stderr.log" | head -1 | grep -o 'live [0-9.]* MB' | awk '{print $2}')
 		gc_total=$(awk -F'\t' -v t="$t1" '$1 <= t && $2 ~ /^gc [0-9]+ \(/' "$o/stderr.log" | wc -l)
 		gc_run=$(awk -F'\t' -v a="$t0" -v t="$t1" '$1 >= a && $1 <= t && $2 ~ /^gc [0-9]+ \(/' "$o/stderr.log" | wc -l)
 	fi
 	echo "idle RSS $(kb VmRSS) KB" >>"$o/run.txt"
-	python3 "$ev/load/seed.py" verify "$sc" >>"$o/run.txt"
+	# ловушка пауз — до проверки инварианта: её запросы (GET всего store)
+	# занимают рабочий поток на секунды, и соединения зонда на том же потоке
+	# ждут их (сопрограммы не вытесняются) — это не пауза сервера
 	if [[ -n $ppid_ ]]; then
 		kill "$ppid_" 2>/dev/null
 		wait "$ppid_" 2>/dev/null
@@ -164,6 +167,7 @@ for v in $variants; do
 		wait "$cpid" 2>/dev/null
 		cpid=
 	fi
+	python3 "$ev/load/seed.py" verify "$sc" >>"$o/run.txt"
 	kill "$pid" 2>/dev/null
 	wait "$pid" 2>/dev/null
 	pid=

@@ -411,7 +411,10 @@ done
 #   strnoscan — короткая строка store в спане со ссылками (gc_strings,
 #              verify);
 #   strnul — короткая строка store без места на нулевой байт (gc_strings,
-#              verify: байты строки выходят за объект).
+#              verify: байты строки выходят за объект);
+#   insertfull — insert в полный список store во время разметки не помечает
+#              последний элемент, сдвинутый за старые границы выросшего на
+#              месте массива (gc_insert, verify).
 mem3_ok=1
 while read -r cut test mode; do
 	[[ -z $cut ]] && continue
@@ -442,6 +445,7 @@ cuts = {
     "reservecommit": ("    let end = (at + n) << GC_PAGE_SHIFT\n    if end > __gc_committed && !__gc_commit_try(end) {\n", "    let end = (at + n) << GC_PAGE_SHIFT\n    if end > __gc_committed {\n        __gc_commit_to(end)\n    }\n    if false {\n", "gc.kh"),
     "strnoscan": ("        return __str_short(__alloc_k(len + 9, K_NOSCAN, 0), ptr, len)\n", "        return __str_short(__alloc_k(len + 9, K_PTRS, 0), ptr, len)\n", "core.kh"),
     "strnul": ("        return __str_short(__alloc_k(len + 9, K_NOSCAN, 0), ptr, len)\n", "        return __str_short(__alloc_k(len + 8, K_NOSCAN, 0), ptr, len)\n", "core.kh"),
+    "insertfull": ("            __gc_insert_full(h, len)\n", "", "core.kh"),
 }
 old, new, f = cuts[m]
 s = open(f"{d}/{f}").read()
@@ -483,6 +487,7 @@ sharedprep gc_inplace plain
 reservecommit gc_commit plain
 strnoscan gc_strings verify
 strnul gc_strings verify
+insertfull gc_insert verify
 CUTS
 [[ $mem3_ok -eq 1 ]] && pass=$((pass + 1))
 

@@ -1,0 +1,2 @@
+ok    insert into a full list growing in place during marking keeps the shifted element
+1 tests: 1 passed, 0 failed

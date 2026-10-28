@@ -1,0 +1,87 @@
+// insert в полный большой список store во время разметки (этап памяти, часть
+// 3, правка после ревью; lib/core.kh __list_insert, lib/gc.kh
+// __gc_insert_full, §7.5): массив растёт на месте, а разметка смотрит его в
+// старых границах — последний элемент, сдвинутый за них, остался бы
+// непросмотренным и освобождался. Сценарий ревью: массив с запасом заполнен до
+// ёмкости, разметка идёт по нему (кадр с границей посередине), insert в начало.
+
+type Item { name: str, n: int }
+
+store items: [Item]
+
+fn exact() -> bool {
+    return (env("KHRIP_GC_STRESS") ?? "") != "1"
+}
+
+fn item_ok(x: Item, name: str) -> bool {
+    let a: int = __cast(x)
+    let s: int = __cast(x.name)
+    return __gc_is_allocated(a) && __gc_is_allocated(s) && x.name == name
+}
+
+fn data(xs: [Item]) -> int {
+    let h: int = __cast(xs)
+    return load64(h)
+}
+
+route POST "/items/{a}/{b}" (a: int, b: int) -> int {
+    for i in a..b {
+        items.push(Item { name: "it {i}", n: i })
+    }
+    return items.len()
+}
+
+// до ёмкости массива
+route POST "/fill" -> int {
+    let h: int = __cast(items)
+    var i = items.len()
+    while items.len() < __list_capacity(h) {
+        items.push(Item { name: "it {i}", n: i })
+        i += 1
+    }
+    return items.len()
+}
+
+route POST "/ins/{k}" (k: int) -> int {
+    items.insert(0, Item { name: "new {k}", n: -1 })
+    return items.len()
+}
+
+test "insert into a full list growing in place during marking keeps the shifted element" {
+    // один переезд (массив берёт запас), затем до ёмкости
+    expect (call POST "/items/0/40000").status == 200
+    expect (call POST "/items/40000/70000").status == 200
+    let n = (call POST "/fill").body.to_int() ?? 0
+    expect n == items.len()
+    __gc_collect()
+    let d = data(items)
+    let before = __gc_inplace_count()
+    __gc_begin_from_roots()
+    // шаги разметки, пока массив не станет кадром с границей посередине
+    var k = 0
+    while k < 1000000 {
+        let p = __gc_frame_pos(d)
+        if p > 0 && p < n * 8 - 4096 {
+            break
+        }
+        if __gc_step(1) {
+            break
+        }
+        k += 1
+    }
+    expect (call POST "/ins/1").status == 200
+    let inplace = data(items) == d && __gc_inplace_count() > before
+    __gc_finish()
+    __gc_collect()
+    expect !exact() || inplace
+    var bad = 0
+    if !item_ok(items[0], "new 1") {
+        bad += 1
+    }
+    for i in 1..items.len() {
+        if !item_ok(items[i], "it {i - 1}") {
+            bad += 1
+        }
+    }
+    expect bad == 0 && items.len() == n + 1
+}

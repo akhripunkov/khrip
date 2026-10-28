@@ -138,6 +138,9 @@ fn __gc_elem(xs: int, i: int) {
 fn __gc_root(slot: int) {
 }
 
+fn __gc_insert_full(h: int, len: int) {
+}
+
 fn __gc_shade(w: int) {
 }
 
