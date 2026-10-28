@@ -1,0 +1,45 @@
+tests/errors/anon_map_guard.kh:15:22: error: ambiguous literal: 'field' is a field name here and also a variable
+        let a = to_json({field: value})
+                         ^
+    hint: 'field' is also a variable here; {field: v} is a struct with field "field": write {(field): v} for a map keyed by its value, or {"field": v}
+tests/errors/anon_map_guard.kh:16:31: error: ambiguous literal: 'field' is a field name here and also a variable
+        let b = to_json({ outer: {field: value} })
+                                  ^
+    hint: 'field' is also a variable here; {field: v} is a struct with field "field": write {(field): v} for a map keyed by its value, or {"field": v}
+tests/errors/anon_map_guard.kh:17:23: error: ambiguous literal: 'key' is a field name here and also a variable
+        let c = to_json([{key: value}])
+                          ^
+    hint: 'key' is also a variable here; {key: v} is a struct with field "key": write {(key): v} for a map keyed by its value, or {"key": v}
+tests/errors/anon_map_guard.kh:18:37: error: ambiguous literal: 'key' is a field name here and also a variable
+        let d = to_json(items.map(x => {key: x}))
+                                        ^
+    hint: 'key' is also a variable here; {key: v} is a struct with field "key": write {(key): v} for a map keyed by its value, or {"key": v}
+tests/errors/anon_map_guard.kh:19:22: error: ambiguous literal: 'KIND' is a field name here and also a variable
+        let e = to_json({KIND: "note"})
+                         ^
+    hint: 'KIND' is also a variable here; {KIND: v} is a struct with field "KIND": write {(KIND): v} for a map keyed by its value, or {"KIND": v}
+tests/errors/anon_map_guard.kh:20:39: error: ambiguous literal: 'field' is a field name here and also a variable
+        let f = to_bson({"$set": to_bson({field: value})})
+                                          ^
+    hint: 'field' is also a variable here; {field: v} is a struct with field "field": write {(field): v} for a map keyed by its value, or {"field": v}
+tests/errors/anon_map_guard.kh:21:22: error: ambiguous literal: 'key' is a field name here and also a variable
+        let g = to_bson({key: owner})
+                         ^
+    hint: 'key' is also a variable here; {key: v} is a struct with field "key": write {(key): v} for a map keyed by its value, or {"key": v}
+tests/errors/anon_map_guard.kh:22:18: error: ambiguous literal: 'field' is a field name here and also a variable
+        let jsonb = {field: key}
+                     ^
+    hint: 'field' is also a variable here; {field: v} is a struct with field "field": write {(field): v} for a map keyed by its value, or {"field": v}
+tests/errors/anon_map_guard.kh:23:22: error: ambiguous literal: 'field' is a field name here and also a variable
+        let h = to_json({field: 1, key: 2})
+                         ^
+    hint: 'field' is also a variable here; {field: v} is a struct with field "field": write {(field): v} for a map keyed by its value, or {"field": v}
+tests/errors/anon_map_guard.kh:30:29: error: ambiguous literal: 'text' is a field name here and also a variable
+        let r = call POST path {text: "x"}
+                                ^
+    hint: 'text' is also a variable here; {text: v} is a struct with field "text": write {(text): v} for a map keyed by its value, or {"text": v}
+tests/errors/anon_map_guard.kh:31:35: error: ambiguous literal: 'text' is a field name here and also a variable
+        let s = call POST "/nowhere" {text: "y"}
+                                      ^
+    hint: 'text' is also a variable here; {text: v} is a struct with field "text": write {(text): v} for a map keyed by its value, or {"text": v}
+11 errors

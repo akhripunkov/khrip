@@ -1052,7 +1052,18 @@ fn route_return(at: Token, has_value: bool) {
         } else if tkind(t) == K_OPT {
             hint = "the value may be none: return x ?? 404 (and declare 404)"
         } else if is_anon_ty(t) {
-            hint = "a struct literal gets the route's type only when the route has one struct type; otherwise write the type: return Name \{ ... }, or copy: Name \{ ...value }"
+            // другой порядок или значение по умолчанию у одного из вариантов
+            for v in r.variants {
+                if v.ty >= 0 && hint.byte_len() == 0 {
+                    hint = anon_diff(t, v.ty)
+                }
+            }
+            if hint.byte_len() > 0 {
+            } else if vtok.kind == '\{' {
+                hint = "a struct literal gets the route's type only when the route has one struct type; otherwise write the type: return Name \{ ... }"
+            } else {
+                hint = "a value of an anonymous type becomes the route's type only explicitly: return Name \{ ...value }"
+            }
         }
         error_tok(vtok, "this route returns " + variants_text(r) + ", found " + ty_name(t), hint)
         ret_holes.push(emit_jmp())
@@ -1346,6 +1357,7 @@ fn parse_call_expr() -> int {
     let saved = no_struct
     no_struct = false
     let pt = tok()
+    let path_at = pos
     var ptype = ty_err
     if pt.kind == T_STR && kind_at(pos + 1) == '[' {
         // call POST "/x" [..]: список — это тело, а не индекс строки
@@ -1355,12 +1367,18 @@ fn parse_call_expr() -> int {
     }
     coerce(ptype, ty_str, pt)
     emit_push(RAX)
+    // путь — один литерал: тело получает тип тела маршрута (литерал без имени
+    // типа проверяется, как в маршруте: опечатка в поле — ошибка)
+    var body_ty = ty_err
+    if pt.kind == T_STR && pos == path_at + 1 {
+        body_ty = call_body_type(method, strlits[pt.val])
+    }
     var has_body = (starts_value(pos) || (kind() == '\{' && !saved)) && tok().line == pt.line
     if kind() == T_IDENT && tok().text == "headers" {
         has_body = false
     }
     if has_body {
-        let bt = parse_expr(ty_err)
+        let bt = parse_expr(body_ty)
         emit_push(RAX)
         emit_mov_imm(RAX, type_desc(bt))
         emit_push(RAX)
@@ -1391,6 +1409,58 @@ fn parse_call_expr() -> int {
         return ty_err
     }
     return ty_struct(s)
+}
+
+// Тип тела маршрута, на который попадёт call METHOD "путь" (строка запроса
+// отбрасывается): ровно один маршрут с этим методом и путём, и у него есть
+// тело; иначе ty_err.
+fn call_body_type(method: str, path: str) -> int {
+    var p = path
+    var q = 0
+    while q < p.byte_len() && p.byte(q) != '?' {
+        q += 1
+    }
+    p = p.byte_slice(0, q)
+    var segs: [str] = []
+    var start = 1
+    var i = 1
+    while i <= p.byte_len() {
+        if i == p.byte_len() || p.byte(i) == '/' {
+            segs.push(p.byte_slice(start, i))
+            start = i + 1
+        }
+        i += 1
+    }
+    var found = -1
+    var n = 0
+    var ri = 0
+    while ri < routes.len() {
+        let r = routes[ri]
+        var ok = r.method == method && r.segs.len() == segs.len() && p.byte_len() > 0 && p.byte(0) == '/'
+        var j = 0
+        while ok && j < segs.len() {
+            let rs = r.segs[j]
+            ok = rs == segs[j] || (rs.starts_with("\{") && segs[j].byte_len() > 0)
+            j += 1
+        }
+        if ok {
+            found = ri
+            n += 1
+        }
+        ri += 1
+    }
+    if n != 1 {
+        return ty_err
+    }
+    let ps = funcs[routes[found].fi].params
+    var k = 0
+    while k < ps.len() {
+        if routes[found].pkind[k] == PK_BODY {
+            return ps[k].ty
+        }
+        k += 1
+    }
+    return ty_err
 }
 
 // fetch МЕТОД url [тело] [headers карта] → Response

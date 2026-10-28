@@ -362,11 +362,26 @@ fn struct_lit_shape(i: int) -> bool {
     if k1 == T_ELLIPSIS {
         return true
     }
+    if keyword_name(k1) {
+        // { type: ... }: поле с именем-ключевым словом — ошибка с подсказкой
+        // в разборе литерала, как у именованного типа
+        return kind_at(i + 2) == ':'
+    }
     if k1 != T_IDENT {
         return false
     }
     let k2 = kind_at(i + 2)
-    return k2 == ':' || k2 == ',' || k2 == '}'
+    if k2 == ':' || k2 == ',' || k2 == '}' {
+        return true
+    }
+    // сокращение, а следующее поле — на новой строке: { a ⏎ b: 2 }
+    return (k2 == T_IDENT || k2 == T_ELLIPSIS) && toks[i + 2].line > toks[i + 1].line
+}
+
+// Лексема-ключевое слово, которое пишут как имя поля (type, match, ...);
+// true, false и none — значения.
+fn keyword_name(k: int) -> bool {
+    return k >= T_FN && k <= T_MATCH && k != T_TRUE && k != T_FALSE && k != T_NONE
 }
 
 // { в начале оператора или ветки match — блок; но «{ имя:», «{ имя,» и
@@ -377,7 +392,13 @@ fn brace_block_is_struct(i: int) -> bool {
     if k1 == T_ELLIPSIS {
         return true
     }
-    return k1 == T_IDENT && (kind_at(i + 2) == ':' || kind_at(i + 2) == ',')
+    return (k1 == T_IDENT || keyword_name(k1)) && (kind_at(i + 2) == ':' || kind_at(i + 2) == ',')
+}
+
+// Ветка match: { имя } после => — тоже E-A1 (как блок это просто имя:
+// пишется => имя).
+fn arm_brace_is_struct(i: int) -> bool {
+    return brace_block_is_struct(i) || (kind_at(i + 1) == T_IDENT && kind_at(i + 2) == '}')
 }
 
 // Как написать литерал с { в позиции i, чтобы он стал значением: (\{ a: ... }).
@@ -391,39 +412,24 @@ fn brace_paren_hint(i: int) -> str {
     return "(\{ ... })"
 }
 
-// Ветка match { имя } — блок со значением имени; но если ждут структуру с
-// полем имя, а значение имени ей не подходит, имелось в виду сокращение
-// поля (\{ имя }) — та же ошибка E-A1, а не «ожидалась структура».
-fn arm_shorthand_meant(i: int, w: int) -> bool {
-    let t = ty_inner(w)
-    if tkind(t) != K_STRUCT || field_find(types[t].a, toks[i].text) < 0 {
-        return false
-    }
-    var vt = ty_err
-    let li = find_local(toks[i].text)
-    if li >= 0 {
-        vt = local_view_ty(li)
-    } else {
-        let s = sym_find(toks[i].text)
-        if s >= 0 && sym_kind(s) == SK_GLOBAL {
-            vt = globals[sym_idx(s)].ty
-        }
-    }
-    return vt != ty_err && !assignable(vt, w)
-}
-
 // Ошибка E-A1 и похожая в начале оператора: литерал на месте блока.
 fn brace_block_error(i: int, arm: bool, w: int) {
     var named = "the type name before the brace"
     if tkind(ty_inner(w)) == K_STRUCT && !is_anon_ty(ty_inner(w)) {
         named = ty_name(ty_inner(w)) + " \{ ... }"
     }
-    if arm {
+    if arm && kind_at(i + 1) == T_IDENT && kind_at(i + 2) == '}' {
+        let x = toks[i + 1].text
+        error_tok(toks[i], "a struct literal as a match arm needs parentheses or its type: " + brace_paren_hint(i), "after => a brace starts a block; write => " + brace_paren_hint(i) + " for a struct, or => " + x + " for the value of " + x)
+    } else if arm {
         error_tok(toks[i], "a struct literal as a match arm needs parentheses or its type: " + brace_paren_hint(i), "after => a brace starts a block; write => " + brace_paren_hint(i) + " or " + named)
     } else {
         error_tok(toks[i], "a struct literal at the start of a statement needs parentheses or its type: " + brace_paren_hint(i), "a brace at the start of a statement starts a block; write " + brace_paren_hint(i) + " or " + named)
     }
 }
+
+// Разбирается заголовок for ... in (для подсказки у литерала там).
+var for_header: bool
 
 // Литерал структуры без имени типа: { поле: значение, ...x, поле }. Тип — тот,
 // что ждут (A2: let x: T, параметр, return, элемент списка, поле другого
@@ -432,19 +438,36 @@ fn parse_brace_struct(w: int) -> int {
     let at = tok()
     if no_struct {
         // в условии, у match и в заголовке for { начинает блок
-        error_tok(at, "a struct literal here needs parentheses: " + brace_paren_hint(pos), "in a condition, a match value or a for loop, a brace starts the block")
+        var hint = "in a condition, a match value or a for loop, a brace starts the block"
+        if for_header && kind_at(pos + 1) == T_IDENT && kind_at(pos + 2) == ':' {
+            // for k in {x: 1}: обходят словарь, а не структуру
+            let x = toks[pos + 1].text
+            hint = "to loop over a map keyed by the value of " + x + " write \{(" + x + "): ...}, or \{\"" + x + "\": ...} for the key \"" + x + "\""
+        }
+        error_tok(at, "a struct literal here needs parentheses: " + brace_paren_hint(pos), hint)
     }
     let t = ty_inner(w)
+    let open = pos
+    var r = ty_err
     if tkind(t) == K_STRUCT {
-        return parse_struct_lit(types[t].a, at)
-    }
-    if tkind(t) == K_SUM {
+        r = parse_struct_lit(types[t].a, at)
+    } else if tkind(t) == K_SUM {
         let su = types[t].a
         error_tok(at, "a struct literal for " + ty_name(t) + " needs the name of its variant", "write it before the brace, e.g. " + structs[sums[su].variants[0]].name + " \{ ... }; variants: " + variant_names(su))
         parse_anon_lit(at)
-        return ty_err
+    } else {
+        r = parse_anon_lit(at)
     }
-    return parse_anon_lit(at)
+    if panic_mode && pos <= matching_close(open) {
+        // синтаксическая ошибка внутри: дальше — за литералом, как после
+        // целого значения (иначе его } приняли бы за конец блока, а следующий
+        // оператор пропал бы при восстановлении)
+        pos = matching_close(open)
+        advance()
+        panic_mode = false
+        r = ty_err
+    }
+    return r
 }
 
 // { поле: значение, ... } без ожидаемого типа (A3): тип — анонимная структура
@@ -458,12 +481,18 @@ fn parse_anon_lit(at: Token) -> int {
     advance()
     let saved = no_struct
     no_struct = false
-    // по записи: имя поля ("" — распаковка) и тип значения
+    // по записи: имя поля ("" — распаковка) и тип значения; лексемы значений
+    // поле: значение — [ivs, ive) (для проверки «это был бы словарь»)
     var inames: [str] = []
     var itys: [int] = []
+    var ivs: [int] = []
+    var ive: [int] = []
+    var ntoks: [Token] = []
+    var plain = true
     var bad = false
     while kind() != '}' && kind() != T_EOF && !panic_mode {
         if kind() == T_ELLIPSIS {
+            plain = false
             let st = tok()
             advance()
             let src = parse_expr(ty_err)
@@ -480,17 +509,23 @@ fn parse_anon_lit(at: Token) -> int {
             emit_push(RAX)
             inames.push("")
             itys.push(src)
+            ivs.push(0)
+            ive.push(0)
+            ntoks.push(st)
         } else {
             let fname = expect_ident()
             if panic_mode {
                 break
             }
             var t = ty_err
+            var vs = pos
             if kind() == ':' {
                 advance()
+                vs = pos
                 t = parse_expr(ty_err)
-            } else if kind() == ',' || kind() == '}' {
+            } else if kind() == ',' || kind() == '}' || tok().line > fname.line {
                 // сокращение: поле с тем же именем, что у переменной
+                plain = false
                 pos -= 1
                 t = parse_ident(ty_err)
             } else {
@@ -513,6 +548,9 @@ fn parse_anon_lit(at: Token) -> int {
             emit_push(RAX)
             inames.push(fname.text)
             itys.push(t)
+            ivs.push(vs)
+            ive.push(pos)
+            ntoks.push(fname)
         }
         if kind() == ',' {
             advance()
@@ -521,6 +559,12 @@ fn parse_anon_lit(at: Token) -> int {
     expect_tok('}')
     no_struct = saved
     let n = inames.len()
+    if plain && !bad && !panic_mode && n > 0 && reads_as_var_map(inames, itys, ivs, ive) {
+        // {k: v}, где k — переменная int или str: раньше это был словарь с
+        // ключом — значением k; теперь структура с полем "k" — громко
+        let k = inames[0]
+        error_tok(ntoks[0], "ambiguous literal: '" + k + "' is a field name here and also a variable", "'" + k + "' is also a variable here; \{" + k + ": v} is a struct with field \"" + k + "\": write \{(" + k + "): v} for a map keyed by its value, or \{\"" + k + "\": v}")
+    }
     // поля типа: имя, тип, откуда значение (запись и номер поля распаковки)
     var names: [str] = []
     var tys: [int] = []
@@ -596,13 +640,57 @@ fn parse_anon_lit(at: Token) -> int {
     return ty_struct(si)
 }
 
+// Литерал A3 без распаковок и сокращений, который раньше был бы словарём с
+// ключами — значениями переменных: каждое имя поля — локальная, параметр,
+// глобальная, store или const типа int или str (у всех один тип), значения
+// одного типа и ни одно значение не упоминает имя своего поля (ни как
+// переменную, ни как поле: { q: q.trim() }, { id: order.id } — структуры).
+fn reads_as_var_map(names: [str], tys: [int], vs: [int], ve: [int]) -> bool {
+    var kt = -1
+    var i = 0
+    while i < names.len() {
+        var t = -1
+        let li = find_local(names[i])
+        if li >= 0 {
+            t = locals[li].ty
+        } else {
+            let s = sym_find(names[i])
+            if s >= 0 && sym_kind(s) == SK_GLOBAL {
+                t = globals[sym_idx(s)].ty
+            } else if s >= 0 && sym_kind(s) == SK_CONST {
+                t = consts[sym_idx(s)].ty
+            }
+        }
+        if t != ty_int && t != ty_str {
+            return false
+        }
+        if kt < 0 {
+            kt = t
+        } else if t != kt {
+            return false
+        }
+        if tys[i] != tys[0] {
+            return false
+        }
+        var j = vs[i]
+        while j < ve[i] {
+            if toks[j].kind == T_IDENT && toks[j].text == names[i] {
+                return false
+            }
+            j += 1
+        }
+        i += 1
+    }
+    return true
+}
+
 // Подсказка для анонимной структуры там, где ждали словарь: {k: 1} с ключом
 // без кавычек — структура.
 fn anon_map_hint(t: int) -> str {
     if !is_anon_ty(t) {
         return ""
     }
-    return "\{ name: value } is a struct; for a map, quote the keys (\{\"k\": 1}), put a variable key in parentheses (\{(k): 1}) or give the type: let m: map[str, int] = \{k: 1}"
+    return "\{ name: value } is a struct; for a map, quote the keys (\{\"k\": 1}) or put a variable key in parentheses (\{(k): 1})"
 }
 
 fn parse_map_lit(want_ty: int) -> int {
@@ -648,6 +736,11 @@ fn parse_map_lit(want_ty: int) -> int {
     emit_push(RAX)
     while kind() != '}' && kind() != T_EOF && !panic_mode {
         let kt_tok = tok()
+        if (kind() == T_IDENT || keyword_name(kind())) && kind_at(pos + 1) == ':' {
+            // ключ — голое имя: без ожидаемого словаря тот же текст —
+            // литерал структуры, поэтому ключ пишется явно
+            error_tok(kt_tok, "a map key cannot be a bare name: '" + kt_tok.text + "'", "write \{\"" + kt_tok.text + "\": v} for the key \"" + kt_tok.text + "\", or \{(" + kt_tok.text + "): v} for a key from the variable " + kt_tok.text)
+        }
         if known {
             want = kt
         } else {

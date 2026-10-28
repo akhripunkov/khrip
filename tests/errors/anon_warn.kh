@@ -5,7 +5,7 @@ fn a(p: { x: int, y: int }) -> int {
     return p.x
 }
 
-fn b(p: { y: int, x: int }) -> int {
+fn b(p: { x: int, y: int }) -> int {
     return p.y
 }
 

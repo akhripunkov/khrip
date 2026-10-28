@@ -1,0 +1,21 @@
+// Порядок полей и значения по умолчанию — часть анонимного типа: типы, которые
+// отличаются только ими, не смешиваются, и сообщение говорит, чем они
+// отличаются.
+fn sort_spec(by: { name: int, score: int }) -> int {
+    return by.name
+}
+
+fn page(p: { limit: int = 20 }) -> int {
+    return p.limit
+}
+
+fn main() {
+    let s = { score: -1, name: 1 }
+    sort_spec(s)
+    let t: { name: int, score: int } = s
+    let q: { limit: int = 50 } = {}
+    page(q)
+    let none_default: { limit: int } = { limit: 1 }
+    page(none_default)
+    print(t.name.to_str())
+}

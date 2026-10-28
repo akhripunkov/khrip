@@ -400,6 +400,10 @@ fn mismatch_hint(from: int, to: int) -> str {
     let tt = ty_inner(to)
     if tkind(from) == K_STRUCT && tkind(tt) == K_STRUCT && (is_anon_ty(from) || is_anon_ty(tt)) {
         // структуры разных типов: в именованный — только явно, литералом
+        let d = anon_diff(from, tt)
+        if d.byte_len() > 0 {
+            return d
+        }
         if is_anon_ty(tt) {
             return "an anonymous type matches only the same fields; copy them: \{ ...value } (set the missing ones)"
         }
@@ -424,6 +428,12 @@ fn coerce(from: int, to: int, at: Token) -> int {
             emit_box()
         }
         return to
+    }
+    let d = anon_diff(from, ty_inner(to))
+    if d.starts_with("\{") {
+        // те же поля в другом порядке: само сообщение — об этом
+        error_tok(at, d, "copy the fields into the expected order: \{ ...value }")
+        return ty_err
     }
     error_tok(at, "expected " + ty_name(to) + ", found " + ty_name(from), mismatch_hint(from, to))
     return ty_err

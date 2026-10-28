@@ -1,17 +1,29 @@
-tests/errors/anon_cond.kh:5:8: error: a struct literal here needs parentheses: ({ a: ... })
+tests/errors/anon_cond.kh:6:8: error: a struct literal here needs parentheses: ({ a: ... })
         if { a: 1 }.a == 1 {
            ^
     hint: in a condition, a match value or a for loop, a brace starts the block
-tests/errors/anon_cond.kh:13:13: error: { k: int } cannot be indexed
-        print((m["x"] ?? 0).to_str())
+tests/errors/anon_cond.kh:13:16: error: a struct literal here needs parentheses: ({ x: ... })
+        for key in {x: 1} {
+                   ^
+    hint: to loop over a map keyed by the value of x write {(x): ...}, or {"x": ...} for the key "x"
+tests/errors/anon_cond.kh:16:13: error: { a: int } cannot be indexed
+        print((m["a"] ?? 0).to_str())
                 ^
-    hint: { name: value } is a struct; for a map, quote the keys ({"k": 1}), put a variable key in parentheses ({(k): 1}) or give the type: let m: map[str, int] = {k: 1}
-tests/errors/anon_cond.kh:14:16: error: cannot loop over { k: int }
+    hint: { name: value } is a struct; for a map, quote the keys ({"k": 1}) or put a variable key in parentheses ({(k): 1})
+tests/errors/anon_cond.kh:17:16: error: cannot loop over { a: int }
         for key in m {
                    ^
-    hint: { name: value } is a struct; for a map, quote the keys ({"k": 1}), put a variable key in parentheses ({(k): 1}) or give the type: let m: map[str, int] = {k: 1}
-tests/errors/anon_cond.kh:16:13: error: { k: int } has no method 'len'
+    hint: { name: value } is a struct; for a map, quote the keys ({"k": 1}) or put a variable key in parentheses ({(k): 1})
+tests/errors/anon_cond.kh:19:13: error: { a: int } has no method 'len'
         print(m.len().to_str())
                 ^
-    hint: { name: value } is a struct; for a map, quote the keys ({"k": 1}), put a variable key in parentheses ({(k): 1}) or give the type: let m: map[str, int] = {k: 1}
-4 errors
+    hint: { name: value } is a struct; for a map, quote the keys ({"k": 1}) or put a variable key in parentheses ({(k): 1})
+tests/errors/anon_cond.kh:20:41: error: a map key cannot be a bare name: 'x'
+        let typed: map[str, int] = {"a": 1, x: 2}
+                                            ^
+    hint: write {"x": v} for the key "x", or {(x): v} for a key from the variable x
+tests/errors/anon_cond.kh:21:34: error: a map key cannot be a bare name: 'x'
+        let typed2: map[str, int] = {x: 2}
+                                     ^
+    hint: write {"x": v} for the key "x", or {(x): v} for a key from the variable x
+7 errors

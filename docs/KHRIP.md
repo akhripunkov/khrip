@@ -116,9 +116,10 @@ let ages = {"ann": 30, "bob": 41}
 ```
 
 `{ x: 1 }` takes the type expected by a typed `let`/`var`, assignment, argument,
-`return`, list or field, else the type of its fields; `{"k": v}` is a map. At a statement start
-and after `=>` write `({ ... })`: `{` there is a block. Types can be inline:
-`-> { token: str }`; a named type takes such a value only as `T { ...x }`.
+`return`, list or field, else the type of its fields; `{"k": v}` and `{(k): v}`
+(key from a variable) are maps. At a statement start and in a match arm write
+`({ ... })`: `{` there is a block. Types can be inline: `-> { token: str }`; a
+named type takes such a value only as `T { ...x }`.
 Structs, lists and maps are references: assigning shares, `.copy()` copies a list.
 
 ## Methods

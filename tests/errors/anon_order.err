@@ -1,0 +1,17 @@
+tests/errors/anon_order.kh:14:15: error: { score: int, name: int } and { name: int, score: int } have the same fields in a different order; JSON and BSON keep each type's order: write them in the same order
+        sort_spec(s)
+                  ^
+    hint: copy the fields into the expected order: { ...value }
+tests/errors/anon_order.kh:15:40: error: { score: int, name: int } and { name: int, score: int } have the same fields in a different order; JSON and BSON keep each type's order: write them in the same order
+        let t: { name: int, score: int } = s
+                                           ^
+    hint: copy the fields into the expected order: { ...value }
+tests/errors/anon_order.kh:17:10: error: expected { limit: int = 20 }, found { limit: int = 50 }
+        page(q)
+             ^
+    hint: the types differ only in the default of 'limit' (= 50 and = 20): a default is part of an anonymous type
+tests/errors/anon_order.kh:19:10: error: expected { limit: int = 20 }, found { limit: int }
+        page(none_default)
+             ^
+    hint: the types differ only in the default of 'limit' (no default and = 20): a default is part of an anonymous type
+4 errors

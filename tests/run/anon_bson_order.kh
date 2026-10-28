@@ -1,0 +1,22 @@
+// Порядок полей — часть анонимного типа: в нём поля уходят в BSON и JSON.
+// Сортировка MongoDB { name: 1, score: -1 } из функции выше не меняет
+// порядок документа { score: -1, name: 1 } ниже (байты BSON — как записано).
+fn by_name() -> Bson {
+    return to_bson({ name: 1, score: -1 })
+}
+
+fn names(d: Bson) -> str {
+    var out: [str] = []
+    for f in bson_fields(d) {
+        out.push(f.name)
+    }
+    return out.join(",")
+}
+
+fn main() {
+    let a = by_name()
+    let b = to_bson({ score: -1, name: 1 })
+    print(names(a) + " " + names(b))
+    print(__hex_bytes(__str_ptr(a.data), a.data.byte_len()))
+    print(__hex_bytes(__str_ptr(b.data), b.data.byte_len()))
+}

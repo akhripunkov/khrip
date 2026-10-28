@@ -12,10 +12,13 @@
 (1, 0)
 {"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}
 m user
+{"stream":false,"messages":[{"role":"user","content":"hi"}],"model":"n"}
 [{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]},{"model":"n","stream":false,"messages":[{"role":"user","content":"hi"}]}]
+{"x":21,"y":22,"z":3}
 {"y":2,"label":"pt","x":100}
 {"x":5,"y":6,"z":0}
 21 {"y":22}
 [{"at":0,"sq":0},{"at":1,"sq":1},{"at":2,"sq":4}]
 1
+{"q":"term"}{"id":9}{"id":7}{"id":7}
 {"modle":"m"}

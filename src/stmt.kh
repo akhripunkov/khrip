@@ -812,7 +812,7 @@ fn assign_field(t: int, f: Token, op: int, at: Token) {
     let si = types[t].a
     let fi = field_find(si, f.text)
     if fi < 0 {
-        error_tok(f, "type '" + structs[si].name + "' has no field '" + f.text + "'", "")
+        error_tok(f, type_label(si) + " has no field '" + f.text + "'", "its fields: " + field_names(si))
         parse_expr(ty_err)
         return
     }
@@ -1447,7 +1447,10 @@ fn parse_for() {
     no_struct = true
     let at = tok()
     let from = pos
+    let saved_fh = for_header
+    for_header = true
     let t = parse_expr(ty_err)
+    for_header = saved_fh
     // for x in xs (xs снаружи tx): элементы — те же значения
     let mark = tx_aliases.len()
     if tx_alias_source(from) {

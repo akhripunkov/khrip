@@ -3,7 +3,8 @@
 // tests/run.sh), снимок KHRIP_DATA (__store_snapshot / __store_restore) с
 // вложенными анонимными списками и словарями; литералы без имени типа в
 // return маршрута (вариант — по статусу или единственной структуре), в теле
-// call (A3) и в записи в store.
+// call (тип — тела маршрута по пути) и в записи в store; порядок полей —
+// часть типа: тип параметра другой функции не меняет порядок ответа.
 
 type Product { id: int, name: str, price: int }
 
@@ -51,8 +52,19 @@ route GET "/pick" (x: int) -> 200 Product | 400 { code: int, msg: str } | 404 {
 
 // A3-значение — ответ, если тип маршрута тот же анонимный
 route GET "/token" -> { token: str, n: int } {
-    let r = { n: 1, token: "t" }
+    let r = { token: "t", n: 1 }
     return r
+}
+
+// те же поля в другом порядке у параметра функции — другой тип: порядок
+// ответа маршрута — его собственный
+fn swapped(p: { b: int, a: int }) -> int {
+    return p.a - p.b
+}
+
+route GET "/order" -> { a: int, b: int } {
+    let d = swapped({ a: 5, b: 3 })
+    return { b: d, a: 1 }
 }
 
 fn churn(n: int) {
@@ -79,6 +91,7 @@ test "routes with anonymous bodies and results" {
     expect (call GET "/pick?x=-1").status == 404
     expect (call GET "/pick?x=3").body == `{"id":3,"name":"pick","price":2}`
     expect (call GET "/token").body == `{"token":"t","n":1}`
+    expect (call GET "/order").body == `{"a":1,"b":2}`
 }
 
 test "nested anonymous values in store survive collections" {

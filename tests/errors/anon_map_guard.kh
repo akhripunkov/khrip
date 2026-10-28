@@ -1,0 +1,33 @@
+// {k: v} без ожидаемого типа — литерал структуры с полем "k". Если такой же
+// текст раньше был словарём с ключами — значениями переменных (каждое имя
+// поля — переменная, параметр, глобальная, store или const типа int или str,
+// одного типа; значения одного типа и не упоминают имя своего поля), это
+// ошибка с подсказкой {(k): v} или {"k": v}: иначе смысл менялся бы молча.
+const KIND = "kind"
+
+store owners: map[str, str]
+
+route POST "/notes" (body: { text: str }) -> int {
+    return body.text.len()
+}
+
+fn payloads(field: str, value: int, key: str, owner: str, items: [str]) -> str {
+    let a = to_json({field: value})
+    let b = to_json({ outer: {field: value} })
+    let c = to_json([{key: value}])
+    let d = to_json(items.map(x => {key: x}))
+    let e = to_json({KIND: "note"})
+    let f = to_bson({"$set": to_bson({field: value})})
+    let g = to_bson({key: owner})
+    let jsonb = {field: key}
+    let h = to_json({field: 1, key: 2})
+    return a + b + c + d + e + f.error + g.error + to_json(jsonb) + h
+}
+
+test "call bodies" {
+    let path = "/notes"
+    let text = "body"
+    let r = call POST path {text: "x"}
+    let s = call POST "/nowhere" {text: "y"}
+    expect r.status + s.status > 0
+}

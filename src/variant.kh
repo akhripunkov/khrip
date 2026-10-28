@@ -172,7 +172,7 @@ fn parse_value_block(w: int) -> int {
 // Ветка match или if, используемая как значение.
 fn parse_arm_value(w: int) -> int {
     let k = kind()
-    if k == '\{' && (brace_block_is_struct(pos) || (kind_at(pos + 1) == T_IDENT && kind_at(pos + 2) == '}' && arm_shorthand_meant(pos + 1, w))) {
+    if k == '\{' && arm_brace_is_struct(pos) {
         // Circle c => { area: 1 }: литерал на месте блока ветки (E-A1); разбор
         // продолжается, как будто он в скобках
         brace_block_error(pos, true, w)
@@ -418,7 +418,7 @@ fn parse_match(as_value: bool, w: int) -> int {
             }
         } else {
             var div = false
-            if kind() == '\{' && brace_block_is_struct(pos) {
+            if kind() == '\{' && arm_brace_is_struct(pos) {
                 brace_block_error(pos, true, ty_err)
                 pos = matching_close(pos)
                 advance()

@@ -5,7 +5,7 @@ tests/errors/anon_variant.kh:11:12: error: this route returns Product | 400 Prob
 tests/errors/anon_variant.kh:16:12: error: this route returns Product, found { id: int, name: str }
         return v
                ^
-    hint: a struct literal gets the route's type only when the route has one struct type; otherwise write the type: return Name { ... }, or copy: Name { ...value }
+    hint: a value of an anonymous type becomes the route's type only explicitly: return Name { ...value }
 tests/errors/anon_variant.kh:20:20: error: a struct literal for Shape needs the name of its variant
         let s: Shape = { r: 2 }
                        ^

@@ -601,7 +601,7 @@ CUTS
 #   anonshort — { x } (одно сокращение поля) не литерал структуры;
 #   anonnostruct — литерал в условии без скобок не ошибка;
 #   anonea1, anonarmshort — нет ошибки E-A1 (литерал на месте блока ветки,
-#                           в том числе { имя } при ожидаемой структуре);
+#                           в том числе { имя });
 # тип литерала и анонимного типа:
 #   anonopt — у ожидаемого T? литерал не получает T;
 #   anonsum — у типа-варианта литерал без имени варианта не ошибка;
@@ -611,9 +611,17 @@ CUTS
 #   anonvariants — тип { поле: T } в результате маршрута не тип;
 #   anonheader, anonglobalhdr — } типа перед телом функции или перед = в
 #                               store/var — «начало объявления»;
-#   anonidentity — тот же набор полей в другом порядке — другой тип;
+#   anonidentity — порядок полей не часть типа (порядок BSON и ответа
+#                  маршрута — по первой записи);
 #   anondefault — значение по умолчанию не часть типа;
-#   anonlayout — поля литерала A3 в порядке записи, а не раскладки типа;
+#   anonordermsg — у типов другого порядка полей — общее сообщение;
+#   anonguard, anonguardmention — {k: v} с переменными k молча структура;
+#                  значение, которое упоминает имя поля, — тоже «словарь»;
+#   anonbarekey — голое имя ключом словаря не ошибка;
+#   anoncalltarget — тело call не получает тип тела маршрута;
+#   anonnewline — { a ⏎ b: 2 } (сокращение, поля через перевод строки) не
+#                 литерал;
+#   anonforhint — у for k in {x: 1} нет подсказки про словарь;
 #   anonspreadlast, anonexplicit — поле из распаковки: не из последней
 #                                  или вместо явного;
 #   anonwarn — W-A2 с четвёртого места, а не с третьего;
@@ -676,12 +684,18 @@ cuts = {
     "methodrecv": ("atom.kh", "            if !assignable(rt, pt) {\n                var hint = \"\"", "            if false {\n                var hint = \"\""),
     "anonmapwant": ("atom.kh", "    let t = ty_inner(w)\n    if tkind(t) == K_MAP {\n        return false\n    }\n    if struct_lit_shape(pos) {", "    let t = ty_inner(w)\n    if struct_lit_shape(pos) {"),
     "anonempty": ("atom.kh", "    return kind_at(pos + 1) == '}' && tkind(t) == K_STRUCT\n", "    return false\n"),
-    "anonspread": ("atom.kh", "    if k1 == T_ELLIPSIS {\n        return true\n    }\n    if k1 != T_IDENT {", "    if k1 != T_IDENT {"),
-    "anonshort": ("atom.kh", "    return k2 == ':' || k2 == ',' || k2 == '}'\n", "    return k2 == ':' || k2 == ','\n"),
-    "anonopt": ("atom.kh", "    let t = ty_inner(w)\n    if tkind(t) == K_STRUCT {\n        return parse_struct_lit(types[t].a, at)", "    let t = w\n    if tkind(t) == K_STRUCT {\n        return parse_struct_lit(types[t].a, at)"),
-    "anonidentity": ("decl.kh", "                let j = field_find(si, names[i])\n", "                var j = -1\n                if fs[i].name == names[i] {\n                    j = i\n                }\n"),
-    "anondefault": ("decl.kh", "                same = j >= 0 && fs[j].ty == tys[i] && default_key(fs[j].def, fs[j].ty) == default_key(defs[i], tys[i])\n", "                same = j >= 0 && fs[j].ty == tys[i]\n"),
-    "anonlayout": ("atom.kh", "        emit_store(RAX, j * 8, RCX)\n        j += 1\n    }\n    emit_alu_imm(0, RSP, n * 8)\n    return ty_struct(si)", "        emit_store(RAX, w * 8, RCX)\n        j += 1\n    }\n    emit_alu_imm(0, RSP, n * 8)\n    return ty_struct(si)"),
+    "anonspread": ("atom.kh", "    if k1 == T_ELLIPSIS {\n        return true\n    }\n    if keyword_name(k1) {", "    if keyword_name(k1) {"),
+    "anonshort": ("atom.kh", "    if k2 == ':' || k2 == ',' || k2 == '}' {\n", "    if k2 == ':' || k2 == ',' {\n"),
+    "anonopt": ("atom.kh", "    let t = ty_inner(w)\n    let open = pos\n", "    let t = w\n    let open = pos\n"),
+    "anonidentity": ("decl.kh", "                same = fs[i].name == names[i] && fs[i].ty == tys[i] && default_key(fs[i].def, fs[i].ty) == default_key(defs[i], tys[i])\n", "                let j = field_find(si, names[i])\n                same = j >= 0 && fs[j].ty == tys[i] && default_key(fs[j].def, fs[j].ty) == default_key(defs[i], tys[i])\n"),
+    "anondefault": ("decl.kh", "                same = fs[i].name == names[i] && fs[i].ty == tys[i] && default_key(fs[i].def, fs[i].ty) == default_key(defs[i], tys[i])\n", "                same = fs[i].name == names[i] && fs[i].ty == tys[i]\n"),
+    "anonordermsg": ("expr.kh", "    if d.starts_with(\"\\{\") {\n", "    if false {\n"),
+    "anonguard": ("atom.kh", "    if plain && !bad && !panic_mode && n > 0 && reads_as_var_map(inames, itys, ivs, ive) {", "    if false {"),
+    "anonguardmention": ("atom.kh", "            if toks[j].kind == T_IDENT && toks[j].text == names[i] {\n                return false\n            }", "            if false {\n                return false\n            }"),
+    "anonbarekey": ("atom.kh", "        if (kind() == T_IDENT || keyword_name(kind())) && kind_at(pos + 1) == ':' {\n            // ключ — голое имя", "        if false {\n            // ключ — голое имя"),
+    "anoncalltarget": ("api.kh", "        body_ty = call_body_type(method, strlits[pt.val])\n", ""),
+    "anonnewline": ("atom.kh", "    return (k2 == T_IDENT || k2 == T_ELLIPSIS) && toks[i + 2].line > toks[i + 1].line\n", "    return false\n"),
+    "anonforhint": ("atom.kh", "        if for_header && kind_at(pos + 1) == T_IDENT && kind_at(pos + 2) == ':' {", "        if false {"),
     "anonspreadlast": ("atom.kh", "                    } else {\n                        from_item[j] = i\n                        from_field[j] = m\n                    }\n", "                    }\n"),
     "anonexplicit": ("atom.kh", "                if !list_has(explicit, f.name) {\n                    var j = 0", "                if true {\n                    var j = 0"),
     "anonroutepick": ("api.kh", "        if other >= 0 {\n", "        if false {\n"),
@@ -690,10 +704,10 @@ cuts = {
     "anonvariants": ("api.kh", " || (kind() == '\\{' && kind_at(pos + 1) == T_IDENT && kind_at(pos + 2) == ':')", ""),
     "anonheader": ("decl.kh", "                if (k == T_FN || k == T_ROUTE || k == T_TEST) && pos > i && toks[pos].kind == '\\{' {", "                if false {"),
     "anonglobalhdr": ("decl.kh", "                if (k == T_VAR || k == T_STORE) && pos > i {", "                if false {"),
-    "anonea1": ("atom.kh", "    return k1 == T_IDENT && (kind_at(i + 2) == ':' || kind_at(i + 2) == ',')\n", "    return false\n"),
-    "anonarmshort": ("atom.kh", "    return vt != ty_err && !assignable(vt, w)\n", "    return false\n"),
+    "anonea1": ("atom.kh", "    return (k1 == T_IDENT || keyword_name(k1)) && (kind_at(i + 2) == ':' || kind_at(i + 2) == ',')\n", "    return false\n"),
+    "anonarmshort": ("atom.kh", "    return brace_block_is_struct(i) || (kind_at(i + 1) == T_IDENT && kind_at(i + 2) == '}')\n", "    return brace_block_is_struct(i)\n"),
     "anonnostruct": ("atom.kh", "    if no_struct {\n        // в условии", "    if false {\n        // в условии"),
-    "anonsum": ("atom.kh", "    if tkind(t) == K_SUM {\n        let su = types[t].a", "    if false {\n        let su = types[t].a"),
+    "anonsum": ("atom.kh", "    } else if tkind(t) == K_SUM {\n        let su = types[t].a", "    } else if false {\n        let su = types[t].a"),
     "anonrwtype": ("rw.kh", "    } else if toks[j].kind == '\\{' {\n        // анонимная структура", "    } else if false {\n        // анонимная структура"),
     "anonrwannot": ("rw.kh", "        let te = rw_annot_end(i, end)\n", "        let te = -1\n"),
     "anonrwroot": ("rw.kh", " || toks[j].kind == ':' || toks[j].kind == '}') {", " || toks[j].kind == ':') {"),
@@ -788,14 +802,22 @@ rwscanline tests/run/chain_fusion.kh run
 rwuserfn tests/run/chain_fusion.kh run
 methodallow tests/errors/internal_method.kh check
 methodrecv tests/errors/join_not_str.kh check
-anonmapwant tests/run/anon_literals.kh run
+anonmapwant tests/errors/anon_cond.kh err
 anonempty tests/run/anon_literals.kh run
 anonspread tests/run/anon_literals.kh run
 anonshort tests/run/anon_literals.kh run
 anonopt tests/run/anon_literals.kh run
 anonidentity tests/run/anon_types.kh run
 anondefault tests/run/anon_types.kh run
-anonlayout tests/run/anon_literals.kh run
+anonidentity tests/run/anon_bson_order.kh run
+anonidentity tests/api/gc_anon.kh test
+anonordermsg tests/errors/anon_order.kh err
+anonguard tests/errors/anon_map_guard.kh err
+anonguardmention tests/run/anon_literals.kh run
+anonbarekey tests/errors/anon_cond.kh err
+anoncalltarget tests/errors/anon_call_typo.kh err
+anonnewline tests/run/anon_literals.kh run
+anonforhint tests/errors/anon_cond.kh err
 anonspreadlast tests/run/anon_literals.kh run
 anonexplicit tests/run/anon_literals.kh run
 anonroutepick tests/errors/anon_variant.kh err

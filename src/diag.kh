@@ -295,6 +295,44 @@ fn json_escape(s: str) -> str {
     return buf_str(b)
 }
 
+// Сообщение о месте в сгенерированном коде: имена __anon<номер> (так он
+// называет анонимные структуры, ty_src) — записью типа: { a: int }. Свой тип
+// программы с таким именем остаётся как есть.
+fn diag_text(d: Diag, s: str) -> str {
+    if files[d.file].path != "<generated>" {
+        return s
+    }
+    return unanon(s)
+}
+
+fn unanon(s: str) -> str {
+    let n = s.byte_len()
+    var out = ""
+    var last = 0
+    var i = 0
+    while i + 6 < n {
+        if s.byte(i) == '_' && s.byte_slice(i, i + 6) == "__anon" && (i == 0 || !is_ident_char(s.byte(i - 1))) {
+            var j = i + 6
+            var v = 0
+            while j < n && is_digit(s.byte(j)) {
+                v = v * 10 + s.byte(j) - '0'
+                j += 1
+            }
+            if j > i + 6 && (j == n || !is_ident_char(s.byte(j))) && v < structs.len() && is_anon(v) && struct_find(s.byte_slice(i, j)) < 0 {
+                out += s.byte_slice(last, i) + structs[v].name
+                last = j
+                i = j
+                continue
+            }
+        }
+        i += 1
+    }
+    if last == 0 {
+        return s
+    }
+    return out + s.byte_slice(last, n)
+}
+
 fn print_diags() {
     if json_errors {
         let b = buf_new(1024)
@@ -311,7 +349,7 @@ fn print_diags() {
                 sev = "warning"
             }
             buf_add(b, "\{\"file\":\"" + json_escape(files[d.file].path) + "\",\"line\":" + d.line.to_str() + ",\"col\":" + col.to_str())
-            buf_add(b, ",\"message\":\"" + json_escape(d.msg) + "\",\"hint\":\"" + json_escape(d.hint) + "\",\"severity\":\"" + sev + "\"}")
+            buf_add(b, ",\"message\":\"" + json_escape(diag_text(d, d.msg)) + "\",\"hint\":\"" + json_escape(diag_text(d, d.hint)) + "\",\"severity\":\"" + sev + "\"}")
             i += 1
         }
         buf_add(b, "]\n")
@@ -326,11 +364,19 @@ fn print_diags() {
         if d.warn {
             sev = ": warning: "
         }
-        eprint(files[d.file].path + ":" + d.line.to_str() + ":" + char_col(line, d.col).to_str() + sev + d.msg)
-        eprint("    " + line)
-        eprint(caret_line(line, col_byte(line, d.col)))
+        eprint(files[d.file].path + ":" + d.line.to_str() + ":" + char_col(line, d.col).to_str() + sev + diag_text(d, d.msg))
+        // строка сгенерированного кода: __anon<номер> — запись типа (и
+        // указатель — под тем же местом)
+        let cb = col_byte(line, d.col)
+        let shown = diag_text(d, line)
+        eprint("    " + shown)
+        var pre = cb
+        if pre > line.byte_len() {
+            pre = line.byte_len()
+        }
+        eprint(caret_line(shown, cb + diag_text(d, line.byte_slice(0, pre)).byte_len() - pre))
         if d.hint.byte_len() > 0 {
-            eprint("    hint: " + d.hint)
+            eprint("    hint: " + diag_text(d, d.hint))
         }
         i += 1
     }
