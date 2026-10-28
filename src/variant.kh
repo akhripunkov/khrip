@@ -809,3 +809,259 @@ fn skip_call_args_from_open() {
         advance()
     }
 }
+
+// ---- Слияние цепочек лямбд ----
+// m.values().filter(f).map(g)...sort_by(k) и xs.filter(f).map(g)... (два звена
+// и больше) — один проход по массивам словаря (или по списку) без списка
+// values() и без промежуточных списков: каждый элемент проходит звенья по
+// очереди, filter отсеивает, map заменяет, any, all и find останавливают обход,
+// когда ответ известен, count считает, sort_by копит элементы и ключи и
+// сортирует в конце; цепочка без них копит элементы в список. Цепочка — звенья
+// до первого из any, all, count, find, sort_by включительно; дальше разбор идёт
+// как обычно (у результата sort_by — .map(...), срез и т. п.).
+// Порядок вычисления другой: лямбды считаются поэлементно (f(x1), g(x1),
+// f(x2)...), как в ленивых цепочках C#, Rust и Java Streams, а элементы после
+// найденного ответа any, all и find не смотрит ни одно звено. Поэтому
+// сливается только цепочка, где все лямбды без побочных действий (src/rw.kh,
+// lambda_pure): тогда это видно лишь по панике — её текст у первого по порядку
+// обхода элемента, на котором она случилась. Словарь во время обхода не
+// меняется (лямбды ничего не пишут): обход идёт по старым массивам, пока
+// словарь store растёт по частям (их читатели и видят до переключения), под
+// разделяемой блокировкой store в читающем маршруте, как и values().
+
+// Звено цепочки: метод (лексема), параметр лямбды и закрывающая скобка вызова.
+type ChainLink { name: str, at: int, param: int, close: int }
+
+// Звенья цепочки, начиная с '.' в позиции i.
+fn chain_links(i: int) -> [ChainLink] {
+    var links: [ChainLink] = []
+    var j = i
+    while kind_at(j) == '.' && kind_at(j + 1) == T_IDENT && is_lambda_method(toks[j + 1].text) && kind_at(j + 2) == '(' && kind_at(j + 3) == T_IDENT && kind_at(j + 4) == T_FATARROW {
+        let close = matching_close(j + 2)
+        if close < 0 || kind_at(close) != ')' {
+            break
+        }
+        let name = toks[j + 1].text
+        links.push(ChainLink { name: name, at: j + 1, param: j + 3, close: close })
+        if name != "filter" && name != "map" {
+            break
+        }
+        j = close + 1
+    }
+    return links
+}
+
+// Все лямбды цепочки без побочных действий.
+fn chain_pure(links: [ChainLink]) -> bool {
+    for l in links {
+        if !lambda_pure(l.param + 2, l.close) {
+            return false
+        }
+    }
+    return true
+}
+
+// Слитая цепочка links; источник в rax: словарь (is_map, тип rt — map[K, V])
+// или список типа rt. Текущий токен — первый после источника ('.' первого
+// звена). → тип результата.
+fn parse_fused(rt: int, is_map: bool, links: [ChainLink]) -> int {
+    var et = ty_err
+    if is_map {
+        et = types[rt].b
+    } else {
+        et = ty_elem(rt)
+    }
+    let src = hidden_local(rt)
+    emit_store_local(src)
+    let last = links[links.len() - 1].name
+    let hmark = hoist_begin(links[0].param, links[links.len() - 1].close)
+    let makes_list = last == "filter" || last == "map" || last == "sort_by"
+    var esize_at = -1
+    var keys = -1
+    if makes_list {
+        emit_mov_imm(RDI, 4)
+        emit_mov_imm(RSI, 8)
+        esize_at = code_len - 4
+        emit_call(rt_func("__list_new"))
+    } else if last == "all" {
+        emit_mov_imm(RAX, 1)
+    } else {
+        emit_mov_imm(RAX, 0)
+    }
+    let res = hidden_local(ty_int)
+    emit_store_local(res)
+    if last == "sort_by" {
+        emit_mov_imm(RDI, 4)
+        emit_mov_imm(RSI, 8)
+        emit_call(rt_func("__list_new"))
+        keys = hidden_local(ty_int)
+        emit_store_local(keys)
+    }
+    let idx = hidden_local(ty_int)
+    emit_mov_imm(RAX, 0)
+    emit_store_local(idx)
+    let cur = hidden_local(et)
+    var exits: [int] = []
+    var nexts: [int] = []
+    let top = here()
+    if is_map {
+        // idx < записей в массивах (u32 в слове 48); признак alive[idx] —
+        // байт в массиве слова 24, значение — в массиве слова 16 (bool —
+        // байтом): массивы читаются из заголовка, как у for по словарю
+        emit_load_local(src)
+        emit_mem_sized(0x8B, RCX, RAX, 48, false)
+        emit_load_local(idx)
+        emit_rr(0x39, RCX, RAX)
+        exits.push(emit_jcc(CC_GE))
+        emit_local_to_rcx(idx)
+        emit_load_local(src)
+        emit_load(RAX, RAX, 24)
+        emit_movzx_index()
+        emit_test_rax()
+        nexts.push(emit_jcc(CC_E))
+        emit_local_to_rcx(idx)
+        emit_load_local(src)
+        emit_load(RAX, RAX, 16)
+        if et == ty_bool {
+            emit_movzx_index()
+        } else {
+            // mov rax, [rax + rcx*8]
+            emit_hex("48 8B 04 C8")
+        }
+    } else {
+        // idx < len?
+        emit_load_local(src)
+        emit_local_to_rcx(idx)
+        emit_mem(0x3B, RCX, RAX, 8)
+        exits.push(emit_jcc(CC_AE))
+        emit_load(RAX, RAX, 0)
+        if esize_of(et) == 1 {
+            emit_movzx_index()
+        } else {
+            emit_hex("48 8B 04 C8")
+        }
+    }
+    emit_store_local(cur)
+    var bt = ty_err
+    var rtype = ty_err
+    for l in links {
+        pos = l.param + 2
+        let pn = toks[l.param]
+        let saved_n = nlocals
+        let x = declare_local(pn.text, et, false)
+        emit_load_local(cur)
+        emit_store_local(x)
+        var w = ty_bool
+        if l.name == "map" || l.name == "sort_by" {
+            w = ty_err
+        }
+        let saved_ns = no_struct
+        no_struct = false
+        let bt_tok = tok()
+        bt = parse_expr(w)
+        no_struct = saved_ns
+        if l.name == "filter" {
+            check_bool(bt, bt_tok, l.name)
+            emit_test_rax()
+            nexts.push(emit_jcc(CC_E))
+        } else if l.name == "map" {
+            if bt == ty_void || bt == ty_none || bt == ty_never {
+                error_tok(bt_tok, "the lambda of map must produce a value", "")
+            }
+            emit_store_local(cur)
+            et = bt
+        } else if l.name == "sort_by" {
+            if bt != ty_int && bt != ty_str && bt != ty_float && bt != ty_err {
+                error_tok(bt_tok, "sort_by needs an int, float or str key, found " + ty_name(bt), "")
+            }
+            if bt == ty_float {
+                // биты double → целое того же порядка (как в parse_lambda_method)
+                emit_hex("48 89 C1 48 C1 F9 3F 48 D1 E9 48 31 C8")
+            }
+            emit_mov_rr(RSI, RAX)
+            emit_load_local(keys)
+            emit_mov_rr(RDI, RAX)
+            emit_call(rt_func("__list_push"))
+            emit_call2("__list_push", res, cur)
+            rtype = ty_list(et)
+        } else {
+            check_bool(bt, bt_tok, l.name)
+            emit_test_rax()
+            if l.name == "all" {
+                nexts.push(emit_jcc(CC_NE))
+                emit_mov_imm(RAX, 0)
+                emit_store_local(res)
+                exits.push(emit_jmp())
+                rtype = ty_bool
+            } else {
+                nexts.push(emit_jcc(CC_E))
+                if l.name == "count" {
+                    emit_load_local(res)
+                    emit_alu_imm(0, RAX, 1)
+                    emit_store_local(res)
+                    rtype = ty_int
+                } else if l.name == "any" {
+                    emit_mov_imm(RAX, 1)
+                    emit_store_local(res)
+                    exits.push(emit_jmp())
+                    rtype = ty_bool
+                } else {
+                    // find: первый подходящий элемент (T? — тот же T?, без
+                    // второй коробки)
+                    emit_load_local(cur)
+                    if !is_ref(et) && tkind(et) != K_OPT {
+                        emit_box()
+                    }
+                    emit_store_local(res)
+                    exits.push(emit_jmp())
+                    rtype = ty_opt(et)
+                }
+            }
+        }
+        locals_to(saved_n)
+        if pos == l.close {
+            advance()
+        } else {
+            expect_tok(')')
+            pos = l.close + 1
+        }
+    }
+    if last == "filter" || last == "map" {
+        emit_call2("__list_push", res, cur)
+        rtype = ty_list(et)
+    }
+    patch_all(nexts, here())
+    // idx += 1
+    emit_load_local(idx)
+    emit_alu_imm(0, RAX, 1)
+    emit_store_local(idx)
+    emit_jmp_to(top)
+    patch_all(exits, here())
+    if makes_list {
+        put32_at(code + esize_at, esize_of(et))
+    }
+    if last == "sort_by" {
+        emit_load_local(res)
+        emit_mov_rr(RDI, RAX)
+        emit_load_local(keys)
+        emit_mov_rr(RSI, RAX)
+        if bt == ty_str {
+            emit_mov_imm(RDX, 1)
+        } else {
+            emit_mov_imm(RDX, 0)
+        }
+        emit_call(rt_func("__sort_by"))
+    } else {
+        emit_load_local(res)
+    }
+    hoist_end(hmark)
+    release_hidden(cur)
+    release_hidden(idx)
+    if keys >= 0 {
+        release_hidden(keys)
+    }
+    release_hidden(res)
+    release_hidden(src)
+    last_was_call = true
+    return rtype
+}

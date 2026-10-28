@@ -1,0 +1,5 @@
+ok    fused chains over store maps answer like a for loop
+ok    a panic is reported for the first element in iteration order
+ok    fused chains read the old arrays while a store map grows
+ok    fused chains during marking and growth keep every value alive
+4 tests: 4 passed, 0 failed

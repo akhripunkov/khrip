@@ -502,7 +502,23 @@ CUTS
 #   hoistend — вынесенные вызовы не забываются после лямбды (встроенная
 #              функция с лямбдой — дважды подряд);
 #   hoistfield — выносится и поле x.name.lower() по имени локальной name;
-#   hoistdedupe — разные методы одного имени — в одной локальной.
+#   hoistdedupe — разные методы одного имени — в одной локальной;
+# слияние цепочек (tests/run/chain_fusion.kh, tests/api/gc_chains.kh — test):
+#   fusepure — сливается и цепочка с побочными действиями (порядок печати);
+#   fuseassign — присваивание в блоке лямбды не побочное действие;
+#   fusereturn — return из блока лямбды не побочное действие;
+#   fusecallee — не смотрится, чисты ли вызванные функции программы;
+#   fuselib — любая функция библиотеки чиста (print);
+#   fuseglobal — запись в глобальную в функции программы не побочное действие;
+#   fusemut — изменяющий метод в лямбде не побочное действие;
+#   fusealive — обход словаря без признака «жива» (удалённые записи);
+#   fusecount — обход до числа живых записей, а не до конца массивов;
+#   fuseterm — цепочка не кончается на sort_by (и any, all, count, find);
+#   fuseone — сливается и одно звено у списка (sort_by сортирует копию);
+#   fusebox — find не кладёт значение int в коробку;
+#   fusestr — sort_by по строке сравнивает слова;
+#   fusefloat — ключ float без перевода в порядок целых;
+#   fuseesize — список bool словами.
 comp_ok=1
 while read -r cut test mode; do
 	[[ -z $cut ]] && continue
@@ -523,6 +539,21 @@ cuts = {
     "hoistend": ("variant.kh", "    while hoist_toks.len() > mark {\n        let h = hoist_locals.pop()", "    while false {\n        let h = hoist_locals.pop()"),
     "hoistfield": ("variant.kh", "if toks[j].kind == T_IDENT && toks[j - 1].kind != '.' && kind_at(j + 1) == '.'", "if toks[j].kind == T_IDENT && kind_at(j + 1) == '.'"),
     "hoistdedupe": ("variant.kh", "if toks[o].text == toks[j + 2].text && toks[o - 2].text == toks[j].text {", "if toks[o - 2].text == toks[j].text {"),
+    "fusepure": ("variant.kh", "        if !lambda_pure(l.param + 2, l.close) {\n            return false\n        }\n", ""),
+    "fuseassign": ("rw.kh", "            if !in_fn || fx_assign_effect(i, body, end) {", "            if in_fn && fx_assign_effect(i, body, end) {"),
+    "fusereturn": ("rw.kh", "        if !in_fn && (k == T_RETURN || k == T_BREAK || k == T_CONTINUE) {", "        if false {"),
+    "fusecallee": ("rw.kh", "    for c in cs {\n        if c >= fx_impure.len() || fx_impure[c] == 1 {", "    for c in cs {\n        if false {"),
+    "fuselib": ("rw.kh", "fn fx_pure_lib(name: str) -> bool {\n", "fn fx_pure_lib(name: str) -> bool {\n    return true\n"),
+    "fuseglobal": ("rw.kh", "    if sym >= 0 && sym_kind(sym) == SK_GLOBAL {\n        return true\n    }\n    if i == s + 1 {", "    if i == s + 1 {"),
+    "fusemut": ("rw.kh", "                    if !in_fn || !rw_fresh_at(i - 2, rw_recv_start(i - 2), body, end, 0) {", "                    if in_fn && !rw_fresh_at(i - 2, rw_recv_start(i - 2), body, end, 0) {"),
+    "fusealive": ("variant.kh", "        emit_movzx_index()\n        emit_test_rax()\n        nexts.push(emit_jcc(CC_E))\n        emit_local_to_rcx(idx)\n", "        emit_movzx_index()\n        emit_test_rax()\n        emit_local_to_rcx(idx)\n"),
+    "fusecount": ("variant.kh", "        emit_load_local(src)\n        emit_mem_sized(0x8B, RCX, RAX, 48, false)", "        emit_load_local(src)\n        emit_mem_sized(0x8B, RCX, RAX, 8, false)"),
+    "fuseterm": ("variant.kh", "        if name != \"filter\" && name != \"map\" {\n            break\n        }\n", ""),
+    "fuseone": ("atom.kh", "            if links.len() >= 2 && chain_pure(links) {", "            if links.len() >= 1 && chain_pure(links) {"),
+    "fusebox": ("variant.kh", "                    emit_load_local(cur)\n                    if !is_ref(et) && tkind(et) != K_OPT {\n                        emit_box()\n                    }", "                    emit_load_local(cur)"),
+    "fusestr": ("variant.kh", "        if bt == ty_str {\n            emit_mov_imm(RDX, 1)\n        } else {\n            emit_mov_imm(RDX, 0)\n        }\n        emit_call(rt_func(\"__sort_by\"))\n    } else {\n        emit_load_local(res)\n    }\n    hoist_end(hmark)\n    release_hidden(cur)", "        emit_mov_imm(RDX, 0)\n        emit_call(rt_func(\"__sort_by\"))\n    } else {\n        emit_load_local(res)\n    }\n    hoist_end(hmark)\n    release_hidden(cur)"),
+    "fusefloat": ("variant.kh", "                // биты double → целое того же порядка (как в parse_lambda_method)\n                emit_hex(\"48 89 C1 48 C1 F9 3F 48 D1 E9 48 31 C8\")\n", ""),
+    "fuseesize": ("variant.kh", "    if makes_list {\n        put32_at(code + esize_at, esize_of(et))\n    }\n", ""),
 }
 f, old, new = cuts[m]
 s = open(f"{d}/{f}").read()
@@ -542,6 +573,8 @@ PY
 	fi
 	if [[ $mode == locks ]]; then
 		{ KHRIP_LIB="$PWD/lib" timeout 120 "$tmp/mkhc" check --locks "$test" >"$tmp/mout.txt" 2>&1; } 2>/dev/null
+	elif [[ $mode == test ]]; then
+		{ KHRIP_LIB="$PWD/lib" env -u KHRIP_GC_VERIFY -u KHRIP_GC_STRESS timeout 300 "$tmp/mkhc" test "$test" >"$tmp/mout.txt" 2>&1; } 2>/dev/null
 	else
 		{ KHRIP_LIB="$PWD/lib" env -u KHRIP_GC_VERIFY -u KHRIP_GC_STRESS timeout 120 "$tmp/mkhc" run "$test" >"$tmp/mout.txt" 2>/dev/null; } 2>/dev/null
 	fi
@@ -560,8 +593,32 @@ hoistbind tests/run/lambda_hoist.kh run
 hoistend tests/run/lambda_hoist.kh run
 hoistfield tests/run/lambda_hoist.kh run
 hoistdedupe tests/run/lambda_hoist.kh run
+fusepure tests/run/chain_fusion.kh run
+fuseassign tests/run/chain_fusion.kh run
+fusereturn tests/run/chain_fusion.kh run
+fusecallee tests/run/chain_fusion.kh run
+fuselib tests/run/chain_fusion.kh run
+fuseglobal tests/run/chain_fusion.kh run
+fusemut tests/run/chain_fusion.kh run
+fusealive tests/run/chain_fusion.kh run
+fusecount tests/run/chain_fusion.kh run
+fuseterm tests/run/chain_fusion.kh run
+fuseone tests/run/chain_fusion.kh run
+fusebox tests/run/chain_fusion.kh run
+fusestr tests/run/chain_fusion.kh run
+fusefloat tests/run/chain_fusion.kh run
+fuseesize tests/run/chain_fusion.kh run
+fusealive tests/api/gc_chains.kh test
+fusecount tests/api/gc_chains.kh test
 CUTS
 [[ $comp_ok -eq 1 ]] && pass=$((pass + 1))
+# Слияние срабатывает: в eval/solutions/bookings все values() — в цепочках
+# лямбд без побочных действий, и списка values() (__map_values) в программе нет.
+if "$KHC" --sizes -o "$tmp/fused" eval/solutions/bookings/khrip/main.kh >"$tmp/fused.txt" 2>&1 && ! grep -q ' __map_values ' "$tmp/fused.txt"; then
+	pass=$((pass + 1))
+else
+	failed "слияние цепочек в bookings" "$(grep ' __map_values ' "$tmp/fused.txt" || cat "$tmp/fused.txt")"
+fi
 
 # Примеры учебника (docs/TUTORIAL.md) и ответы к заданиям: программы
 # выполняются, API проходят свои блоки test.

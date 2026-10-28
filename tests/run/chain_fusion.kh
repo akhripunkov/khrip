@@ -1,0 +1,233 @@
+// Слияние цепочек (этап скорости, часть 2, п. 3): m.values() и списки с
+// filter, map, any, all, count, find и sort_by — одним проходом. Каждая
+// слитая форма сверяется с той же цепочкой по звену на оператор (так она не
+// сливается: values() отдельно — список, одно звено у списка — обычный цикл) на
+// случайных словарях (int и str ключи, удалённые записи, bool-значения,
+// пустые) и списках. Цепочки с побочными действиями в лямбдах (печать, запись
+// в глобальную через функцию, return из блока лямбды) не сливаются: порядок
+// печати — сначала всё первое звено, потом второе. Ожидаемый вывод — вывод
+// этой программы, собранной без слияния.
+
+type Item { id: int, group: int, name: str, price: float, tags: [str], ok: bool }
+
+var seed: int = 5
+var trace: [str] = []
+var calls: int = 0
+
+fn rnd(n: int) -> int {
+    seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+    return (seed >> 8) % n
+}
+
+fn words() -> [str] {
+    return ["apple", "Steel", "green", "PRO", "mini", "ultra", "classic", "smart", "eco", "max"]
+}
+
+fn mk(i: int) -> Item {
+    let w = words()
+    return Item { id: i, group: rnd(5), name: "{w[rnd(10)]} {w[rnd(10)]} {rnd(100)}", price: rnd(100000).to_float() / 100.0, tags: [w[rnd(10)], w[rnd(10)]], ok: rnd(3) == 0 }
+}
+
+// чистая функция программы: можно звать из сливаемой лямбды
+fn cheap(x: Item) -> bool {
+    var n = 0
+    for t in x.tags {
+        if t.len() > 3 {
+            n += 1
+        }
+    }
+    return n >= 1 && x.price < 700.0
+}
+
+fn label(x: Item) -> str {
+    return "{x.group}:{x.name.lower()}"
+}
+
+// побочные действия
+fn seen(tag: str, x: Item) -> bool {
+    print("{tag} {x.id}")
+    return true
+}
+
+fn remember(x: Item) -> bool {
+    trace.push("r{x.id}")
+    return x.id % 2 == 0
+}
+
+fn bump(x: Item) -> bool {
+    calls += 1
+    return true
+}
+
+// два звена, каждое может вернуться из функции: без слияния первым
+// возвращается первое звено (оно проходит весь список раньше второго)
+fn two_returns(xs: [Item]) -> int {
+    let n = xs.filter(x => if x.id == 4 {
+        return 400
+    } else {
+        true
+    }).filter(x => if x.id == 1 {
+        return 100
+    } else {
+        true
+    }).len()
+    return n
+}
+
+// присваивание внутри блока лямбды: второе звено видит n после всего первого
+fn assigns(xs: [Item]) -> str {
+    var n = 0
+    let r = xs.filter(x => if true {
+        n += 1
+        n > 2
+    } else {
+        false
+    }).map(x => n)
+    return r.map(v => v.to_str()).join(",")
+}
+
+// изменяющий метод в лямбде
+fn pops(xs: [Item]) -> str {
+    let st = [1, 2, 3, 4, 5, 6, 7, 8]
+    let r = xs.map(x => st.pop()).map(y => y * 10 + st.len())
+    return r.map(v => v.to_str()).join(",")
+}
+
+fn ids(xs: [Item]) -> str {
+    return xs.map(x => x.id.to_str()).join(",")
+}
+
+fn early(xs: [Item]) -> int {
+    let n = xs.filter(x => if x.id > 1000 {
+        return -1
+    } else {
+        true
+    }).map(x => x.id).len()
+    return n
+}
+
+fn check(m: map[int, Item], s: map[str, Item], flags: map[str, bool], l: [Item], q: str, g: int) {
+    // filter
+    let a1 = m.values().filter(x => x.group == g && x.name.lower().contains(q))
+    let r0 = m.values()
+    let r1 = r0.filter(x => x.group == g && x.name.lower().contains(q))
+    print("filter {ids(a1) == ids(r1)} {a1.len()}")
+    // filter, filter, filter
+    let a2 = m.values().filter(x => x.price > 100.0).filter(x => x.ok || x.tags.contains("eco")).filter(x => cheap(x))
+    let r2a = r0.filter(x => x.price > 100.0)
+    let r2b = r2a.filter(x => x.ok || x.tags.contains("eco"))
+    let r2 = r2b.filter(x => cheap(x))
+    print("filter3 {ids(a2) == ids(r2)} {a2.len()}")
+    // map
+    let a3 = m.values().map(x => label(x))
+    let r3 = r0.map(x => label(x))
+    print("map {a3.join("|") == r3.join("|")} {a3.len()}")
+    // filter, map, count
+    let a4 = m.values().filter(x => x.ok).map(x => x.price * 2.0).count(p => p > 500.0)
+    let r4a = r0.filter(x => x.ok)
+    let r4b = r4a.map(x => x.price * 2.0)
+    print("count {a4 == r4b.count(p => p > 500.0)} {a4}")
+    // any, all, find
+    let a5 = m.values().any(x => x.group == g && x.price < 50.0)
+    print("any {a5 == r0.any(x => x.group == g && x.price < 50.0)} {a5}")
+    let a6 = m.values().filter(x => x.ok).all(x => x.price >= 1.0)
+    let r6 = r0.filter(x => x.ok)
+    print("all {a6 == r6.all(x => x.price >= 1.0)} {a6}")
+    let a7 = m.values().map(x => x.name).find(n => n.starts_with("eco"))
+    let r7 = r0.map(x => x.name)
+    print("find {(a7 ?? "-") == (r7.find(n => n.starts_with("eco")) ?? "-")} {a7 ?? "-"}")
+    let a7i = m.values().map(x => x.id * 3).find(v => v % 7 == 1)
+    let r7i = r0.map(x => x.id * 3)
+    print("find int {(a7i ?? -1) == (r7i.find(v => v % 7 == 1) ?? -1)} {a7i ?? -1}")
+    let a8 = m.values().find(x => x.id < 0)
+    print("find none {a8 == none}")
+    let a8b = m.values().filter(x => x.group == g).find(x => x.ok)
+    let r8b = r0.filter(x => x.group == g)
+    print("find after filter {(a8b?? mk(-1)).id == (r8b.find(x => x.ok) ?? mk(-1)).id}")
+    // sort_by: str, float, int, after map
+    let a9 = m.values().filter(x => x.group != g).sort_by(x => x.name)
+    let r9 = r0.filter(x => x.group != g)
+    r9.sort_by(x => x.name)
+    print("sort str {ids(a9) == ids(r9)}")
+    let a10 = m.values().sort_by(x => -x.price)
+    let r10 = r0.copy()
+    r10.sort_by(x => -x.price)
+    print("sort float {ids(a10) == ids(r10)}")
+    let a11 = m.values().map(x => x.group * 1000 + x.id % 7).sort_by(v => v)
+    let r11 = r0.map(x => x.group * 1000 + x.id % 7)
+    r11.sort_by(v => v)
+    print("sort int after map {a11.map(v => v.to_str()).join(",") == r11.map(v => v.to_str()).join(",")}")
+    // после sort_by цепочка идёт дальше обычным образом
+    let a12 = m.values().filter(x => x.ok).sort_by(x => x.price).map(x => x.id)
+    let r12 = r0.filter(x => x.ok)
+    r12.sort_by(x => x.price)
+    print("after sort {a12.map(v => v.to_str()).join(",") == r12.map(x => x.id.to_str()).join(",")}")
+    // str ключи, bool-значения
+    let b1 = s.values().filter(x => x.name.len() > 12).map(x => x.id)
+    let s0 = s.values()
+    let rb1 = s0.filter(x => x.name.len() > 12)
+    print("str keys {b1.map(v => v.to_str()).join(",") == rb1.map(x => x.id.to_str()).join(",")}")
+    let f0 = flags.values()
+    print("bools {flags.values().count(f => f) == f0.count(f => f)} {flags.values().filter(f => !f).len() == f0.filter(f => !f).len()} {flags.values().map(f => !f).count(f => f) == f0.count(f => !f)}")
+    // список bool — байтами
+    let fl = flags.values().filter(f => f)
+    let fm = l.map(x => x.ok).filter(f => !f)
+    print("bool lists {fl.count(f => f) == fl.len()} {fm.count(f => !f) == fm.len()} {fm.len() == l.count(x => !x.ok)}")
+    // списки: два звена и больше
+    let c1 = l.filter(x => x.ok).map(x => x.name)
+    let rc1 = l.filter(x => x.ok)
+    print("list {c1.join("|") == rc1.map(x => x.name).join("|")}")
+    let c2 = l.map(x => x.price).filter(p => p < 300.0).sort_by(p => p)
+    let rc2a = l.map(x => x.price)
+    let rc2 = rc2a.filter(p => p < 300.0)
+    rc2.sort_by(p => p)
+    print("list sort {c2.map(p => p.to_str()).join(",") == rc2.map(p => p.to_str()).join(",")}")
+    print("list any {l.filter(x => x.group == g).any(x => x.ok) == l.filter(x => x.group == g).copy().any(x => x.ok)}")
+    // исходный список не меняется
+    let before = ids(l)
+    let c3 = l.filter(x => x.id >= 0).sort_by(x => x.name)
+    print("source kept {ids(l) == before} {c3.len() == l.len()}")
+}
+
+fn main() {
+    for round in 0..6 {
+        var m: map[int, Item] = {}
+        var s: map[str, Item] = {}
+        var flags: map[str, bool] = {}
+        var l: [Item] = []
+        let n = [0, 1, 7, 40, 200, 1000][round]
+        for i in 0..n {
+            let it = mk(i)
+            m[i] = it
+            s["k{i}"] = it
+            flags["f{i}"] = it.ok
+            l.push(it)
+        }
+        // удалённые записи — дыры в массивах словаря
+        for i in 0..n / 5 {
+            m.remove(rnd(n))
+            s.remove("k{rnd(n)}")
+            flags.remove("f{rnd(n)}")
+        }
+        print("round {round}: {m.len()} items")
+        check(m, s, flags, l, ["", "e", "pro", "apple g", "zzz"][rnd(5)], rnd(5))
+    }
+
+    // побочные действия — цепочка не сливается: первое звено целиком, потом второе
+    var m: map[int, Item] = {}
+    for i in 0..6 {
+        m[i] = mk(i)
+    }
+    print(m.values().filter(x => seen("a", x)).filter(x => seen("b", x)).len())
+    print(m.values().filter(x => x.id < 4).map(x => seen("m", x)).count(v => v))
+    let xs = m.values()
+    print(xs.filter(x => remember(x)).filter(x => remember(x)).len())
+    print(trace.join(","))
+    print(early(xs))
+    print(two_returns(xs))
+    print(assigns(xs))
+    print(pops(xs))
+    print(xs.filter(x => bump(x)).map(x => calls).map(v => v.to_str()).join(","))
+    m[2000] = mk(2000)
+    print(early(m.values()))
+}

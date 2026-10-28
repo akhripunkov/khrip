@@ -418,3 +418,173 @@ fn route_reads_only(r: Route) -> bool {
     }
     return r.fi < rw_writes.len() && rw_writes[r.fi] == 0
 }
+
+// ============================================================================
+// Лямбды без побочных действий (слияние цепочек, src/variant.kh). Цепочку
+// m.values().filter(f).map(g)... можно вычислять поэлементно одним проходом,
+// только если ни одна её лямбда ничего не меняет и ни с чем не общается:
+// тогда порядок вычисления лямбд не виден, кроме паники (её текст — у первого
+// по порядку обхода элемента, на котором она случилась). Анализ по лексемам и
+// консервативный: всё, в чём он не уверен, — побочное действие. В теле лямбды
+// побочные действия:
+//   - любое присваивание (бывает в блоке-значении if или match);
+//   - изменяющий метод (push, sort_by, ...) у чего угодно;
+//   - return, break, continue (выход из цикла посреди цепочки), sql и ch,
+//     fetch, call, tx;
+//   - вызов функции библиотеки не из списка чистых (print, now, random_str,
+//     fail, sleep, драйверы...) или неизвестной функции;
+//   - вызов функции программы, у которой они есть (ниже).
+// Функция программы чиста, если в её теле нет этого же, но присваивать ей
+// можно своим локальным, а менять свежие локальные коллекции (как в анализе
+// чтения выше: литералы, filter, map, ...), и return у неё свой; и если все
+// функции, которые она вызывает, чисты (неподвижная точка, рекурсия — чиста).
+// ============================================================================
+
+// По функциям программы: 0 — чистая, 1 — нет.
+var fx_impure: [int]
+var fx_done: bool
+
+// Функции библиотеки без побочных действий: ответ зависит только от
+// аргументов (и от окружения процесса — env); __to_str — подстановка в
+// строку "{x}".
+fn fx_pure_lib(name: str) -> bool {
+    return name == "__to_str" || name == "time_iso" || name == "parse_time" || name == "parse_date" || name == "to_json" || name == "sha256" || name == "url_encode" || name == "env"
+}
+
+// Побочные действия в лексемах [a, b) тела: лямбды (in_fn = false) или
+// функции fi (in_fn = true; body, end — её тело). Вызванные функции программы —
+// в callees (их чистоту решает fx_analyze).
+fn fx_scan(a: int, b: int, in_fn: bool, body: int, end: int, callees: [int]) -> bool {
+    var i = a
+    while i < b {
+        let t = toks[i]
+        let k = t.kind
+        if k == T_SQL || k == T_CALL {
+            return true
+        }
+        if !in_fn && (k == T_RETURN || k == T_BREAK || k == T_CONTINUE) {
+            return true
+        }
+        if rw_is_assign(k) {
+            if !in_fn || fx_assign_effect(i, body, end) {
+                return true
+            }
+        } else if k == T_IDENT {
+            if t.text == "fetch" || (t.text == "tx" && kind_at(i + 1) == '\{') {
+                return true
+            }
+            let sym = sym_find(t.text)
+            if sym >= 0 && (sym_kind(sym) == SK_TABLE || sym_kind(sym) == SK_CONN) && toks[i - 1].kind != '.' {
+                // таблица или соединение базы (и локальная с тем же именем)
+                return true
+            }
+            if kind_at(i + 1) == '(' {
+                let after_dot = toks[i - 1].kind == '.'
+                if after_dot && rw_mutating(t.text) {
+                    if !in_fn || !rw_fresh_at(i - 2, rw_recv_start(i - 2), body, end, 0) {
+                        return true
+                    }
+                }
+                if sym >= 0 && sym_kind(sym) == SK_FN {
+                    let f = sym_idx(sym)
+                    if funcs[f].is_lib {
+                        if !fx_pure_lib(t.text) {
+                            return true
+                        }
+                    } else {
+                        callees.push(f)
+                    }
+                } else if !after_dot && t.text != "__to_str" {
+                    // встроенная функция компилятора или неизвестное имя
+                    return true
+                }
+            }
+        }
+        i += 1
+    }
+    return false
+}
+
+// Присваивание в позиции i внутри тела функции [body, end) меняет что-то
+// кроме её локальных: глобальную или store, поле или элемент не свежей
+// локальной (как в rw_scan).
+fn fx_assign_effect(i: int, body: int, end: int) -> bool {
+    var s = i - 1
+    while s > body && toks[s - 1].line == toks[i].line && toks[s - 1].kind != '\{' && toks[s - 1].kind != '}' {
+        s -= 1
+    }
+    var j = s
+    while j < i {
+        if toks[j].kind == T_LET || toks[j].kind == T_VAR {
+            return false
+        }
+        j += 1
+    }
+    let st = toks[s]
+    if st.kind != T_IDENT {
+        return true
+    }
+    let sym = sym_find(st.text)
+    if sym >= 0 && sym_kind(sym) == SK_GLOBAL {
+        return true
+    }
+    if i == s + 1 {
+        return false
+    }
+    if !rw_fresh_local(st.text, body, end, 0) {
+        return true
+    }
+    return !((toks[s + 1].kind == '[' && matching_close(s + 1) == i - 1) || (toks[s + 1].kind == '.' && i == s + 3))
+}
+
+fn fx_analyze() {
+    fx_done = true
+    var from: [int] = []
+    var to: [int] = []
+    var f = 0
+    while f < funcs.len() {
+        var w = 1
+        if funcs[f].body >= 0 && !funcs[f].is_lib {
+            var cs: [int] = []
+            w = 0
+            if fx_scan(funcs[f].body, funcs[f].body_end, true, funcs[f].body, funcs[f].body_end, cs) {
+                w = 1
+            }
+            for c in cs {
+                from.push(f)
+                to.push(c)
+            }
+        }
+        fx_impure.push(w)
+        f += 1
+    }
+    var changed = true
+    while changed {
+        changed = false
+        var e = 0
+        while e < from.len() {
+            if fx_impure[to[e]] == 1 && fx_impure[from[e]] == 0 {
+                fx_impure[from[e]] = 1
+                changed = true
+            }
+            e += 1
+        }
+    }
+}
+
+// Тело лямбды — лексемы [a, b) — без побочных действий.
+fn lambda_pure(a: int, b: int) -> bool {
+    if !fx_done {
+        fx_analyze()
+    }
+    var cs: [int] = []
+    if fx_scan(a, b, false, a, b, cs) {
+        return false
+    }
+    for c in cs {
+        if c >= fx_impure.len() || fx_impure[c] == 1 {
+            return false
+        }
+    }
+    return true
+}

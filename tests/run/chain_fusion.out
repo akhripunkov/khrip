@@ -1,0 +1,158 @@
+round 0: 0 items
+filter true 0
+filter3 true 0
+map true 0
+count true 0
+any true false
+all true true
+find true -
+find int true -1
+find none true
+find after filter true
+sort str true
+sort float true
+sort int after map true
+after sort true
+str keys true
+bools true true true
+bool lists true true true
+list true
+list sort true
+list any true
+source kept true true
+round 1: 1 items
+filter true 0
+filter3 true 0
+map true 1
+count true 0
+any true false
+all true true
+find true -
+find int true -1
+find none true
+find after filter true
+sort str true
+sort float true
+sort int after map true
+after sort true
+str keys true
+bools true true true
+bool lists true true true
+list true
+list sort true
+list any true
+source kept true true
+round 2: 6 items
+filter true 1
+filter3 true 2
+map true 6
+count true 2
+any true false
+all true true
+find true -
+find int true 15
+find none true
+find after filter true
+sort str true
+sort float true
+sort int after map true
+after sort true
+str keys true
+bools true true true
+bool lists true true true
+list true
+list sort true
+list any true
+source kept true true
+round 3: 34 items
+filter true 0
+filter3 true 10
+map true 34
+count true 9
+any true false
+all true true
+find true eco eco 51
+find int true 15
+find none true
+find after filter true
+sort str true
+sort float true
+sort int after map true
+after sort true
+str keys true
+bools true true true
+bool lists true true true
+list true
+list sort true
+list any true
+source kept true true
+round 4: 163 items
+filter true 38
+filter3 true 37
+map true 163
+count true 35
+any true true
+all true true
+find true eco apple 78
+find int true 15
+find none true
+find after filter true
+sort str true
+sort float true
+sort int after map true
+after sort true
+str keys true
+bools true true true
+bool lists true true true
+list true
+list sort true
+list any true
+source kept true true
+round 5: 823 items
+filter true 150
+filter3 true 182
+map true 823
+count true 188
+any true true
+all true true
+find true eco green 19
+find int true 15
+find none true
+find after filter true
+sort str true
+sort float true
+sort int after map true
+after sort true
+str keys true
+bools true true true
+bool lists true true true
+list true
+list sort true
+list any true
+source kept true true
+a 0
+a 1
+a 2
+a 3
+a 4
+a 5
+b 0
+b 1
+b 2
+b 3
+b 4
+b 5
+6
+m 0
+m 1
+m 2
+m 3
+4
+3
+r0,r1,r2,r3,r4,r5,r0,r2,r4
+6
+400
+6,6,6,6
+82,72,62,52,42,32
+6,6,6,6,6,6
+-1

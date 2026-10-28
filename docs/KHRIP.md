@@ -135,6 +135,15 @@ Any function is also a method of its first argument: `p.describe()`.
 - `map[K, V]`: `len has get remove keys values clear`, `m[k]` (V?), `m[k] = v`;
   keys and values come in insertion order
 
+Chains run element by element, like LINQ, Rust iterators and Java Streams:
+in `m.values().filter(f).map(g).count(h)` each item goes through `f`, `g`
+and `h` before the next item, and no lists are built in between; `any`,
+`all` and `find` stop at the item that decides the answer. You only see this
+when lambdas panic: the panic comes from the first item (in order) that
+panics. Lambdas with side effects (assignments, printing, store writes,
+`fetch`, databases, `fail`, `return`, or calling a function that does any of
+these) are not chained: each method then runs over the whole list in turn.
+
 Functions: `print(s)`, `eprint(s)`, `write(s)`, `args()`, `env(name) -> str?`,
 `read_file(path) -> str?`, `write_file(path, text, executable) -> bool`,
 `exit(code)`, `sleep(ms)`, `now()` (unix seconds), `now_ms()`, `time_iso(t)` →

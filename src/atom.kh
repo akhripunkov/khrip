@@ -2282,6 +2282,11 @@ fn parse_method(rt: int, nt: Token) -> int {
     if k == K_LIST {
         tt = ty_elem(rt)
         if is_lambda_method(name) {
+            // два звена и больше без побочных действий — одним проходом
+            let links = chain_links(pos - 2)
+            if links.len() >= 2 && chain_pure(links) {
+                return parse_fused(rt, false, links)
+            }
             return parse_lambda_method(rt, nt)
         }
         if name == "contains" || name == "sort" || name == "index_of" {
@@ -2462,6 +2467,16 @@ fn parse_map_method(rt: int, nt: Token) -> int {
     let name = nt.text
     let kt = types[rt].a
     let vt = types[rt].b
+    if name == "values" && kind_at(pos + 1) == ')' {
+        // m.values().filter(...)... без побочных действий — проход прямо по
+        // массивам словаря, без списка values() (src/variant.kh, parse_fused)
+        let links = chain_links(pos + 2)
+        if links.len() >= 1 && chain_pure(links) {
+            advance()
+            advance()
+            return parse_fused(rt, true, links)
+        }
+    }
     emit_push(RAX)
     advance()
     var argc = 0
