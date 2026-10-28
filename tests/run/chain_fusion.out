@@ -156,3 +156,6 @@ r0,r1,r2,r3,r4,r5,r0,r2,r4
 82,72,62,52,42,32
 6,6,6,6,6,6
 -1
+shadow_push: true log=6
+qq_next: true n=6
+named_copy: true items=6

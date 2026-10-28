@@ -1,0 +1,360 @@
+// Анализ чтения после ревью этапа скорости (часть 2): каждый маршрут, кроме
+// отмеченных read, меняет store — через псевдоним, который по лексемам
+// похож на свежее значение. Ложное read — гонка данных.
+//   - выражение кончается там, где его кончает парсер: ?? и постфиксы на
+//     следующей строке — то же выражение, ; лексер отбрасывает;
+//   - цель присваивания — по лексемам назад от =, а не от начала строки
+//     (let t = 1; c.name = v — поле c); объявление — только если тип между
+//     именем и = разбирается, как в parse_type (var x: [int]; m[k] = v — не
+//     объявление);
+//   - имя параметра, глобальной или store не судится по let/var в теле
+//     (локальная во вложенном блоке — другое имя);
+//   - имя с двумя объявлениями — не свежее (по лексемам их не различить);
+//   - x.values() и x.copy() не свежие, если в программе есть своя функция
+//     с этим именем (tests/locks/rw_named.kh).
+
+type Cat { name: str, count: int, ids: [int] }
+type Box { n: int, tags: [str] }
+type Shape = Circle { c: Cat } | Empty
+
+store items: map[int, Cat]
+store groups: map[str, Cat]
+store lists: map[str, [int]]
+store clists: map[str, [Cat]]
+store nested: map[str, map[str, Cat]]
+store boxes: map[str, Box]
+store log: [str]
+
+route POST "/init" -> int {
+    boxes["a"] = Box { n: 0, tags: [] }
+    lists["a"] = []
+    return 1
+}
+
+// ?? в начале следующей строки
+route GET "/qq-nextline" -> int {
+    var cats: map[str, Cat] = {}
+    let c = cats["a"]
+        ?? groups["a"] ?? Cat { name: "a", count: 0, ids: [] }
+    c.count += 1
+    cats["a"] = c
+    return 1
+}
+
+// то же, но обе части свежие — read
+route GET "/qq-nextline-fresh" -> int {
+    var cats: map[str, Cat] = {}
+    let c = cats["a"]
+        ?? Cat { name: "a", count: 0, ids: [] }
+    c.count += 1
+    cats["a"] = c
+    return 1
+}
+
+route GET "/bump" -> int {
+    var seen: map[str, Box] = {}
+    let b = seen["a"]
+        ?? boxes["a"] ?? Box { n: 0, tags: [] }
+    b.n += 1
+    seen["a"] = b
+    return b.n
+}
+
+route GET "/push" -> int {
+    var seen: map[str, [int]] = {}
+    let xs = seen["a"]
+        ?? lists["a"] ?? []
+    xs.push(1)
+    return xs.len()
+}
+
+route GET "/tag" -> int {
+    var seen: map[str, Box] = {}
+    let b = seen["a"]
+        ?? boxes["a"] ?? Box { n: 0, tags: [] }
+    b.tags = ["x", "y"]
+    return b.tags.len()
+}
+
+// только читает — read
+route GET "/stat" -> str {
+    let b = boxes["a"] ?? Box { n: -1, tags: [] }
+    let xs = lists["a"] ?? []
+    return "{b.n} {xs.len()}"
+}
+
+route GET "/cache-list/{k}" (k: str) -> int {
+    var seen: map[str, [int]] = {}
+    let xs = seen[k]
+        ?? lists[k]
+        ?? []
+    xs.push(1)
+    seen[k] = xs.copy()
+    return xs.len()
+}
+
+// в «свежий» словарь кладут из store через ?? на следующей строке
+route GET "/fill" -> int {
+    var other: map[str, Cat] = {}
+    var cats: map[str, Cat] = {}
+    cats["a"] = other["a"]
+        ?? groups["a"] ?? Cat { name: "a", count: 0, ids: [] }
+    let c = cats["a"] ?? Cat { name: "a", count: 0, ids: [] }
+    c.count += 1
+    return 1
+}
+
+// индекс на следующей строке: [список store][0] — сам список store
+route GET "/index-nextline" -> int {
+    let xs = [lists["a"] ?? []]
+        [0]
+    xs.push(1)
+    return 1
+}
+
+// ; лексер отбрасывает: c.name = "x" — не часть объявления let t
+route GET "/semi" -> int {
+    let c = groups["a"] else {
+        return 0
+    }
+    let t = 1; c.name = "x"
+    return t
+}
+
+// var x: [int] без значения: = после него — уже следующий оператор, запись в
+// store
+route GET "/typed-semi/{k}" (k: str) -> int {
+    var x: [int]; lists[k] = [1]
+    return x.len()
+}
+
+route GET "/typed-semi-map/{k}" (k: str) -> int {
+    var x: map[str, [int]]; lists[k] = [1]
+    return x.len()
+}
+
+// присваивание имени не в начале строки
+route GET "/reassign-semi" -> int {
+    var c = Cat { name: "", count: 0, ids: [] }
+    let t = 1; c = groups["a"] ?? Cat { name: "", count: 0, ids: [] }
+    c.count += 1
+    return t
+}
+
+// глобальная store, а локальная с тем же именем — позже
+route GET "/shadow-later" -> int {
+    let c = groups["a"] ?? Cat { name: "a", count: 0, ids: [] }
+    c.count += 1
+    var groups: map[str, Cat] = {}
+    groups["b"] = Cat { name: "b", count: 0, ids: [] }
+    return groups.len()
+}
+
+// ... или во вложенном блоке
+route GET "/shadow-block" -> int {
+    if items.len() > 1000000 {
+        var groups: map[str, Cat] = {}
+        groups["b"] = Cat { name: "b", count: 0, ids: [] }
+    }
+    let c = groups["a"] ?? Cat { name: "a", count: 0, ids: [] }
+    c.count += 1
+    return 1
+}
+
+route GET "/shadow-list" -> int {
+    let xs = lists["a"] ?? []
+    xs.push(1)
+    var lists: map[str, [int]] = {}
+    return lists.len()
+}
+
+route GET "/pre-global" -> int {
+    log.push("x")
+    if log.len() > 1000000 {
+        let log: [str] = []
+    }
+    return 1
+}
+
+// параметр и локальная с тем же именем во вложенном блоке
+fn bump_list(ls: map[str, [int]], k: str) {
+    let xs = ls[k] ?? []
+    xs.push(1)
+    if k == "never" {
+        var ls: map[str, [int]] = {}
+        ls["x"] = [1]
+    }
+}
+
+route GET "/param-shadow/{k}" (k: str) -> int {
+    bump_list(lists, k)
+    return 1
+}
+
+fn bump_param(xs: [int]) {
+    xs.push(1)
+    if xs.len() > 1000000 {
+        let xs: [int] = []
+    }
+}
+
+route GET "/param-shadow2/{k}" (k: str) -> int {
+    let xs = lists[k] else {
+        return 0
+    }
+    bump_param(xs)
+    return 1
+}
+
+// два объявления одного имени — не свежее, даже если оба свежие (по лексемам
+// не понять, к какому относится упоминание) — write
+route GET "/decl-twice" -> int {
+    if groups.len() > 0 {
+        let xs: [int] = []
+        xs.push(1)
+    }
+    let xs: [int] = [2]
+    xs.push(3)
+    return xs.len()
+}
+
+route GET "/elem-twice" -> int {
+    if groups.len() > 0 {
+        var cats: map[str, Cat] = {}
+        cats["a"] = Cat { name: "", count: 0, ids: [] }
+    }
+    var cats: map[str, Cat] = {}
+    cats["b"] = Cat { name: "", count: 0, ids: [] }
+    let c = cats["b"] ?? Cat { name: "", count: 0, ids: [] }
+    c.count += 1
+    return 1
+}
+
+route GET "/var-loop" -> int {
+    var c = Cat { name: "", count: 0, ids: [] }
+    for it in groups.values() {
+        c = it
+    }
+    c.count += 1
+    return 1
+}
+
+route GET "/var-loop-local" -> int {
+    var cats: map[str, Cat] = {}
+    var c = Cat { name: "", count: 0, ids: [] }
+    for it in groups.values() {
+        c = cats[it.name] ?? it
+    }
+    c.count += 1
+    return 1
+}
+
+route GET "/if-expr" -> int {
+    var cats: map[str, Cat] = {}
+    let c = if cats.len() > 0 { cats["a"] ?? Cat { name: "", count: 0, ids: [] } } else { groups["a"] ?? Cat { name: "", count: 0, ids: [] } }
+    c.count += 1
+    return 1
+}
+
+route GET "/match-expr" -> int {
+    var cats: map[str, Cat] = {}
+    let s: Shape = Empty
+    let c = match s {
+        Circle x => x.c
+        Empty => cats["a"] ?? Cat { name: "", count: 0, ids: [] }
+    }
+    c.count += 1
+    return 1
+}
+
+route GET "/spread" -> int {
+    var cats: map[str, Cat] = {}
+    let g = groups["a"] ?? Cat { name: "", count: 0, ids: [] }
+    cats["a"] = Cat { ...g }
+    let c = cats["a"] ?? Cat { name: "", count: 0, ids: [] }
+    c.count += 1
+    c.ids.push(1)
+    return 1
+}
+
+route GET "/list-lit" -> int {
+    var cats: map[str, [Cat]] = {}
+    cats["a"] = [groups["a"] ?? Cat { name: "", count: 0, ids: [] }]
+    let xs = cats["a"] ?? []
+    xs[0].count += 1
+    return 1
+}
+
+route GET "/values-elem" -> int {
+    var cats: map[str, [Cat]] = {}
+    cats["a"] = groups.values()
+    let xs = cats["a"] ?? []
+    xs.push(Cat { name: "", count: 0, ids: [] })
+    let c = xs[0]
+    c.count += 1
+    return 1
+}
+
+route GET "/nested-map" -> int {
+    var cats: map[str, map[str, Cat]] = {}
+    cats["a"] = nested["a"] ?? {}
+    let inner = cats["a"] ?? {}
+    inner["x"] = Cat { name: "", count: 0, ids: [] }
+    return 1
+}
+
+route GET "/nested-map2" -> int {
+    var cats: map[str, map[str, Cat]] = {}
+    cats["a"] = {}
+    let inner = cats["a"] ?? {}
+    inner["x"] = groups["z"] ?? Cat { name: "", count: 0, ids: [] }
+    let c = inner["x"] ?? Cat { name: "", count: 0, ids: [] }
+    c.count += 1
+    return 1
+}
+
+// копия списка store — новый список: read
+route GET "/copy-list" -> int {
+    var cats: map[str, [Cat]] = {}
+    let src = clists["a"] ?? []
+    cats["a"] = src.copy()
+    let xs = cats["a"] ?? []
+    xs.push(Cat { name: "", count: 0, ids: [] })
+    return xs.len()
+}
+
+route GET "/nocopy-list" -> int {
+    var cats: map[str, [Cat]] = {}
+    let src = clists["a"] ?? []
+    cats["a"] = src
+    let xs = cats["a"] ?? []
+    xs.push(Cat { name: "", count: 0, ids: [] })
+    return xs.len()
+}
+
+fn get_store(k: str) -> Cat? {
+    return groups[k]
+}
+
+route GET "/helper" -> int {
+    var cats: map[str, Cat] = {}
+    cats["a"] = get_store("a") ?? Cat { name: "", count: 0, ids: [] }
+    let c = cats["a"] ?? Cat { name: "", count: 0, ids: [] }
+    c.count += 1
+    return 1
+}
+
+route GET "/lambda-capture" -> int {
+    var cats: map[str, Cat] = {}
+    let n = groups.values().filter(g => g.count > 0).map(g => g.name).len()
+    let c = cats["a"] ?? groups.values().find(g => g.count > 0) ?? Cat { name: "", count: 0, ids: [] }
+    c.count += 1
+    return n
+}
+
+route GET "/paren" -> int {
+    var cats: map[str, Cat] = {}
+    let c = (cats["a"] ?? groups["a"]) ?? Cat { name: "", count: 0, ids: [] }
+    c.count += 1
+    return 1
+}

@@ -18,6 +18,8 @@
 #                       ещё раз — с проверками сборщика (KHRIP_GC_VERIFY=1:
 #                       граф и куча store после загрузки и каждого теста);
 #   tests/locks/*.kh  — какие маршруты берут store на чтение (khc check --locks);
+#   tests/rw_gen.py   — то же на сгенерированных маршрутах, которые меняют store
+#                       через псевдонимы: ни одного read;
 #   tests/sqlcheck/   — правильный SQL: khc check без базы не находит ошибок;
 #   tests/chcheck/    — то же для ch "..." и таблиц ClickHouse (PostgreSQL их
 #                       не подтверждает, поэтому отдельно от tests/sqlcheck);
@@ -527,7 +529,28 @@ CUTS
 #   rwelemescape — словарь можно упоминать как угодно (псевдоним);
 #   rwelemdecl — словарь можно объявить любым литералом;
 #   rwelemstack — без предположения о своих элементах (свёртка — write);
-#   rwlambda — параметр лямбды с тем же именем — всегда другое имя.
+#   rwlambda — параметр лямбды с тем же именем — всегда другое имя;
+# границы выражений и имён (после ревью; tests/locks/rw_aliases.kh,
+# tests/locks/rw_named.kh — locks):
+#   rwscanline — выражение кончается с концом строки (?? в начале следующей
+#                строки парсер присоединяет);
+#   rwscanpost — постфиксы .имя, [..] на следующей строке не видны;
+#   rwunsafeparam — имя параметра судится по let/var в теле;
+#   rwunsafeglobal — то же для глобальной и store;
+#   rwdecltwice — имя с двумя объявлениями свежее, если свежи оба;
+#   rwrootsemi — присваивание в строке, которая начинается с let (через ;), —
+#                «объявление»;
+#   rwreassign — присваивание имени видно только в начале строки;
+#   rwdecltype — тип в let/var x: тип = — любые имена и скобки до = (var x:
+#                [int]; m[k] = v — «объявление» x);
+#   rwuserfn — x.values() свежее и при своей функции values;
+#   rwunsafeglobal, rwscanline, rwuserfn — и в анализе чистоты
+#   (tests/run/chain_fusion.kh, named_cases — run);
+# методы встроенных типов (tests/errors/internal_method.kh,
+# tests/errors/join_not_str.kh — check):
+#   methodallow — в программе можно звать и внутренние __list_*, __int_*
+#                 (xs.slice, n.to_f64_bits);
+#   methodrecv — получатель не сверяется с первым параметром ([1].join).
 comp_ok=1
 while read -r cut test mode; do
 	[[ -z $cut ]] && continue
@@ -553,7 +576,7 @@ cuts = {
     "fusereturn": ("rw.kh", "        if !in_fn && (k == T_RETURN || k == T_BREAK || k == T_CONTINUE) {", "        if false {"),
     "fusecallee": ("rw.kh", "    for c in cs {\n        if c >= fx_impure.len() || fx_impure[c] == 1 {", "    for c in cs {\n        if false {"),
     "fuselib": ("rw.kh", "fn fx_pure_lib(name: str) -> bool {\n", "fn fx_pure_lib(name: str) -> bool {\n    return true\n"),
-    "fuseglobal": ("rw.kh", "    if sym >= 0 && sym_kind(sym) == SK_GLOBAL {\n        return true\n    }\n    if i == s + 1 {", "    if i == s + 1 {"),
+    "fuseglobal": ("rw.kh", "    if sym >= 0 && sym_kind(sym) == SK_GLOBAL {\n        return true\n    }\n    if root == i - 1 {", "    if root == i - 1 {"),
     "fusemut": ("rw.kh", "                    if !in_fn || !rw_fresh_at(i - 2, rw_recv_start(i - 2), body, end, 0) {", "                    if in_fn && !rw_fresh_at(i - 2, rw_recv_start(i - 2), body, end, 0) {"),
     "fusealive": ("variant.kh", "        emit_movzx_index()\n        emit_test_rax()\n        nexts.push(emit_jcc(CC_E))\n        emit_local_to_rcx(idx)\n", "        emit_movzx_index()\n        emit_test_rax()\n        emit_local_to_rcx(idx)\n"),
     "fusecount": ("variant.kh", "        emit_load_local(src)\n        emit_mem_sized(0x8B, RCX, RAX, 48, false)", "        emit_load_local(src)\n        emit_mem_sized(0x8B, RCX, RAX, 8, false)"),
@@ -565,11 +588,22 @@ cuts = {
     "fuseesize": ("variant.kh", "    if makes_list {\n        put32_at(code + esize_at, esize_of(et))\n    }\n", ""),
     "rwqqleft": ("rw.kh", "            return rw_fresh_at(q - 1, a, body, end, depth + 1) && rw_fresh_at(last, q + 1, body, end, depth + 1)", "            return rw_fresh_at(last, q + 1, body, end, depth + 1)"),
     "rwqqoff": ("rw.kh", "        let q = rw_top_qq(a, last)\n", "        let q = -1\n"),
-    "rwelemstore": ("rw.kh", "                    if !rw_fresh_at(e - 1, close + 2, body, end, depth + 1) {\n                        return false\n                    }\n", ""),
+    "rwelemstore": ("rw.kh", "                    if !rw_fresh_expr(close + 2, body, end, depth + 1) {\n                        return false\n                    }\n", ""),
     "rwelemescape": ("rw.kh", "            } else if pk == T_IN && nk == '\\{' {\n            } else {\n                return false\n            }", "            }"),
-    "rwelemdecl": ("rw.kh", "                if j + 2 >= end || toks[j].kind != '=' || toks[j + 1].kind != '\\{' || toks[j + 2].kind != '}' || (toks[j + 3].line == toks[j + 2].line && toks[j + 3].kind != '}') {", "                if j >= end || toks[j].kind != '=' {"),
+    "rwelemdecl": ("rw.kh", "                if found || j < 0 || j + 2 >= end || toks[j + 1].kind != '\\{' || toks[j + 2].kind != '}' || rw_expr_scan(j + 1, end) != j + 3 {", "                if found || j < 0 {"),
     "rwelemstack": ("rw.kh", "        if s == name {\n            return true\n        }", "        if s == name {\n            return false\n        }"),
     "rwlambda": ("rw.kh", "            } else if nk == T_FATARROW && pk == '(' && at >= 0 && (at < i || at > matching_close(i - 1)) {", "            } else if nk == T_FATARROW && pk == '(' {"),
+    "rwscanline": ("rw.kh", "        if i < limit && rw_binop(toks[i].kind) {\n            i += 1", "        if i < limit && rw_binop(toks[i].kind) && toks[i].line == toks[i - 1].line {\n            i += 1"),
+    "rwscanpost": ("rw.kh", "        // постфиксы\n        while i < limit {", "        // постфиксы\n        while i < limit && toks[i].line == toks[i - 1].line {"),
+    "rwunsafeparam": ("rw.kh", "            for p in funcs[f].params {\n                if p.name == name {\n                    return true\n                }\n            }\n", ""),
+    "rwunsafeglobal": ("rw.kh", "    let sym = sym_find(name)\n    if sym >= 0 && sym_kind(sym) == SK_GLOBAL {\n        return true\n    }\n    var f = 0", "    var f = 0"),
+    "rwdecltwice": ("rw.kh", "                decls += 1\n                if decls > 1 {\n                    return false\n                }\n", "                decls = 1\n"),
+    "rwrootsemi": ("rw.kh", "    let root = rw_assign_root(i, body)\n    if root == -2 {", "    let root = rw_assign_root(i, body)\n    var s = i\n    while s > body && toks[s - 1].line == toks[i].line {\n        s -= 1\n    }\n    if root == -2 || toks[s].kind == T_LET || toks[s].kind == T_VAR {"),
+    "rwdecltype": ("rw.kh", "        j = rw_type_end(j + 1, end)\n        if j < 0 {\n            return -1\n        }\n", "        j += 1\n        while j < end && (toks[j].kind == T_IDENT || toks[j].kind == '[' || toks[j].kind == ']' || toks[j].kind == ',' || toks[j].kind == '?') {\n            j += 1\n        }\n"),
+    "rwreassign": ("rw.kh", "            } else if nk == '=' {\n                // присваивание имени", "            } else if nk == '=' && toks[i - 1].line != toks[i].line {\n                // присваивание имени"),
+    "rwuserfn": ("rw.kh", "    let f = func_find(name)\n    return f >= 0 && !funcs[f].is_lib", "    return false"),
+    "methodallow": ("atom.kh", "    } else if prefix.byte_len() > 0 && (system_code(nt) || builtin_method(k, name)) {", "    } else if prefix.byte_len() > 0 {"),
+    "methodrecv": ("atom.kh", "            if !assignable(rt, pt) {\n                var hint = \"\"", "            if false {\n                var hint = \"\""),
 }
 f, old, new = cuts[m]
 s = open(f"{d}/{f}").read()
@@ -589,6 +623,14 @@ PY
 	fi
 	if [[ $mode == locks ]]; then
 		{ KHRIP_LIB="$PWD/lib" timeout 120 "$tmp/mkhc" check --locks "$test" >"$tmp/mout.txt" 2>&1; } 2>/dev/null
+	elif [[ $mode == check ]]; then
+		# ошибка компиляции, которой ждёт тест, должна пропасть
+		if KHRIP_LIB="$PWD/lib" timeout 120 "$tmp/mkhc" check "$test" >"$tmp/mout.txt" 2>&1; then
+			continue
+		fi
+		comp_ok=0
+		failed "оптимизации компилятора ($cut)" "$test не компилируется и без проверяемого условия: $(cat "$tmp/mout.txt")"
+		continue
 	elif [[ $mode == test ]]; then
 		{ KHRIP_LIB="$PWD/lib" env -u KHRIP_GC_VERIFY -u KHRIP_GC_STRESS timeout 300 "$tmp/mkhc" test "$test" >"$tmp/mout.txt" 2>&1; } 2>/dev/null
 	else
@@ -633,6 +675,20 @@ rwelemescape tests/locks/fresh_maps.kh locks
 rwelemdecl tests/locks/fresh_maps.kh locks
 rwelemstack tests/locks/fresh_maps.kh locks
 rwlambda tests/locks/fresh_maps.kh locks
+rwscanline tests/locks/rw_aliases.kh locks
+rwscanpost tests/locks/rw_aliases.kh locks
+rwunsafeparam tests/locks/rw_aliases.kh locks
+rwunsafeglobal tests/locks/rw_aliases.kh locks
+rwdecltwice tests/locks/rw_aliases.kh locks
+rwrootsemi tests/locks/rw_aliases.kh locks
+rwreassign tests/locks/rw_aliases.kh locks
+rwdecltype tests/locks/rw_aliases.kh locks
+rwuserfn tests/locks/rw_named.kh locks
+rwunsafeglobal tests/run/chain_fusion.kh run
+rwscanline tests/run/chain_fusion.kh run
+rwuserfn tests/run/chain_fusion.kh run
+methodallow tests/errors/internal_method.kh check
+methodrecv tests/errors/join_not_str.kh check
 CUTS
 [[ $comp_ok -eq 1 ]] && pass=$((pass + 1))
 # Слияние срабатывает: в eval/solutions/bookings все values() — в цепочках
@@ -849,6 +905,18 @@ for src in tests/locks/*.kh; do
 		continue
 	fi
 	pass=$((pass + 1))
+done
+# Сгенерированные программы (tests/rw_gen.py): сотни маршрутов, где значение
+# store доходит до локальной через ?? на следующей строке, ;, скобки, if и
+# match, свежие словари, с приманками — локальными с именем store или
+# параметра, вторым объявлением, своей функцией copy. Ни одного ложного read.
+mkdir -p "$tmp/rw_gen"
+for seed in 1 2 3; do
+	if python3 tests/rw_gen.py "$KHC" "$tmp/rw_gen" "$seed" >"$tmp/rw_gen.txt" 2>&1; then
+		pass=$((pass + 1))
+	else
+		failed "tests/rw_gen.py (seed $seed)" "$(tail -20 "$tmp/rw_gen.txt")"
+	fi
 done
 
 # Библиотеки драйверов — только программам, которые пользуются их именами:

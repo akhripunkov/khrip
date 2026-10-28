@@ -29,14 +29,22 @@ fn rw_mutating(name: str) -> bool {
     return name == "push" || name == "pop" || name == "insert" || name == "remove_at" || name == "clear" || name == "truncate" || name == "reverse" || name == "sort" || name == "sort_by" || name == "remove"
 }
 
-// Методы, которые возвращают новую коллекцию.
+// Методы, которые возвращают новую коллекцию. Своя функция программы с тем
+// же именем (fn values(s: Shop) -> [Cat] { return s.cats }) может вернуть
+// что угодно, и x.values() тогда вызывает её — тогда не свежее.
 fn rw_fresh_method(name: str) -> bool {
-    return name == "values" || name == "keys" || name == "filter" || name == "map" || name == "copy" || name == "split"
+    return (name == "values" || name == "keys" || name == "filter" || name == "map" || name == "copy" || name == "split") && !rw_user_fn(name)
 }
 
-// Методы, которые возвращают свой получатель.
+// Методы, которые возвращают свой получатель (то же условие).
 fn rw_same_method(name: str) -> bool {
-    return name == "sort_by" || name == "sort" || name == "reverse"
+    return (name == "sort_by" || name == "sort" || name == "reverse") && !rw_user_fn(name)
+}
+
+// Есть функция программы с таким именем.
+fn rw_user_fn(name: str) -> bool {
+    let f = func_find(name)
+    return f >= 0 && !funcs[f].is_lib
 }
 
 // Функции библиотеки, которые не трогают store.
@@ -161,27 +169,263 @@ fn rw_open_of(j: int, from: int) -> int {
     return -1
 }
 
-// Конец выражения, которое начинается в a: до новой строки на верхнем уровне
-// скобок (строка, начатая с «.», продолжает цепочку методов).
-fn rw_expr_end(a: int, limit: int) -> int {
-    var depth = 0
+// Конец выражения, которое начинается в a, так, как его читает парсер
+// (src/expr.kh, src/atom.kh): операнды через ?? || && == != < <= > >= + - | ^
+// * / % << >> & — и через перевод строки (парсер переводов строк внутри
+// выражения не видит, а ; лексер отбрасывает); у операнда — префиксы - ! ~,
+// атом (литерал, (...), [...], {...}, имя, имя(...), Структура {...}, if и
+// match как значения) и постфиксы .имя, .имя(...), [...]. → индекс первой
+// лексемы после выражения или -1, если вид незнаком (fetch, sql, call, tx...)
+// или выражение не кончается до limit: тогда оно не свежее.
+fn rw_expr_scan(a: int, limit: int) -> int {
     var i = a
-    while i < limit {
+    while true {
+        while i < limit && (toks[i].kind == '-' || toks[i].kind == '!' || toks[i].kind == '~') {
+            i += 1
+        }
+        if i >= limit {
+            return -1
+        }
         let k = toks[i].kind
-        if i > a && depth == 0 && toks[i].line != toks[i - 1].line && k != '.' {
+        if k == T_INT || k == T_FLOAT || k == T_CHAR || k == T_STR || k == T_TRUE || k == T_FALSE || k == T_NONE {
+            i += 1
+        } else if k == '(' || k == '[' || k == '\{' {
+            i = rw_close_in(i, limit)
+        } else if k == T_IDENT {
+            let name = toks[i].text
+            if name == "fetch" || name == "tx" {
+                return -1
+            }
+            i += 1
+            if i < limit && toks[i].kind == '(' {
+                i = rw_close_in(i, limit)
+            } else if i < limit && toks[i].kind == '\{' && struct_find(name) >= 0 {
+                i = rw_close_in(i, limit)
+            }
+        } else if k == T_IF {
+            i = rw_if_scan(i, limit)
+        } else if k == T_MATCH {
+            let b = rw_brace_at(i + 1, limit)
+            if b < 0 {
+                return -1
+            }
+            i = rw_close_in(b, limit)
+        } else {
+            return -1
+        }
+        if i < 0 {
+            return -1
+        }
+        // постфиксы
+        while i < limit {
+            if toks[i].kind == '.' && i + 1 < limit && toks[i + 1].kind == T_IDENT {
+                i += 2
+                if i < limit && toks[i].kind == '(' {
+                    i = rw_close_in(i, limit)
+                    if i < 0 {
+                        return -1
+                    }
+                }
+            } else if toks[i].kind == '[' {
+                i = rw_close_in(i, limit)
+                if i < 0 {
+                    return -1
+                }
+            } else {
+                break
+            }
+        }
+        if i < limit && rw_binop(toks[i].kind) {
+            i += 1
+        } else {
             return i
+        }
+    }
+    return -1
+}
+
+// Бинарный оператор выражения (все уровни parse_coalesce … parse_mul).
+fn rw_binop(k: int) -> bool {
+    return k == T_QQ || k == T_OROR || k == T_ANDAND || k == T_EQ || k == T_NE || k == '<' || k == T_LE || k == '>' || k == T_GE || k == '+' || k == '-' || k == '|' || k == '^' || k == '*' || k == '/' || k == '%' || k == T_SHL || k == T_SHR || k == '&'
+}
+
+// Лексема после скобки, парной к открывающей в i, или -1 (нет пары до limit).
+fn rw_close_in(i: int, limit: int) -> int {
+    let c = matching_close(i)
+    if c < 0 || c >= limit {
+        return -1
+    }
+    return c + 1
+}
+
+// Первая { на нулевой глубине скобок с позиции i (условие if, подлежащее
+// match: там структуры без скобок не пишут) или -1.
+fn rw_brace_at(i: int, limit: int) -> int {
+    var depth = 0
+    var j = i
+    while j < limit {
+        let k = toks[j].kind
+        if k == '\{' && depth == 0 {
+            return j
         }
         if k == '(' || k == '[' || k == '\{' {
             depth += 1
         } else if k == ')' || k == ']' || k == '}' {
             depth -= 1
             if depth < 0 {
-                return i
+                return -1
             }
         }
-        i += 1
+        j += 1
     }
-    return limit
+    return -1
+}
+
+// if как значение с позиции i: if условие { ... } else if ... else { ... }
+// → лексема после него или -1.
+fn rw_if_scan(i: int, limit: int) -> int {
+    let b = rw_brace_at(i + 1, limit)
+    if b < 0 {
+        return -1
+    }
+    let e = rw_close_in(b, limit)
+    if e < 0 || e >= limit || toks[e].kind != T_ELSE {
+        return e
+    }
+    if e + 1 < limit && toks[e + 1].kind == T_IF {
+        return rw_if_scan(e + 1, limit)
+    }
+    if e + 1 < limit && toks[e + 1].kind == '\{' {
+        return rw_close_in(e + 1, limit)
+    }
+    return -1
+}
+
+// Свежее ли выражение, которое начинается в a (до limit), целиком.
+fn rw_fresh_expr(a: int, body: int, end: int, depth: int) -> bool {
+    let e = rw_expr_scan(a, end)
+    if e <= a {
+        return false
+    }
+    return rw_fresh_at(e - 1, a, body, end, depth)
+}
+
+// Имя нельзя судить по объявлениям в теле: оно — параметр функции с телом
+// body, глобальная или store (локальная с тем же именем в каком-то блоке не
+// говорит ничего об упоминаниях вне него).
+fn rw_name_unsafe(name: str, body: int) -> bool {
+    let sym = sym_find(name)
+    if sym >= 0 && sym_kind(sym) == SK_GLOBAL {
+        return true
+    }
+    var f = 0
+    while f < funcs.len() {
+        if funcs[f].body == body {
+            for p in funcs[f].params {
+                if p.name == name {
+                    return true
+                }
+            }
+            return false
+        }
+        f += 1
+    }
+    return false
+}
+
+// Позиция = в объявлении let/var имя [: тип] = с именем в i, или -1 (нет
+// значения: var x: [int]; y[k] = v — у x значения нет, а = — уже другого
+// оператора).
+fn rw_decl_eq(i: int, end: int) -> int {
+    var j = i + 1
+    if j < end && toks[j].kind == ':' {
+        j = rw_type_end(j + 1, end)
+        if j < 0 {
+            return -1
+        }
+    }
+    if j < end && toks[j].kind == '=' {
+        return j
+    }
+    return -1
+}
+
+// Лексема после типа с позиции j, как его читает parse_type (src/decl.kh):
+// имя, [тип] или map[тип, тип] и, может быть, ? → индекс или -1.
+fn rw_type_end(j: int, end: int) -> int {
+    if j >= end {
+        return -1
+    }
+    var e = -1
+    if toks[j].kind == '[' {
+        let t = rw_type_end(j + 1, end)
+        if t < 0 || t >= end || toks[t].kind != ']' {
+            return -1
+        }
+        e = t + 1
+    } else if toks[j].kind == T_IDENT {
+        e = j + 1
+        if toks[j].text == "map" {
+            if e >= end || toks[e].kind != '[' {
+                return -1
+            }
+            let k = rw_type_end(e + 1, end)
+            if k < 0 || k >= end || toks[k].kind != ',' {
+                return -1
+            }
+            let v = rw_type_end(k + 1, end)
+            if v < 0 || v >= end || toks[v].kind != ']' {
+                return -1
+            }
+            e = v + 1
+        }
+    } else {
+        return -1
+    }
+    if e < end && toks[e].kind == '?' {
+        e += 1
+    }
+    return e
+}
+
+// Цель присваивания, оператор которого в позиции i: -2 — объявление let/var;
+// иначе позиция имени в начале цепочки имя(.поле | [индекс])* перед
+// оператором или -1, если цель не такая. По лексемам назад, без оглядки на
+// строки: let t = 1; c.name = v — цель c.name (; лексер отбрасывает).
+fn rw_assign_root(i: int, body: int) -> int {
+    if toks[i].kind == '=' {
+        // let имя = / let имя: тип = — тип разобран так же, как parse_type
+        var j = i - 1
+        while j > body && (toks[j].kind == T_IDENT || toks[j].kind == '[' || toks[j].kind == ']' || toks[j].kind == ',' || toks[j].kind == '?' || toks[j].kind == ':') {
+            if toks[j].kind == T_IDENT && (toks[j - 1].kind == T_LET || toks[j - 1].kind == T_VAR) {
+                if rw_decl_eq(j, i + 1) == i {
+                    return -2
+                }
+                break
+            }
+            j -= 1
+        }
+    }
+    var r = i - 1
+    while r >= body {
+        let k = toks[r].kind
+        if k == ']' {
+            let o = rw_open_of(r, body)
+            if o <= body {
+                return -1
+            }
+            r = o - 1
+        } else if k == T_IDENT {
+            if toks[r - 1].kind == '.' {
+                r -= 2
+            } else {
+                return r
+            }
+        } else {
+            return -1
+        }
+    }
+    return -1
 }
 
 // Свежее ли значение выражения, которое кончается лексемой last (начало — a
@@ -310,6 +554,9 @@ fn rw_fresh_elems(name: str, body: int, end: int, depth: int) -> bool {
 }
 
 fn rw_fresh_elems_scan(name: str, body: int, end: int, depth: int) -> bool {
+    if rw_name_unsafe(name, body) {
+        return false
+    }
     var found = false
     var i = body
     while i < end {
@@ -321,12 +568,10 @@ fn rw_fresh_elems_scan(name: str, body: int, end: int, depth: int) -> bool {
                 if toks[i - 2].kind == T_IF || toks[i - 2].kind == T_WHILE {
                     return false
                 }
-                // var name[: тип] = {} — и на этом оператор кончается
-                var j = i + 1
-                while j < end && toks[j].kind != '=' && toks[j].line == t.line {
-                    j += 1
-                }
-                if j + 2 >= end || toks[j].kind != '=' || toks[j + 1].kind != '\{' || toks[j + 2].kind != '}' || (toks[j + 3].line == toks[j + 2].line && toks[j + 3].kind != '}') {
+                // var name[: тип] = {} — и на этом выражение кончается; одно
+                // объявление на всё тело
+                let j = rw_decl_eq(i, end)
+                if found || j < 0 || j + 2 >= end || toks[j + 1].kind != '\{' || toks[j + 2].kind != '}' || rw_expr_scan(j + 1, end) != j + 3 {
                     return false
                 }
                 found = true
@@ -337,8 +582,7 @@ fn rw_fresh_elems_scan(name: str, body: int, end: int, depth: int) -> bool {
                 }
                 if toks[close + 1].kind == '=' {
                     // name[k] = v: v свежее (элементы name здесь — свежие)
-                    let e = rw_expr_end(close + 2, end)
-                    if !rw_fresh_at(e - 1, close + 2, body, end, depth + 1) {
+                    if !rw_fresh_expr(close + 2, body, end, depth + 1) {
                         return false
                     }
                 }
@@ -366,47 +610,72 @@ fn rw_recv_start(last: int) -> int {
 // at — лексема, где имя упомянуто (или -1): параметр лямбды с тем же именем,
 // в теле которой at нет (xs.map(c => ...) рядом с let c = ...), — другое имя.
 fn rw_fresh_local(name: str, at: int, body: int, end: int, depth: int) -> bool {
-    if depth > 8 {
+    if depth > 8 || rw_name_unsafe(name, body) {
         return false
     }
-    var found = false
+    var decls = 0
     var i = body
     while i < end {
         let t = toks[i]
-        if t.kind == T_IDENT && t.text == name {
+        if t.kind == T_IDENT && t.text == name && toks[i - 1].kind != '.' {
             let pk = toks[i - 1].kind
             let nk = toks[i + 1].kind
             if pk == T_LET || pk == T_VAR {
                 if toks[i - 2].kind == T_IF || toks[i - 2].kind == T_WHILE {
                     return false
                 }
-                // let name[: тип] = выражение
-                var j = i + 1
-                while j < end && toks[j].kind != '=' && toks[j].line == t.line {
-                    j += 1
-                }
-                if j >= end || toks[j].kind != '=' {
+                // let name[: тип] = выражение — одно объявление на всё тело
+                // (имя в другом блоке — другая переменная, а по лексемам их
+                // не различить)
+                let j = rw_decl_eq(i, end)
+                if j < 0 || !rw_fresh_expr(j + 1, body, end, depth + 1) {
                     return false
                 }
-                let e = rw_expr_end(j + 1, end)
-                if !rw_fresh_at(e - 1, j + 1, body, end, depth + 1) {
+                decls += 1
+                if decls > 1 {
                     return false
                 }
-                found = true
             } else if nk == T_FATARROW && pk == '(' && at >= 0 && (at < i || at > matching_close(i - 1)) {
                 // параметр другой лямбды
             } else if pk == T_FOR || nk == T_FATARROW || (pk == ',' && toks[i - 2].kind == T_IDENT && toks[i - 3].kind == T_FOR) {
                 return false
-            } else if nk == '=' && (pk == '\{' || pk == '}' || toks[i - 1].line != t.line) {
-                let e = rw_expr_end(i + 2, end)
-                if !rw_fresh_at(e - 1, i + 2, body, end, depth + 1) {
+            } else if nk == '=' {
+                // присваивание имени — где бы оно ни стояло в строке (; лексер
+                // отбрасывает): и оно свежее
+                if !rw_fresh_expr(i + 2, body, end, depth + 1) {
                     return false
                 }
             }
         }
         i += 1
     }
-    return found
+    return decls == 1
+}
+
+// Присваивание с оператором в i (тело [body, end)) меняет что-то кроме
+// локальных функции: цель — глобальная или store, поле или элемент не свежей
+// локальной (на один уровень: xs[i] = ..., s.f = ...) или цель не узнана.
+fn rw_assign_effect(i: int, body: int, end: int) -> bool {
+    let root = rw_assign_root(i, body)
+    if root == -2 {
+        return false
+    }
+    if root < 0 {
+        return true
+    }
+    let name = toks[root].text
+    let sym = sym_find(name)
+    if sym >= 0 && sym_kind(sym) == SK_GLOBAL {
+        return true
+    }
+    if root == i - 1 {
+        // своей локальной (параметры и переменные циклов неизменяемы)
+        return false
+    }
+    if !rw_fresh_local(name, root, body, end, 0) {
+        return true
+    }
+    return !((toks[root + 1].kind == '[' && matching_close(root + 1) == i - 1) || (toks[root + 1].kind == '.' && i == root + 3))
 }
 
 // Пишет ли функция fi сама (без учёта вызываемых); вызванные функции
@@ -419,39 +688,8 @@ fn rw_scan(fi: int, callees: [int]) -> bool {
         let t = toks[i]
         let k = t.kind
         if rw_is_assign(k) {
-            // начало оператора: та же строка, после { или }
-            var s = i - 1
-            while s > body && toks[s - 1].line == toks[i].line && toks[s - 1].kind != '\{' && toks[s - 1].kind != '}' {
-                s -= 1
-            }
-            var decl = false
-            var j = s
-            while j < i {
-                if toks[j].kind == T_LET || toks[j].kind == T_VAR {
-                    decl = true
-                }
-                j += 1
-            }
-            if !decl {
-                let st = toks[s]
-                if st.kind != T_IDENT {
-                    return true
-                }
-                let sym = sym_find(st.text)
-                let is_global = sym >= 0 && sym_kind(sym) == SK_GLOBAL
-                if i == s + 1 {
-                    if is_global {
-                        return true
-                    }
-                } else if is_global || !rw_fresh_local(st.text, s, body, end, 0) {
-                    return true
-                } else {
-                    // свежая коллекция: xs[i] = ... или s.f = ... на один уровень
-                    let ok = (toks[s + 1].kind == '[' && matching_close(s + 1) == i - 1) || (toks[s + 1].kind == '.' && i == s + 3)
-                    if !ok {
-                        return true
-                    }
-                }
+            if rw_assign_effect(i, body, end) {
+                return true
             }
         } else if k == T_IDENT && toks[i + 1].kind == '(' {
             let name = t.text
@@ -624,32 +862,7 @@ fn fx_scan(a: int, b: int, in_fn: bool, body: int, end: int, callees: [int]) -> 
 // кроме её локальных: глобальную или store, поле или элемент не свежей
 // локальной (как в rw_scan).
 fn fx_assign_effect(i: int, body: int, end: int) -> bool {
-    var s = i - 1
-    while s > body && toks[s - 1].line == toks[i].line && toks[s - 1].kind != '\{' && toks[s - 1].kind != '}' {
-        s -= 1
-    }
-    var j = s
-    while j < i {
-        if toks[j].kind == T_LET || toks[j].kind == T_VAR {
-            return false
-        }
-        j += 1
-    }
-    let st = toks[s]
-    if st.kind != T_IDENT {
-        return true
-    }
-    let sym = sym_find(st.text)
-    if sym >= 0 && sym_kind(sym) == SK_GLOBAL {
-        return true
-    }
-    if i == s + 1 {
-        return false
-    }
-    if !rw_fresh_local(st.text, s, body, end, 0) {
-        return true
-    }
-    return !((toks[s + 1].kind == '[' && matching_close(s + 1) == i - 1) || (toks[s + 1].kind == '.' && i == s + 3))
+    return rw_assign_effect(i, body, end)
 }
 
 fn fx_analyze() {

@@ -2134,6 +2134,25 @@ fn str_method_fn(name: str, system: bool) -> str {
     return "__str_" + name
 }
 
+// Методы списков, int, float и bool в коде программы, которые вызывают
+// функцию библиотеки по префиксу (__list_push, __int_abs, ...); len, to_int,
+// to_float, contains, index_of, sort и лямбды разбираются отдельно.
+fn builtin_method(k: int, name: str) -> bool {
+    if k == K_LIST {
+        return name == "push" || name == "pop" || name == "last" || name == "insert" || name == "remove_at" || name == "clear" || name == "truncate" || name == "copy" || name == "reverse" || name == "join" || name == "sum"
+    }
+    if k == K_INT {
+        return name == "to_str" || name == "abs" || name == "min" || name == "max"
+    }
+    if k == K_FLOAT {
+        return name == "to_str" || name == "round" || name == "floor" || name == "ceil" || name == "round_to" || name == "abs" || name == "sqrt" || name == "min" || name == "max"
+    }
+    if k == K_BOOL {
+        return name == "to_str"
+    }
+    return true
+}
+
 // Встроенные методы str в коде программы → сколько у них аргументов после
 // получателя: 0 или 1 (один и больше); -1 — не метод. s.имя(...) вызывает
 // встроенный метод, даже если в программе есть fn имя(s: str, ...), поэтому
@@ -2301,10 +2320,26 @@ fn parse_method(rt: int, nt: Token) -> int {
         if system_code(nt) || str_method_args(name) >= 0 {
             fi = func_find(str_method_fn(name, system_code(nt)))
         }
-    } else if prefix.byte_len() > 0 {
+    } else if prefix.byte_len() > 0 && (system_code(nt) || builtin_method(k, name)) {
+        // в коде программы — только описанные методы: прочие __list_*,
+        // __int_*, ... — внутренние функции библиотеки (xs.vacate(i) обнулял
+        // бы память списка store мимо блокировки)
         fi = func_find(prefix + name)
         if k == K_LIST && name == "sum" && tt == ty_float {
             fi = func_find("__list_sum_float")
+        }
+        if fi >= 0 && !system_code(nt) && funcs[fi].params.len() > 0 {
+            // получатель — первый параметр: [1, 2].join(",") — не [str]
+            let pt = subst(funcs[fi].params[0].ty, tt, ty_err, ty_err)
+            if !assignable(rt, pt) {
+                var hint = ""
+                if name == "join" {
+                    hint = "turn the items into text first: xs.map(x => x.to_str()).join(\", \")"
+                }
+                error_tok(nt, "." + name + "() works on " + ty_name(pt) + ", not " + ty_name(rt), hint)
+                skip_call_args()
+                return ty_err
+            }
         }
     }
     if fi < 0 {
@@ -2338,6 +2373,9 @@ fn parse_method(rt: int, nt: Token) -> int {
             if uf >= 0 && funcs[uf].params.len() > 0 {
                 hint = "'" + name + "' takes " + ty_name(funcs[uf].params[0].ty) + " as its first parameter"
             }
+        }
+        if hint.byte_len() == 0 && k == K_LIST {
+            hint = "list methods: len push pop last insert remove_at clear truncate copy contains index_of sort reverse join sum, and map filter find any all count sort_by"
         }
         error_tok(nt, ty_name(rt) + " has no method '" + name + "'", hint)
         skip_call_args()

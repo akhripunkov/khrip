@@ -106,6 +106,60 @@ fn early(xs: [Item]) -> int {
     return n
 }
 
+// Функции, которые меняют глобальные, хотя по именам похоже, что только свои
+// локальные (после ревью): из лямбды их цепочка не сливается — каждая
+// вызывается на всех шести элементах.
+type Cat { name: str, n: int }
+type Holder { items: [str] }
+
+var log: [str] = []
+var gm: map[str, Cat] = {}
+var holder: Holder = Holder { items: [] }
+
+// глобальная log и локальная log во вложенном блоке
+fn shadow_push(x: int) -> bool {
+    log.push("s{x}")
+    if x < -1000000 {
+        var log: [str] = []
+        log.push("z")
+    }
+    return x > 2
+}
+
+// элемент глобального словаря через «свежую» локальную: ?? — в начале
+// следующей строки
+fn qq_next(x: int) -> bool {
+    var seen: map[str, Cat] = {}
+    let c = seen["a"]
+        ?? gm["a"] ?? Cat { name: "d", n: 0 }
+    c.n += 1
+    seen["a"] = c
+    return x > 2
+}
+
+// своя функция с именем метода, который возвращает новый список
+fn copy(h: Holder) -> [str] {
+    return h.items
+}
+
+fn named_copy(x: int) -> bool {
+    let xs = holder.copy()
+    xs.push("n{x}")
+    return x > 2
+}
+
+fn named_cases() {
+    gm["a"] = Cat { name: "a", n: 0 }
+    let xs = [1, 2, 3, 4, 5, 6]
+    let a1 = xs.filter(x => shadow_push(x)).any(x => x > 3)
+    print("shadow_push: {a1} log={log.len()}")
+    let a2 = xs.filter(x => qq_next(x)).any(x => x > 3)
+    let c = gm["a"] ?? Cat { name: "", n: -1 }
+    print("qq_next: {a2} n={c.n}")
+    let a3 = xs.filter(x => named_copy(x)).any(x => x > 3)
+    print("named_copy: {a3} items={holder.items.len()}")
+}
+
 fn check(m: map[int, Item], s: map[str, Item], flags: map[str, bool], l: [Item], q: str, g: int) {
     // filter
     let a1 = m.values().filter(x => x.group == g && x.name.lower().contains(q))
@@ -230,4 +284,5 @@ fn main() {
     print(xs.filter(x => bump(x)).map(x => calls).map(v => v.to_str()).join(","))
     m[2000] = mk(2000)
     print(early(m.values()))
+    named_cases()
 }
