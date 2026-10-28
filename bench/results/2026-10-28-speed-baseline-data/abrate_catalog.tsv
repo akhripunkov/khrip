@@ -1,0 +1,5 @@
+round	scenario	variant	rate	rps	p50_ms	p99_ms	p999_ms	max_ms	cpu_us_per_req	non2xx_pct
+1	catalog	c7_catfix2_libx	2800	2797	1.19	5.64	60.58	98.94	167.3	0.0
+2	catalog	c7_catfix2_libx	2800	2797	1.15	3.53	29.17	66.37	161.9	0.0
+1	catalog	c7_catfix2_libx	4000	3995	1.16	4.93	32.14	49.82	153.6	0.0
+2	catalog	c7_catfix2_libx	4000	3995	1.17	3.48	18.96	48.96	150.3	0.0

@@ -1,4 +1,5 @@
-"""Модель кеша callgrind (--cache-sim=yes): промахи на запрос по функциям.
+"""Модели callgrind (--cache-sim=yes, --branch-sim=yes): промахи кеша и ошибки
+предсказания переходов на запрос по функциям.
 
     python3 cachesum.py <cg-файл> [функций]
 
@@ -49,7 +50,7 @@ for v in self_c.values():
         tot[i] += x
 idx = {e: i for i, e in enumerate(events)}
 print(f"запросов {reqs}; на запрос: " + ", ".join(f"{e} {tot[i] / reqs:,.0f}" for i, e in enumerate(events)))
-for key in ("D1mr", "DLmr"):
+for key in ("D1mr", "DLmr", "Bcm", "Bim"):
     if key not in idx:
         continue
     k = idx[key]
