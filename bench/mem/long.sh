@@ -8,6 +8,7 @@
 # Варианты:
 #   khrip          — обычная сборка (с KHRIP_GC_LOG=1: строка о каждой сборке)
 #   khrip-gcoff    — то же с KHRIP_GC=off
+#   khrip-gc100    — то же с KHRIP_GC=100 (запас до части 2)
 #   khrip-m1       — компилятор KHC_M1: копия библиотеки, где m всегда 1
 #                    (в репозиторий не входит)
 #   khrip-m1-gc50  — то же с KHRIP_GC=50
@@ -79,13 +80,14 @@ for v in $variants; do
 	mkdir -p "$o"
 	envs=(PORT=8080)
 	case $v in
-	khrip | khrip-gcoff | khrip-m1 | khrip-m1-gc50)
+	khrip | khrip-gcoff | khrip-gc100 | khrip-m1 | khrip-m1-gc50)
 		khc=$root/build/khc
 		[[ $v == khrip-m1* ]] && khc=${KHC_M1:?KHC_M1 — компилятор с копией библиотеки, где m = 1}
 		KHRIP_GC_LOG=1 "$khc" -o "$tmp/server" "$ev/solutions/$sc/khrip/main.kh" || exit 1
 		envs+=(KHRIP_GC_LOG=1)
 		[[ $v == khrip-gcoff ]] && envs+=(KHRIP_GC=off)
 		[[ $v == *-gc50 ]] && envs+=(KHRIP_GC=50)
+		[[ $v == khrip-gc100 ]] && envs+=(KHRIP_GC=100)
 		;;
 	go)
 		rm -rf "${tmp:?}/go"

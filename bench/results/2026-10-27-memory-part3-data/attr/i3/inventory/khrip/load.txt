@@ -1,0 +1,15 @@
+VmRSS 218.4 MB, smaps 215.5 MB
+  live store data                              207.88
+  store: free slots and garbage in spans         0.03
+  store: free pages kept                         0.01
+  GC metadata                                    7.19
+  request arenas                                 0.05
+  thread heaps                                   0.04
+  coroutine stacks                               0.04
+  buffers and pools                              0.12
+  binary                                         0.20
+  other                                         -0.02
+  store: committed 292.0, resident 207.9, in spans 207.9 (allocated slots 223.45, resident 207.88, free slots 0.04, tails 0.00, growth reserve 48.00), free kept 0.01, released 20.5, 22210 spans
+  classes (slot B: spans, allocated MB / span MB): 32: 13322, 104.1/104.1, 16777216: 3, 48.0/96.0, 16: 8880, 69.4/69.4, 2097152: 1, 2.0/2.0, 2048: 2, 0.0/0.0, 64: 1, 0.0/0.0, 256: 1, 0.0/0.0
+  arenas: 3 with memory, KB min 16, median 20, max 20, sum 0.1 MB
+  mmap pieces: 4 KB block 0.05, thread heap chunk 0.04, conn out 0.02, db block 0.02, request stack 0.02, perm chunk 0.01, thread stack 0.01, conn table 0.01, conn in 0.01, other 36864 0.00, other 8192 0.00, other 12288 0.00, other 32768 0.00

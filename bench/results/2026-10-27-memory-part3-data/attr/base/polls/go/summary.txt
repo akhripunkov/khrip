@@ -1,0 +1,8 @@
+== polls / go: 27000 запросов/с, seeded 8236 KB
+load snapshot: RSS 288600 KB, HWM 288600 KB
+after run: RSS 298736 KB, HWM 300668 KB; Requests/sec:  26964.68
+memstats before heap_alloc=232813904 heap_inuse=237699072 heap_idle=54853632 heap_released=3604480 heap_sys=292552704 heap_objects=2920214 stack_inuse=1048576 stack_sys=1048576 mspan_inuse=3103840 mcache_inuse=2416 gc_sys=5781784 other_sys=813422 buck_hash_sys=2994 sys=304344144 num_gc=428 next_gc=290288626
+memstats after-gc heap_alloc=131762824 heap_inuse=136683520 heap_idle=156000256 heap_released=4063232 heap_sys=292683776 heap_objects=1951189 stack_inuse=917504 stack_sys=917504 mspan_inuse=1159840 mcache_inuse=2416 gc_sys=5781784 other_sys=813422 buck_hash_sys=2994 sys=304344144 num_gc=429 next_gc=263727410
+after GC: RSS 298340 KB
+idle 15s: RSS 298340 KB
+invariant: ok
