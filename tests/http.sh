@@ -464,3 +464,67 @@ print("".join(f"k{i}={val[i]}," for i in order))')
 else
 	failed "tests/load/grow_store.kh" "$(cat "$tmp/grow_store.err")"
 fi
+
+# Анонимные структуры (A1–A3, tests/load/anon_store.kh): store с вложенными
+# анонимными типами переживает перезапуск (KHRIP_DATA; с KHRIP_GC_VERIFY —
+# проверка графа после загрузки и восстановления), а литерал без типа (A3)
+# уходит телом fetch как JSON на эхо-сервер (тело и Content-Type — как есть).
+an_port=$((HTTP_PORT + 13))
+an_echo=$((HTTP_PORT + 14))
+an_url="http://127.0.0.1:$an_port"
+an_start() {
+	PORT=$an_port THREADS=2 KHRIP_GC_VERIFY=1 ECHO_PORT=$an_echo KHRIP_DATA="$tmp/anon.json" "$tmp/anon_store" 2>"$tmp/anon_store.log" &
+	an_pid=$!
+	for _ in $(seq 600); do
+		curl -s -o /dev/null "$an_url/dump" && return
+		sleep 0.05
+	done
+}
+an_stop() {
+	kill -TERM "$an_pid"
+	wait "$an_pid" 2>/dev/null
+}
+if KHRIP_GC_VERIFY=1 "$KHC" -o "$tmp/anon_store" tests/load/anon_store.kh >"$tmp/anon_store.err" 2>&1; then
+	python3 -I -c '
+import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        out = (self.headers.get("Content-Type", "") + " ").encode() + body
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+    def log_message(self, *a):
+        pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+' "$an_echo" 2>/dev/null &
+	an_echo_pid=$!
+	for _ in $(seq 100); do
+		curl -s -o /dev/null -X POST "http://127.0.0.1:$an_echo/echo" && break
+		sleep 0.05
+	done
+	rm -f "$tmp/anon.json"
+	an_start
+	curl -s -o /dev/null -X POST "$an_url/s/a/5"
+	curl -s -o /dev/null -X POST "$an_url/s/b/3"
+	curl -s -o /dev/null -X POST "$an_url/s/a/2"
+	d1=$(curl -s "$an_url/dump")
+	an_stop
+	an_start
+	d2=$(curl -s "$an_url/dump")
+	sent=$(curl -s -X POST "$an_url/send")
+	an_stop
+	kill "$an_echo_pid" 2>/dev/null
+	wait "$an_echo_pid" 2>/dev/null
+	want_dump='{"sessions":2,"count":10,"last":"a","json":"{\"a\":{\"user\":\"u-a\",\"hist\":[{\"at\":0,\"note\":\"even 0\"},{\"at\":1,\"note\":null},{\"at\":2,\"note\":\"even 2\"},{\"at\":3,\"note\":null},{\"at\":4,\"note\":\"even 4\"},{\"at\":0,\"note\":\"even 0\"},{\"at\":1,\"note\":null}],\"tags\":{\"t0\":{\"n\":3},\"t1\":{\"n\":3},\"t2\":{\"n\":1}}},\"b\":{\"user\":\"u-b\",\"hist\":[{\"at\":0,\"note\":\"even 0\"},{\"at\":1,\"note\":null},{\"at\":2,\"note\":\"even 2\"}],\"tags\":{\"t0\":{\"n\":1},\"t1\":{\"n\":1},\"t2\":{\"n\":1}}}}"}'
+	want_send='200 application/json {"model":"m","stream":true,"messages":[{"role":"user","content":"привет"}],"n":10}'
+	if [[ "$d1" == "$want_dump" && "$d2" == "$want_dump" && "$sent" == "$want_send" ]] && grep -q '^khrip: gc verify (restore): 2 roots, [0-9]* objects in STORE, every pointer in STORE or DATA$' "$tmp/anon_store.log"; then
+		http_ok
+	else
+		failed "http: анонимные структуры в store и в fetch" "до: $d1; после перезапуска: $d2; fetch: $sent; журнал: $(cat "$tmp/anon_store.log")"
+	fi
+	rm -f "$tmp/anon.json"
+else
+	failed "tests/load/anon_store.kh" "$(cat "$tmp/anon_store.err")"
+fi

@@ -1,0 +1,28 @@
+// В начале оператора { — блок: литерал структуры там (и в конце блока со
+// значением) — ошибка с подсказкой про скобки; оператор «имя:» — тоже.
+type Point { x: int, y: int }
+
+fn pick(c: bool) -> Point {
+    return if c { { x: 1, y: 2 } } else { Point { x: 0, y: 0 } }
+}
+
+fn main() {
+    { x: 1, y: 2 }
+    let p: Point = tx_free(true)
+    print(pick(true).x.to_str() + p.x.to_str())
+}
+
+fn tx_free(c: bool) -> Point {
+    let v: Point = if c {
+        let a = 1
+        { ...pick(c), x: a }
+    } else {
+        pick(c)
+    }
+    return v
+}
+
+// тело if — блок, а не литерал: поля без своих скобок
+fn bare(c: bool) -> Point {
+    return if c { x: 1, y: 2 } else { pick(c) }
+}

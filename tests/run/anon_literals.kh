@@ -1,0 +1,130 @@
+// Литералы структур без имени типа (A2, A3). В позиции значения { и за ней
+// имя и «:», «,» или «}» либо «...» — литерал структуры; ключ-строка —
+// словарь; {} — словарь, если не ждут структуру. Тип литерала — тот, что ждут
+// (let/var с типом, присваивание, параметр, return, элемент списка, поле
+// другого литерала, значение словаря, ??); иначе — анонимный тип его полей.
+// В начале оператора и после => { — блок: литералу там нужны скобки.
+
+type Point { x: int, y: int }
+type Box { name: str, at: Point, tags: [str] = [], note: str? }
+type Shape = Circle { r: int } | Rect { w: int, h: int }
+
+var origin: Point = { x: 0, y: 0 }
+var boxes: [Box] = []
+
+fn show(p: Point) -> str {
+    return "({p.x}, {p.y})"
+}
+
+fn mk(n: int) -> Box {
+    // return с объявленным результатом; вложенный литерал — по типу поля
+    return { name: "b{n}", at: { x: n, y: -n } }
+}
+
+fn maybe(n: int) -> Point? {
+    if n < 0 {
+        return none
+    }
+    return { x: n, y: n }
+}
+
+fn area(s: Shape) -> { area: int } {
+    // ветки match и if со значением: литерал в скобках
+    return match s {
+        Circle c => ({ area: 3 * c.r * c.r })
+        Rect r => if r.w == r.h { ({ area: r.w * r.w }) } else { ({ area: r.w * r.h }) }
+    }
+}
+
+fn main() {
+    // let и var с типом
+    let a: Point = { x: 1, y: 2 }
+    var b: Point = { y: 4, x: 3 }
+    print(show(a) + show(b))
+    // присваивание локальной, глобальной, полю и элементу
+    b = { x: 5, y: 6 }
+    origin = { x: 7, y: 8 }
+    var bx = mk(1)
+    bx.at = { x: 9, y: 10 }
+    boxes.push(bx)
+    boxes[0] = { ...bx, name: "renamed" }
+    print(show(b) + show(origin) + show(bx.at) + boxes[0].name)
+    // параметры, в том числе обобщённые параметры методов списка
+    print(show({ x: 11, y: 12 }))
+    var ps: [Point] = [{ x: 1, y: 1 }]
+    ps.push({ x: 2, y: 2 })
+    ps.insert(0, { x: 0, y: 0 })
+    print(ps.map(p => p.x).join_ints())
+    // значение словаря и ??
+    let m: map[str, Point] = {"a": { x: 1, y: 1 }, "b": { x: 2, y: 2 }}
+    let got = m["zz"] ?? { x: -1, y: -1 }
+    print(show(got) + show(maybe(4) ?? { x: 0, y: 0 }) + show(maybe(-1) ?? { x: 9, y: 9 }))
+    // сокращение поля, распаковка первой, запятая в конце, несколько строк
+    let x = 21
+    let y = 22
+    let c: Point = { x, y }
+    let d: Point = { ...c, y: 99, }
+    let e: Box = {
+        name: "multi",
+        at: {
+            x: 1,
+            y: 2,
+        },
+        tags: ["t"],
+    }
+    print(show(c) + show(d) + e.name + show(e.at) + e.tags.len().to_str())
+    // пустые {}: структура, если ждут структуру и у полей есть значения по умолчанию
+    let opts: { limit: int = 10, on: bool = false } = {}
+    print(opts.limit.to_str() + " " + opts.on.to_str())
+    // ...но словарь без ожидаемого типа структуры
+    var empty: map[str, int] = {}
+    empty["k"] = 1
+    print(empty.len().to_str())
+    // ключ без кавычек при ожидаемом словаре — по-прежнему словарь
+    let key = "dyn"
+    let byvar: map[str, int] = {key: 5}
+    print(to_json(byvar))
+    // ключ-выражение в скобках — словарь и без ожидаемого типа
+    let paren = {(key): 6}
+    print(to_json(paren))
+    // ветки match и if со значением
+    print(area(Circle { r: 2 }).area.to_str() + " " + area(Rect { w: 3, h: 3 }).area.to_str() + " " + area(Rect { w: 2, h: 5 }).area.to_str())
+    let pick: Point = if a.x > 0 { ({ x: 1, y: 0 }) } else { origin }
+    print(show(pick))
+
+    // A3: без ожидаемого типа — анонимный тип полей
+    let req = { model: "m", stream: true, messages: [{ role: "user", content: "hi" }] }
+    print(to_json(req))
+    print(req.model + " " + req.messages[0].role)
+    // тот же набор полей в другом порядке — тот же тип (JSON — в порядке первой записи)
+    let req2 = { stream: false, messages: req.messages, model: "n" }
+    let both = [req, req2]
+    print(to_json(both))
+    // распаковка в A3: поля структуры и явные (явное важнее)
+    let view = { ...a, label: "pt", x: 100 }
+    print(to_json(view))
+    // две распаковки с общим полем: значение — из последней
+    let merged = { ...a, ...b, z: 0 }
+    print(to_json(merged))
+    // одно сокращение поля
+    let only: { x: int } = { x }
+    let only3 = { y }
+    print(only.x.to_str() + " " + to_json(only3))
+    // лямбда со значением-литералом: анонимный тип
+    let pairs = ps.map(p => { at: p.x, sq: p.x * p.x })
+    print(to_json(pairs))
+    // список литералов: тип — по первому
+    let rows = [{ id: 1, ok: true }, { id: 2, ok: false }]
+    print(rows.filter(r => r.ok).len().to_str())
+    // опечатка в имени поля A3 молча даёт другой тип (как у словаря): так задумано
+    let typo = { modle: "m" }
+    print(to_json(typo))
+}
+
+fn join_ints(xs: [int]) -> str {
+    var parts: [str] = []
+    for v in xs {
+        parts.push(v.to_str())
+    }
+    return parts.join(",")
+}

@@ -250,7 +250,8 @@ fn parse_variants() -> [Variant] {
             }
             advance()
         }
-        if kind() == T_IDENT || kind() == '[' {
+        // { поле: тип } — тип; { в другом виде — уже тело маршрута
+        if kind() == T_IDENT || kind() == '[' || (kind() == '\{' && kind_at(pos + 1) == T_IDENT && kind_at(pos + 2) == ':') {
             ty = parse_type()
         }
         if !has_st && ty < 0 {
@@ -852,6 +853,16 @@ fn variants_text(r: Route) -> str {
     return s
 }
 
+// Статус первого варианта с типом t.
+fn find_status(r: Route, t: int) -> int {
+    for v in r.variants {
+        if v.ty == t {
+            return v.status
+        }
+    }
+    return 200
+}
+
 fn find_variant(r: Route, status: int) -> int {
     var i = 0
     while i < r.variants.len() {
@@ -937,7 +948,7 @@ fn route_return(at: Token, has_value: bool) {
             route_status_only(t0)
             return
         }
-        if starts_value(pos + 1) {
+        if starts_value(pos + 1) || (kind_at(pos + 1) == '\{' && !ends_stmt(pos + 1)) {
             advance()
             if vi < 0 || r.variants[vi].ty < 0 {
                 route_status_only(t0)
@@ -964,7 +975,33 @@ fn route_return(at: Token, has_value: bool) {
         i += 1
     }
     var w = ty_err
-    if ntyped == 1 {
+    if kind() == '\{' && struct_lit_shape(pos) {
+        // литерал структуры без имени и без статуса: тип — единственная
+        // структура среди вариантов маршрута; две разные — нужно имя
+        var st = -1
+        var other = -1
+        for v in r.variants {
+            if v.ty >= 0 && tkind(v.ty) == K_STRUCT {
+                if st < 0 {
+                    st = v.ty
+                } else if v.ty != st && other < 0 {
+                    other = v.ty
+                }
+            }
+        }
+        if other >= 0 {
+            error_tok(tok(), "this route returns " + variants_text(r) + ": a struct literal here needs the name of its type", "return " + ty_name(st) + " \{ ... } or return " + ty_name(other) + " \{ ... }, or give the status: return " + find_status(r, st).to_str() + " \{ ... }")
+            parse_expr(ty_err)
+            ret_holes.push(emit_jmp())
+            return
+        }
+        if st >= 0 {
+            w = st
+        }
+    }
+    if w != ty_err {
+        // тип выбран по литералу структуры
+    } else if ntyped == 1 {
         w = r.variants[only].ty
     } else {
         // несколько типов: ожидается тип единственного успешного (2xx) варианта
@@ -1014,6 +1051,8 @@ fn route_return(at: Token, has_value: bool) {
             hint = "a status without a value must be declared: -> " + variants_text(r) + " | " + t0.val.to_str()
         } else if tkind(t) == K_OPT {
             hint = "the value may be none: return x ?? 404 (and declare 404)"
+        } else if is_anon_ty(t) {
+            hint = "a struct literal gets the route's type only when the route has one struct type; otherwise write the type: return Name \{ ... }, or copy: Name \{ ...value }"
         }
         error_tok(vtok, "this route returns " + variants_text(r) + ", found " + ty_name(t), hint)
         ret_holes.push(emit_jmp())
@@ -1316,7 +1355,7 @@ fn parse_call_expr() -> int {
     }
     coerce(ptype, ty_str, pt)
     emit_push(RAX)
-    var has_body = starts_value(pos) && tok().line == pt.line
+    var has_body = (starts_value(pos) || (kind() == '\{' && !saved)) && tok().line == pt.line
     if kind() == T_IDENT && tok().text == "headers" {
         has_body = false
     }
@@ -1364,7 +1403,8 @@ fn parse_fetch(at: Token) -> int {
     let utype = parse_add()
     coerce(utype, ty_str, ut)
     emit_push(RAX)
-    var has_body = starts_value(pos) && tok().line == ut.line
+    // тело — значение на той же строке; { — литерал (не в условии: там { — блок)
+    var has_body = (starts_value(pos) || (kind() == '\{' && !saved)) && tok().line == ut.line
     if kind() == T_IDENT && tok().text == "headers" {
         has_body = false
     }
@@ -1440,7 +1480,7 @@ fn gen_param(b: Buf, r: Route, i: int) {
         return
     }
     if k == PK_BODY {
-        buf_add(b, "            let " + v + "_o: " + ty_name(p.ty) + "? = from_json(__r.body)\n")
+        buf_add(b, "            let " + v + "_o: " + ty_src(p.ty) + "? = from_json(__r.body)\n")
         buf_add(b, "            let " + v + " = " + v + "_o else \{\n                __reply_json_error()\n                return\n            }\n")
         return
     }
@@ -1453,7 +1493,7 @@ fn gen_param(b: Buf, r: Route, i: int) {
     }
     if is_enum(inner) {
         if optional {
-            buf_add(b, "            var " + v + ": " + ty_name(p.ty) + " = none\n")
+            buf_add(b, "            var " + v + ": " + ty_src(p.ty) + " = none\n")
             buf_add(b, "            if let " + v + "_s = " + q + " \{\n")
             gen_enum_param(b, v + "_x", inner, v + "_s", lit)
             buf_add(b, "                " + v + " = " + v + "_x\n            }\n")
@@ -1477,7 +1517,7 @@ fn gen_param(b: Buf, r: Route, i: int) {
         buf_add(b, "            let " + v + " = " + conv + "(" + v + "_s, " + lit + ") else \{\n                return\n            }\n")
         return
     }
-    buf_add(b, "            var " + v + ": " + ty_name(p.ty) + " = none\n")
+    buf_add(b, "            var " + v + ": " + ty_src(p.ty) + " = none\n")
     buf_add(b, "            if let " + v + "_s = " + q + " \{\n")
     buf_add(b, "                let " + v + "_x = " + conv + "(" + v + "_s, " + lit + ") else \{\n                    return\n                }\n")
     buf_add(b, "                " + v + " = " + v + "_x\n            }\n")
@@ -1506,7 +1546,7 @@ fn default_src(ti: int, ty: int) -> str {
 fn gen_default_param(b: Buf, p: Param, q: str, lit: str) {
     let v = "p_" + p.name
     let dv = default_src(p.def, p.ty)
-    buf_add(b, "            var " + v + ": " + ty_name(p.ty) + " = " + dv + "\n")
+    buf_add(b, "            var " + v + ": " + ty_src(p.ty) + " = " + dv + "\n")
     buf_add(b, "            if let " + v + "_s = " + q + " \{\n")
     if is_enum(p.ty) {
         gen_enum_param(b, v + "_x", p.ty, v + "_s", lit)
@@ -1527,7 +1567,7 @@ fn gen_default_param(b: Buf, p: Param, q: str, lit: str) {
 // Перечисление из текста: значение — имя варианта.
 fn gen_enum_param(b: Buf, v: str, t: int, text: str, lit: str) {
     let names = src_lit(variant_names(types[t].a))
-    buf_add(b, "            let " + v + "_o: " + ty_name(t) + "? = from_json(__json_quote(" + text + "))\n")
+    buf_add(b, "            let " + v + "_o: " + ty_src(t) + "? = from_json(__json_quote(" + text + "))\n")
     buf_add(b, "            let " + v + " = " + v + "_o else \{\n                __reply_text(400, \"parameter '\" + " + lit + " + \"' must be one of: \" + " + names + ")\n                return\n            }\n")
 }
 
@@ -1647,7 +1687,7 @@ fn gen_snapshot(b: Buf) {
     buf_add(b, "type __Snapshot \{\n")
     for g in globals {
         if g.is_store && !files[toks[g.tok].file].is_lib {
-            buf_add(b, "    " + g.name + ": " + ty_name(ty_opt(g.ty)) + "\n")
+            buf_add(b, "    " + g.name + ": " + ty_src(ty_opt(g.ty)) + "\n")
         }
     }
     buf_add(b, "}\n\nfn __store_snapshot() -> str \{\n    return to_json(__Snapshot \{")

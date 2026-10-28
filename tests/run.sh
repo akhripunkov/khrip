@@ -151,14 +151,14 @@ for i in range(n):
     try:
         items = json.loads(open(f"{d}/{i}.json", "rb").read().decode("utf-8"))
         assert isinstance(items, list) and items, "an empty list"
-        got = [(e["file"], e["line"], e["col"], e["message"], e["hint"]) for e in items]
+        got = [(e["file"], e["line"], e["col"], e["severity"], e["message"], e["hint"]) for e in items]
     except Exception as e:
         print(f"{src}: not valid --json: {e}")
         bad += 1
         continue
     text = open(f"{d}/{i}.txt", "rb").read().decode("utf-8", "replace")
-    want = [(f, int(l), int(c), m) for f, l, c, m in re.findall(r"^(.*):(\d+):(\d+): error: (.*)$", text, re.M)]
-    if [g[:4] for g in got] != want:
+    want = [(f, int(l), int(c), sev, m) for f, l, c, sev, m in re.findall(r"^(.*):(\d+):(\d+): (error|warning): (.*)$", text, re.M)]
+    if [g[:5] for g in got] != want:
         print(f"{src}: --json differs from the text output:\n  {got}\n  {want}")
         bad += 1
 sys.exit(1 if bad else 0)
@@ -167,6 +167,47 @@ PY
 	else
 		failed "khc check --json" "$(cat "$tmp/json.txt")"
 	fi
+fi
+
+# Предупреждение (W-A2: анонимный тип, записанный трижды) сборку не
+# останавливает: khc check — код 0, одна строка «warning:» и итог «1 warning»,
+# в --json — запись с "severity":"warning"; код программы с предупреждением
+# тот же, что без него (встраивание не выключается: --sizes у main одинаков).
+cat >"$tmp/warn2.kh" <<'KH'
+fn a(p: { x: int }) -> int {
+    return p.x
+}
+fn b(p: { x: int }) -> int {
+    return p.x
+}
+fn add1(x: int) -> int {
+    return x + 1
+}
+fn main() {
+    print((add1(41) + a({ x: 1 }) + b({ x: 2 })).to_str())
+}
+KH
+cp "$tmp/warn2.kh" "$tmp/warn3.kh"
+cat >>"$tmp/warn3.kh" <<'KH'
+fn c(p: { x: int }) -> int {
+    return p.x
+}
+KH
+w_ok=1
+"$KHC" check "$tmp/warn3.kh" >"$tmp/warn.txt" 2>&1 || w_ok=0
+[[ $(grep -c ': warning: the anonymous type { x: int } is written 3 times$' "$tmp/warn.txt") == 1 && $(tail -1 "$tmp/warn.txt") == "1 warning" ]] || w_ok=0
+"$KHC" check --json "$tmp/warn3.kh" >"$tmp/warn.json" 2>&1 || w_ok=0
+grep -q '"severity":"warning"}]$' "$tmp/warn.json" || w_ok=0
+"$KHC" check "$tmp/warn2.kh" >"$tmp/warn2.txt" 2>&1 || w_ok=0
+[[ ! -s "$tmp/warn2.txt" ]] || w_ok=0
+"$KHC" --sizes -o "$tmp/warn2" "$tmp/warn2.kh" 2>/dev/null | grep ' main @' | cut -d' ' -f1 >"$tmp/warn2.size"
+"$KHC" --sizes -o "$tmp/warn3" "$tmp/warn3.kh" 2>/dev/null | grep ' main @' | cut -d' ' -f1 >"$tmp/warn3.size"
+[[ -s "$tmp/warn2.size" ]] && cmp -s "$tmp/warn2.size" "$tmp/warn3.size" || w_ok=0
+[[ $("$tmp/warn3") == 45 ]] || w_ok=0
+if [[ $w_ok -eq 1 ]]; then
+	pass=$((pass + 1))
+else
+	failed "предупреждение W-A2" "$(cat "$tmp/warn.txt" "$tmp/warn.json" "$tmp/warn2.txt" "$tmp/warn2.size" "$tmp/warn3.size")"
 fi
 
 for src in tests/api/*.kh; do

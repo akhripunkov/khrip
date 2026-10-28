@@ -1,0 +1,28 @@
+// W-A2: одна и та же анонимная структура, записанная как тип три раза, —
+// предупреждение «дайте ей имя» у третьего места (сборку оно не останавливает:
+// здесь её останавливает ошибка в main).
+fn a(p: { x: int, y: int }) -> int {
+    return p.x
+}
+
+fn b(p: { y: int, x: int }) -> int {
+    return p.y
+}
+
+fn c() -> [{ x: int, y: int }] {
+    return [{ x: 1, y: 2 }]
+}
+
+// записан дважды — без предупреждения
+fn d(p: { x: int, z: int }) -> int {
+    return p.x + p.z
+}
+
+fn e(p: { z: int, x: int }) -> int {
+    return p.x
+}
+
+fn main() {
+    let n: int = "x"
+    print((a({ x: 1, y: 2 }) + b({ x: 1, y: 2 }) + c().len() + d({ x: 3, z: 4 }) + e({ x: 5, z: 6 }) + n).to_str())
+}

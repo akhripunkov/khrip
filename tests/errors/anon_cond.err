@@ -1,0 +1,17 @@
+tests/errors/anon_cond.kh:5:8: error: a struct literal here needs parentheses: ({ a: ... })
+        if { a: 1 }.a == 1 {
+           ^
+    hint: in a condition, a match value or a for loop, a brace starts the block
+tests/errors/anon_cond.kh:13:13: error: { k: int } cannot be indexed
+        print((m["x"] ?? 0).to_str())
+                ^
+    hint: { name: value } is a struct; for a map, quote the keys ({"k": 1}), put a variable key in parentheses ({(k): 1}) or give the type: let m: map[str, int] = {k: 1}
+tests/errors/anon_cond.kh:14:16: error: cannot loop over { k: int }
+        for key in m {
+                   ^
+    hint: { name: value } is a struct; for a map, quote the keys ({"k": 1}), put a variable key in parentheses ({(k): 1}) or give the type: let m: map[str, int] = {k: 1}
+tests/errors/anon_cond.kh:16:13: error: { k: int } has no method 'len'
+        print(m.len().to_str())
+                ^
+    hint: { name: value } is a struct; for a map, quote the keys ({"k": 1}), put a variable key in parentheses ({(k): 1}) or give the type: let m: map[str, int] = {k: 1}
+4 errors

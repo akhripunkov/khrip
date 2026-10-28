@@ -1,0 +1,99 @@
+// Анонимные структуры (A1, docs/design/v0.14-protocols.md, приложение A):
+// тип { поле: T } пишется везде, где пишется тип; тип структурный — те же поля
+// с теми же типами (и значениями по умолчанию) в любом порядке — один тип, а
+// раскладка и порядок полей в JSON — как у записи, которая встретилась первой.
+// Именованные типы — номинальные: значение анонимного типа становится
+// именованным только литералом или распаковкой.
+
+type User { id: int, name: str }
+type Feed {
+    owner: { id: int, name: str }
+    items: [{ title: str, tags: [str] = [] }]
+    seen: map[str, { at: int, n: int? }]
+    pinned: { title: str, tags: [str] = [] }?
+}
+
+// параметр, результат и локальная другого порядка полей — тот же тип
+fn swap(p: { a: int, b: str }) -> { b: str, a: int } {
+    let q: { b: str, a: int } = p
+    return q
+}
+
+// функция — метод своего первого параметра и с анонимным типом
+fn label(p: { a: int, b: str }) -> str {
+    return p.b + "#" + p.a.to_str()
+}
+
+// опциональное поле — другой тип, чем обязательное
+fn opt_b(p: { a: int, b: str? }) -> str {
+    return p.b ?? "none"
+}
+
+fn total(xs: [{ qty: int, price: int }]) -> int {
+    var s = 0
+    for x in xs {
+        s += x.qty * x.price
+    }
+    return s
+}
+
+fn main() {
+    let p: { a: int, b: str } = { a: 1, b: "x" }
+    let q = swap(p)
+    print(label(q))
+    print(q.label())
+    print(to_json(q))
+    // порядок полей у второй записи — тот же тип: JSON — в порядке первой
+    let r: { b: str, a: int } = { b: "y", a: 2 }
+    print(to_json(r))
+    print(opt_b({ a: 1, b: none }) + " " + opt_b({ a: 1, b: "z" }) + " " + opt_b({ a: 1 }))
+    print(total([{ qty: 2, price: 150 }, { price: 10, qty: 3 }]).to_str())
+
+    // вложенные типы, списки и словари анонимных структур; значения по
+    // умолчанию — как у именованных
+    let f: Feed? = from_json(`{"owner": {"id": 7, "name": "ann"}, "items": [{"title": "a"}, {"title": "b", "tags": ["t"]}], "seen": {"k": {"at": 5}}}`)
+    let feed = f else {
+        print("no feed")
+        return
+    }
+    print(feed.owner.name + " " + feed.items.len().to_str() + " " + feed.items[0].tags.len().to_str() + " " + feed.items[1].tags[0])
+    let s = feed.seen["k"] else {
+        print("no seen")
+        return
+    }
+    print(s.at.to_str() + " " + (s.n ?? -1).to_str())
+    print(to_json(feed))
+    // значение по умолчанию в анонимном типе — в литерале и в JSON
+    let d: { limit: int = 20, q: str = "all", on: bool = true } = {}
+    print(to_json(d))
+    let d2: { limit: int = 20, q: str = "all", on: bool = true }? = from_json(`{"q": "x"}`)
+    print(to_json(d2))
+    // значение по умолчанию — часть типа: другое значение — другой тип
+    let d3: { limit: int = 5, q: str = "all", on: bool = true } = {}
+    print(d3.limit.to_str())
+
+    // из анонимного в именованный — только явно: литерал или распаковка
+    let o = feed.owner
+    let u = User { ...o }
+    let u2: User = { ...o, name: "bob" }
+    print(u.name + " " + u2.name + " " + u2.id.to_str())
+    // и обратно: именованный в анонимный — тоже распаковкой
+    let back: { id: int, name: str } = { ...u2 }
+    print(to_json(back))
+
+    // список и словарь с анонимными значениями
+    var m: map[str, { n: int }] = {}
+    m["a"] = { n: 1 }
+    m["b"] = { n: 2 }
+    var acc = 0
+    for k, v in m {
+        acc += v.n
+    }
+    print(acc.to_str() + " " + to_json(m))
+    var ys: [{ x: int, y: int }] = []
+    ys.push({ x: 1, y: 2 })
+    ys.insert(0, { y: 4, x: 3 })
+    ys[1] = { x: 5, y: 6 }
+    print(to_json(ys))
+    print(ys.map(e => e.x + e.y).sum().to_str())
+}

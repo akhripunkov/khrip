@@ -11,11 +11,15 @@ type Diag {
     col: int
     msg: str
     hint: str
+    // предупреждение: печатается, но сборку не останавливает
+    warn: bool
 }
 
 const MAX_ERRORS = 100
 
 var diags: [Diag]
+// Ошибок среди diags (без предупреждений): сборка идёт, только если их нет.
+var nerrors: int
 var json_errors: bool
 // Пока идёт восстановление после синтаксической ошибки, новые ошибки не пишутся.
 var panic_mode: bool
@@ -26,15 +30,17 @@ fn report_at(file: int, line: int, col: int, msg: str, hint: str) {
     if diags.len() >= MAX_ERRORS {
         return
     }
-    // одна ошибка на строку — остальные обычно следствие первой
+    // одна ошибка на строку — остальные обычно следствие первой; предупреждение
+    // на той же строке ошибку не прячет
     var i = 0
     while i < diags.len() {
-        if diags[i].file == file && diags[i].line == line {
+        if diags[i].file == file && diags[i].line == line && !diags[i].warn {
             return
         }
         i += 1
     }
-    diags.push(Diag { file: file, line: line, col: col, msg: msg, hint: hint })
+    diags.push(Diag { file: file, line: line, col: col, msg: msg, hint: hint, warn: false })
+    nerrors += 1
 }
 
 fn error_tok(t: Token, msg: str, hint: str) {
@@ -42,6 +48,22 @@ fn error_tok(t: Token, msg: str, hint: str) {
         return
     }
     report_at(t.file, t.line, t.col, msg, hint)
+}
+
+// Предупреждение (W-...): место, сообщение и подсказка — как у ошибки, но
+// программа собирается. На строке, где уже есть сообщение, не пишется.
+fn warn_tok(t: Token, msg: str, hint: str) {
+    if quiet > 0 || panic_mode || diags.len() >= MAX_ERRORS {
+        return
+    }
+    var i = 0
+    while i < diags.len() {
+        if diags[i].file == t.file && diags[i].line == t.line {
+            return
+        }
+        i += 1
+    }
+    diags.push(Diag { file: t.file, line: t.line, col: t.col, msg: msg, hint: hint, warn: true })
 }
 
 // Синтаксическая ошибка: дальше до конца оператора ошибки не пишутся.
@@ -284,8 +306,12 @@ fn print_diags() {
                 buf_add(b, ",\n ")
             }
             let col = src_col(d.file, d.line, d.col)
+            var sev = "error"
+            if d.warn {
+                sev = "warning"
+            }
             buf_add(b, "\{\"file\":\"" + json_escape(files[d.file].path) + "\",\"line\":" + d.line.to_str() + ",\"col\":" + col.to_str())
-            buf_add(b, ",\"message\":\"" + json_escape(d.msg) + "\",\"hint\":\"" + json_escape(d.hint) + "\"}")
+            buf_add(b, ",\"message\":\"" + json_escape(d.msg) + "\",\"hint\":\"" + json_escape(d.hint) + "\",\"severity\":\"" + sev + "\"}")
             i += 1
         }
         buf_add(b, "]\n")
@@ -296,7 +322,11 @@ fn print_diags() {
     while i < diags.len() {
         let d = diags[i]
         let line = source_line(d.file, d.line)
-        eprint(files[d.file].path + ":" + d.line.to_str() + ":" + char_col(line, d.col).to_str() + ": error: " + d.msg)
+        var sev = ": error: "
+        if d.warn {
+            sev = ": warning: "
+        }
+        eprint(files[d.file].path + ":" + d.line.to_str() + ":" + char_col(line, d.col).to_str() + sev + d.msg)
         eprint("    " + line)
         eprint(caret_line(line, col_byte(line, d.col)))
         if d.hint.byte_len() > 0 {
@@ -304,11 +334,25 @@ fn print_diags() {
         }
         i += 1
     }
-    var word = " errors"
-    if diags.len() == 1 {
-        word = " error"
+    // итог: «2 errors», «1 error, 1 warning», «3 warnings»
+    let nw = diags.len() - nerrors
+    var total = ""
+    if nerrors > 0 {
+        total = nerrors.to_str() + " error"
+        if nerrors != 1 {
+            total += "s"
+        }
     }
-    eprint(diags.len().to_str() + word)
+    if nw > 0 {
+        if nerrors > 0 {
+            total += ", "
+        }
+        total += nw.to_str() + " warning"
+        if nw != 1 {
+            total += "s"
+        }
+    }
+    eprint(total)
 }
 
 // Подсказка для неизвестного имени: привычки из других языков.

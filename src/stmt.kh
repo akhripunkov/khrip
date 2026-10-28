@@ -142,6 +142,13 @@ fn parse_stmt() -> bool {
         return false
     }
     if k == '\{' {
+        if brace_block_is_struct(pos) {
+            // { имя: ... } блоком быть не может: литерал без скобок (E-A1)
+            brace_block_error(pos, false, ty_err)
+            pos = matching_close(pos)
+            advance()
+            return false
+        }
         return parse_block()
     }
     if k == T_IDENT && t.text == "tx" && kind_at(pos + 1) == '\{' {
@@ -149,6 +156,12 @@ fn parse_stmt() -> bool {
     }
     if k == T_FN || k == T_TYPE {
         syntax_error(t, "declarations are only allowed at the top level", "move it outside the function")
+        return false
+    }
+    if k == T_IDENT && kind_at(pos + 1) == ':' {
+        // if c { x: 1 }: оператор «имя:» не бывает — это поля литерала, у
+        // которого нет своих скобок
+        syntax_error(t, "a statement cannot start with '" + t.text + ":'", "a struct literal needs its own braces, and at the start of a block parentheses: \{ (\{ " + t.text + ": ... }) }, or write its type: T \{ " + t.text + ": ... }")
         return false
     }
     if k == T_IDENT && (kind_at(pos + 1) == T_PLUSPLUS || kind_at(pos + 1) == T_MINUSMINUS) {
@@ -312,7 +325,11 @@ fn zero_value(t: int, at: Token) -> bool {
         return true
     }
     if t != ty_err {
-        error_tok(at, "a value of type " + ty_name(t) + " needs an initial value", "write = " + ty_name(t) + " \{ ... }")
+        var hint = "write = " + ty_name(t) + " \{ ... }"
+        if tkind(t) == K_STRUCT {
+            hint = "write = \{ " + structs[types[t].a].fields[0].name + ": ... }"
+        }
+        error_tok(at, "a value of type " + ty_name(t) + " needs an initial value", hint)
     }
     return false
 }
@@ -870,7 +887,7 @@ fn assign_index(t: int) {
             error_tok(at, "strings are immutable", "build a new string, e.g. s[..i] + \"x\" + s[i + 1..]")
         }
     } else if k != K_LIST && t != ty_err {
-        error_tok(at, ty_name(t) + " cannot be indexed", "")
+        error_tok(at, ty_name(t) + " cannot be indexed", anon_map_hint(t))
     }
     if k == K_LIST && !barrier_on(ty_elem(t)) && fast_index_store(t, at) {
         return
@@ -1461,6 +1478,8 @@ fn parse_for() {
                     hint = "to count, use a range: for i in 0..n"
                 } else if tkind(t) == K_OPT {
                     hint = "unwrap the optional first"
+                } else {
+                    hint = anon_map_hint(t)
                 }
                 error_tok(at, "cannot loop over " + ty_name(t), hint)
             }

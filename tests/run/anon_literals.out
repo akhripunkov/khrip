@@ -1,0 +1,21 @@
+(1, 2)(3, 4)
+(5, 6)(7, 8)(9, 10)renamed
+(11, 12)
+0,1,2
+(-1, -1)(4, 4)(9, 9)
+(21, 22)(21, 99)multi(1, 2)1
+10 false
+1
+{"dyn":5}
+{"dyn":6}
+12 9 10
+(1, 0)
+{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}
+m user
+[{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]},{"model":"n","stream":false,"messages":[{"role":"user","content":"hi"}]}]
+{"y":2,"label":"pt","x":100}
+{"x":5,"y":6,"z":0}
+21 {"y":22}
+[{"at":0,"sq":0},{"at":1,"sq":1},{"at":2,"sq":4}]
+1
+{"modle":"m"}

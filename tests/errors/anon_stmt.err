@@ -1,0 +1,17 @@
+tests/errors/anon_stmt.kh:6:19: error: a struct literal at the start of a statement needs parentheses or its type: ({ x: ... })
+        return if c { { x: 1, y: 2 } } else { Point { x: 0, y: 0 } }
+                      ^
+    hint: a brace at the start of a statement starts a block; write ({ x: ... }) or Point { ... }
+tests/errors/anon_stmt.kh:10:5: error: a struct literal at the start of a statement needs parentheses or its type: ({ x: ... })
+        { x: 1, y: 2 }
+        ^
+    hint: a brace at the start of a statement starts a block; write ({ x: ... }) or the type name before the brace
+tests/errors/anon_stmt.kh:27:19: error: a statement cannot start with 'x:'
+        return if c { x: 1, y: 2 } else { pick(c) }
+                      ^
+    hint: a struct literal needs its own braces, and at the start of a block parentheses: { ({ x: ... }) }, or write its type: T { x: ... }
+tests/errors/anon_stmt.kh:18:9: error: a struct literal at the start of a statement needs parentheses or its type: ({ ... })
+            { ...pick(c), x: a }
+            ^
+    hint: a brace at the start of a statement starts a block; write ({ ... }) or Point { ... }
+4 errors

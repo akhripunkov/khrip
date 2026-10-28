@@ -397,6 +397,14 @@ fn mismatch_hint(from: int, to: int) -> str {
     if from == ty_none {
         return "only optional types accept none; declare the type as " + ty_name(to) + "?"
     }
+    let tt = ty_inner(to)
+    if tkind(from) == K_STRUCT && tkind(tt) == K_STRUCT && (is_anon_ty(from) || is_anon_ty(tt)) {
+        // структуры разных типов: в именованный — только явно, литералом
+        if is_anon_ty(tt) {
+            return "an anonymous type matches only the same fields; copy them: \{ ...value } (set the missing ones)"
+        }
+        return "a value of another type becomes " + ty_name(tt) + " only explicitly: " + ty_name(tt) + " \{ ...value }"
+    }
     if tkind(from) == K_VOID {
         return "this function returns nothing"
     }

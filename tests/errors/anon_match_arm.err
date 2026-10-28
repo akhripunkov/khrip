@@ -1,0 +1,17 @@
+tests/errors/anon_match_arm.kh:8:21: error: a struct literal as a match arm needs parentheses or its type: ({ value: ... })
+            Circle c => { value: c.r * c.r * 3 }
+                        ^
+    hint: after => a brace starts a block; write => ({ value: ... }) or Area { ... }
+tests/errors/anon_match_arm.kh:16:21: error: a struct literal as a match arm needs parentheses or its type: ({ ... })
+            Circle c => { ...c, text: "circle" }
+                        ^
+    hint: after => a brace starts a block; write => ({ ... }) or the type name before the brace
+tests/errors/anon_match_arm.kh:17:21: error: a struct literal as a match arm needs parentheses or its type: ({ text })
+            Square q => { text }
+                        ^
+    hint: after => a brace starts a block; write => ({ text }) or the type name before the brace
+tests/errors/anon_match_arm.kh:24:21: error: a struct literal as a match arm needs parentheses or its type: ({ value: ... })
+            Circle c => { value: c.r }
+                        ^
+    hint: after => a brace starts a block; write => ({ value: ... }) or the type name before the brace
+4 errors

@@ -1,0 +1,71 @@
+// Литералы структур без имени типа (A2, A3) в анализе чтения — свежие, как
+// T { ... }; локальная с анонимным типом (let x: { поле: T } = ...) —
+// объявление, а значение по умолчанию в таком типе — не присваивание. Значение
+// store внутри литерала, псевдоним и запись в поле значения store — write.
+
+type Cat { name: str, count: int }
+type Item { id: int, name: str }
+
+store items: map[int, Item]
+store cats_s: map[str, Cat]
+
+// свёртка в локальный словарь: литерал без имени в ?? — свежий
+route GET "/fold" -> [Cat] {
+    var cats: map[str, Cat] = {}
+    for it in items.values() {
+        let c = cats[it.name] ?? { name: it.name, count: 0 }
+        c.count += 1
+        cats[c.name] = c
+    }
+    return cats.values()
+}
+
+// A3: анонимный литерал, изменение его поля и новое значение литералом
+route GET "/a3" -> int {
+    var acc = { n: 0, last: "" }
+    for it in items.values() {
+        acc.n += it.id
+        acc = { ...acc, last: it.name }
+    }
+    return acc.n
+}
+
+// объявление с анонимным типом и значениями по умолчанию
+route GET "/typed" -> int {
+    var t: { n: int = 0, tags: [str] = [] } = {}
+    t.n += items.len()
+    return t.n + t.tags.len()
+}
+
+// словарь с анонимными значениями, в который кладут только свежее
+route GET "/elems" -> int {
+    var groups: map[str, { n: int }] = {}
+    for it in items.values() {
+        let g = groups[it.name] ?? { n: 0 }
+        g.n += 1
+        groups[it.name] = g
+    }
+    return groups.len()
+}
+
+// значение store в литерале: его список — общий со store
+route GET "/store-in-literal" -> int {
+    let c = cats_s["a"] ?? { name: "a", count: 0 }
+    c.count += 1
+    return c.count
+}
+
+// поле анонимного литерала — значение store, и оно меняется
+route GET "/store-field" -> int {
+    let w = { cat: cats_s["a"] ?? { name: "a", count: 0 } }
+    w.cat.count += 1
+    return w.cat.count
+}
+
+// распаковка значения store в литерал: поля копируются, но список — общий
+route GET "/spread" -> int {
+    let src = items[1] ?? { id: 0, name: "" }
+    var x = { ...src, extra: [1] }
+    x.extra.push(2)
+    return x.extra.len()
+}

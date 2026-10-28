@@ -212,9 +212,10 @@ test "a bool map copied into store and a literal typed by its first entry" {
     }
     expect yes == 749 && !copied.has(5) && (copied[9] ?? false)
     __gc_collect()
-    // литерал без известного типа: ключ — не литерал, значения bool
+    // литерал без известного типа: ключ — не литерал (в скобках: {key: ...}
+    // без них — литерал структуры), значения bool
     let key = "a" + "b"
-    let lit = {key: true, "c": false}
+    let lit = {(key): true, "c": false}
     expect (lit["ab"] ?? false) && !(lit["c"] ?? true) && to_json(lit) == "\{\"ab\":true,\"c\":false}"
     let lh: int = __cast(lit)
     expect __map_flags_of(lh) == 3

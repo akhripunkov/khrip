@@ -1,0 +1,33 @@
+tests/errors/anon_fields.kh:9:20: error: missing fields in Point: y: int
+        let a: Point = { x: 1 }
+                       ^
+    hint: set every field, or copy them with ...other
+tests/errors/anon_fields.kh:10:34: error: type 'Point' has no field 'color'
+        let b: Point = { x: 1, y: 2, color: "red" }
+                                     ^
+    hint: its fields: x, y
+tests/errors/anon_fields.kh:11:25: error: expected int, found str
+        let c: Point = { x: "1", y: 2 }
+                            ^
+    hint: parse with s.to_int() ?? 0
+tests/errors/anon_fields.kh:12:19: error: missing fields in Opts: sort: str
+        let d: Opts = {}
+                      ^
+    hint: write them in the braces: { sort: ... }
+tests/errors/anon_fields.kh:13:15: error: cannot infer the type of field 'name' from none
+        let e = { name: none }
+                  ^
+    hint: give the literal a type: let v: { name: T? } = ..., or a named type
+tests/errors/anon_fields.kh:14:21: error: field 'n' is set twice
+        let f = { n: 1, n: 2 }
+                        ^
+    hint: remove one of them
+tests/errors/anon_fields.kh:15:28: error: type 'Point' has no field 'yy'
+        let g: Point = { x: 1, yy: 2 }
+                               ^
+    hint: did you mean 'y'?
+tests/errors/anon_fields.kh:16:22: error: expected ':' after field 'f', found '('
+        let h = { x: 1, f(2) }
+                         ^
+    hint: { name: value } or { name } for a variable of that name
+8 errors

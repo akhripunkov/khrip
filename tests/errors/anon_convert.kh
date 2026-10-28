@@ -1,0 +1,18 @@
+// Анонимные типы структурные, именованные — номинальные: значение анонимного
+// типа становится именованным только явно (User { ...x }), и наоборот; разные
+// наборы полей — разные типы.
+type User { id: int, name: str }
+
+fn save(u: User) -> int {
+    return u.id
+}
+
+fn main() {
+    let a = { id: 1, name: "ann" }
+    save(a)
+    let u = User { id: 2, name: "bob" }
+    let b: { id: int, name: str } = u
+    let c: { id: int } = a
+    let d: { id: int, name: str? } = a
+    print(b.name + c.id.to_str() + d.id.to_str())
+}

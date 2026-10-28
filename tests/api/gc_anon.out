@@ -1,0 +1,4 @@
+ok    routes with anonymous bodies and results
+ok    nested anonymous values in store survive collections
+ok    KHRIP_DATA snapshot of anonymous types round-trips
+3 tests: 3 passed, 0 failed

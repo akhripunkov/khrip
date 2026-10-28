@@ -1,0 +1,17 @@
+tests/errors/anon_convert.kh:12:10: error: expected User, found { id: int, name: str }
+        save(a)
+             ^
+    hint: a value of another type becomes User only explicitly: User { ...value }
+tests/errors/anon_convert.kh:14:37: error: expected { id: int, name: str }, found User
+        let b: { id: int, name: str } = u
+                                        ^
+    hint: an anonymous type matches only the same fields; copy them: { ...value } (set the missing ones)
+tests/errors/anon_convert.kh:15:26: error: expected { id: int }, found { id: int, name: str }
+        let c: { id: int } = a
+                             ^
+    hint: an anonymous type matches only the same fields; copy them: { ...value } (set the missing ones)
+tests/errors/anon_convert.kh:16:38: error: expected { id: int, name: str? }, found { id: int, name: str }
+        let d: { id: int, name: str? } = a
+                                         ^
+    hint: an anonymous type matches only the same fields; copy them: { ...value } (set the missing ones)
+4 errors
