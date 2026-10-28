@@ -1,0 +1,35 @@
+var seed: int = 12345
+
+fn rnd(n: int) -> int {
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    return seed % n
+}
+
+fn pick() -> str {
+    let parts = ["a", "B", "z", "Z", "0", " ", "Apple", "GREEN", "pro", "K", "İ", "Ж", "ж", "ß", "~", "@", "[", "`", "\{", "mini", "MAX"]
+    var s = ""
+    let n = rnd(40)
+    for i in 0..n {
+        s += parts[rnd(parts.len())]
+    }
+    return s
+}
+
+fn check(s: str, sub: str) -> bool {
+    return __text_contains_lower(s, sub)
+}
+
+fn main() {
+    var h = 0
+    for k in 0..20000 {
+        let s = pick()
+        var sub = pick()
+        if sub.len() > 3 {
+            sub = sub[0..3]
+        }
+        if rnd(2) == 0 {
+            sub = sub.lower()
+        }
+        print(s.lower() + "|" + s.upper() + "|" + sub + "|" + check(s, sub).to_str())
+    }
+}

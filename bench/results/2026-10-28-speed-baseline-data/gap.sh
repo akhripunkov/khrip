@@ -13,9 +13,8 @@ root=$(cd "$here/../../.." && pwd)
 mode=$1
 rounds=${2:-3}
 shift 2 || shift $#
-if pgrep -f 'tests/run|wrk |perf.sh' >/dev/null; then
+if pgrep -x wrk >/dev/null || pgrep -f '^(/usr)?(/bin/)?bash [^ ]*(perf|run)\.sh' >/dev/null; then
 	echo "gap.sh: идёт другой замер" >&2
-	pgrep -af 'tests/run|wrk |perf.sh' >&2
 	exit 2
 fi
 for r in $(seq "$rounds"); do
