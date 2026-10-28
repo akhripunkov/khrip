@@ -1,0 +1,11 @@
+// Необязательное значение в sql — только ровно ({x} IS NULL OR col = {x}), без приведения типа.
+// in: postgresql.md
+// rule: `{expr}` is a typed parameter (no `::cast`), never SQL text; `none` is NULL, so compare an optional exactly as `({x} IS NULL OR col = {x})`.
+// expect: {before} may be none, and a comparison with NULL is never true
+migration 1 `CREATE TABLE items (id bigserial PRIMARY KEY, name text NOT NULL)`
+
+type Item { id: int, name: str }
+
+route GET "/items" (before: int?) -> [Item] {
+    return sql "SELECT * FROM items WHERE ({before}::bigint IS NULL OR id < {before}) ORDER BY id"
+}

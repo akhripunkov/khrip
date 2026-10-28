@@ -85,9 +85,8 @@ if q == none {
 
 Checks against `none` narrow a `let` or a parameter (not a `var`). Narrowing and
 `if let` work in `if` statements, not in an `if` used as a value: unwrap before
-it. `m[k]`, `.get(k)`, `.remove(k)`,
-`.find(s)`, `.to_int()`, `.to_float()`, `.index_of(x)`, `env`, `header`,
-`parse_time` and `from_json` return `T?`.
+it. `m[k]`, `.get(k)`, `.remove(k)`, `.find(s)`, `.to_int()`, `.to_float()`,
+`.index_of(x)`, `env`, `header`, `parse_time` and `from_json` return `T?`.
 
 ## Values
 

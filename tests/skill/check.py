@@ -18,8 +18,12 @@
 # 3. Ключевые правила: tests/skill/rules/*.kh. «// in: файл» и «// rule: текст»
 #    — текст правила, который должен быть в этом файле скилла (пробелы и
 #    переводы строк сравниваются как один пробел); дальше «// expect: ...» —
-#    программа не компилируется и вывод содержит каждую строку; файл .out —
+#    программа не компилируется и вывод содержит каждую строку; «// compiles» —
+#    khc check без ошибок (запросы sql — по миграциям, без базы); файл .out —
 #    вывод khc run совпадает с ним; иначе блоки test проходят (khc test).
+#
+# 0. Формат скилла агента: SKILL.md начинается с frontmatter из name (= имя
+#    папки: строчные буквы, цифры, дефис, до 64) и description (до 1024).
 #
 # Печатает FAIL и SKIP, последняя строка — «skill: <прошло> <провалено>».
 import os
@@ -84,6 +88,17 @@ def blocks(md):
         i = j + 1
     return out
 
+
+# 0. Frontmatter
+head = re.match(r'---\nname: ([^\n]*)\ndescription: ([^\n]*)\n---\n', open(f'{skill}/SKILL.md', encoding='utf-8').read())
+if not head:
+    fail(f'{skill}/SKILL.md', 'must start with ---, name:, description:, ---')
+elif head.group(1) != os.path.basename(skill) or not re.fullmatch(r'[a-z0-9-]{1,64}', head.group(1)):
+    fail(f'{skill}/SKILL.md', f'name {head.group(1)!r} must be the folder name, lowercase letters, digits and -')
+elif not 0 < len(head.group(2)) <= 1024 or ': ' in head.group(2):
+    fail(f'{skill}/SKILL.md', 'description must be 1-1024 characters, a plain YAML scalar (no ": ")')
+else:
+    ok()
 
 # 1. Блоки кода
 first_program = {}
@@ -173,6 +188,11 @@ for f in sorted(os.listdir(f'{here}/rules')):
         bad = [e for e in expects if e not in out]
         if code == 0 or bad:
             fail(src, f'expected an error with "{bad[0] if bad else expects[0]}", got:\n{out}')
+            continue
+    elif re.search(r'^// compiles$', head, re.M):
+        code, out = run([khc, 'check', src])
+        if code != 0:
+            fail(src, f'khc check:\n{out}')
             continue
     elif os.path.exists(src[:-3] + '.out'):
         code, out = run([khc, 'run', src])

@@ -1,0 +1,92 @@
+type Creds { username: str, password: str }
+type Account { id: int, username: str, hash: str }
+type NewNote { title: str, text: str }
+type Note { id: int, title: str, text: str, created_at: str }
+type StoredNote { owner: int, note: Note }
+
+store accounts: map[str, Account]
+store last_user: int
+store tokens: map[str, int]
+store notes: map[int, StoredNote]
+store last_note: int
+
+fn auth() -> int {
+    let h = header("Authorization") ?? fail(401, "missing token")
+    if !h.starts_with("Bearer ") {
+        fail(401, "invalid token")
+    }
+    let t = h[7..].trim()
+    return tokens[t] ?? fail(401, "unknown token")
+}
+
+route POST "/register" (body: Creds) -> 201 { id: int, username: str } | 400 str | 409 str {
+    let n = body.username.len()
+    if n < 3 || n > 32 {
+        return 400 "username must be 3-32 characters"
+    }
+    if body.password.len() < 8 {
+        return 400 "password must be at least 8 characters"
+    }
+    if accounts.has(body.username) {
+        return 409 "username taken"
+    }
+    let hash = hash_password(body.password)
+    if accounts.has(body.username) {
+        return 409 "username taken"
+    }
+    last_user += 1
+    let id = last_user
+    accounts[body.username] = Account { id, username: body.username, hash }
+    return 201 { id, username: body.username }
+}
+
+route POST "/login" (body: Creds) -> { token: str } | 401 str {
+    let acc = accounts[body.username] else {
+        return 401 "wrong username or password"
+    }
+    if !check_password(body.password, acc.hash) {
+        return 401 "wrong username or password"
+    }
+    let token = random_str(32)
+    tokens[token] = acc.id
+    return { token }
+}
+
+route POST "/notes" (body: NewNote) -> 201 Note | 400 str | 401 str {
+    let uid = auth()
+    if body.title.trim().len() == 0 {
+        return 400 "title is blank"
+    }
+    last_note += 1
+    let note = Note { id: last_note, title: body.title, text: body.text, created_at: time_iso(now()) }
+    notes[note.id] = StoredNote { owner: uid, note }
+    return 201 note
+}
+
+route GET "/notes" () -> [Note] | 401 str {
+    let uid = auth()
+    return notes.values().filter(s => s.owner == uid).map(s => s.note)
+}
+
+route GET "/notes/{id}" (id: int) -> Note | 401 str | 404 str {
+    let uid = auth()
+    let s = notes[id] else {
+        return 404 "note not found"
+    }
+    if s.owner != uid {
+        return 404 "note not found"
+    }
+    return s.note
+}
+
+route DELETE "/notes/{id}" (id: int) -> 204 | 401 str | 404 str {
+    let uid = auth()
+    let s = notes[id] else {
+        return 404 "note not found"
+    }
+    if s.owner != uid {
+        return 404 "note not found"
+    }
+    notes.remove(id)
+    return 204
+}

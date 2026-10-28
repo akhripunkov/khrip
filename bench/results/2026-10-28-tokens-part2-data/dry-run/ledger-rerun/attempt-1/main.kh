@@ -1,0 +1,113 @@
+migration 1 `
+CREATE TABLE IF NOT EXISTS accounts (
+    id bigserial PRIMARY KEY,
+    owner text NOT NULL,
+    currency text NOT NULL,
+    balance bigint NOT NULL DEFAULT 0 CHECK (balance >= 0)
+);
+CREATE TABLE IF NOT EXISTS transfers (
+    id bigserial PRIMARY KEY,
+    from_id bigint NOT NULL REFERENCES accounts(id),
+    to_id bigint NOT NULL REFERENCES accounts(id),
+    amount bigint NOT NULL CHECK (amount > 0),
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS transfers_from_idx ON transfers (from_id, id);
+CREATE INDEX IF NOT EXISTS transfers_to_idx ON transfers (to_id, id);
+CREATE TABLE IF NOT EXISTS idempotency (
+    key text PRIMARY KEY,
+    body_hash text NOT NULL,
+    transfer_id bigint NOT NULL REFERENCES transfers(id)
+);
+`
+
+type Account { id: int, owner: str, currency: str, balance: int }
+type Transfer { id: int, from: int, to: int, amount: int, created_at: str }
+type Idem { body_hash: str, transfer_id: int }
+type Balances { USD: int, EUR: int, GBP: int }
+
+route POST "/accounts" (body: { owner: str, currency: str }) -> 201 Account | 400 str {
+    if body.owner.trim().len() == 0 {
+        return 400 "owner is blank"
+    }
+    if body.currency != "USD" && body.currency != "EUR" && body.currency != "GBP" {
+        return 400 "currency must be USD, EUR or GBP"
+    }
+    let a: Account = sql "INSERT INTO accounts (owner, currency) VALUES ({body.owner}, {body.currency}) RETURNING id, owner, currency, balance"
+    return 201 a
+}
+
+route GET "/accounts/{id}" (id: int) -> Account | 404 {
+    let a: Account = sql "SELECT id, owner, currency, balance FROM accounts WHERE id = {id}"
+    return a
+}
+
+route POST "/accounts/{id}/deposit" (id: int, body: { amount: int }) -> Account | 400 str | 404 {
+    if body.amount <= 0 {
+        return 400 "amount must be positive"
+    }
+    let a: Account = sql "UPDATE accounts SET balance = balance + {body.amount} WHERE id = {id} RETURNING id, owner, currency, balance"
+    return a
+}
+
+route POST "/transfers" (body: { from: int, to: int, amount: int }) -> 201 Transfer | 400 str | 404 | 409 str | 422 str {
+    if body.amount <= 0 {
+        return 400 "amount must be positive"
+    }
+    if body.from == body.to {
+        return 400 "from and to must differ"
+    }
+    let key = header("Idempotency-Key")
+    if key != none {
+        if key.len() < 1 || key.len() > 64 {
+            return 400 "Idempotency-Key must be 1-64 characters"
+        }
+    }
+    let hash = "{body.from}:{body.to}:{body.amount}"
+    tx {
+        if let k = key {
+            let ex: Idem? = sql "SELECT body_hash, transfer_id FROM idempotency WHERE key = {k} LIMIT 1"
+            if let e = ex {
+                if e.body_hash != hash {
+                    return 422 "idempotency key reused with a different body"
+                }
+                let old: Transfer = sql "SELECT id, from_id AS \"from\", to_id AS \"to\", amount, created_at FROM transfers WHERE id = {e.transfer_id}"
+                return 201 old
+            }
+        }
+        let a: Account = sql "SELECT id, owner, currency, balance FROM accounts WHERE id = {body.from}"
+        let b: Account = sql "SELECT id, owner, currency, balance FROM accounts WHERE id = {body.to}"
+        if a.currency != b.currency {
+            return 422 "currencies differ"
+        }
+        if a.balance < body.amount {
+            return 409 "insufficient funds"
+        }
+        sql "UPDATE accounts SET balance = balance - {body.amount} WHERE id = {a.id}"
+        sql "UPDATE accounts SET balance = balance + {body.amount} WHERE id = {b.id}"
+        let t: Transfer = sql "INSERT INTO transfers (from_id, to_id, amount) VALUES ({a.id}, {b.id}, {body.amount}) RETURNING id, from_id AS \"from\", to_id AS \"to\", amount, created_at"
+        if let k = key {
+            sql "INSERT INTO idempotency (key, body_hash, transfer_id) VALUES ({k}, {hash}, {t.id})"
+        }
+        return 201 t
+    }
+}
+
+route GET "/accounts/{id}/transfers" (id: int, limit: int = 20, before: int?) -> [Transfer] | 400 str | 404 {
+    if limit < 1 || limit > 100 {
+        return 400 "limit must be 1-100"
+    }
+    if before != none && before < 1 {
+        return 400 "bad before"
+    }
+    let a: Account = sql "SELECT id, owner, currency, balance FROM accounts WHERE id = {id}"
+    let items: [Transfer] = sql "SELECT id, from_id AS \"from\", to_id AS \"to\", amount, created_at FROM transfers WHERE (from_id = {a.id} OR to_id = {a.id}) AND ({before}::bigint IS NULL OR id < {before}) ORDER BY id DESC LIMIT {limit}"
+    return items
+}
+
+route GET "/stats" () -> { accounts: int, transfers: int, balances: Balances } {
+    let accounts: int = sql "SELECT count(*) FROM accounts"
+    let transfers: int = sql "SELECT count(*) FROM transfers"
+    let balances: Balances = sql "SELECT COALESCE(SUM(balance) FILTER (WHERE currency = 'USD'), 0)::bigint AS \"USD\", COALESCE(SUM(balance) FILTER (WHERE currency = 'EUR'), 0)::bigint AS \"EUR\", COALESCE(SUM(balance) FILTER (WHERE currency = 'GBP'), 0)::bigint AS \"GBP\" FROM accounts"
+    return { accounts, transfers, balances }
+}

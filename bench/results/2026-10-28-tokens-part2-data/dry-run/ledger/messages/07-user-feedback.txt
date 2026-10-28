@@ -1,0 +1,12 @@
+Your program does not pass yet. It does not build or start:
+
+main.kh:67:12: error: if let cannot be used as a value
+            if let p = prev {
+               ^
+    hint: use x ?? default or match
+main.kh:73:11: error: expected a value, found 'else'
+            } else {
+              ^
+2 errors
+
+Fix it. Answer with the whole file only.

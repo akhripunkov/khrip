@@ -1,0 +1,9 @@
+You are the model under test in a dry run of a programming language description. Rules for this whole conversation: do not use any tools at all (no shell, no file reading or writing, no web search) and do not look for any repository; work only from the text of these messages. Your entire reply is passed as is to an automatic checker, so reply exactly as the instructions below say, with nothing else.
+
+=== SYSTEM PROMPT ===
+
+<system.txt>
+
+=== USER MESSAGE ===
+
+<messages/01-user-task.txt>

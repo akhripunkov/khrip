@@ -7,12 +7,12 @@ at start.
 ```khrip
 migration 1 `
 CREATE TABLE accounts (id bigserial PRIMARY KEY, owner text NOT NULL,
-    balance bigint NOT NULL DEFAULT 0 CHECK (balance >= 0), note text,
+    balance bigint NOT NULL DEFAULT 0 CHECK (balance >= 0),
     created_at timestamptz NOT NULL DEFAULT now());
 `
-type Account { id: int, owner: str, balance: int, note: str?, created_at: str }
+type Account { id: int, owner: str, balance: int, created_at: str }
 
-route POST "/accounts" (body: { owner: str, note: str? }) -> 201 Account {
+route POST "/accounts" (body: { owner: str }) -> 201 Account {
     return 201 sql "INSERT INTO accounts {body} RETURNING *"   // fields → columns
 }
 
@@ -30,10 +30,11 @@ route POST "/transfers" (body: { from: int, to: int, amount: int }) -> 204 | 404
 }
 ```
 
-- `sql "..."` (or `` sql `...` ``) runs one statement. `{expr}` is a parameter,
-  never SQL text; `none` is NULL, so compare an optional as `({x} IS NULL OR col =
-  {x})`. `IN ({list})` takes a list; `ILIKE '%{q}%'` matches q literally; `ORDER
-  BY {o}` takes a local made of string literals (`if`, `match`).
+- `sql "..."` (or `` sql `...` ``) runs one statement. `{expr}` is a typed
+  parameter (no `::cast`), never SQL text; `none` is NULL, so compare an optional
+  exactly as `({x} IS NULL OR col = {x})`. `IN ({list})` takes a list; `ILIKE
+  '%{q}%'` matches q literally; `ORDER BY {o}` takes a local made of string
+  literals (`if`, `match`).
 - The expected type picks the result: `T` one row, none → 404 (the route lists
   `| 404`, or `let r: T = sql "..." else { return 401 }`); `T?` one row or none
   (add `LIMIT 1`); `[T]` all rows; no type: rows changed. `T` is a struct
@@ -55,5 +56,5 @@ route POST "/transfers" (body: { from: int, to: int, amount: int }) -> 204 | 404
   `call`, MongoDB, ClickHouse, store or outer-variable changes; a status from
   400, `fail` or a panic rolls it back. `let t = tx { ...; value }` commits and
   gives the value.
-- `khc test` works in a temporary schema of `KHRIP_TEST_DATABASE_URL` (else
-  `DATABASE_URL`); tests share it.
+- `khc test` uses a temporary schema of `KHRIP_TEST_DATABASE_URL` (else
+  `DATABASE_URL`).

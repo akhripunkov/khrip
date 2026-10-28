@@ -1,0 +1,20 @@
+{
+ "task": "ledger",
+ "lang": "khrip",
+ "model": "dry-run",
+ "passed": true,
+ "attempts": 4,
+ "calls": 5,
+ "chapters_read": [
+  "postgresql.md"
+ ],
+ "tokens": {
+  "system": 3029,
+  "task": 713,
+  "chapters": 892,
+  "answers": 5483,
+  "feedback": 512
+ },
+ "cost_w0.02": 7189.9,
+ "cost_w0.2": 9916.0
+}

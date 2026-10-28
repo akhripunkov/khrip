@@ -1,0 +1,17 @@
+Your program does not pass yet. It does not build or start:
+
+main.kh:65:86: error: {key} may be none, and a comparison with NULL is never true: rows would silently not match
+            let prev: Idem? = sql "SELECT body, transfer_id FROM idempotency WHERE key = {key} LIMIT 1"
+                                                                                         ^
+    hint: write ({key} IS NULL OR column = {key}), or unwrap it first: let v = key else { return 400 }
+main.kh:67:21: error: the value may be none; unwrap it before reading .body
+                if prev.body != sig {
+                        ^
+    hint: if let v = x { v.body } or let v = x else { return ... }
+main.kh:70:138: error: the value may be none; unwrap it before reading .transfer_id
+                let old: Transfer = sql "SELECT id, from_id AS \"from\", to_id AS \"to\", amount, created_at FROM transfers WHERE id = {prev.transfer_id}"
+                                                                                                                                             ^
+    hint: if let v = x { v.transfer_id } or let v = x else { return ... }
+3 errors
+
+Fix it. Answer with the whole file only.

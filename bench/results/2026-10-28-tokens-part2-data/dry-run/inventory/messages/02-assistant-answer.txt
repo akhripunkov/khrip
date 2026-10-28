@@ -1,0 +1,127 @@
+```khrip
+type Item { sku: str, name: str, stock: int }
+type Line { sku: str, qty: int }
+type NewOrder { lines: [Line] = [] }
+type Restock { amount: int }
+type Order { id: int, lines: [Line], status: str, total_qty: int }
+
+store items: map[str, Item]
+store orders: map[int, Order]
+store last_order: int
+
+route POST "/items" (body: Item) -> 201 Item | 400 str | 409 str {
+    if !body.sku.matches(`[A-Z0-9-]{3,20}`) {
+        return 400 "sku is invalid"
+    }
+    if body.name.trim().len() == 0 {
+        return 400 "name is blank"
+    }
+    if body.stock < 0 {
+        return 400 "stock is negative"
+    }
+    if items.has(body.sku) {
+        return 409 "sku exists"
+    }
+    let item = Item { sku: body.sku, name: body.name, stock: body.stock }
+    items[item.sku] = item
+    return 201 item
+}
+
+route GET "/items" () -> [Item] {
+    return items.values().sort_by(i => i.sku)
+}
+
+route POST "/items/{sku}/restock" (sku: str, body: Restock) -> Item | 400 str | 404 str {
+    if body.amount <= 0 {
+        return 400 "amount must be positive"
+    }
+    let item = items[sku] else {
+        return 404 "unknown sku"
+    }
+    item.stock += body.amount
+    return item
+}
+
+route POST "/orders" (body: NewOrder) -> 201 Order | 400 str | 404 str | 409 str {
+    if body.lines.len() == 0 {
+        return 400 "no lines"
+    }
+    for l in body.lines {
+        if l.qty <= 0 {
+            return 400 "qty must be positive"
+        }
+    }
+    var need: map[str, int] = {}
+    for l in body.lines {
+        if !items.has(l.sku) {
+            return 404 "unknown sku {l.sku}"
+        }
+        need[l.sku] = (need[l.sku] ?? 0) + l.qty
+    }
+    for k, v in need {
+        let it = items[k] else {
+            return 404 "unknown sku {k}"
+        }
+        if it.stock < v {
+            return 409 "not enough stock for {k}"
+        }
+    }
+    for k, v in need {
+        if let it = items[k] {
+            it.stock -= v
+        }
+    }
+    var lines: [Line] = []
+    var total = 0
+    for l in body.lines {
+        lines.push(Line { sku: l.sku, qty: l.qty })
+        total += l.qty
+    }
+    last_order += 1
+    let order = Order { id: last_order, lines: lines, status: "placed", total_qty: total }
+    orders[order.id] = order
+    return 201 order
+}
+
+route POST "/orders/{id}/cancel" (id: int) -> Order | 404 str | 409 str {
+    let order = orders[id] else {
+        return 404 "unknown order"
+    }
+    if order.status == "cancelled" {
+        return 409 "already cancelled"
+    }
+    for l in order.lines {
+        if let it = items[l.sku] {
+            it.stock += l.qty
+        }
+    }
+    order.status = "cancelled"
+    return order
+}
+
+route GET "/orders" (status: str?) -> [Order] | 400 str {
+    if status != none && status != "placed" && status != "cancelled" {
+        return 400 "status is invalid"
+    }
+    return orders.values().filter(o => status == none || o.status == status)
+}
+
+test "items and orders" {
+    let r = call POST "/items" { sku: "AB-1", name: "Widget", stock: 5 }
+    expect r.status == 201
+    expect (call POST "/items" { sku: "ab", name: "x", stock: 1 }).status == 400
+    expect (call POST "/items" { sku: "AB-1", name: "Widget", stock: 5 }).status == 409
+    expect (call POST "/items/AB-1/restock" { amount: 0 }).status == 400
+    expect (call POST "/items/ZZZ/restock" { amount: 1 }).status == 404
+    expect (call POST "/orders" { lines: [{ sku: "AB-1", qty: 3 }, { sku: "AB-1", qty: 3 }] }).status == 409
+    expect (call POST "/orders" { lines: [] }).status == 400
+    expect (call POST "/orders" { lines: [{ sku: "NOPE", qty: 1 }] }).status == 404
+    let o = call POST "/orders" { lines: [{ sku: "AB-1", qty: 2 }] }
+    expect o.status == 201
+    expect (call POST "/orders/1/cancel").status == 200
+    expect (call POST "/orders/1/cancel").status == 409
+    expect (call POST "/orders/9/cancel").status == 404
+    expect (call GET "/orders?status=bad").status == 400
+    expect (call GET "/orders?status=cancelled").status == 200
+}
+```

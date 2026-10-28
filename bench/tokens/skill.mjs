@@ -57,7 +57,7 @@ for (const m of Object.keys(metrics)) {
       }
       const ratio = (v) => (v / sum.cost).toFixed(2);
       console.log(`| **${title}** | **${sum.prog}** | **${fmt(sum.cost)}** | ${sum.others.map((v) => `**${v}** (×${ratio(v)})`).join(' | ')} |`);
-      console.log(`| то же, главы как prompt (вес w) | | ${fmt(sum.costPrompt)} | ${sum.others.map((v) => `×${(v / sum.costPrompt).toFixed(2)}`).join(' | ')} |`);
+      if (chapters.length) console.log(`| то же, главы как prompt (вес w) | | ${fmt(sum.costPrompt)} | ${sum.others.map((v) => `×${(v / sum.costPrompt).toFixed(2)}`).join(' | ')} |`);
       console.log(`| то же, прежний способ: KHRIP.md в prompt | | ${fmt(sum.oldCost)} | ${sum.others.map((v) => `×${(v / sum.oldCost).toFixed(2)}`).join(' | ')} |`);
       for (const k of ['prog', 'cost', 'costPrompt', 'oldCost']) all[k] += sum[k];
       sum.others.forEach((v, i) => (all.others[i] += v));

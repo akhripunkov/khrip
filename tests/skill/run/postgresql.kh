@@ -6,12 +6,10 @@ test "postgresql chapter" {
     let ann: Account? = from_json(a.body)
     expect ann != none
     expect ann.balance == 0
-    expect ann.note == none
     expect parse_time(ann.created_at) != none
-    let b = call POST "/accounts" { owner: "bob", note: "vip" }
+    let b = call POST "/accounts" { owner: "bob" }
     let bob: Account? = from_json(b.body)
     expect bob != none
-    expect bob.note == "vip"
     sql "UPDATE accounts SET balance = 100 WHERE id = {ann.id}"
     expect (call POST "/transfers" { from: ann.id, to: bob.id, amount: 30 }).status == 204
     expect (call POST "/transfers" { from: ann.id, to: bob.id, amount: 71 }).status == 409

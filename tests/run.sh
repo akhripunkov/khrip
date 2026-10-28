@@ -45,10 +45,10 @@
 #   eval/solutions/*/khrip — решения задач проверки проходят eval/run.sh;
 #   skill/khrip/      — скилл Khrip: ядро SKILL.md не больше 3000 токенов o200k,
 #                       глава — не больше 900 (eval/tokens/count.mjs --raw; без
-#                       node или gpt-tokenizer — строка SKIP); блоки кода
-#                       компилируются, примеры глав работают на настоящих базах,
-#                       ключевые правила сходятся с компилятором
-#                       (tests/skill/check.py).
+#                       node или gpt-tokenizer — строка SKIP); frontmatter
+#                       скилла агента, блоки кода компилируются, примеры глав
+#                       работают на настоящих базах, ключевые правила сходятся
+#                       с компилятором (tests/skill/check.py).
 # Компилятор берётся из $KHC (по умолчанию build/khc). С KHRIP_GC_VERIFY=1 в
 # окружении проверки сборщика идут во всех программах набора (tests/api без
 # них — только первый проход); с KHRIP_GC_VERIFY=fast — те же проверки, но
@@ -1241,6 +1241,8 @@ if command -v python3 >/dev/null; then
 	else
 		failed "tests/skill/check.py" "$(cat "$tmp/skill.txt")"
 	fi
+else
+	echo "SKIP skill/khrip: нет python3 — блоки кода и правила скилла не проверены"
 fi
 
 echo "тестов пройдено: $pass, провалено: $fail"

@@ -1,0 +1,22 @@
+{
+ "task": "inventory",
+ "lang": "khrip",
+ "model": "dry-run",
+ "db": false,
+ "attempts": 1,
+ "passed": true,
+ "done": true,
+ "chapters": [],
+ "messages": [
+  {
+   "role": "user",
+   "kind": "task",
+   "file": "messages/01-user-task.txt"
+  },
+  {
+   "role": "assistant",
+   "kind": "answer",
+   "file": "messages/02-assistant-answer.txt"
+  }
+ ]
+}
