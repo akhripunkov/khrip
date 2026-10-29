@@ -12,8 +12,9 @@
 #       RSS — среднее и пик за последние SCALE_WINDOW (30) с, когда все
 #       соединения открыты; строки — в results/perf_conn.tsv
 #
-# Частота — общая для всех языков (по умолчанию khrip go csharp): ≈ 70 %
-# максимума Go в замкнутом цикле на этой машине (как выбрана — в rates.tsv).
+# Частота — общая для всех языков (по умолчанию khrip go csharp java node
+# bun): ≈ 70 % максимума Go в замкнутом цикле на этой машине (как выбрана — в
+# rates.tsv); кто её не держит, тот behind — частоту ради него не снижают.
 # RATE=<запросов/с> задаёт одну частоту всем сценариям. Python этих частот не
 # держит: он идёт, только если указан в LANGS и задан RATE_PYTHON, — для
 # сведения, не для сравнения.
@@ -58,7 +59,7 @@ lat_ms() {
 pct_of() { lat_ms "$(awk -v p="$1" '$1 == p {print $2; exit}' <<<"$2")"; }
 # выборка RSS сервера в фоне: sampler_start <файл> <фаза>, sampler_stop
 sampler_start() {
-	taskset -c "$CLIENT_CPUS" python3 "$here/rss_sample.py" "$pid" "$1" "$2" "$RSS_MS" &
+	taskset -c "$CLIENT_CPUS" python3 "$here/rss_sample.py" "$(tree_pids "$pid" | paste -sd,)" "$1" "$2" "$RSS_MS" &
 	spid=$!
 }
 sampler_stop() {
@@ -100,8 +101,9 @@ for sc in "${scenarios[@]}"; do
 	db=0
 	[[ -f "$here/tasks/$task/db" ]] && db=1
 	for lang in $LANGS; do
-		dir=$here/solutions/$task/$lang
+		dir=$here/solutions/$task/$(sol_lang "$lang")
 		[[ -d $dir ]] || continue
+		[[ $lang == node-cluster && $db == 0 ]] && continue
 		if [[ -n $CONN_SCALE ]]; then
 			rate=$SCALE_RATE
 		elif [[ $lang == python ]]; then
@@ -140,7 +142,7 @@ for sc in "${scenarios[@]}"; do
 				wpid=$!
 				sleep $((dur - 5))
 				# открытые дескрипторы сервера: соединения, слушающий сокет, epoll, база
-				fds=$(ls "/proc/$pid/fd" 2>/dev/null | wc -l)
+				fds=$(for p in $(tree_pids "$pid"); do ls "/proc/$p/fd" 2>/dev/null; done | wc -l)
 				wait "$wpid"
 				wpid=
 				sampler_stop

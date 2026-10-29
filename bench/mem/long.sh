@@ -13,6 +13,10 @@
 #                    (в репозиторий не входит)
 #   khrip-m1-gc50  — то же с KHRIP_GC=50
 #   go             — копия решения с bench/mem/go_memstats.go, GODEBUG=gctrace=1
+#   csharp, java, node, bun — решения eval/solutions как есть, собранные и
+#                    запущенные как в eval/server.sh (настройки сред по
+#                    умолчанию); живое в конце и число сборок у них не
+#                    считаются («-»)
 #
 # Окружение: RATE (по умолчанию из eval/load/rates.tsv), WARMUP (60 с),
 # DURATION (600 с), IDLE_MAX (180 с — сколько ждать первой сборки Khrip после
@@ -79,6 +83,7 @@ for v in $variants; do
 	rm -rf "${o:?}"
 	mkdir -p "$o"
 	envs=(PORT=8080)
+	cmd=("$tmp/server")
 	case $v in
 	khrip | khrip-gcoff | khrip-gc100 | khrip-m1 | khrip-m1-gc50)
 		khc=$root/build/khc
@@ -96,12 +101,26 @@ for v in $variants; do
 		(cd "$tmp/go" && go build -o "$tmp/server" .) || exit 1
 		envs+=(GODEBUG=gctrace=1)
 		;;
+	csharp)
+		build_solution csharp "$ev/solutions/$sc/csharp" "$tmp" || exit 1
+		cmd=(dotnet "$tmp/cs/$(basename "$(ls "$ev/solutions/$sc/csharp"/*.csproj)" .csproj).dll")
+		;;
+	java)
+		rm -rf "${tmp:?}/java"
+		build_solution java "$ev/solutions/$sc/java" "$tmp" || exit 1
+		cmd=(env -u JAVA_TOOL_OPTIONS java -jar "$tmp/java/target/app.jar")
+		;;
+	node | bun)
+		build_solution "$v" "$ev/solutions/$sc/node" "$tmp" || exit 1
+		cmd=(env -u NODE_OPTIONS node "$ev/solutions/$sc/node/server.js")
+		[[ $v == bun ]] && cmd=(env -u BUN_OPTIONS -u BUN_FEATURE_FLAG_DISABLE_STANDALONE_MADVISE bun "$ev/solutions/$sc/node/server.js")
+		;;
 	*)
 		echo "вариант $v?" >&2
 		exit 2
 		;;
 	esac
-	env "${envs[@]}" taskset -c "$SERVER_CPUS" "$tmp/server" 2> >(taskset -c "$CLIENT_CPUS" python3 "$here/ts_lines.py" >"$o/stderr.log") &
+	env "${envs[@]}" taskset -c "$SERVER_CPUS" "${cmd[@]}" 2> >(taskset -c "$CLIENT_CPUS" python3 "$here/ts_lines.py" >"$o/stderr.log") >"$o/stdout.log" &
 	pid=$!
 	wait_up || { echo "не запустилось" >&2; exit 1; }
 	env_line=$(python3 "$ev/load/seed.py" seed "$sc") || exit 1
@@ -139,6 +158,9 @@ for v in $variants; do
 		live=$(awk '/memstats after-gc/ {for (i = 1; i <= NF; i++) if ($i ~ /^heap_alloc=/) {split($i, a, "="); printf "%.1f", a[2] / 1048576}}' "$o/stderr.log" | tail -1)
 		gc_total=$(awk -F'\t' -v t="$t1" '$1 <= t && $2 ~ /^gc [0-9]+ @/' "$o/stderr.log" | wc -l)
 		gc_run=$(awk -F'\t' -v a="$t0" -v t="$t1" '$1 >= a && $1 <= t && $2 ~ /^gc [0-9]+ @/' "$o/stderr.log" | wc -l)
+	elif [[ $v != khrip* ]]; then
+		gc_total=-
+		gc_run=-
 	else
 		# первая сборка простоя после замера (через 10 с без выделений store)
 		# или по таймеру (forced: store меняли, а сборки не было 2 минуты), не

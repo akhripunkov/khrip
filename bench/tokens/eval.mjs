@@ -9,6 +9,8 @@ const langs = [
   ['Python FastAPI', 'python/main.py'],
   ['C#', 'csharp/Program.cs'],
   ['Go', 'go/main.go'],
+  ['Java', 'java/src/main/java/app/App.java'],
+  ['Node', 'node/server.js'],
 ];
 // Задачи, на которых язык дорабатывался (v0.9), и отложенные: написаны после того,
 // как язык был заморожен, — по ним видно, обобщаются ли доработки.

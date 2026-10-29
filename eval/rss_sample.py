@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """RSS процесса во времени (eval/perf.sh, RATE_MODE=1).
 
-    rss_sample.py <pid> <файл> <фаза> [интервал, мс = 100] [abs]
+    rss_sample.py <pid>[,<pid>...] <файл> <фаза> [интервал, мс = 100] [abs]
         каждые «интервал» мс дописывает в файл строку «фаза<TAB>мс от начала
-        фазы<TAB>VmRSS, КБ» (из /proc/<pid>/status), пока процесс жив и пока не
+        фазы<TAB>VmRSS, КБ» (из /proc/<pid>/status; у нескольких процессов —
+        сумма, например node-cluster: главный и рабочие), пока жив первый и пока не
         придёт SIGTERM или SIGINT; с abs вместо мс от начала фазы — мс
         CLOCK_MONOTONIC (их можно сопоставить с другими журналами)
 
@@ -17,7 +18,7 @@ import sys
 import time
 
 
-def sample(pid, path, phase, interval_ms, absolute=False):
+def sample(pids, path, phase, interval_ms, absolute=False):
     stop = False
 
     def on_signal(_sig, _frame):
@@ -26,17 +27,22 @@ def sample(pid, path, phase, interval_ms, absolute=False):
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
-    status = f"/proc/{pid}/status"
     step = interval_ms / 1000.0
     t0 = time.monotonic()
     k = 0
     with open(path, "a", buffering=1) as out:
         while not stop:
-            try:
-                with open(status) as f:
-                    rss = next((l.split()[1] for l in f if l.startswith("VmRSS:")), None)
-            except OSError:
-                break
+            rss = 0
+            for i, pid in enumerate(pids):
+                try:
+                    with open(f"/proc/{pid}/status") as f:
+                        kb = next((int(l.split()[1]) for l in f if l.startswith("VmRSS:")), None)
+                except OSError:
+                    kb = None
+                if kb is None and i == 0:
+                    rss = None
+                    break
+                rss += kb or 0
             if rss is None:
                 break
             t = time.monotonic()
@@ -76,4 +82,4 @@ if __name__ == "__main__":
     if a and a[0] == "--stats":
         stats(a[1], a[2], float(a[3]) if len(a) > 3 else 30.0)
     else:
-        sample(int(a[0]), a[1], a[2], int(a[3]) if len(a) > 3 else 100, len(a) > 4 and a[4] == "abs")
+        sample([int(p) for p in a[0].split(",")], a[1], a[2], int(a[3]) if len(a) > 3 else 100, len(a) > 4 and a[4] == "abs")

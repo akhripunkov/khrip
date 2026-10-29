@@ -16,6 +16,11 @@
 # RATE_MODE=1 — постоянная частота запросов, одна для всех языков (wrk2), RSS
 # во времени и от числа соединений: perf_rate.sh. Без него — замкнутый цикл,
 # как выше.
+#
+# Языки: khrip go csharp java node bun python (по умолчанию все, кроме
+# node-cluster); node-cluster — только задачи с базой, у других пропускается.
+# Процессор и память сервера — сумма по процессу и его потомкам (у
+# node-cluster — главный и два рабочих; у остальных процесс один).
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/server.sh"
@@ -23,7 +28,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 if [[ ${RATE_MODE:-0} == 1 ]]; then
 	DURATION=${DURATION:-60s}
 	WARMUP=${WARMUP:-60s}
-	LANGS=${LANGS:-khrip go csharp}
+	LANGS=${LANGS:-khrip go csharp java node bun}
 fi
 
 SERVER_CPUS=${SERVER_CPUS:-0,1}
@@ -31,7 +36,7 @@ CLIENT_CPUS=${CLIENT_CPUS:-2,3}
 CONNECTIONS=${CONNECTIONS:-64}
 DURATION=${DURATION:-10s}
 WARMUP=${WARMUP:-3s}
-LANGS=${LANGS:-khrip go csharp python}
+LANGS=${LANGS:-khrip go csharp java node bun python}
 OUT=${OUT:-$here/results/perf.tsv}
 OUT_DB=${OUT_DB:-$here/results/perf_db.tsv}
 export LOAD_DIR=$here/load WINDOW_SECONDS=1
@@ -44,8 +49,15 @@ pid=
 trap '[[ -n $pid ]] && kill $pid 2>/dev/null; wait 2>/dev/null; rm -rf "$tmp"' EXIT
 
 now_ms() { echo $(($(date +%s%N) / 1000000)); }
-status_kb() { awk -v k="$1:" '$1 == k {print $2}' "/proc/$pid/status"; }
-cpu_ticks() { awk '{print $14 + $15}' "/proc/$pid/stat"; }
+# сумма по процессу сервера и его потомкам
+status_kb() {
+	local p
+	for p in $(tree_pids "$pid"); do awk -v k="$1:" '$1 == k {print $2}' "/proc/$p/status" 2>/dev/null; done | awk '{t += $1} END {print t + 0}'
+}
+cpu_ticks() {
+	local p
+	for p in $(tree_pids "$pid"); do awk '{print $14 + $15}' "/proc/$p/stat" 2>/dev/null; done | awk '{t += $1} END {print t + 0}'
+}
 # процессор всех процессов PostgreSQL (сотые доли секунды); закрытые соединения
 # учтены в cutime/cstime главного процесса, который их дождался
 pg_ticks() {
@@ -61,7 +73,8 @@ to_ms() {
 		else if (v ~ /s$/) n *= 1000; printf "%.2f", n }'
 }
 stop() {
-	kill "$pid" 2>/dev/null
+	# shellcheck disable=SC2046
+	kill $(tree_pids "$pid") 2>/dev/null
 	wait "$pid" 2>/dev/null
 	pid=
 }
@@ -70,6 +83,8 @@ size_of() {
 	khrip | go) stat -c %s "$2/server" ;;
 	csharp) du -sb --exclude='*.pdb' "$2/cs" | cut -f1 ;;
 	python) stat -c %s "$3/main.py" ;;
+	java) stat -c %s "$2/java/target/app.jar" ;;
+	node | bun | node-cluster) du -sb "$3" | cut -f1 ;;
 	esac
 }
 
@@ -88,8 +103,9 @@ for sc in "${scenarios[@]}"; do
 	db=0
 	[[ -f "$here/tasks/$task/db" ]] && db=1
 	for lang in $LANGS; do
-		dir=$here/solutions/$task/$lang
+		dir=$here/solutions/$task/$(sol_lang "$lang")
 		[[ -d $dir ]] || continue
+		[[ $lang == node-cluster && $db == 0 ]] && continue
 		if port_busy; then
 			echo "порт 8080 занят" >&2
 			exit 2
