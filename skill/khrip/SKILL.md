@@ -3,13 +3,13 @@ name: khrip
 description: Khrip, a compiled language for HTTP JSON backends (.kh files, khc). Use it for any Khrip code.
 ---
 
-# Khrip
+# Khrip (short form; full reference: `docs/KHRIP.md`)
 
 A compiled, strictly typed language for HTTP APIs. A program is one namespace:
 no imports, declarations in any order. `khc run|test|check app.kh` runs it, runs
 its tests, lists all errors with fixes.
 
-Chapters beside this file (read one only when the task needs it):
+Chapters (read one only when the task needs it):
 - `postgresql.md`: PostgreSQL (`sql "..."`, `tx`, migrations).
 - `mongodb.md`: MongoDB.
 - `clickhouse.md`: ClickHouse (`ch "..."`, `table`).
@@ -18,7 +18,7 @@ Chapters beside this file (read one only when the task needs it):
 ## Types and declarations
 
 `int` (64-bit, overflow panics), `float`, `bool`, `str` (UTF-8), `[T]`,
-`map[K, V]` (K is int or str), `T?` (optional), `{ id: int, name: str }`
+`map[K, V]` (K is int or str), `T?`, `{ id: int, name: str }`
 (anonymous struct, usable as any type) and named types. In a type, `...Point`
 copies Point's fields, `tags: [str] = []` has a default (a literal, `[]`, `{}` or
 an enum value), and `note: str?` defaults to none.
@@ -204,7 +204,7 @@ every 10 min {
 `fetch METHOD url [body] [headers map]` returns a `Response` (header names lower
 case); `status` 0 means unreachable or a TLS error. A body value is sent as
 JSON, a str as text. `fetch`, `sql`, `sleep` and `hash_password` wait without
-async/await; meanwhile other requests may change the store: read it again after.
+async/await; other requests may change the store meanwhile: read it again.
 `every N ms|s|min|h|d` runs a block in a background thread.
 
 ## Traps from other languages
