@@ -159,10 +159,11 @@ references: assigning shares (a field changed through `let u = users[id] else
 
 ## Methods
 
-A function you declare is also a method of its first argument: `p.describe()`.
-Built-ins are methods only (`xs.sum()`, `a.max(b)`), except `len(xs)`;
-`to_json`, `url_encode` and `print` are functions only. Other methods of the
-library are not reachable (`xs.slice(0, 2)` is an error: `xs[0..2]`).
+A function is also a method of its first argument, whether you declare it or
+the library does: `p.describe()`, `s.url_encode()`. Built-ins are methods only
+(`xs.sum()`, `a.max(b)`), except `len(xs)`; `to_json` and `from_json` are
+functions only. Other methods of the library are not reachable (`xs.slice(0, 2)`
+is an error: `xs[0..2]`).
 
 - `str`: `len contains starts_with ends_with find trim lower upper split
   replace repeat to_int to_float`, `find_from(x, i)` (index or -1),
@@ -205,7 +206,9 @@ Functions: `print(s)`, `eprint(s)`, `write(s)`, `args()`, `env(name) -> str?`,
 (hex), `hash_password(p)`, `check_password(p, hash) -> bool`, `url_encode(s)`,
 `to_json(value)`, `from_json(text) -> T?` (the type comes from the annotation:
 `let u: User? = from_json(text)`), `json_error()` (why the last `from_json` gave
-none).
+none). `url_encode` and `json_error` belong to the API library, which a program
+gets with routes, tests, `store`, `every`, `fetch`, a database or JSON
+(`to_json`, `from_json`).
 
 Index out of range, overflow, int division by zero and `pop` or `last` on an
 empty list panic: the program exits with code 101; in a server the request gets

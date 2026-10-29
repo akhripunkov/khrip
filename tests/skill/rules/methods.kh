@@ -1,6 +1,7 @@
-// Встроенные — методы (кроме len), print, to_json, url_encode — функции.
+// Встроенные — методы (кроме len); функция — и метод первого аргумента, кроме
+// to_json и from_json: они только функции.
 // in: SKILL.md
-// rule: Built-ins are methods (`xs.sum()`, `a.max(b)`; `len(xs)` too); a function you declare is also a method of its first argument; `print`, `to_json`, `url_encode` and the calls below are functions only.
+// rule: Built-ins are methods (`xs.sum()`, `a.max(b)`; `len(xs)` too); a function (yours or a call below) is also a method of its first argument; `to_json` and `from_json` are functions only.
 fn main() {
     let xs = [1, 2]
     let a = 3

@@ -108,9 +108,9 @@ list.
 
 ## Methods and functions
 
-Built-ins are methods (`xs.sum()`, `a.max(b)`; `len(xs)` too); a function you
-declare is also a method of its first argument; `print`, `to_json`,
-`url_encode` and the calls below are functions only.
+Built-ins are methods (`xs.sum()`, `a.max(b)`; `len(xs)` too); a function
+(yours or a call below) is also a method of its first argument; `to_json` and
+`from_json` are functions only.
 
 - `str`: `len contains starts_with ends_with find trim lower upper split replace
   repeat to_int to_float`, `matches(regex)` (whole string; `[a-z] \d \w \s . * +

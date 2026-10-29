@@ -1,7 +1,7 @@
-// Правильная половина: методы встроенных, len в обеих формах, своя функция —
-// и функция, и метод первого аргумента.
+// Правильная половина: методы встроенных, len в обеих формах, своя функция и
+// функция библиотеки (url_encode) — и функции, и методы первого аргумента.
 // in: SKILL.md
-// rule: Built-ins are methods (`xs.sum()`, `a.max(b)`; `len(xs)` too); a function you declare is also a method of its first argument; `print`, `to_json`, `url_encode` and the calls below are functions only.
+// rule: Built-ins are methods (`xs.sum()`, `a.max(b)`; `len(xs)` too); a function (yours or a call below) is also a method of its first argument; `to_json` and `from_json` are functions only.
 fn twice(n: int) -> int {
     return n * 2
 }
@@ -10,5 +10,5 @@ fn main() {
     let xs = [1, 2]
     let a = 3
     print("{xs.sum()} {a.max(2)} {len(xs)} {xs.len()} {twice(a)} {a.twice()}")
-    print(" x ".trim() + url_encode("a b") + to_json(xs))
+    print(" x ".trim() + url_encode("a b") + "a b".url_encode() + to_json(xs))
 }
