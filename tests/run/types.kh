@@ -14,7 +14,7 @@ type User {
     ...NewUser
 }
 
-fn find(users: [User], id: int) -> User? {
+fn find_user(users: [User], id: int) -> User? {
     for u in users {
         if u.id == id {
             return u
@@ -31,7 +31,7 @@ fn half(x: int) -> int? {
 }
 
 fn describe(users: [User], id: int) -> str {
-    let u = find(users, id) else {
+    let u = find_user(users, id) else {
         return "no user " + id.to_str()
     }
     return u.name + " is " + u.age.to_str()
@@ -65,9 +65,9 @@ fn main() {
     } else {
         print("odd")
     }
-    let missing = find(users, 100)
+    let missing = find_user(users, 100)
     print(missing == none)
-    print(find(users, 7) != none)
-    let name = (find(users, 7) ?? v).name
+    print(find_user(users, 7) != none)
+    let name = (find_user(users, 7) ?? v).name
     print(name)
 }

@@ -3,13 +3,13 @@ name: khrip
 description: Khrip, a compiled language for HTTP JSON backends (.kh files, khc). Use it for any Khrip code.
 ---
 
-# Khrip (short form; full reference: `docs/KHRIP.md`)
+# Khrip (short form of `docs/KHRIP.md`)
 
-A compiled, strictly typed language for HTTP APIs. A program is one namespace:
-no imports, declarations in any order. `khc run|test|check app.kh` runs it, runs
-its tests, lists all errors with fixes.
+A compiled, strictly typed language for HTTP APIs. One namespace: no imports,
+declarations in any order. `khc run|test|check app.kh` runs it, runs its
+tests, lists all errors with fixes.
 
-Chapters (read one only when the task needs it):
+Chapters (read one when needed):
 - `postgresql.md`: PostgreSQL (`sql "..."`, `tx`, migrations).
 - `mongodb.md`: MongoDB.
 - `clickhouse.md`: ClickHouse (`ch "..."`, `table`).
@@ -19,9 +19,9 @@ Chapters (read one only when the task needs it):
 
 `int` (64-bit, overflow panics), `float`, `bool`, `str` (UTF-8), `[T]`,
 `map[K, V]` (K is int or str), `T?`, `{ id: int, name: str }`
-(anonymous struct, usable as any type) and named types. In a type, `...Point`
-copies Point's fields, `tags: [str] = []` has a default (a literal, `[]`, `{}` or
-an enum value), and `note: str?` defaults to none.
+(anonymous struct) and named types. In a type, `...Point` copies its fields,
+`tags: [str] = []` has a default (a literal, `[]`, `{}` or an enum value), and
+`note: str?` defaults to none.
 
 ```khrip top
 type Point { x: int, y: int }
@@ -35,11 +35,11 @@ fn add(a: int, b: int = 1) -> int {    // defaults are literals; no result: no -
 ```
 
 `let s: Shape = Circle { r: 2 }`, `let r = Admin`; enum values compare with `==`,
-variant fields are read with `match`. No null (`T?` and `none`), classes,
+variant fields are read with `match`. No null (`T?`, `none`), classes,
 generics or exceptions. Implicit conversions: `T` → `T?`, variant → its type, int
 *literal* → float (`t * 2`); otherwise `n.to_float()`, `x.to_int()`, `x.round()`:
-int and float never mix, `7 / 2` is 3. Parameters are read-only, `let` is
-immutable, `var` mutable. A global `var` is not allowed in servers: use `store`.
+int and float never mix, `7 / 2` is 3. `let` is immutable, `var` mutable. A
+global `var` is not allowed in servers: use `store`.
 
 ## Statements
 
@@ -61,7 +61,7 @@ let area = match s {        // every case, or _ =>
 `return ...`. `+` also joins strings.
 
 `"Hi, {user.name}!"` interpolates an expression that does not start with a quote
-(`{2,5}` stays text). Escapes: `\n \t \" \\ \{` and more. Raw strings in
+(`{2,5}` stays text). Escapes: `\n \" \{` and more. Raw strings in
 backticks have neither and may span lines; JSON and regexes go there:
 `` `{"id": 1}` ``, `` `\d{4}` ``. `len`, `s[i]` (a str), slices and `find` count
 characters. Slices `s[a..b]`, `xs[a..]`, `xs[..b]` are clamped to the bounds.
@@ -99,34 +99,36 @@ let ages = {"ann": 30, (key): 41}      // map keys: "text" or (expression)
 
 `...old` of the same type copies all fields; clear one explicitly: `note:
 patch.note`. A type is expected by a typed `let`, assignment, argument,
-`return`, list item or field. `{k: v}` with an int or str local `k` is an
-error: add a type or rename `k`. At a statement start and in a `match` arm `{`
-opens a block: write `({ ... })`. A named type takes an anonymous value only
-as `T { ...x }`. Structs, lists and maps are references: assigning shares (a
-field changed through `let u = users[id] else {...}` changes the store);
-`.copy()` copies a list.
+`return`, list item or field. `{k: v}` with an int or str variable `k` that `v`
+does not use is an error: add a type or rename `k`. At a statement start and in
+a `match` arm `{` opens a block: write `({ ... })`. A named type takes an
+anonymous value only as `T { ...x }`. Structs, lists and maps are references:
+assigning shares (a field changed through `let u = users[id] else {...}`
+changes the store); `.copy()` copies a list.
 
 ## Methods and functions
 
 Built-ins are methods (`xs.sum()`, `a.max(b)`; `len(xs)` too); a function
-(yours or a call below) is also a method of its first argument; `to_json` and
-`from_json` are functions only.
+(yours or a call below) is also a method of its first argument (not of a map or
+`T?`; a built-in method name of that type is an error: `fn max(a: int, b: int)`);
+`to_json` and `from_json` are functions only.
 
 - `str`: `len contains starts_with ends_with find trim lower upper split replace
   repeat to_int to_float`, `matches(regex)` (whole string; `[a-z] \d \w \s . * +
   ? {n,m} ( | )`)
 - `int`: `to_str to_float abs min max`; `bool`: `to_str`; `float`: `to_str to_int
   round floor ceil` (→ int) `round_to(digits) abs sqrt min max`
-- `[T]`: `len push pop last insert remove_at clear truncate copy contains
-  index_of`, `sort reverse` (in place, return the list; sort: int or str), `join`
-  ([str]), `sum` ([int], [float])
+- `[T]`: `len push pop last insert remove_at clear truncate copy`, `contains
+  index_of` (int, str, bool; else `xs.any(x => x == v)`), `sort reverse`
+  (in place, return the list; sort: int or str), `join` ([str]), `sum` ([int],
+  [float])
 - lambdas `x => expr` in list methods: `map filter find` (T?) `any all count
   sort_by` (int, float or str key; stable, in place); they see locals
 - `map[K, V]`: `len has get remove keys values clear`, `m[k]` (V?), `m[k] = v`;
   insertion order
 
 `print(s)`, `eprint(s)`, `env(name)`, `sleep(ms)`, `now()` (Unix seconds),
-`now_ms()`, `time_iso(t)`, `parse_time(s)` (ISO 8601), `parse_date("2026-10-19")`,
+`now_ms()`, `time_iso(t)`, `parse_time(s)`, `parse_date(s)` (ISO 8601),
 `random_str(n)`, `sha256(s)`, `hash_password(p)`, `check_password(p,
 hash)`, `url_encode(s)`, `to_json(x)`, `from_json(text)` (type from the
 annotation: `let u: User? = from_json(t)`).
@@ -183,8 +185,8 @@ test "create and delete" {
   `str` is sent as text, other types as JSON.
 - `header(name)` reads a request header, `set_header(name, value)` adds a
   response header; `fail(status[, message])` ends the request from anywhere.
-- `store name: T` (or `= value`) outlives requests; they see it as if run one at
-  a time (no locks).
+- `store name: T` (or `= value`) outlives requests; they see it as if run
+  one at a time.
 - Tests run in order and share the store. `call METHOD "path?query" [body]
   [headers map]` returns `Response { status, body, headers }`; a typed body
   leaves `none` fields unsent (`f: none` is an error; for `null` send a raw
@@ -205,18 +207,17 @@ every 10 min {
 case); `status` 0 means unreachable or a TLS error. A body value is sent as
 JSON, a str as text. `fetch`, `sql`, `sleep` and `hash_password` wait without
 async/await; other requests may change the store meanwhile: read it again.
-`every N ms|s|min|h|d` runs a block in a background thread.
+`every N ms|s|min|h|d` runs in a background thread.
 
 ## Traps from other languages
 
-- `null nil None` → `none`; `c ? a : b` → `if c { a } else { b }`; `switch` →
-  `match`; `enum E { A, B }` → `type E = A | B`; `if xs` → `if xs.len() > 0`
+- `null nil None` → `none`; `c ? a : b` → `if`; `switch` → `match`;
+  `enum E { A, B }` → `type E = A | B`; `if xs` → `if xs.len() > 0`
   (conditions are `bool`); `x in xs`, `k in m` → `xs.contains(x)`, `m.has(k)`;
   `d.get(k, v)` → `m[k] ?? v`.
 - `str(n)`, `int(s)` → `n.to_str()`, `s.to_int()` (`int?`); `f"{x}"`, `${x}` →
   `"{x}"`; `{x:.2f}` → `{x.round_to(2)}`; `"n=" + n` is an error.
-- `try/catch`, `throw`, `raise HTTPException` → optionals, `else`, `fail`;
-  `return 400, "msg"` → `return 400 "msg"`.
+- `try/catch`, `throw`, `raise HTTPException` → optionals, `else`, `fail`.
 - `lambda x:`, `(x) => {...}` → `x => expr`; sorting with a comparator →
   `sort_by(x => -x.n)` (descending), stable `sort_by` calls for several keys
   (last key first).

@@ -1,7 +1,8 @@
 // Правильная половина: методы встроенных, len в обеих формах, своя функция и
-// функция библиотеки (url_encode) — и функции, и методы первого аргумента.
+// функция библиотеки (url_encode) — и функции, и методы первого аргумента;
+// функция словаря — функцией; имя не из встроенных методов типа — можно.
 // in: SKILL.md
-// rule: Built-ins are methods (`xs.sum()`, `a.max(b)`; `len(xs)` too); a function (yours or a call below) is also a method of its first argument; `to_json` and `from_json` are functions only.
+// rule: Built-ins are methods (`xs.sum()`, `a.max(b)`; `len(xs)` too); a function (yours or a call below) is also a method of its first argument (not of a map or `T?`; a built-in method name of that type is an error: `fn max(a: int, b: int)`); `to_json` and `from_json` are functions only.
 fn twice(n: int) -> int {
     return n * 2
 }
@@ -11,4 +12,19 @@ fn main() {
     let a = 3
     print("{xs.sum()} {a.max(2)} {len(xs)} {xs.len()} {twice(a)} {a.twice()}")
     print(" x ".trim() + url_encode("a b") + "a b".url_encode() + to_json(xs))
+    let m: map[str, int] = {"a": 1, "b": 2}
+    let o: int? = 3
+    print("{total(m)} {a.bigger(5)} {show(o)}")
+}
+
+fn total(m: map[str, int]) -> int {
+    return m.len()
+}
+
+fn show(x: int?) -> str {
+    return "{x ?? 0}"
+}
+
+fn bigger(a: int, b: int) -> int {
+    return a.max(b)
 }

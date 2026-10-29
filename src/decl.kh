@@ -889,6 +889,7 @@ fn prescan_fn(kind_: int) {
     let ps = parse_params()
     if !files[name.file].is_lib {
         str_method_clash(name, ps)
+        kind_method_clash(name, ps)
     }
     var ret = ty_void
     if kind() == T_ARROW {

@@ -141,8 +141,9 @@ let ages = {"ann": 30, (key): 41}      // map keys: "text" or (expression)
 
 `{ x: 1 }` takes the type expected by a typed `let`/`var`, assignment, argument,
 `return`, list item, field, map value or `??`, else the anonymous type of its
-fields (map keys are `"k"` or `(k)`); `{}` is an empty map unless a struct is
-expected. Without an expected type, `{k: v}` where `k` is also an int or str
+fields (map keys are `"k"` or `(k)`); `{}` is an empty map where a map is
+expected, an empty struct literal where a struct is, and an error where nothing
+is. Without an expected type, `{k: v}` where `k` is also an int or str
 variable (local, parameter, global, store or const) and `v` does not mention it
 is an error, and so is such a literal with more fields (names all variables of
 one type, values all of one type): give it a type or rename `k` (for a map write
@@ -163,10 +164,16 @@ references: assigning shares (a field changed through `let u = users[id] else
 ## Methods
 
 A function is also a method of its first argument, whether you declare it or
-the library does: `p.describe()`, `s.url_encode()`. Built-ins are methods only
+the library does: `p.describe()`, `s.url_encode()`. Two exceptions: a map has
+only its own methods (`total(m)`, not `m.total()`), and a `T?` value has none
+until it is unwrapped (`show(x)`, not `x.show()`). Built-ins are methods only
 (`xs.sum()`, `a.max(b)`), except `len(xs)`; `to_json` and `from_json` are
-functions only. Other methods of the library are not reachable (`xs.slice(0, 2)`
-is an error: `xs[0..2]`).
+functions only. A function you declare cannot take the name of a built-in
+method of its first parameter's type (str, a list, a map, int, float or bool,
+also as `T?`): `fn max(a: int, b: int)`, `fn sum(xs: [int])` and
+`fn trim(s: str)` are errors, since the built-in would always be called. Other
+methods of the library are not reachable (`xs.slice(0, 2)` is an error:
+`xs[0..2]`).
 
 - `str`: `len contains starts_with ends_with find trim lower upper split
   replace repeat to_int to_float`, `find_from(x, i)` (index or -1),
@@ -176,14 +183,15 @@ is an error: `xs[0..2]`).
   (`"ÉCOLE Ёж".lower()` is `"école ёж"`, `ß` stays), `split("")` gives the
   characters. Bytes: `byte_len`, `byte(i)` (int), `byte_slice(a, b)`,
   `byte_find(x)` (`int?`, like `find`), `byte_find_from(x, i)` (index or -1),
-  `ascii_lower`, `ascii_upper`, `ascii_trim`. A function you declare cannot take
-  the name of a str method if its first parameter is a str.
+  `ascii_lower`, `ascii_upper`, `ascii_trim`.
 - `int`: `to_str to_float abs min max`; `bool`: `to_str`
 - `float`: `to_str to_int round floor ceil` (→ int) `round_to(digits) abs sqrt
   min max`
-- `[T]`: `len push pop last insert remove_at clear truncate copy contains
-  index_of`, `sort reverse` (in place, return the list; sort: int or str),
-  `join` ([str]: `xs.map(x => x.to_str()).join(", ")` for others), `sum`
+- `[T]`: `len push pop last insert remove_at clear truncate copy`, `contains
+  index_of` (lists of int, str or bool; for others `xs.any(x => x == v)`, and
+  for structs, which have no `==`, a field: `xs.any(x => x.id == v.id)`), `sort
+  reverse` (in place, return the list; sort: int or str), `join` ([str]:
+  `xs.map(x => x.to_str()).join(", ")` for others), `sum`
   ([int], [float])
 - lambdas `x => expr` in list methods: `map filter find` (T?) `any all count
   sort_by` (int, float or str key; stable, in place, returns the list); they see
@@ -376,7 +384,7 @@ tx {
 Like `sql`: the expected type picks the result, `{x}` is always a parameter,
 failures end the request, and the server checks every table and query against
 ClickHouse at start. The connection is `CLICKHOUSE_URL=http://user:pass@host:8123/db`
-(`CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD` override the URL's).
+(`CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD` override the URL's user and password).
 
 ```khrip
 migration ch 1 `CREATE TABLE events (ts DateTime, user_id UInt64,
@@ -481,8 +489,10 @@ failures show both sides; `expect r != none` stops the test when `r` is none, an
 after it `r` is a value: `let u: User? = from_json(r.body)`, `expect u != none`,
 `expect u.name == "Ann"`. Tests run in order and share store and the databases:
 PostgreSQL (`KHRIP_TEST_DATABASE_URL`, else `DATABASE_URL`; khc test works in a
-temporary schema and drops it) and ClickHouse (`KHRIP_TEST_CLICKHOUSE_URL`, else
-`CLICKHOUSE_URL`; a temporary database, dropped at the end).
+temporary schema and drops it) and ClickHouse (`KHRIP_TEST_CLICKHOUSE_URL` with
+`KHRIP_TEST_CLICKHOUSE_USER` and `KHRIP_TEST_CLICKHOUSE_PASSWORD`, else
+`CLICKHOUSE_URL` with `CLICKHOUSE_USER` and `CLICKHOUSE_PASSWORD`, for every
+connection, named ones too; a temporary database, dropped at the end).
 
 ## Production
 
@@ -502,11 +512,11 @@ written three times, with `"severity"`) as JSON; warnings do not stop a build.
 | `KHRIP_GC_MIN_MB`, `KHRIP_GC_LIMIT_MB` | smallest collection goal (4 MB); soft limit of the store heap (none) |
 | `KHRIP_GC_LOG=1` | one stderr line per collection, if the program was also built with it set |
 | `DATABASE_URL` | PostgreSQL; `sslmode` `disable`, `prefer` (default), `require`, `verify-ca`, `verify-full` |
-| `DATABASE_POOL` | PostgreSQL connections, 4 per thread, at most 32 |
+| `DATABASE_POOL` | PostgreSQL connections per process, shared by the threads (at least 1 each); default 4 per thread, at most 32 |
 | `DATABASE_TIMEOUT` | ms per statement or `tx` with retries (10000), then 503 |
 | `DATABASE_MIGRATE` | `apply` (default) runs migrations at start; `check` only verifies (`./app migrate` applies and exits) |
 | `CLICKHOUSE_URL`, `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD` | ClickHouse |
-| `CLICKHOUSE_TIMEOUT`, `CLICKHOUSE_MAX_RESULT`, `CLICKHOUSE_INFLIGHT` | ms per operation (`DATABASE_TIMEOUT`, 10000), bytes of one result (64 MiB), operations per thread (32) |
+| `CLICKHOUSE_TIMEOUT`, `CLICKHOUSE_MAX_RESULT`, `CLICKHOUSE_INFLIGHT` | ms per operation (`DATABASE_TIMEOUT` if set, else 10000), bytes of one result (64 MiB), operations per thread (32) |
 | `SSL_CERT_FILE` | root certificates for https (else the system's) |
 | `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` | for `fetch` |
 

@@ -1,6 +1,7 @@
-// Встроенные — методы (кроме len), функция — и метод; to_json, from_json — нет.
+// Встроенные — методы (кроме len), функция — и метод (не у словаря и не у T?;
+// имя встроенного метода типа — ошибка); to_json, from_json — нет.
 // in: SKILL.md
-// rule: Built-ins are methods (`xs.sum()`, `a.max(b)`; `len(xs)` too); a function (yours or a call below) is also a method of its first argument; `to_json` and `from_json` are functions only.
+// rule: Built-ins are methods (`xs.sum()`, `a.max(b)`; `len(xs)` too); a function (yours or a call below) is also a method of its first argument (not of a map or `T?`; a built-in method name of that type is an error: `fn max(a: int, b: int)`); `to_json` and `from_json` are functions only.
 fn main() {
     let xs = [1, 2]
     let a = 3
@@ -8,4 +9,20 @@ fn main() {
     let m = max(a, 2)
     let t = trim(" x ")
     let j = xs.to_json()
+    let m: map[str, int] = {"a": 1}
+    let n = m.total()
+    let o: int? = 3
+    let s = o.show()
+}
+
+fn show(x: int?) -> str {
+    return "{x ?? 0}"
+}
+
+fn total(m: map[str, int]) -> int {
+    return m.len()
+}
+
+fn max(a: int, b: int) -> int {
+    return a
 }
