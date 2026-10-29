@@ -1,0 +1,389 @@
+### closed1 start 2026-10-29T03:58:15Z ef9a776
+== shortener / khrip
+shortener	khrip	195848	0.28	12.20	0.0	0.3	0.6	314.8	300.4	8.7	9	0.0	203064	ok
+== shortener / go
+shortener	go	71594	0.80	14.97	0.0	7.2	11.5	388.6	388.6	27.4	10	0.3	8666891	ok
+== shortener / csharp
+shortener	csharp	110711	0.50	4.89	0.0	70.6	73.8	433.3	433.3	17.3	306	5.3	91457	ok
+== shortener / java
+shortener	java	40390	1.48	10.60	0.0	172.6	218.8	859.4	859.4	47.6	2305	2.7	21110938	ok
+== shortener / node
+shortener	node	36853	1.72	3.16	0.0	74.0	74.8	176.8	176.8	27.1	165	0.8	8351194	ok
+== shortener / bun
+shortener	bun	38302	1.57	10.42	0.0	56.7	70.5	287.2	256.9	26.7	170	0.8	8351194	ok
+== shortener / python
+shortener	python	10285	6.15	8.76	0.0	44.5	44.9	87.1	87.1	97.0	278	0.0	2006	ok
+== bank / khrip
+bank	khrip	146800	0.38	14.11	0.0	0.3	0.4	1220.8	1220.8	11.2	10	0.0	165048	ok
+== bank / go
+bank	go	81947	0.73	143.49	0.0	7.4	8.3	1636.5	1323.8	24.1	12	0.3	8641223	ok
+== bank / csharp
+bank	csharp	100952	0.57	38.82	0.0	69.7	71.3	1226.6	1226.6	18.8	305	5.4	96577	ok
+== bank / java
+bank	java	26551	2.30	14.34	0.0	190.8	206.5	1279.4	1279.4	70.1	2311	2.9	21113871	ok
+== bank / node
+bank	node	27601	2.24	4.46	0.0	72.9	73.3	417.1	417.1	36.5	198	0.8	8351767	ok
+== bank / bun
+bank	bun	31396	1.85	30.52	0.0	58.5	62.9	762.4	656.5	33.4	168	0.8	8351767	ok
+== bank / python
+bank	python	7506	8.25	16.40	0.0	44.6	44.6	279.9	279.9	132.7	264	0.0	2322	ok
+== notes / khrip
+notes	khrip	220996	0.23	7.82	0.0	0.3	0.4	462.8	447.9	8.0	10	0.0	199624	ok
+== notes / go
+notes	go	69115	0.82	16.19	0.0	7.3	8.0	413.5	413.5	28.6	11	0.3	8681138	ok
+== notes / csharp
+notes	csharp	106090	0.54	4.54	0.0	70.0	76.6	399.5	399.5	17.8	308	5.6	100161	ok
+== notes / java
+notes	java	30466	2.03	6.06	0.0	193.2	215.0	652.0	652.0	63.2	2478	2.8	21114556	ok
+== notes / node
+notes	node	26493	2.32	5.10	0.0	74.7	75.3	176.0	176.0	37.7	174	0.8	8352728	ok
+== notes / bun
+notes	bun	36713	1.64	8.74	0.0	59.4	62.4	300.4	273.5	28.0	166	0.8	8352728	ok
+== notes / python
+notes	python	3603	17.28	26.98	0.0	44.7	45.6	67.5	67.5	285.8	267	0.0	3518	ok
+== login / khrip
+login	khrip	174	386.46	465.92	0.0	0.3	0.4	5.9	5.9	11470.9	12	0.0	199624	ok
+== login / go
+login	go	131	424.45	897.92	0.0	7.2	7.8	16.1	16.1	15166.0	11	0.3	8681138	ok
+== login / csharp
+login	csharp	99	626.09	1140.00	0.0	69.6	76.2	108.4	108.4	20162.2	306	1.4	100161	ok
+== login / java
+login	java	101	628.63	1000.00	0.0	193.9	215.3	437.8	435.6	19771.4	2514	2.9	21114556	ok
+== login / node
+login	node	160	396.17	454.53	0.0	74.6	75.1	99.6	99.6	12464.1	168	0.8	8352728	ok
+== login / bun
+login	bun	161	386.24	1050.00	0.0	59.8	62.9	88.7	78.1	12376.0	164	0.9	8352728	ok
+== login / python
+login	python	99	635.07	965.43	0.0	44.7	45.7	51.2	51.2	20149.7	298	0.0	3518	ok
+== ratelimit / khrip
+ratelimit	khrip	147884	0.39	1.60	0.1	0.3	0.3	20.5	20.5	11.5	11	0.0	168944	ok
+== ratelimit / go
+ratelimit	go	75112	0.77	5.63	0.0	7.3	7.3	57.2	55.1	26.1	11	0.3	8493536	ok
+== ratelimit / csharp
+ratelimit	csharp	104669	0.55	5.32	0.0	69.8	69.8	168.1	153.7	18.4	287	5.5	92481	ok
+== ratelimit / java
+ratelimit	java	32272	1.90	11.87	0.0	192.6	192.6	899.3	899.3	60.1	2502	2.8	21109659	ok
+== ratelimit / node
+ratelimit	node	32539	1.94	3.54	0.0	68.0	68.0	216.9	216.9	31.0	148	0.8	8350948	ok
+== ratelimit / bun
+ratelimit	bun	40414	1.44	10.31	0.0	49.4	49.4	168.7	156.1	25.6	134	0.8	8350948	ok
+== ratelimit / python
+ratelimit	python	3718	16.65	27.69	0.0	44.6	44.6	107.7	105.2	277.0	261	0.0	1404	ok
+== catalog / khrip
+catalog	khrip	34495	1.77	3.74	0.0	0.3	0.8	0.9	0.9	57.7	13	0.1	195360	ok
+== catalog / go
+catalog	go	7622	8.19	13.20	0.0	7.2	12.4	15.1	14.3	195.2	12	0.3	8672245	ok
+== catalog / csharp
+catalog	csharp	30314	2.03	4.20	0.0	70.5	75.6	96.4	90.8	59.9	353	5.6	99649	ok
+== catalog / java
+catalog	java	8014	8.55	14.77	0.0	173.4	245.8	446.7	442.5	159.0	2354	2.8	21115164	ok
+== catalog / node
+catalog	node	9570	6.40	14.96	0.0	73.5	74.4	102.4	102.4	104.5	179	0.8	8352653	ok
+== catalog / bun
+catalog	bun	7879	7.84	15.02	0.0	58.6	73.9	112.1	105.0	127.4	166	0.8	8352653	ok
+== catalog / python
+catalog	python	1794	34.91	59.42	0.0	44.7	45.9	46.7	46.7	554.7	296	0.0	3169	ok
+== patch / khrip
+patch	khrip	169470	0.33	2.99	0.0	0.3	0.8	3.5	3.5	10.2	11	0.1	195360	ok
+== patch / go
+patch	go	82168	0.71	4.26	0.0	7.2	12.4	14.9	14.1	23.1	11	0.3	8672245	ok
+== patch / csharp
+patch	csharp	94163	0.61	4.24	0.0	70.3	75.3	103.4	95.8	19.9	317	1.4	99649	ok
+== patch / java
+patch	java	27967	2.25	5.66	0.0	178.4	253.3	511.2	511.2	69.4	2441	2.9	21115164	ok
+== patch / node
+patch	node	24755	2.50	4.88	0.0	71.3	72.4	115.9	114.2	40.7	169	0.8	8352653	ok
+== patch / bun
+patch	bun	34944	1.76	3.64	0.0	58.5	72.1	106.1	97.5	29.0	169	0.9	8352653	ok
+== patch / python
+patch	python	6754	9.22	16.94	0.0	44.6	45.7	46.6	46.6	147.4	259	0.0	3169	ok
+== inventory / khrip
+inventory	khrip	49130	1.23	3.01	0.0	0.3	0.4	688.5	688.5	30.4	11	0.1	208520	ok
+== inventory / go
+inventory	go	33075	1.75	16.17	0.0	7.7	8.6	981.2	981.2	55.5	12	0.3	8997920	ok
+== inventory / csharp
+inventory	csharp	53356	1.09	28.98	0.0	70.2	72.5	1445.1	1445.1	35.9	322	5.9	97601	ok
+== inventory / java
+inventory	java	20543	3.07	36.68	0.0	182.5	199.7	1559.4	1559.4	92.1	2467	3.2	21115515	ok
+== inventory / node
+inventory	node	19358	3.09	6.42	0.0	71.2	71.6	457.2	457.2	52.0	173	0.8	8352467	ok
+== inventory / bun
+inventory	bun	22906	2.55	15.24	0.0	59.2	63.8	999.2	989.8	45.7	167	0.9	8352467	ok
+== inventory / python
+inventory	python	2759	22.66	46.01	0.0	44.6	44.7	226.4	226.4	361.3	252	0.0	2924	ok
+== polls / khrip
+polls	khrip	126707	0.44	3.43	0.0	0.3	0.4	532.3	510.7	13.0	12	0.0	182288	ok
+== polls / go
+polls	go	64303	0.90	14.88	0.0	7.3	8.1	788.5	788.5	30.7	11	0.3	8667291	ok
+== polls / csharp
+polls	csharp	88112	0.66	10.19	0.0	70.4	71.5	608.0	607.5	21.9	343	6.0	97601	ok
+== polls / java
+polls	java	24248	2.50	28.21	0.0	190.6	202.6	1380.2	1380.2	77.1	2425	2.9	21114960	ok
+== polls / node
+polls	node	24397	2.55	4.43	0.0	70.8	71.2	243.9	238.9	41.3	178	0.8	8352076	ok
+== polls / bun
+polls	bun	30693	1.86	29.48	0.0	59.2	62.0	717.6	707.2	35.4	186	0.8	8352076	ok
+== polls / python
+polls	python	5969	10.54	16.32	0.0	44.6	44.8	114.4	114.4	167.2	277	0.0	2593	ok
+== bookings / khrip
+bookings	khrip	26535	2.38	5.16	30.0	0.3	0.5	2.5	2.3	61.4	11	0.0	173520	ok
+== bookings / go
+bookings	go	7764	7.87	14.53	30.0	7.3	9.7	17.7	17.7	165.9	11	0.3	8669376	ok
+== bookings / csharp
+bookings	csharp	15542	3.96	8.66	30.0	70.1	72.7	108.3	95.0	85.1	305	5.6	99137	ok
+== bookings / java
+bookings	java	3149	20.48	29.75	29.9	190.8	223.1	387.6	387.6	486.3	2323	2.8	21114288	ok
+== bookings / node
+bookings	node	3951	15.62	25.72	30.0	70.2	71.9	102.3	86.4	252.7	160	0.9	8352314	ok
+== bookings / bun
+bookings	bun	4129	15.12	25.54	30.0	59.0	67.4	130.6	116.7	244.8	169	0.8	8352314	ok
+== bookings / python
+bookings	python	315	201.33	288.86	20.0	44.7	45.1	49.3	49.3	3163.9	271	0.0	2768	ok
+== ledger / khrip
+ledger	khrip	5590	10.97	34.72	0.0	0.6	0.6	5.4	4.9	116.7	27	0.1	438648	ok	352.5
+== ledger / go
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 context canceled
+2026/10/29 06:28:25 timeout: context already done: context canceled
+2026/10/29 06:29:25 context canceled
+2026/10/29 06:29:25 context canceled
+2026/10/29 06:29:25 context canceled
+2026/10/29 06:29:25 context canceled
+2026/10/29 06:29:25 context canceled
+2026/10/29 06:29:25 context canceled
+2026/10/29 06:29:25 context canceled
+2026/10/29 06:29:25 context canceled
+2026/10/29 06:29:25 context canceled
+2026/10/29 06:29:25 context canceled
+2026/10/29 06:29:25 context canceled
+2026/10/29 06:29:25 context canceled
+2026/10/29 06:29:25 context canceled
+2026/10/29 06:29:25 context canceled
+2026/10/29 06:29:25 context canceled
+2026/10/29 06:29:25 context canceled
+2026/10/29 06:29:25 context canceled
+2026/10/29 06:29:25 context canceled
+2026/10/29 06:29:25 context canceled
+2026/10/29 06:29:25 context canceled
+2026/10/29 06:29:25 context canceled
+2026/10/29 06:29:25 context canceled
+2026/10/29 06:29:25 context canceled
+2026/10/29 06:29:25 context canceled
+ledger	go	4016	14.58	32.20	0.0	10.9	12.3	18.6	18.4	212.9	27	0.5	14873235	ok	320.0
+== ledger / csharp
+ledger	csharp	4463	12.76	62.20	0.0	89.2	92.8	144.8	122.1	166.7	489	5.8	1804106	ok	543.7
+== ledger / java
+ledger	java	4469	13.26	36.01	0.0	238.5	204.3	311.6	311.6	284.2	2928	3.1	23198315	ok	325.5
+== ledger / node
+ledger	node	4470	13.03	34.02	0.0	75.6	76.3	102.8	102.6	191.4	211	0.9	8818194	ok	441.0
+== ledger / bun
+ledger	bun	4484	13.01	31.23	0.0	63.2	69.9	102.4	81.3	179.0	207	0.9	8818194	ok	450.4
+== ledger / python
+ledger	python	1733	34.10	81.67	0.0	47.8	47.9	49.6	49.6	572.7	310	0.0	6345	ok	430.5
+== ledger / node-cluster
+ledger	node-cluster	3882	15.65	38.63	0.0	193.1	194.8	248.7	239.9	261.5	282	0.8	8818194	ok	524.8
+== shop / khrip
+shop	khrip	1935	30.14	112.74	0.0	0.7	0.8	9.2	4.7	125.9	39	0.1	515424	ok	1801.9
+== shop / go
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:45:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+2026/10/29 06:46:19 context canceled
+shop	go	1895	32.32	79.50	0.0	10.9	14.9	19.0	18.9	241.4	29	0.5	14997540	ok	1542.5
+== shop / csharp
+shop	csharp	1849	26.66	460.67	0.0	89.3	97.9	150.9	126.9	163.1	549	6.0	1836874	ok	1940.2
+== shop / java
+shop	java	1913	29.56	133.99	0.0	199.9	202.6	281.3	277.3	303.7	3050	3.1	23209055	ok	1624.9
+== shop / node
+shop	node	1781	33.17	102.81	0.0	76.9	83.3	105.8	103.0	228.6	251	1.0	8822290	ok	1774.4
+== shop / bun
+shop	bun	1792	32.16	123.89	0.0	64.2	74.8	107.9	84.3	239.7	215	0.9	8822290	ok	1857.5
+== shop / python
+shop	python	976	60.93	181.16	0.0	48.4	48.6	50.9	50.9	640.3	328	0.0	10040	ok	3039.2
+== shop / node-cluster
+shop	node-cluster	1813	32.27	136.71	0.0	197.9	204.7	253.2	221.5	248.4	318	0.8	8822290	ok	1841.7
+== tracker / khrip
+tracker	khrip	2531	22.67	64.46	0.0	0.6	0.7	4.4	4.4	72.6	29	0.1	490408	ok	1237.8
+== tracker / go
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:02:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+2026/10/29 07:03:19 context canceled
+tracker	go	2297	27.14	47.20	0.0	11.0	16.1	18.8	18.6	189.1	28	0.5	14889402	ok	1114.5
+== tracker / csharp
+tracker	csharp	2354	21.03	395.18	0.0	88.6	102.1	133.7	123.0	157.7	492	5.9	1820490	ok	1348.9
+== tracker / java
+tracker	java	2223	26.13	78.48	0.0	211.0	216.0	299.2	299.2	249.6	3104	3.1	23202358	ok	1087.0
+== tracker / node
+tracker	node	2089	26.56	65.22	0.0	76.2	85.7	105.2	98.6	185.9	218	0.9	8819616	ok	1262.2
+== tracker / bun
+tracker	bun	2295	23.86	63.71	0.0	63.9	75.7	104.5	84.7	183.2	218	0.9	8819616	ok	1250.4
+== tracker / python
+tracker	python	1990	31.20	74.81	0.0	48.4	48.5	50.6	50.6	449.2	311	0.0	8349	ok	880.1
+== tracker / node-cluster
+tracker	node-cluster	2247	25.41	73.94	0.0	197.9	208.0	254.2	218.7	210.2	270	0.8	8819616	ok	1307.7
+### closed1 end 2026-10-29T07:16:21Z status 0
