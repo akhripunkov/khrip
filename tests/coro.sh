@@ -126,28 +126,35 @@ coro_stop
 
 # Окна без блокировки store (docs/design/v0.13-store-gc.md §6): пока пишущий
 # запрос ждёт fetch к себе (окно: блокировка отпущена, запись контекста
-# опубликована), читающий и пишущие запросы на том же единственном потоке идут
-# сразу — если бы окно держало блокировку, поток встал бы навсегда; строка
-# store и список в арене, которые держит ждущий, после окна те же. Хеш пароля
-# — тоже окно.
+# опубликована), читающий и пять пишущих запросов на том же единственном
+# потоке проходят — если бы окно держало блокировку, поток встал бы навсегда
+# (curl --max-time делает это ошибкой, а не зависанием). fetch идёт к воротам
+# /gate: окно кончается, только когда тест их откроет, а открывает он их
+# после чтения и записей, так что они прошли, пока ждущий заведомо был в
+# окне, — без порогов времени. Строка store и список в арене, которые держит
+# ждущий, после окна те же. Хеш пароля — тоже окно.
 coro_windows() {
-	local tag=$1 t0 t1 t2 t3 hold_pid r r2
-	t0=$(ms_now)
-	curl -s --max-time 10 -X POST "$url/hold?port=$CORO_PORT&ms=600&tag=$tag" >"$tmp/hold.out" &
+	local tag=$1 hold_pid st r r2 waiting=0
+	curl -s --max-time 30 -X POST "$url/hold?port=$CORO_PORT&tag=$tag" >"$tmp/hold.out" &
 	hold_pid=$!
-	sleep 0.15
+	# /gate вошёл и ждёт — значит, /hold уже отпустил блокировку и ждёт ответа
+	for _ in $(seq 1000); do
+		st=$(curl -s --max-time 5 "$url/gate-state?tag=$tag")
+		[[ $st == 1 ]] && break
+		sleep 0.01
+	done
 	r=$(curl -s --max-time 5 "$url/marks")
-	t1=$(ms_now)
 	r2=$(curl_many 5 --max-time 5 -X POST "$url/log?text=w" | sort | uniq -c | tr -s ' ')
-	t2=$(ms_now)
+	# ворота ещё закрыты: /hold закончиться не мог
+	kill -0 "$hold_pid" 2>/dev/null && [[ ! -s $tmp/hold.out ]] && waiting=1
+	curl -s -o /dev/null --max-time 5 -X POST "$url/open?tag=$tag"
 	wait "$hold_pid"
-	t3=$(ms_now)
-	if [[ "$r" =~ ^[0-9]+$ && "$r" -ge 1 && "$r2" == " 5 200" ]] && ((t1 - t0 < 500 && t2 - t0 < 600 && t3 - t0 >= 600)); then
+	if [[ $st == 1 && "$r" =~ ^[0-9]+$ && "$r" -ge 1 && "$r2" == " 5 200" && $waiting == 1 ]]; then
 		http_ok
 	else
-		failed "coro: store читают и пишут, пока запрос ждёт fetch ($tag)" "marks: $r, log: $r2, чтение через $((t1 - t0)) мс, запись через $((t2 - t0)) мс, ждущий — $((t3 - t0)) мс"
+		failed "coro: store читают и пишут, пока запрос ждёт fetch ($tag)" "ворота: $st, marks: $r, log: $r2, ждущий был в окне: $waiting"
 	fi
-	expect_count "запрос держит store через fetch ($tag)" "$(cat "$tmp/hold.out")" "^200 slept $tag held-$tag$" 1
+	expect_count "запрос держит store через fetch ($tag)" "$(cat "$tmp/hold.out")" "^200 opened $tag held-$tag$" 1
 	r=$(curl_many 3 --max-time 10 -X POST "$url/hash?tag=$tag" | sort | uniq -c | tr -s ' ')
 	expect_count "хеш пароля без блокировки store ($tag)" "$r" "^ 3 200$" 1
 	r=$(curl -s --max-time 10 -X POST "$url/hash?tag=$tag")

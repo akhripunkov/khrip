@@ -49,6 +49,10 @@ fn __gc_hbuf_fault(cap: int) -> bool {
     return false
 }
 
+// KHRIP_GC_WINDOW_CYCLE — только с проверками: окно сервера не точка сборки.
+fn __gc_window_cycle() {
+}
+
 // Шаги сборки KHRIP_GC_STRESS (khc test, программы без потока сборщика) — с
 // проверками (lib/gc_verify.kh); без них у жёсткого предела — сборка целиком
 // (→ false), а окно — не точка сборки.
