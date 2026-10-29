@@ -44,7 +44,7 @@ immutable, `var` mutable. A global `var` is not allowed in servers: use `store`.
 ## Statements
 
 `if`/`else if`/`else` and `match` are values too: `let v = if c { let a = f();
-a + 1 } else { 0 }` (a block's value is its last line).
+a + 1 } else { 0 }` (a block ends with its value).
 `while c { }`, `i += 1` (`-= *= /= %=`, no `++`), `break`, `continue`; `for x in
 xs` (items, characters), `for i, x in xs`, `for k, v in m`, `for i in 0..n`
 (`0..=n` includes n).
@@ -99,12 +99,12 @@ let ages = {"ann": 30, (key): 41}      // map keys: "text" or (expression)
 
 `...old` of the same type copies all fields; clear one explicitly: `note:
 patch.note`. A type is expected by a typed `let`, assignment, argument,
-`return`, list item or field. `{k: v}` with a local `k` is an error: give it a
-type or rename `k`. At a statement start and in a `match` arm `{` opens a block:
-write `({ ... })`. A named type takes an anonymous value only as `T { ...x }`.
-Structs, lists and maps are references: assigning shares (a field changed
-through `let u = users[id] else {...}` changes the store); `.copy()` copies a
-list.
+`return`, list item or field. `{k: v}` with an int or str local `k` is an
+error: add a type or rename `k`. At a statement start and in a `match` arm `{`
+opens a block: write `({ ... })`. A named type takes an anonymous value only
+as `T { ...x }`. Structs, lists and maps are references: assigning shares (a
+field changed through `let u = users[id] else {...}` changes the store);
+`.copy()` copies a list.
 
 ## Methods and functions
 

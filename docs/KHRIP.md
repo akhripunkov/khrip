@@ -142,15 +142,18 @@ let ages = {"ann": 30, (key): 41}      // map keys: "text" or (expression)
 `{ x: 1 }` takes the type expected by a typed `let`/`var`, assignment, argument,
 `return`, list item, field, map value or `??`, else the anonymous type of its
 fields (map keys are `"k"` or `(k)`); `{}` is an empty map unless a struct is
-expected. `{k: v}`, where `k` is also a local int or str variable, is an error:
-give it a type or rename `k` (for a map write `{(k): v}`). At a statement start,
-in a match arm, in a condition, a `match` value or a `for` header write
-`({ ... })`: `{` there is a block. Types can be inline: `-> { token: str }`; a
-named type takes an anonymous value only as `T { ...x }`, so a literal with an
-expected type is checked in full (missing, extra and mistyped fields), while a
-typo in a literal without one goes unnoticed, as in a map key. A spread of the same type
-(`...old`) copies every field; of another type (a patch) it skips `none` fields,
-so clearing a field is explicit: `note: patch.note`. Field names may be `type`,
+expected. Without an expected type, `{k: v}` where `k` is also an int or str
+variable (local, parameter, global, store or const) and `v` does not mention it
+is an error, and so is such a literal with more fields (names all variables of
+one type, values all of one type): give it a type or rename `k` (for a map write
+`{(k): v}`). At a statement start, in a match arm, in a condition, a `match`
+value or a `for` header write `({ ... })`: `{` there is a block. Types can be
+inline: `-> { token: str }`; a named type takes an anonymous value only as
+`T { ...x }`, so a literal with an expected type is checked in full (missing,
+extra and mistyped fields), while a typo in a literal without one goes
+unnoticed, as in a map key. A spread of the same type (`...old`) copies every
+field; of another type (a patch) it skips `none` fields, so clearing a field is
+explicit: `note: patch.note`. Field names may be `type`,
 `in`, `match`, `test` or `call` (JSON keys), except `type` in a variant; `type`
 and `test` are keywords only where a top-level declaration starts, so a query
 parameter or a local may be called `type` too. Structs, lists and maps are
@@ -172,9 +175,9 @@ is an error: `xs[0..2]`).
   `trim` removes Unicode white space, `lower` and `upper` map letters one to one
   (`"ÉCOLE Ёж".lower()` is `"école ёж"`, `ß` stays), `split("")` gives the
   characters. Bytes: `byte_len`, `byte(i)` (int), `byte_slice(a, b)`,
-  `byte_find(x)`, `byte_find_from(x, i)` (index or -1), `ascii_lower`,
-  `ascii_upper`, `ascii_trim`. A function you declare cannot take the name of a
-  str method if its first parameter is a str.
+  `byte_find(x)` (`int?`, like `find`), `byte_find_from(x, i)` (index or -1),
+  `ascii_lower`, `ascii_upper`, `ascii_trim`. A function you declare cannot take
+  the name of a str method if its first parameter is a str.
 - `int`: `to_str to_float abs min max`; `bool`: `to_str`
 - `float`: `to_str to_int round floor ceil` (→ int) `round_to(digits) abs sqrt
   min max`
@@ -306,7 +309,7 @@ async/await): while a request waits, the server runs other requests, and they
 may change store (so may password hashing): read store again after the call.
 A long computation, unlike a wait, holds its thread. `every N ms|s|min|h|d` runs
 a block in a background thread. `KHRIP_DATA=file.json` keeps store across
-restarts: loaded at start and saved as JSON a second after changes and on
+restarts: loaded at start and saved as JSON within a second of changes and on
 SIGTERM or SIGINT; a missing or unreadable file starts from the initial values,
 an unparsable one stops the start.
 
@@ -508,7 +511,7 @@ written three times, with `"severity"`) as JSON; warnings do not stop a build.
 | `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` | for `fetch` |
 
 Each request has its own memory arena, freed at the end; the store has its own
-heap and an incremental collector, which marks in slices of at most 200 µs that
+heap and an incremental collector, which marks in slices of about 200 µs that
 only writers wait for and returns free pages to the system. While a request
 waits (`fetch`, databases, `sleep`, password hashing), its thread runs other
 requests. A program without routes runs `fn main()` once.

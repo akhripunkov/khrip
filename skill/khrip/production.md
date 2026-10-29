@@ -10,7 +10,7 @@ routes only read the store.
 |---|---|
 | `PORT` | port, 8080 |
 | `THREADS` | worker threads, all cores |
-| `KHRIP_DATA=file.json` | the store, loaded at start and saved as JSON a second after changes and on SIGTERM or SIGINT; a missing or unreadable file starts an empty store, an unparsable one stops the start |
+| `KHRIP_DATA=file.json` | the store, loaded at start and saved as JSON within a second of changes and on SIGTERM or SIGINT; a missing or unreadable file keeps the initial values, an unparsable one stops the start |
 | `DATABASE_URL` | PostgreSQL; `sslmode` `disable`, `prefer` (default), `require`, `verify-ca`, `verify-full` |
 | `DATABASE_POOL` | PostgreSQL connections, 4 per thread, at most 32 |
 | `DATABASE_TIMEOUT` | ms per statement or `tx` with retries (10000), then 503 |

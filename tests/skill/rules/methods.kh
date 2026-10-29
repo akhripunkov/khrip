@@ -1,5 +1,4 @@
-// Встроенные — методы (кроме len); функция — и метод первого аргумента, кроме
-// to_json и from_json: они только функции.
+// Встроенные — методы (кроме len), функция — и метод; to_json, from_json — нет.
 // in: SKILL.md
 // rule: Built-ins are methods (`xs.sum()`, `a.max(b)`; `len(xs)` too); a function (yours or a call below) is also a method of its first argument; `to_json` and `from_json` are functions only.
 fn main() {
