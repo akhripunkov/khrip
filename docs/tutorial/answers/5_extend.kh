@@ -15,8 +15,6 @@ type LoanStatus = Active | Overdue | Returned
 
 type Loan { id: int, book_id: int, member_id: int, due: str, status: LoanStatus = Active, extended: bool = false }
 
-type NewLoan { book_id: int }
-
 store members: map[int, Member]
 store keys: map[str, int]
 store books: map[int, Book]
@@ -48,7 +46,7 @@ route POST "/books" (body: Book) -> 201 Book {
     return 201 body
 }
 
-route POST "/loans" (body: NewLoan) -> 201 Loan | 404 | 409 str {
+route POST "/loans" (body: { book_id: int }) -> 201 Loan | 404 | 409 str {
     let me = current_member()
     if !books.has(body.book_id) {
         return 404
@@ -105,11 +103,11 @@ test "member, loan, return" {
     expect key.len() == 24
 
     let auth = {"X-API-Key": key}
-    expect (call POST "/loans" NewLoan { book_id: 7 }).status == 401
-    let loan = call POST "/loans" NewLoan { book_id: 7 } headers auth
+    expect (call POST "/loans" { book_id: 7 }).status == 401
+    let loan = call POST "/loans" { book_id: 7 } headers auth
     expect loan.status == 201
-    expect (call POST "/loans" NewLoan { book_id: 7 } headers auth).status == 409
-    expect (call POST "/loans" NewLoan { book_id: 99 } headers auth).status == 404
+    expect (call POST "/loans" { book_id: 7 } headers auth).status == 409
+    expect (call POST "/loans" { book_id: 99 } headers auth).status == 404
     expect (call GET "/me/loans" headers auth).body.contains(`"status":"Active"`)
     expect (call POST "/loans/1/return" headers auth).body.contains(`"status":"Returned"`)
 }
@@ -151,7 +149,7 @@ test "extend once" {
     let r: Registered? = from_json(reg.body)
     expect r != none
     let auth = {"X-API-Key": r.api_key}
-    let loan: Loan? = from_json((call POST "/loans" NewLoan { book_id: 8 } headers auth).body)
+    let loan: Loan? = from_json((call POST "/loans" { book_id: 8 } headers auth).body)
     expect loan != none
     let id = loan.id
     expect (call POST "/loans/{id}/extend" headers auth).status == 200

@@ -599,7 +599,11 @@ CUTS
 # tests/errors/join_not_str.kh — check):
 #   methodallow — в программе можно звать и внутренние __list_*, __int_*
 #                 (xs.slice, n.to_f64_bits);
-#   methodrecv — получатель не сверяется с первым параметром ([1].join).
+#   methodrecv — получатель не сверяется с первым параметром ([1].join);
+#   methodclash — fn max(a: int, ...), fn sum(xs: [int]), fn has(m: map...)
+#                 молча проигрывают встроенным методам (tests/errors/method_clash.kh);
+#   returncomma — return 400, "msg" без подсказки про запятую
+#                 (tests/errors/return_comma.kh — err).
 # анонимные структуры (этап токенов, часть 1; tests/run/anon_*.kh — run,
 # tests/api/gc_anon.kh — test, tests/locks/anon.kh — locks, tests/errors/anon_*
 # — err: сообщения компилятора отличаются от .err). Выбор литерала у {:
@@ -720,6 +724,8 @@ cuts = {
     "rwuserfn": ("rw.kh", "    let f = func_find(name)\n    return f >= 0 && !funcs[f].is_lib", "    return false"),
     "methodallow": ("atom.kh", "    } else if prefix.byte_len() > 0 && (system_code(nt) || builtin_method(k, name)) {", "    } else if prefix.byte_len() > 0 {"),
     "methodrecv": ("atom.kh", "            if !assignable(rt, pt) {\n                var hint = \"\"", "            if false {\n                var hint = \"\""),
+    "methodclash": ("atom.kh", "    if !kind_method(tkind(t), name.text) {\n        return\n    }", "    if true {\n        return\n    }"),
+    "returncomma": ("api.kh", "    if t0.kind == T_INT && kind_at(pos + 1) == ',' {\n", "    if false {\n"),
     "anonmapwant": ("atom.kh", "    let t = ty_inner(w)\n    if tkind(t) == K_MAP {\n        return false\n    }\n    if struct_lit_shape(pos) {", "    let t = ty_inner(w)\n    if struct_lit_shape(pos) {"),
     "anonempty": ("atom.kh", "    return kind_at(pos + 1) == '}' && tkind(t) == K_STRUCT\n", "    return false\n"),
     "anonspread": ("atom.kh", "    if k1 == T_ELLIPSIS {\n        return true\n    }\n    if keyword_name(k1) {", "    if keyword_name(k1) {"),
@@ -869,6 +875,8 @@ rwscanline tests/run/chain_fusion.kh run
 rwuserfn tests/run/chain_fusion.kh run
 methodallow tests/errors/internal_method.kh check
 methodrecv tests/errors/join_not_str.kh check
+methodclash tests/errors/method_clash.kh check
+returncomma tests/errors/return_comma.kh err
 anonmapwant tests/errors/anon_cond.kh err
 anonempty tests/run/anon_literals.kh run
 anonspread tests/run/anon_literals.kh run

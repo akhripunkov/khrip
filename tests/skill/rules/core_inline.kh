@@ -1,7 +1,7 @@
 // Примеры из текста ядра (не из блоков кода) работают.
 // in: SKILL.md
 // rule: `let s: Shape = Circle { r: 2 }`, `let r = Admin`; enum values compare with `==`, variant fields are read with `match`.
-// rule: `let v = if c { let a = f(); a + 1 } else { 0 }` (a block's value is its last line).
+// rule: `let v = if c { let a = f(); a + 1 } else { 0 }` (a block ends with its value).
 // rule: `for x in xs` (items, characters), `for i, x in xs`, `for k, v in m`, `for i in 0..n` (`0..=n` includes n).
 // rule: arms may be `200 | 201 => ...`, blocks or `return ...`.
 // rule: Slices `s[a..b]`, `xs[a..]`, `xs[..b]` are clamped to the bounds.

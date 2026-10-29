@@ -1,0 +1,75 @@
+// expect: method_clash.kh:22:4: error: fn max clashes with the built-in int method max
+// expect: hint: 'max' is a built-in method of int; choose another name
+// expect: method_clash.kh:26:4: error: fn sum clashes with the built-in [int] method sum
+// expect: hint: 'sum' is a built-in method of [int]; choose another name
+// expect: method_clash.kh:30:4: error: fn has clashes with the built-in map[str, int] method has
+// expect: method_clash.kh:34:4: error: fn to_str clashes with the built-in int method to_str
+// expect: method_clash.kh:38:4: error: fn len clashes with the built-in [str] method len
+// expect: method_clash.kh:42:4: error: fn round clashes with the built-in float method round
+// expect: hint: 'round' is a built-in method of float; choose another name
+// expect: method_clash.kh:46:4: error: fn filter clashes with the built-in [int] method filter
+// expect: method_clash.kh:50:4: error: fn reverse clashes with the built-in [bool] method reverse
+// expect: 8 errors
+// Функция программы — метод своего первого параметра, но у списков, словарей,
+// int, float и bool встроенные методы главнее: (3).max(5) вызывает встроенный
+// max, xs.sum() — встроенный sum, m.has(k) — встроенный has, даже если в
+// программе есть такие функции, а len(xs) — встроенный len. Раньше такая
+// функция молча не вызывалась; теперь её объявление — ошибка (и с T? первым
+// параметром), как у str (str_method_clash.kh). Функции с тем же именем и
+// другим первым параметром (count у структуры, abs у bool) и с именами
+// внутренних функций библиотеки (__list_slice) — методы, как раньше; функция
+// словаря с именем не из его методов (total) — функция, как раньше.
+fn max(a: int, b: int) -> int {
+    return a
+}
+
+fn sum(xs: [int]) -> int {
+    return 0
+}
+
+fn has(m: map[str, int], k: str) -> bool {
+    return false
+}
+
+fn to_str(n: int) -> str {
+    return "n"
+}
+
+fn len(xs: [str]) -> int {
+    return 7
+}
+
+fn round(x: float?) -> int {
+    return 0
+}
+
+fn filter(xs: [int], n: int) -> [int] {
+    return xs
+}
+
+fn reverse(b: [bool]) -> int {
+    return 1
+}
+
+fn count(p: Point) -> int {
+    return p.x
+}
+
+fn slice(xs: [int], a: int) -> int {
+    return a
+}
+
+fn total(m: map[str, int]) -> int {
+    return 0
+}
+
+fn abs(b: bool) -> int {
+    return 1
+}
+
+type Point { x: int }
+
+fn main() {
+    let p = Point { x: 2 }
+    print("{p.count()} {[1, 2].slice(1)} {total({"a": 1})} {true.abs()}")
+}

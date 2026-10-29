@@ -136,19 +136,49 @@ route GET "/text" (seed: int) -> str {
 // Пишущий запрос держит строку store и список в арене со ссылкой на неё через
 // fetch к себе: в окне блокировка отпущена, и запись контекста опубликована.
 // Пока он ждёт, читающий запрос (/marks) и пишущие (/log) на том же потоке
-// идут без задержки; после окна указатели те же.
+// идут без задержки; после окна указатели те же. fetch идёт к воротам
+// (/gate): они отвечают, только когда тест их откроет (/open), — так окно
+// /hold кончается не по времени, а после того, как тест дождался чтения и
+// записей.
 store marks: [str]
 
-route POST "/hold" (port: int, ms: int, tag: str) -> str {
+// ворота по метке: 1 — запрос /gate вошёл и ждёт, 2 — открыты
+store gates: map[str, int]
+
+route POST "/hold" (port: int, tag: str) -> str {
     marks.push("held-" + tag)
     let mine = marks[marks.len() - 1]
     let keep = [mine, "x"]
-    let r = fetch GET "http://127.0.0.1:{port}/sleep?ms={ms}&tag={tag}"
+    let r = fetch GET "http://127.0.0.1:{port}/gate?tag={tag}"
     marks.push("after-" + tag)
     if mine != "held-" + tag || keep[0] != mine {
         return "lost"
     }
     return "{r.status} {r.body} {mine}"
+}
+
+// Ждёт открытия ворот (опрос раз в 5 мс). Не дольше 20 с: если тест упал, не
+// открыв их, /hold и /gate всё равно кончатся.
+route GET "/gate" (tag: str) -> str {
+    gates[tag] = 1
+    var n = 0
+    while (gates[tag] ?? 0) == 1 && n < 4000 {
+        sleep(5)
+        n += 1
+    }
+    if (gates[tag] ?? 0) != 2 {
+        return "gate {tag} not opened"
+    }
+    return "opened {tag}"
+}
+
+route GET "/gate-state" (tag: str) -> int {
+    return gates[tag] ?? 0
+}
+
+route POST "/open" (tag: str) -> int {
+    gates[tag] = 2
+    return 2
 }
 
 route GET "/marks" () -> int {

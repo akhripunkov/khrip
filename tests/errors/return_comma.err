@@ -1,0 +1,17 @@
+tests/errors/return_comma.kh:16:19: error: a status and its value are written without a comma
+            return 400, "negative"
+                      ^
+    hint: write return 400 "msg" (no comma)
+tests/errors/return_comma.kh:23:19: error: a status and its value are written without a comma
+            return 400, "negative"
+                      ^
+    hint: write return 400 "msg" (no comma)
+tests/errors/return_comma.kh:30:19: error: a status and its value are written without a comma
+            return 409, "busy"
+                      ^
+    hint: write return 409 "msg" (no comma) and declare the status: -> str | 409 str
+tests/errors/return_comma.kh:37:16: error: this route returns str | 400 str, found int
+            return 400 + n
+                   ^
+    hint: status 400 carries a str: return 400 "msg"
+4 errors

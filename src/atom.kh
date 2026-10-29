@@ -2720,6 +2720,43 @@ fn str_method_clash(name: Token, ps: [Param]) {
     error_tok(name, "fn " + name.text + " clashes with the built-in str method " + name.text, "rename it: " + form + " calls the built-in, never a function that takes str first")
 }
 
+// Встроенные методы списков, словарей, int, float и bool — те, что вызов
+// x.имя(...) находит раньше функции программы (parse_method,
+// parse_map_method), и len(x).
+fn kind_method(k: int, name: str) -> bool {
+    if k == K_LIST {
+        return name == "len" || builtin_method(K_LIST, name) || name == "contains" || name == "sort" || name == "index_of" || is_lambda_method(name)
+    }
+    if k == K_MAP {
+        return name == "len" || name == "has" || name == "get" || name == "remove" || name == "contains" || name == "keys" || name == "values" || name == "clear"
+    }
+    if k == K_INT {
+        return builtin_method(K_INT, name) || name == "to_float"
+    }
+    if k == K_FLOAT {
+        return builtin_method(K_FLOAT, name) || name == "to_int"
+    }
+    if k == K_BOOL {
+        return builtin_method(K_BOOL, name)
+    }
+    return false
+}
+
+// То же, что str_method_clash, для остальных типов с встроенными методами:
+// fn max(a: int, b: int) молча проигрывала (3).max(5), fn sum(xs: [int]) —
+// xs.sum(), fn has(m: map[...]) — m.has(k), fn len(xs: [int]) — даже len(xs).
+// Теперь это ошибка в объявлении. Первый параметр T? — тоже.
+fn kind_method_clash(name: Token, ps: [Param]) {
+    if ps.len() == 0 || ps[0].ty == ty_err {
+        return
+    }
+    let t = ty_inner(ps[0].ty)
+    if !kind_method(tkind(t), name.text) {
+        return
+    }
+    error_tok(name, "fn " + name.text + " clashes with the built-in " + ty_name(t) + " method " + name.text, "'" + name.text + "' is a built-in method of " + ty_name(t) + "; choose another name")
+}
+
 // Методы str, которые в системном коде запрещены: у них будет символьный смысл.
 // Текущий токен — '('.
 fn system_str_method(nt: Token) {
@@ -3027,7 +3064,20 @@ fn parse_list_typed_method(rt: int, nt: Token) -> int {
     } else if et == ty_str {
         suffix = "_str"
     } else {
-        error_tok(nt, "." + nt.text + "() works on lists of int or str, not " + ty_name(rt), "")
+        if nt.text == "sort" {
+            error_tok(nt, ".sort() works on lists of int or str, not " + ty_name(rt), "sort by a key: xs.sort_by(x => x.n)")
+        } else {
+            var hint = "write xs.any(x => x == v)"
+            if nt.text == "index_of" {
+                hint = "find the item instead: xs.find(x => x == v)"
+            }
+            if tkind(et) == K_STRUCT && nt.text == "index_of" {
+                hint = "find the item by a field: xs.find(x => x.id == v.id)"
+            } else if tkind(et) == K_STRUCT {
+                hint = "compare a field: xs.any(x => x.id == v.id)"
+            }
+            error_tok(nt, "." + nt.text + "() works on lists of int, str or bool, not " + ty_name(rt), hint)
+        }
         skip_call_args()
         return ty_err
     }

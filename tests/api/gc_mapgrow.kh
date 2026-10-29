@@ -109,7 +109,7 @@ fn same_str(m: map[str, Item], keys: [str], names: [str]) -> bool {
     return true
 }
 
-fn index_of(xs: [int], k: int) -> int {
+fn key_pos(xs: [int], k: int) -> int {
     for i in 0..xs.len() {
         if xs[i] == k {
             return i
@@ -221,17 +221,17 @@ test "between growth steps a store map answers from the old arrays" {
     // удаление перенесённой записи и ещё не перенесённой
     expect (byid.remove(0) ?? item(-1, "x")).n == 0
     expect (byid.remove(k - 2) ?? item(-1, "x")).n == k - 2
-    let i0 = index_of(keys, 0)
+    let i0 = key_pos(keys, 0)
     keys.remove_at(i0)
     names.remove_at(i0)
-    let i1 = index_of(keys, k - 2)
+    let i1 = key_pos(keys, k - 2)
     keys.remove_at(i1)
     names.remove_at(i1)
     // замена перенесённой записи и ещё не перенесённой
     byid[1] = item(1, "b")
-    names[index_of(keys, 1)] = "b 1"
+    names[key_pos(keys, 1)] = "b 1"
     byid[k - 3] = item(k - 3, "b")
-    names[index_of(keys, k - 3)] = "b {k - 3}"
+    names[key_pos(keys, k - 3)] = "b {k - 3}"
     expect __map_grow_moved(mi(byid)) == 48
     expect same_int(byid, keys, names)
     // вставки — шаги; между ними всё на месте
@@ -246,11 +246,11 @@ test "between growth steps a store map answers from the old arrays" {
         if steps == 3 {
             // ещё раз: удалить и заменить перенесённую, вернуть удалённый ключ
             expect (byid.remove(5) ?? item(-1, "x")).n == 5
-            let i5 = index_of(keys, 5)
+            let i5 = key_pos(keys, 5)
             keys.remove_at(i5)
             names.remove_at(i5)
             byid[6] = item(6, "c")
-            names[index_of(keys, 6)] = "c 6"
+            names[key_pos(keys, 6)] = "c 6"
             byid[0] = item(0, "d")
             keys.push(0)
             names.push("d 0")
@@ -509,16 +509,16 @@ test "a copied store map grows twofold and keeps a large enough table" {
     // номерам в новых массивах
     expect (copied.remove(3) ?? item(-1, "x")).n == 3
     expect (copied.remove(1000) ?? item(-1, "x")).n == 1000
-    let i3 = index_of(keys, 3)
+    let i3 = key_pos(keys, 3)
     keys.remove_at(i3)
     names.remove_at(i3)
-    let i1000 = index_of(keys, 1000)
+    let i1000 = key_pos(keys, 1000)
     keys.remove_at(i1000)
     names.remove_at(i1000)
     copied[5] = item(5, "q")
-    names[index_of(keys, 5)] = "q 5"
+    names[key_pos(keys, 5)] = "q 5"
     copied[1200] = item(1200, "q")
-    names[index_of(keys, 1200)] = "q 1200"
+    names[key_pos(keys, 1200)] = "q 1200"
     expect same_int(copied, keys, names)
     while __map_growing(h) {
         copied[k] = item(k, "p")

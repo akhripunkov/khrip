@@ -555,8 +555,6 @@ type LoanStatus = Active | Overdue | Returned
 
 type Loan { id: int, book_id: int, member_id: int, due: str, status: LoanStatus = Active }
 
-type NewLoan { book_id: int }
-
 store members: map[int, Member]
 store keys: map[str, int]
 store books: map[int, Book]
@@ -588,7 +586,7 @@ route POST "/books" (body: Book) -> 201 Book {
     return 201 body
 }
 
-route POST "/loans" (body: NewLoan) -> 201 Loan | 404 | 409 str {
+route POST "/loans" (body: { book_id: int }) -> 201 Loan | 404 | 409 str {
     let me = current_member()
     if !books.has(body.book_id) {
         return 404
@@ -645,11 +643,11 @@ test "member, loan, return" {
     expect key.len() == 24
 
     let auth = {"X-API-Key": key}
-    expect (call POST "/loans" NewLoan { book_id: 7 }).status == 401
-    let loan = call POST "/loans" NewLoan { book_id: 7 } headers auth
+    expect (call POST "/loans" { book_id: 7 }).status == 401
+    let loan = call POST "/loans" { book_id: 7 } headers auth
     expect loan.status == 201
-    expect (call POST "/loans" NewLoan { book_id: 7 } headers auth).status == 409
-    expect (call POST "/loans" NewLoan { book_id: 99 } headers auth).status == 404
+    expect (call POST "/loans" { book_id: 7 } headers auth).status == 409
+    expect (call POST "/loans" { book_id: 99 } headers auth).status == 404
     expect (call GET "/me/loans" headers auth).body.contains(`"status":"Active"`)
     expect (call POST "/loans/1/return" headers auth).body.contains(`"status":"Returned"`)
 }
@@ -684,6 +682,9 @@ ok    overdue
   встроенные функции для типичных задач бэкенда.
 - `s.matches(`...`)` проверяет строку регулярным выражением целиком. Время проверки
   линейное, поэтому злой шаблон или ввод не подвесят сервер.
+- Тело из одного поля не требует своего типа: `(body: { book_id: int })` — тип
+  без имени, а `{ book_id: 7 }` в `call POST "/loans"` берёт тип тела маршрута.
+  Имя стоит дать типу, который пишут несколько раз, как `Registered`.
 - `every 1 h { ... }` — фоновая задача. Её тело лучше вынести в функцию, чтобы
   проверить тестом без ожидания.
 - В тестах можно менять `store` напрямую (`loans[50] = ...`): так готовятся данные
@@ -724,7 +725,7 @@ test "extend once" {
     let r: Registered? = from_json(reg.body)
     expect r != none
     let auth = {"X-API-Key": r.api_key}
-    let loan: Loan? = from_json((call POST "/loans" NewLoan { book_id: 8 } headers auth).body)
+    let loan: Loan? = from_json((call POST "/loans" { book_id: 8 } headers auth).body)
     expect loan != none
     let id = loan.id
     expect (call POST "/loans/{id}/extend" headers auth).status == 200
@@ -1019,15 +1020,18 @@ test "return a book" {
 
 ## Чего пока нет
 
-- **Других баз и очередей** (MySQL, Redis, Kafka): из баз — только PostgreSQL.
-- **Освобождения старых значений в `store`:** при постоянных обновлениях память растёт.
+- **Других баз и очередей** (MySQL, Redis, Kafka): из баз — PostgreSQL, ClickHouse
+  и MongoDB ([DATABASES.md](DATABASES.md)).
+- **Потоковых ответов, WebSocket, HTTP/2 и gRPC** — они в планах v0.14–v0.16
+  ([ROADMAP.md](ROADMAP.md)).
 - **TLS 1.2 и TLS на стороне сервера:** `fetch` умеет только TLS 1.3, сервер Khrip
   работает за обратным прокси.
 - **Модулей, обобщённых типов, наследования и исключений** — сознательно.
 
 ## Что читать дальше
 
-- [KHRIP.md](KHRIP.md) — полное описание языка (для промпта нейросети, англ.).
+- [KHRIP.md](KHRIP.md) — полное описание языка (англ.); его сжатая форма для
+  нейросетей — [скилл Khrip](../skill/khrip/SKILL.md).
 - [eval/](../eval/README.md) — одиннадцать задач бэкенда (три — на PostgreSQL), решённых на Khrip, Go, C# и Python,
   с замерами токенов, скорости и памяти.
 - [examples/weather/weather.kh](../examples/weather/weather.kh) — погодный бэкенд:

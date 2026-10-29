@@ -1,0 +1,5 @@
+tests/skill/rules/list_contains.kh:6:16: error: .contains() works on lists of int, str or bool, not [float]
+        print("{fs.contains(1.5)}")
+                   ^
+    hint: write xs.any(x => x == v)
+1 error

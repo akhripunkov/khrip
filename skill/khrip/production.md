@@ -10,12 +10,12 @@ routes only read the store.
 |---|---|
 | `PORT` | port, 8080 |
 | `THREADS` | worker threads, all cores |
-| `KHRIP_DATA=file.json` | the store, loaded at start and saved as JSON a second after changes and on SIGTERM or SIGINT; a missing or unreadable file starts an empty store, an unparsable one stops the start |
+| `KHRIP_DATA=file.json` | the store, loaded at start and saved as JSON within a second of changes and on SIGTERM or SIGINT; a missing or unreadable file keeps the initial values, an unparsable one stops the start |
 | `DATABASE_URL` | PostgreSQL; `sslmode` `disable`, `prefer` (default), `require`, `verify-ca`, `verify-full` |
-| `DATABASE_POOL` | PostgreSQL connections, 4 per thread, at most 32 |
+| `DATABASE_POOL` | PostgreSQL connections per process, default 4 per thread up to 32 |
 | `DATABASE_TIMEOUT` | ms per statement or `tx` with retries (10000), then 503 |
 | `DATABASE_MIGRATE` | `apply` (default) runs migrations at start; `check` only verifies (`./app migrate` applies and exits) |
-| `CLICKHOUSE_TIMEOUT`, `CLICKHOUSE_MAX_RESULT`, `CLICKHOUSE_INFLIGHT` | ms per operation (10000), bytes of one result (64 MiB), operations per thread (32) |
+| `CLICKHOUSE_TIMEOUT`, `CLICKHOUSE_MAX_RESULT`, `CLICKHOUSE_INFLIGHT` | ms per operation (`DATABASE_TIMEOUT` or 10000), bytes of one result (64 MiB), operations per thread (32) |
 | `SSL_CERT_FILE` | root certificates for https (else the system's) |
 | `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` | for `fetch` |
 | `KHRIP_GC`, `KHRIP_GC_MIN_MB`, `KHRIP_GC_LIMIT_MB` | store collector: headroom % over live data (50), smallest goal (4 MB), soft limit |
@@ -29,8 +29,7 @@ routes only read the store.
   request waits (`fetch`, databases, `sleep`, password hashing), its thread runs
   other requests, but a long computation holds its thread.
 - A request (head and body) is at most 64 KiB: more gets 413, too large headers
-  431, a chunked body 501. `fetch` gives up after 30 s; https is TLS 1.3 only,
-  and connections are reused.
+  431, a chunked body 501. `fetch` gives up after 30 s; https is TLS 1.3 only.
 - Index out of range, overflow, int division by zero, `pop` or `last` on an
   empty list panic: the request gets 500 and the server goes on; a panic in
   `every` is logged; a program without routes exits with code 101. Float

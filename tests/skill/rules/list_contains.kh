@@ -1,0 +1,7 @@
+// contains и index_of — у списков int, str и bool; у прочих — ошибка.
+// in: SKILL.md
+// rule: `contains index_of` (int, str, bool; else `xs.any(x => x == v)`)
+fn main() {
+    let fs = [1.5, 2.5]
+    print("{fs.contains(1.5)}")
+}

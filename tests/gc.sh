@@ -9,10 +9,13 @@
 # и: держатели продолжают посреди разметки, начатой, пока они ждали, и
 # передают арены сами, фоновая задача — тоже, а сборка у жёсткого предела
 # посреди запроса доделывает разметку потока сборщика. Затем — те же
-# держатели по одному виду окна подряд (sleep, fetch, хеш пароля, читатель):
-# каждый вид продолжает посреди разметки; окна драйверов MongoDB и
-# ClickHouse — tests/gc/dbwin.kh (если заданы MONGODB_URI и CLICKHOUSE_URL),
-# окна PostgreSQL — tests/pg.sh. Затем KHRIP_DATA: сохранение под нагрузкой (SIGTERM),
+# держатели по одному виду окна подряд (sleep, fetch, хеш пароля, читатель,
+# долгий опрос, большая арена): сначала рядом с писателями — ответы верны;
+# затем с KHRIP_GC_WINDOW_CYCLE=1, где каждое окно начинает сборку, —
+# каждый держатель продолжает посреди разметки, начатой в его окне, и
+# передаёт арену сам; окна драйверов MongoDB и ClickHouse — так же,
+# tests/gc/dbwin.kh (если заданы MONGODB_URI и CLICKHOUSE_URL), окна
+# PostgreSQL — tests/pg.sh. Затем KHRIP_DATA: сохранение под нагрузкой (SIGTERM),
 # перезапуск и восстановление со сборками — снимок цел. Сборка в простое после
 # записи без выделений. И тест внутри
 # tests/gc/server.kh: khc test держит товар через call, без проверок и со
@@ -123,35 +126,55 @@ PY
 	fi
 }
 
+# gc_probe_run <отчёт> <имя> <бинарник> <probe|probe-seq> "<переменные>"
+# <вид путь раз>...: сервер с KHRIP_GC_STRESS=1 (сборки одна за другой, куски
+# разметки по 5 мкс, проверки), товары, затем держатели каждого вида подряд
+# (tests/gc/drive.py). Всегда: ни одного неверного ответа, сервер жив,
+# проверки молчат. probe — писатели меняют товары одновременно с держателями,
+# сборки ведёт поток сборщика: продолжит ли держатель посреди разметки (ok~,
+# ok+), решает то, как легли куски, — это только в отчёте. probe-seq — сервер
+# с KHRIP_GC_WINDOW_CYCLE=1 (lib/gc_verify.kh): каждое окно доделывает идущую
+# сборку и начинает новую, захватив запись держателя; писатель меняет товары
+# перед каждым запросом держателя, а пока тот ждёт, в store никто не выделяет,
+# и разметку этой сборки никто не ведёт. Поэтому каждый ответ — ok+: держатель
+# продолжил посреди разметки, начатой в его окне, и передал арену сам — при
+# любой скорости машины.
+gc_probe_run() {
+	local report=$1 name=$2 bin=$3 mode=$4 envs=$5 probe kind path times res probes="" bad="" alive=0 vfail
+	shift 5
+	# shellcheck disable=SC2086
+	gc_start "$bin" KHRIP_GC=20 KHRIP_GC_MIN_MB=1 KHRIP_GC_STRESS=1 $envs
+	curl -s -o /dev/null -X POST "$gc_url/seed"
+	for probe in "$@"; do
+		read -r kind path times <<<"$probe"
+		res=$(python3 tests/gc/drive.py "$mode" "$GC_PORT" "$path" "$times" 2>&1)
+		probes+="$kind $res; "
+		if ! python3 -c 'import json, sys; r = json.loads(sys.argv[1]); sys.exit(0 if not r["bad"] and (sys.argv[2] == "probe" or r["ok+"] == int(sys.argv[3])) else 1)' "$res" "$mode" "$times" 2>/dev/null; then
+			bad+="$kind: $res; "
+		fi
+	done
+	kill -0 "$gc_pid" 2>/dev/null && alive=1
+	gc_stop
+	vfail=$(grep 'gc verify' "$tmp/gc.log" | grep -cv 'gc verify (boot): ')
+	if [[ -z $bad && $alive == 1 && $vfail == 0 ]]; then
+		http_ok
+		echo "$report: $probes"
+	else
+		failed "$name" "${bad:-сервер упал или ошибка проверок}"$'\n'"$probes"$'\n'"$(grep -v '^gc [0-9]' "$tmp/gc.log" | tail -5)"
+	fi
+}
+
 if KHRIP_GC_LOG=1 "$KHC" -o "$tmp/gcsrv" tests/gc/server.kh 2>"$tmp/gcsrv.err" && KHRIP_GC_LOG=1 KHRIP_GC_STRESS=1 "$KHC" -o "$tmp/gcsrv_s" tests/gc/server.kh 2>>"$tmp/gcsrv.err"; then
 	gc_matrix plain "$tmp/gcsrv" 8
 	gc_matrix "KHRIP_GC_STRESS=1" "$tmp/gcsrv_s" 8 KHRIP_GC_STRESS=1
 
 	# окна по видам: держатель подряд, пока писатели меняют товары, а сборки с
-	# KHRIP_GC_STRESS=1 идут одна за другой (куски по 5 мкс) — каждый вид окна
-	# хоть раз продолжает посреди разметки, начатой, пока он ждал
-	gc_start "$tmp/gcsrv_s" KHRIP_GC=20 KHRIP_GC_MIN_MB=1 KHRIP_GC_STRESS=1
-	curl -s -o /dev/null -X POST "$gc_url/seed"
-	gc_probes=""
-	gc_probe_bad=""
-	for probe in "sleep /hold/{i}?ms=20 30" "reader /search/{i} 30" "fetch /fx?n=10 30" "hash /login 12" "poll /poll?ms=2 12" "many /hold-many?ms=30 12"; do
-		read -r kind path times <<<"$probe"
-		res=$(python3 tests/gc/drive.py probe "$GC_PORT" "$path" "$times" 2>&1)
-		gc_probes+="$kind $res; "
-		if ! python3 -c 'import json, sys; r = json.loads(sys.argv[1]); sys.exit(0 if not r["bad"] and r["ok~"] + r["ok+"] > 0 else 1)' "$res" 2>/dev/null; then
-			gc_probe_bad+="$kind: $res; "
-		fi
-	done
-	gc_alive=0
-	kill -0 "$gc_pid" 2>/dev/null && gc_alive=1
-	gc_stop
-	gc_vfail=$(grep 'gc verify' "$tmp/gc.log" | grep -cv 'gc verify (boot): ')
-	if [[ -z $gc_probe_bad && $gc_alive == 1 && $gc_vfail == 0 ]]; then
-		http_ok
-		echo "gc windows by kind (KHRIP_GC_STRESS=1): $gc_probes"
-	else
-		failed "gc: окна по видам посреди разметки" "${gc_probe_bad:-сервер упал или ошибка проверок}"$'\n'"$gc_probes"$'\n'"$(grep -v '^gc [0-9]' "$tmp/gc.log" | tail -5)"
-	fi
+	# KHRIP_GC_STRESS=1 идут одна за другой (куски по 5 мкс); затем те же
+	# держатели с KHRIP_GC_WINDOW_CYCLE=1 — каждый продолжает посреди
+	# разметки, начатой, пока он ждал, и передаёт арену сам
+	gc_kinds=("sleep /hold/{i}?ms=20 30" "reader /search/{i} 30" "fetch /fx?n=10 30" "hash /login 12" "poll /poll?ms=2 12" "many /hold-many?ms=30 12")
+	gc_probe_run "gc windows by kind (KHRIP_GC_STRESS=1)" "gc: окна по видам" "$tmp/gcsrv_s" probe "" "${gc_kinds[@]}"
+	gc_probe_run "gc windows by kind, each resumed mid-marking (KHRIP_GC_WINDOW_CYCLE=1)" "gc: окна по видам посреди разметки" "$tmp/gcsrv_s" probe-seq KHRIP_GC_WINDOW_CYCLE=1 "${gc_kinds[@]}"
 
 	# нет памяти на hbuf (только с проверками): KHRIP_GC_FAULT=hbuf — ни разу,
 	# hbuf2 — только при росте hbuf, где уже лежит часть арены. Держатель,
@@ -160,31 +183,11 @@ if KHRIP_GC_LOG=1 "$KHC" -o "$tmp/gcsrv" tests/gc/server.kh 2>"$tmp/gcsrv.err" &
 	# ожидания). /hold-many держит каждый товар одним звеном в начале большой
 	# арены, писатели товары заменяют: потерянное найденное слово — неверный
 	# ответ или строка проверки. Сервер не падает, значения целы, проверки
-	# молчат. fetch — 32 раза: из 16 его окно иногда ни разу не попадало на
-	# разметку
+	# молчат; с KHRIP_GC_WINDOW_CYCLE=1 этот путь проходит каждый держатель
+	gc_kinds=("many /hold-many?ms=30 16" "sleep /hold/{i}?ms=20 16" "reader /search/{i} 16" "fetch /fx?n=10 16")
 	for fault in hbuf hbuf2; do
-		gc_start "$tmp/gcsrv_s" KHRIP_GC=20 KHRIP_GC_MIN_MB=1 KHRIP_GC_STRESS=1 KHRIP_GC_FAULT=$fault
-		curl -s -o /dev/null -X POST "$gc_url/seed"
-		gc_probes=""
-		gc_probe_bad=""
-		for probe in "many /hold-many?ms=30 16" "sleep /hold/{i}?ms=20 16" "reader /search/{i} 16" "fetch /fx?n=10 32"; do
-			read -r kind path times <<<"$probe"
-			res=$(python3 tests/gc/drive.py probe "$GC_PORT" "$path" "$times" 2>&1)
-			gc_probes+="$kind $res; "
-			if ! python3 -c 'import json, sys; r = json.loads(sys.argv[1]); sys.exit(0 if not r["bad"] and r["ok~"] + r["ok+"] > 0 else 1)' "$res" 2>/dev/null; then
-				gc_probe_bad+="$kind: $res; "
-			fi
-		done
-		gc_alive=0
-		kill -0 "$gc_pid" 2>/dev/null && gc_alive=1
-		gc_stop
-		gc_vfail=$(grep 'gc verify' "$tmp/gc.log" | grep -cv 'gc verify (boot): ')
-		if [[ -z $gc_probe_bad && $gc_alive == 1 && $gc_vfail == 0 ]]; then
-			http_ok
-			echo "gc windows without memory for hbuf (KHRIP_GC_FAULT=$fault): $gc_probes"
-		else
-			failed "gc: окна без памяти на hbuf ($fault)" "${gc_probe_bad:-сервер упал или ошибка проверок}"$'\n'"$gc_probes"$'\n'"$(grep -v '^gc [0-9]' "$tmp/gc.log" | tail -5)"
-		fi
+		gc_probe_run "gc windows without memory for hbuf (KHRIP_GC_FAULT=$fault)" "gc: окна без памяти на hbuf ($fault)" "$tmp/gcsrv_s" probe "KHRIP_GC_FAULT=$fault" "${gc_kinds[@]}"
+		gc_probe_run "gc windows without memory for hbuf, each resumed mid-marking (KHRIP_GC_FAULT=$fault KHRIP_GC_WINDOW_CYCLE=1)" "gc: окна без памяти на hbuf посреди разметки ($fault)" "$tmp/gcsrv_s" probe-seq "KHRIP_GC_FAULT=$fault KHRIP_GC_WINDOW_CYCLE=1" "${gc_kinds[@]}"
 	done
 
 	# KHRIP_DATA: SIGTERM посреди нагрузки сохраняет целый снимок; перезапуск
@@ -241,32 +244,14 @@ if KHRIP_GC_LOG=1 "$KHC" -o "$tmp/gcsrv" tests/gc/server.kh 2>"$tmp/gcsrv.err" &
 
 	# окна драйверов MongoDB и ClickHouse (настоящие серверы): читатель держит
 	# товар через команду и запрос, писатели меняют товары, сборки идут одна за
-	# другой — оба вида окна продолжают посреди разметки
+	# другой; с KHRIP_GC_WINDOW_CYCLE=1 оба вида окна каждый раз продолжают
+	# посреди разметки и передают арену сами
 	if [[ -z ${MONGODB_URI:-} || -z ${CLICKHOUSE_URL:-} ]]; then
 		echo "SKIP gc driver windows: set MONGODB_URI and CLICKHOUSE_URL"
 	elif KHRIP_GC_LOG=1 KHRIP_GC_STRESS=1 "$KHC" -o "$tmp/gcdb" tests/gc/dbwin.kh 2>"$tmp/gcdb.err"; then
-		gc_start "$tmp/gcdb" KHRIP_GC=20 KHRIP_GC_MIN_MB=1 KHRIP_GC_STRESS=1
-		curl -s -o /dev/null -X POST "$gc_url/seed"
-		gc_probes=""
-		gc_probe_bad=""
-		for probe in "mongo /mongo/{i} 30" "clickhouse /ch/{i} 20"; do
-			read -r kind path times <<<"$probe"
-			res=$(python3 tests/gc/drive.py probe "$GC_PORT" "$path" "$times" 2>&1)
-			gc_probes+="$kind $res; "
-			if ! python3 -c 'import json, sys; r = json.loads(sys.argv[1]); sys.exit(0 if not r["bad"] and r["ok~"] + r["ok+"] > 0 else 1)' "$res" 2>/dev/null; then
-				gc_probe_bad+="$kind: $res; "
-			fi
-		done
-		gc_alive=0
-		kill -0 "$gc_pid" 2>/dev/null && gc_alive=1
-		gc_stop
-		gc_vfail=$(grep 'gc verify' "$tmp/gc.log" | grep -cv 'gc verify (boot): ')
-		if [[ -z $gc_probe_bad && $gc_alive == 1 && $gc_vfail == 0 ]]; then
-			http_ok
-			echo "gc driver windows (KHRIP_GC_STRESS=1): $gc_probes"
-		else
-			failed "gc: окна драйверов посреди разметки" "${gc_probe_bad:-сервер упал или ошибка проверок}"$'\n'"$gc_probes"$'\n'"$(grep -v '^gc [0-9]' "$tmp/gc.log" | tail -5)"
-		fi
+		gc_kinds=("mongo /mongo/{i} 30" "clickhouse /ch/{i} 20")
+		gc_probe_run "gc driver windows (KHRIP_GC_STRESS=1)" "gc: окна драйверов" "$tmp/gcdb" probe "" "${gc_kinds[@]}"
+		gc_probe_run "gc driver windows, each resumed mid-marking (KHRIP_GC_WINDOW_CYCLE=1)" "gc: окна драйверов посреди разметки" "$tmp/gcdb" probe-seq KHRIP_GC_WINDOW_CYCLE=1 "${gc_kinds[@]}"
 	else
 		failed "tests/gc/dbwin.kh" "$(cat "$tmp/gcdb.err")"
 	fi

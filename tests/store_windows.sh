@@ -22,7 +22,7 @@ rules=(
 	"= __store_release_keep( lib/rt.kh:__store_release_keep lib/rt.kh:__co_wait lib/fetch.kh:__fetch lib/crypto.kh:__pbkdf2_unlocked lib/mongo.kh:mongo_command lib/clickhouse.kh:__ch_run"
 	"= __store_unlock_raw( lib/rt.kh:__store_unlock_raw lib/rt.kh:__store_release_keep lib/rt.kh:__store_release_final lib/gc.kh:__pin_self_fallback"
 	"= __store_write_unlock( lib/rt.kh:__store_write_unlock lib/rt.kh:__store_unlock_raw lib/rt.kh:__store_unlock_gc"
-	"< __store_unlock_gc( lib/rt.kh:__store_unlock_gc lib/gc.kh:* tests/api/gc_records.kh:*"
+	"< __store_unlock_gc( lib/rt.kh:__store_unlock_gc lib/gc.kh:* lib/gc_verify.kh:__gc_window_cycle tests/api/gc_records.kh:*"
 	"< __store_unlock_marker( lib/rt.kh:__store_unlock_marker lib/gc.kh:* tests/api/gc_records.kh:*"
 	"< __store_rw lib/rt.kh:- lib/rt.kh:__store_rw_init lib/rt.kh:__store_lock lib/rt.kh:__store_unlock_raw lib/rt.kh:__store_lock_gc lib/rt.kh:__store_unlock_gc lib/rt.kh:__store_lock_marker lib/rt.kh:__store_unlock_marker lib/rt.kh:__perm_alloc lib/rt.kh:__arena_take lib/text.kh:__chars lib/x509.kh:__roots lib/x509.kh:__roots_from lib/clickhouse.kh:__ch_schema_block lib/gc_verify.kh:__gc_check_owner tests/api/gc_records.kh:*"
 )

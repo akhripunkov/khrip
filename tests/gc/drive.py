@@ -8,6 +8,10 @@
                                              подряд, пока писатели меняют товары:
                                              сколько раз он продолжил посреди
                                              разметки (JSON)
+    python3 drive.py probe-seq <порт> <путь> <раз> — то же, но писатель меняет
+                                             товары перед каждым запросом
+                                             держателя, а не одновременно с ним
+                                             (сервер с KHRIP_GC_WINDOW_CYCLE=1)
 
 Каждый поток — своё соединение keep-alive. Держатели проверяют ответ сервера
 ("ok"; "ok~" — запрос продолжил посреди разметки сборки, начатой, пока он
@@ -161,26 +165,40 @@ def load(port, seconds):
     print(json.dumps(out))
 
 
-def probe(port, path, times):
+def probe(port, path, times, seq=False):
     """Запрос держателя path подряд times раз, пока поток писателей меняет
     товары (сборки идут одна за другой): сколько ответов ok, ok~, ok+ и
-    неверных."""
+    неверных. seq — писатель меняет товары перед каждым запросом держателя
+    (тем же соединением), а пока держатель ждёт, в store никто не выделяет:
+    на сервере с KHRIP_GC_WINDOW_CYCLE=1 сборку, начатую в окне держателя,
+    тогда ничто не доведёт до конца раньше, чем он продолжит."""
     stop = [False]
     method = "POST" if path.startswith(("/login", "/fx", "/resurrect")) else "GET"
+    rnd = random.Random(7)
+
+    def churn_once(c):
+        c.request("POST", f"/churn/{rnd.randrange(N)}/20")
+        r = c.getresponse()
+        b = r.read().decode("utf-8", "replace")
+        return "" if r.status == 200 and b == "ok" else f"churn: {r.status} {b}"
 
     def churn():
         c = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
-        rnd = random.Random(7)
         while not stop[0]:
-            c.request("POST", f"/churn/{rnd.randrange(N)}/20")
-            c.getresponse().read()
+            churn_once(c)
 
-    t = threading.Thread(target=churn)
-    t.start()
+    t = None
+    if not seq:
+        t = threading.Thread(target=churn)
+        t.start()
     counts = {"ok": 0, "ok~": 0, "ok+": 0, "bad": []}
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
     try:
         for i in range(times):
+            if seq:
+                e = churn_once(c)
+                if e and len(counts["bad"]) < 5:
+                    counts["bad"].append(e)
             c.request(method, path.replace("{i}", str(i * 37 % N)))
             r = c.getresponse()
             b = r.read().decode("utf-8", "replace")
@@ -190,14 +208,15 @@ def probe(port, path, times):
                 counts["bad"].append(f"{r.status} {b}")
     finally:
         stop[0] = True
-        t.join()
+        if t:
+            t.join()
     print(json.dumps(counts))
 
 
 if __name__ == "__main__":
     if sys.argv[1] == "check":
         check_file(sys.argv[2])
-    elif sys.argv[1] == "probe":
-        probe(int(sys.argv[2]), sys.argv[3], int(sys.argv[4]))
+    elif sys.argv[1] in ("probe", "probe-seq"):
+        probe(int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), sys.argv[1] == "probe-seq")
     else:
         load(int(sys.argv[2]), float(sys.argv[3]))

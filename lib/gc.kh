@@ -3915,9 +3915,19 @@ fn __gc_test_point(end: bool) {
 // блокировка уже отпущена) — тоже точка сборки, как будто в окно попал кусок
 // разметки потока сборщика: контекст опубликовал себя и не держит store. Шаг
 // сборки (__gc_stress_step); сборка, начатая здесь, захватывает арену окна, и
-// контекст, продолжив, передаёт её сам.
+// контекст, продолжив, передаёт её сам. С потоком сборщика окно — точка
+// сборки только в тестах сервера с KHRIP_GC_WINDOW_CYCLE=1
+// (__gc_window_cycle, lib/gc_verify.kh): __gc_busy там смотрится под
+// блокировкой, а не здесь, где его может держать кусок потока сборщика.
 fn __gc_window_point() {
-    if !__gc_stress || __gc_has_thread || __gc_busy || __gc_pct < 0 || !__gc_ready {
+    if !__gc_stress || __gc_pct < 0 || !__gc_ready {
+        return
+    }
+    if __gc_has_thread {
+        __gc_window_cycle()
+        return
+    }
+    if __gc_busy {
         return
     }
     __store_lock_gc()

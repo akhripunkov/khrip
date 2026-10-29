@@ -30,10 +30,12 @@ fn __gc_verify_init() {
     } else if f == "hbuf2" {
         __gcv_hbuf_fault = 2
     }
+    __gcv_window_cycle = (env("KHRIP_GC_WINDOW_CYCLE") ?? "") == "1"
     __gc_slow_update()
 }
 
 var __gcv_hbuf_fault: int
+var __gcv_window_cycle: bool
 
 fn __gc_hbuf_fault(cap: int) -> bool {
     return __gcv_hbuf_fault == 1 || (__gcv_hbuf_fault == 2 && cap > 0)
@@ -934,6 +936,33 @@ fn __gcv_place(t: int, cap: int, p: int) {
         i = (i + 1) & (cap - 1)
     }
     store64(t + i * 8, p)
+}
+
+// KHRIP_GC_WINDOW_CYCLE=1 вместе с KHRIP_GC_STRESS=1 (tests/gc.sh, держатели
+// по видам окон): окно и в программе с потоком сборщика — точка сборки, как в
+// khc test (__gc_window_point). Контекст опубликовал запись и отпустил store
+// (__store_release_keep); идущая сборка доделывается под исключительной
+// блокировкой сборщика (разметка, её конец и уборка), и начинается новая — она
+// захватывает и его запись, арена ждёт в PENDING. Поток сборщика ведёт кусками
+// только сборки, которые начал сам, поэтому эту разметку двигают лишь помощь
+// писателей, сборка у жёсткого предела и следующее такое окно (оно снова
+// начнёт сборку, захватив и этот контекст). Пока в окне никто не выделяет в
+// store, контекст продолжит посреди разметки, начатой в его окне, и передаст
+// арену сам — при любой скорости машины.
+fn __gc_window_cycle() {
+    if !__gcv_window_cycle {
+        return
+    }
+    __store_lock_gc()
+    if !__gc_busy {
+        __gc_busy = true
+        if __gc_phase == GC_PH_MARK {
+            __gc_finish_stw(GC_WHY_WINDOW)
+        }
+        __gc_begin_cycle(0, GC_WHY_WINDOW)
+        __gc_busy = false
+    }
+    __store_unlock_gc()
 }
 
 // KHRIP_GC_STRESS без потока сборщика (khc test): шаг сборки вместо сборки

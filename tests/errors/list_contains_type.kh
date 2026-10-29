@@ -1,0 +1,17 @@
+// expect: list_contains_type.kh:14:16: error: .contains() works on lists of int, str or bool, not [float]
+// expect: hint: write xs.any(x => x == v)
+// expect: list_contains_type.kh:15:20: error: .index_of() works on lists of int, str or bool, not [Role]
+// expect: hint: find the item instead: xs.find(x => x == v)
+// expect: list_contains_type.kh:16:27: error: .contains() works on lists of int, str or bool, not [P]
+// expect: hint: compare a field: xs.any(x => x.id == v.id)
+// expect: 3 errors
+// contains и index_of — у списков int, str и bool; у прочих — подсказка с any
+// или find (у структуры — по полю: == для структур нет).
+type P { id: int }
+type Role = A | B
+fn main() {
+    let fs = [1.5]
+    print("{fs.contains(1.5)} {[true].contains(true)} {[true].index_of(true) ?? -1}")
+    print("{[A, B].index_of(B) ?? -1} {fs.any(x => x == 1.5)}")
+    print("{[P { id: 1 }].contains(P { id: 1 })}")
+}

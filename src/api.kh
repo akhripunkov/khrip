@@ -951,6 +951,19 @@ fn route_return(at: Token, has_value: bool) {
         return
     }
     let t0 = tok()
+    if t0.kind == T_INT && kind_at(pos + 1) == ',' {
+        // return 400, "msg" из Python и Go: статус и значение — без запятой
+        var hint = "write return " + t0.val.to_str() + " \"msg\" (no comma)"
+        if find_variant(r, t0.val) < 0 && status_like(t0.val) {
+            hint = hint + " and declare the status: -> " + variants_text(r) + " | " + t0.val.to_str() + " str"
+        }
+        error_tok(toks[pos + 1], "a status and its value are written without a comma", hint)
+        advance()
+        advance()
+        parse_expr(ty_err)
+        ret_holes.push(emit_jmp())
+        return
+    }
     if t0.kind == T_INT {
         let vi = find_variant(r, t0.val)
         if ends_stmt(pos + 1) && (vi >= 0 || !returns_int(r) || status_like(t0.val)) {
@@ -1076,7 +1089,16 @@ fn route_return(at: Token, has_value: bool) {
     if vi < 0 {
         var hint = ""
         if t0.kind == T_INT {
-            hint = "a status without a value must be declared: -> " + variants_text(r) + " | " + t0.val.to_str()
+            // подсказать объявить статус — только если его ещё нет
+            // (иначе «declared twice») и это статус, а не число
+            let sv = find_variant(r, t0.val)
+            if sv < 0 && status_like(t0.val) {
+                hint = "a status without a value must be declared: -> " + variants_text(r) + " | " + t0.val.to_str()
+            } else if sv >= 0 && r.variants[sv].ty == ty_str {
+                hint = "status " + t0.val.to_str() + " carries a str: return " + t0.val.to_str() + " \"msg\""
+            } else if sv >= 0 && r.variants[sv].ty >= 0 {
+                hint = "status " + t0.val.to_str() + " carries a " + ty_name(r.variants[sv].ty) + ": return " + t0.val.to_str() + " and the value"
+            }
         } else if tkind(t) == K_OPT {
             hint = "the value may be none: return x ?? 404 (and declare 404)"
         } else if is_anon_ty(t) {

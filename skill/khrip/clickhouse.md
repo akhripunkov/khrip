@@ -49,5 +49,6 @@ route GET "/stats/pages" (from: int, to: int, page: str?, limit: int = 10) -> [P
   (`r.ok`, `r.error`, `r.unknown_outcome`; it must be checked).
 - Other servers: `clickhouse metrics = env("METRICS_URL")`; `table hits: Hit in
   metrics`, `migration metrics 1`, `ch metrics "..."`.
-- `khc test` creates a temporary database on `KHRIP_TEST_CLICKHOUSE_URL` (else
-  `CLICKHOUSE_URL`) and drops it; tests may call `ch` and `t.insert`.
+- `khc test` uses a temporary database on `KHRIP_TEST_CLICKHOUSE_URL`, `_USER`,
+  `_PASSWORD` (else the `CLICKHOUSE_` ones) and drops it; tests may call `ch` and
+  `t.insert`.

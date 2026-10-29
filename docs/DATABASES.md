@@ -6,7 +6,9 @@
 
 Библиотека драйвера подключается, только если программа пользуется её именем:
 функцией, типом или константой (`mongo_find`, `Mongo`, `bson_new`, `ChConfig`,
-...) или встроенной функцией (`to_bson`, `from_bson`, `ch_encode`, `ch_decode`).
+...) или встроенной функцией (`to_bson`, `from_bson`, `ch_encode`, `ch_decode`);
+слой ClickHouse в языке — формами `ch "..."`, `table`, `clickhouse ИМЯ = ...` и
+`migration ch`.
 Имя сравнивается точно. Своё имя верхнего уровня (`fn`, `type`, `const`, `var`,
 `store`) — собственное имя программы, а функция драйвера считается, только
 когда её вызывают: локальная или параметр `object_id` драйвер не подключают.
@@ -18,8 +20,10 @@
 указывает на объявление в программе: `'Mongo' is also a name of the MongoDB
 driver (lib/mongo.kh), which this program uses`.
 
-Подключения задаются значениями `Mongo` и `ChConfig`: одна программа может
-обращаться к нескольким базам, в том числе одновременно с PostgreSQL.
+Подключение к MongoDB задаётся значением `Mongo`, к ClickHouse — переменной
+`CLICKHOUSE_URL` и объявлениями `clickhouse ИМЯ = ...` (в низкоуровневом API —
+значением `ChConfig`): одна программа может обращаться к нескольким базам, в том
+числе одновременно с PostgreSQL.
 Ожидание сети использует сопрограммы рантайма; блокировка `store` отпускается
 на время операции. Значения `store` после такого вызова следует читать заново.
 Маршрут, который `store` только читает, берёт разделяемую блокировку и с
@@ -632,7 +636,9 @@ GRANT и `DROP USER` такого параметра не принимают). �
 (`Array(String)` с кавычками внутри) так не передать: их разбор зависит от типа
 параметра, который знает только форма `ch "..."`.
 
-`ChResult` содержит `ok`, `status`, `body`, `error`, `query_id`, `unknown_outcome`.
+`ChResult` содержит `ok`, `status`, `body`, `error`, `query_id`, `unknown_outcome`,
+`code` (код исключения ClickHouse, 0 — сервер его не назвал) и `written_rows`
+(записано строк, по `X-ClickHouse-Summary`).
 При потере подтверждения после начала отправки `unknown_outcome=true`.
 Проверяйте `ok`
 перед декодированием, затем результат `ch_decode`. При ошибке `ch_encode`
@@ -754,9 +760,14 @@ Tuple, Map, IPv4/IPv6 и другие типы приводите в запро�
 ```sh
 bash tests/mongo.sh
 bash tests/clickhouse.sh
+bash tests/chdb.sh
 bash tests/databases/compiler.sh
 bash tests/databases/runtime.sh
 ```
+
+`tests/chdb.sh` проверяет слой ClickHouse в языке (`ch "..."`, таблицы, вставки,
+миграции, проверки при запуске, `khc test`) на настоящем сервере; без
+`CLICKHOUSE_URL` он пишет строку `SKIP`.
 
 Кодеки и проверки повреждённых сообщений не требуют БД. С `MONGODB_URI`
 `tests/mongo.sh` также запускает `khc test tests/mongo/request.kh`: память арены
@@ -778,8 +789,10 @@ TLS к настоящему mongod проверяет `tests/mongo/tls.sh` (ег
 MongoDB (`MONGODB_TEST_IMAGE`, иначе `mongo:8.0` или
 `mirror.gcr.io/library/mongo:8.0`); без них сценарий пишет строку `SKIP`.
 
-`tests/run.sh` запускает все три сценария (`runtime.sh` — когда заданы оба
-адреса) и печатает их строки `SKIP`: пропуск настоящих серверов виден в
+`tests/run.sh` запускает `tests/mongo.sh`, `tests/clickhouse.sh`,
+`tests/databases/runtime.sh` (без обоих адресов он пишет строку `SKIP`) и
+`tests/chdb.sh`, а проверки `compiler.sh` у него свои (tests/errors,
+tests/locks); строки `SKIP` он печатает: пропуск настоящих серверов виден в
 итоге, а не только в журнале.
 
 Воспроизводимый запуск на Linux и macOS с Docker:
