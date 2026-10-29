@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # Собрать, запустить и проверить решение:
 #   eval/run.sh <задача> <язык> [папка решения]
-# Язык: khrip (main.kh), go (модуль), csharp (проект), python (main.py, FastAPI app);
-# для любого другого языка — START="команда запуска" eval/run.sh <задача> other <папка>.
-# Папка по умолчанию — eval/solutions/<задача>/<язык>. Сервер слушает порт 8080.
+# Язык: khrip (main.kh), go (модуль), csharp (проект), python (main.py, FastAPI app),
+# java (проект Maven, Spring Boot), node (server.js, Fastify), bun (тот же
+# server.js под Bun), node-cluster (он же в двух процессах node:cluster — только
+# задачи с базой); для любого другого языка — START="команда запуска"
+# eval/run.sh <задача> other <папка>.
+# Папка по умолчанию — eval/solutions/<задача>/<язык> (у bun и node-cluster —
+# .../node). Сервер слушает порт 8080.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/server.sh"
 task=$1
 lang=$2
-dir=$(cd "${3:-$here/solutions/$task/$lang}" && pwd) || exit 2
+dir=$(cd "${3:-$here/solutions/$task/$(sol_lang "$lang")}" && pwd) || exit 2
 tmp=$(mktemp -d)
 pid=
 pid2=

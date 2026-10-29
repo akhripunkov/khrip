@@ -1,0 +1,9 @@
+{
+  "name": "ledger",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "fastify": "5.12.7",
+    "pg": "8.23.1"
+  }
+}

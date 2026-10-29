@@ -4,5 +4,7 @@ obj/
 __pycache__/
 node_modules/
 package-lock.json
+!eval/solutions/*/node/package-lock.json
+target/
 bench/gc/out/
 bench/mem/out/
