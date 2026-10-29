@@ -1,0 +1,17 @@
+// Правильная половина: с переменной k — словарь {(k): v} или {"k": v};
+// структура с полем, как у локальной, — с типом.
+// in: SKILL.md
+// rule: `{k: v}` with a local `k` is an error: give it a type or rename `k`.
+// rule: let ages = {"ann": 30, (key): 41} // map keys: "text" or (expression)
+type Status { status: str }
+
+fn main() {
+    let k = "a"
+    let m = {(k): 1, "b": 2}
+    print(to_json(m))
+    let status = "x"
+    let r: { status: str } = { status: "done" }
+    print(to_json(r))
+    print(to_json(Status { status: "done" }))
+    print(status)
+}

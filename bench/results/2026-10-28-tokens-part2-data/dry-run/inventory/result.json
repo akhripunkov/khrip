@@ -1,0 +1,18 @@
+{
+ "task": "inventory",
+ "lang": "khrip",
+ "model": "dry-run",
+ "passed": true,
+ "attempts": 1,
+ "calls": 1,
+ "chapters_read": [],
+ "tokens": {
+  "system": 3029,
+  "task": 467,
+  "chapters": 0,
+  "answers": 1208,
+  "feedback": 0
+ },
+ "cost_w0.02": 1268.6,
+ "cost_w0.2": 1813.8
+}

@@ -1,0 +1,15 @@
+// Проверка на none сужает let и параметр, но не var и не поле.
+// in: SKILL.md
+// rule: Checks against `none` narrow a `let` or a parameter, not a `var` or a field: `if let t = body.title { }`.
+type Body { title: str? }
+
+fn main() {
+    var x: int? = 3
+    if x != none {
+        print("{x + 1}")
+    }
+    let body = Body { title: "a" }
+    if body.title != none {
+        print(body.title.upper())
+    }
+}

@@ -7,6 +7,8 @@
 //   eval/tokens/run.sh --base HEAD~3      # другая точка отсчёта
 //   eval/tokens/run.sh --pairs eval/tokens/protocols   # пары X.before.kh / X.after.kh
 //   eval/tokens/run.sh --files a.kh b.kh  # просто файлы
+//   eval/tokens/run.sh --raw skill/khrip/*.md   # весь текст, с комментариями:
+//                                         # так его читает модель (скилл)
 //
 // protocols/ — программы P1–P4 из docs/design/v0.14-protocols.md, §16.1
 // (X.before.kh — как там, X.after.kh — с анонимными типами и литералами,
@@ -69,7 +71,11 @@ const opt = (name, def) => {
   return i >= 0 ? args[i + 1] : def;
 };
 
-if (args.includes('--files')) {
+if (args.includes('--raw')) {
+  for (const f of args.slice(args.indexOf('--raw') + 1)) {
+    console.log(`${encode(readFileSync(f, 'utf8')).length}\t${f}`);
+  }
+} else if (args.includes('--files')) {
   for (const f of args.slice(args.indexOf('--files') + 1)) {
     console.log(`${tokens(readFileSync(f, 'utf8'))}\t${f}`);
   }

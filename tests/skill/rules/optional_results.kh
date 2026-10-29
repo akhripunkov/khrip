@@ -1,0 +1,12 @@
+// Что даёт T?: без разворачивания значение не подходит туда, где ждут T.
+// in: SKILL.md
+// rule: `m[k]`, `.get(k)`, `.remove(k)`, `.find(s)`, `.to_int()`, `.to_float()`, `.index_of(x)`, `env`, `header`, `parse_time`, `parse_date` and `from_json` return `T?`.
+fn main() {
+    let m = {"a": 1}
+    let a: int = m["a"]
+    let b: int = "5".to_int()
+    let c: int = [1, 2].index_of(2)
+    let d: int = parse_date("2026-10-19")
+    let e: int = parse_time("2026-10-19T15:04:05Z")
+    let f: str = env("HOME")
+}

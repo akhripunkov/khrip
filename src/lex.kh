@@ -130,6 +130,10 @@ var lx_p: int
 var lx_line: int
 var lx_line_start: int
 var lx_file: int
+// глубина скобок ( [ { в текущем файле и первая лексема файла: type и test —
+// ключевые слова только в начале объявления верхнего уровня (contextual_name)
+var lx_depth: int
+var lx_file_first: int
 
 fn is_alpha(c: int) -> bool {
     return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_'
@@ -217,7 +221,97 @@ fn keyword_kind(s: str) -> int {
     return T_IDENT
 }
 
+// type и test — ключевые слова только в начале объявления верхнего уровня:
+// вне скобок и первыми в строке (имя или строка могут быть и на следующей
+// строке). Иначе это имена: поле (JSON {"type": ...}), параметр запроса
+// (?type=note), локальная. Первыми в строке с первого столбца, перед именем
+// (type) или строкой (test), они ключевые слова и внутри скобок: незакрытая
+// скобка выше не превращает объявления ниже в имена. in, match и call — ещё и
+// операторы, поэтому они имена только как поле (field_keyword_here).
+fn contextual_name(kw: int, start: int, end: int) -> bool {
+    if kw == T_TYPE || kw == T_TEST {
+        let n = toks.len()
+        let line_start = n == lx_file_first || toks[n - 1].line != lx_line
+        if !line_start {
+            return true
+        }
+        if lx_depth == 0 {
+            return false
+        }
+        // внутри скобок: ключевое слово, только если с первого столбца и
+        // дальше, как у объявления, имя или строка
+        if start != lx_line_start {
+            return true
+        }
+        var q = lx_p
+        while q < end && (lx_text.byte(q) == ' ' || lx_text.byte(q) == '\t') {
+            q += 1
+        }
+        if q >= end {
+            return true
+        }
+        let c = lx_text.byte(q)
+        if kw == T_TEST {
+            return c != '"' && c != '`'
+        }
+        if !is_alpha(c) {
+            return true
+        }
+        var e = q
+        while e < end && is_ident_char(lx_text.byte(e)) {
+            e += 1
+        }
+        return keyword_kind(lx_text.byte_slice(q, e)) != T_IDENT
+    }
+    return field_keyword_here(kw, end)
+}
+
+// type, in, match, test, call как имя поля (JSON {"type": ...}): после точки
+// (x.type) и перед двоеточием, когда ближайшая открытая скобка — { (поле в
+// объявлении типа или в литерале структуры). В параметрах (скобка ( ) и в
+// начале объявлений ключевое слово остаётся ключевым.
+fn field_keyword_here(kw: int, end: int) -> bool {
+    if kw != T_TYPE && kw != T_IN && kw != T_MATCH && kw != T_TEST && kw != T_CALL {
+        return false
+    }
+    let n = toks.len()
+    if n > 0 && toks[n - 1].kind == '.' {
+        return true
+    }
+    var q = lx_p
+    while q < end && lx_text.byte(q) == ' ' {
+        q += 1
+    }
+    if q >= end || lx_text.byte(q) != ':' || (q + 1 < end && lx_text.byte(q + 1) == ':') {
+        return false
+    }
+    var depth = 0
+    var i = n - 1
+    while i >= 0 {
+        let k = toks[i].kind
+        if k == ')' || k == ']' || k == '}' {
+            depth += 1
+        } else if k == '(' || k == '[' || k == '\{' {
+            if depth == 0 {
+                return k == '\{'
+            }
+            depth -= 1
+        }
+        i -= 1
+    }
+    return false
+}
+
+fn track_depth(kind: int) {
+    if kind == '(' || kind == '[' || kind == '\{' {
+        lx_depth += 1
+    } else if kind == ')' || kind == ']' || kind == '}' {
+        lx_depth -= 1
+    }
+}
+
 fn add_tok(kind: int, val: int, start: int, len: int) {
+    track_depth(kind)
     toks.push(Token {
         kind: kind,
         val: val,
@@ -230,6 +324,7 @@ fn add_tok(kind: int, val: int, start: int, len: int) {
 
 // Синтетический токен (из интерполяции) с текстом и местом исходной строки.
 fn add_tok_text(kind: int, val: int, text: str, start: int) {
+    track_depth(kind)
     toks.push(Token {
         kind: kind,
         val: val,
@@ -645,6 +740,40 @@ fn is_typed_param(from: int, to: int) -> bool {
     return i < to && is_alpha(lx_text.byte(i))
 }
 
+// [from, to) — «x:.2f», «x:>8» из Python/C#: позиция двоеточия на верхнем
+// уровне выражения или -1. В выражении Khrip двоеточия вне скобок не бывает.
+fn format_spec_colon(from: int, to: int) -> int {
+    var depth = 0
+    var i = from
+    while i < to {
+        let c = lx_text.byte(i)
+        if c == '"' || c == '\'' {
+            // строка "..." и символ ':' — с экранированием \
+            i += 1
+            while i < to && lx_text.byte(i) != c {
+                if lx_text.byte(i) == '\\' {
+                    i += 1
+                }
+                i += 1
+            }
+        } else if c == '`' {
+            // сырая строка `a:b` — без экранирования
+            i += 1
+            while i < to && lx_text.byte(i) != '`' {
+                i += 1
+            }
+        } else if c == '(' || c == '[' || c == '\{' {
+            depth += 1
+        } else if c == ')' || c == ']' || c == '}' {
+            depth -= 1
+        } else if c == ':' && depth == 0 {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
 // Путь маршрута и имя теста — без интерполяции: {id} в пути — параметр.
 fn raw_string_here() -> bool {
     let n = toks.len()
@@ -727,6 +856,25 @@ fn lex_string(end: int) {
                     buf_byte(b, lx_text.byte(lx_p))
                     lx_p += 1
                 }
+                continue
+            }
+            let spec = format_spec_colon(lx_p + 1, close)
+            if spec > lx_p + 1 {
+                // {x:.2f}: форматов в интерполяции нет — подсказка вместо
+                // каскада «expected ')'»
+                let e = lx_text.byte_slice(lx_p + 1, spec).ascii_trim()
+                var hint = "there are no width or alignment specs: write \{" + e + "}"
+                var d = spec + 1
+                while d < close && lx_text.byte(d) != '.' {
+                    d += 1
+                }
+                if d + 1 < close && is_digit(lx_text.byte(d + 1)) {
+                    hint = "round the value first: \{" + e + ".round_to(" + lx_text.byte_slice(d + 1, d + 2) + ")}"
+                }
+                lex_error_hint("format specs like \{" + e + lx_text.byte_slice(spec, close) + "} are not supported", hint, spec)
+                // дальше — после }: выражение без формата не разбирается, чтобы
+                // ошибка не перешла на остаток строки
+                lx_p = close + 1
                 continue
             }
             if is_quantifier(lx_p + 1, close) {
@@ -1116,7 +1264,11 @@ fn lex_range(end: int) {
                 lex_sql(start, end, true)
                 continue
             }
-            add_tok(keyword_kind(word), 0, start, lx_p - start)
+            var kw = keyword_kind(word)
+            if kw != T_IDENT && contextual_name(kw, start, end) {
+                kw = T_IDENT
+            }
+            add_tok(kw, 0, start, lx_p - start)
             continue
         }
         if is_digit(c) {
@@ -1318,6 +1470,8 @@ fn lex_file(fi: int) {
     lx_p = 0
     lx_line = 1
     lx_line_start = 0
+    lx_depth = 0
+    lx_file_first = toks.len()
     // исходник — текст UTF-8: иначе символы и строки в нём не прочитать
     let n = lx_text.byte_len()
     let bad = __utf8_bad_at(__str_ptr(lx_text), n)

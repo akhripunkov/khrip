@@ -1,0 +1,17 @@
+// Привычки Python: in, get с умолчанием, формат в подстановке — ошибки с
+// подсказкой формы Khrip.
+// in: SKILL.md
+// rule: `x in xs`, `k in m` → `xs.contains(x)`, `m.has(k)`; `d.get(k, v)` → `m[k] ?? v`.
+// rule: `{x:.2f}` → `{x.round_to(2)}`
+fn main() {
+    let xs = [1, 2]
+    let m = {"a": 1}
+    let x = 2
+    let price = 1.2345
+    if x in xs {
+        print("yes")
+    }
+    let has = "a" in m
+    let v = m.get("b", 0)
+    print("{price:.2f}")
+}

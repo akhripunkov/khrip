@@ -1,0 +1,58 @@
+// Примеры из текста главы (не из блоков кода) компилируются: запросы
+// проверяются по миграциям без базы; на настоящей базе их гоняет
+// tests/skill/run/postgresql.kh.
+// in: postgresql.md
+// rule: `IN ({list})` takes a list; `ILIKE '%{q}%'` matches q literally; `ORDER BY {o}` takes a local made of string literals.
+// rule: `let r: T = sql "..." else { return 401 }`
+// rule: `let n: int = sql "SELECT count(*) ..."`
+// rule: `{rows}` with a list inserts them all. `SET {patch}` sets only the fields the request sent. A duplicate allowed: `let r: T? = sql "INSERT ... ON CONFLICT DO NOTHING RETURNING *"` (none: it existed).
+// rule: `let t = tx { ...; value }` commits and gives the value.
+// compiles
+migration 1 `
+CREATE TABLE items (id bigserial PRIMARY KEY, name text NOT NULL UNIQUE, price bigint NOT NULL DEFAULT 0, made date);
+`
+type Item { id: int, name: str, price: int, made: str? }
+type NewItem { name: str, price: int = 0 }
+type ItemPatch { name: str?, price: int? }
+
+route GET "/items" (ids: [int], q: str = "", desc: bool = false) -> [Item] {
+    let o = if desc { "price DESC" } else { "price" }
+    return sql "SELECT * FROM items WHERE id = ANY({ids}) OR id IN ({ids}) OR name ILIKE '%{q}%' ORDER BY {o}"
+}
+
+route GET "/items/{id}" (id: int, key: str?) -> Item | 401 {
+    if key == none {
+        return 401
+    }
+    let r: Item = sql "SELECT * FROM items WHERE id = {id}" else {
+        return 401
+    }
+    return r
+}
+
+route GET "/count" -> int {
+    let n: int = sql "SELECT count(*) FROM items"
+    return n
+}
+
+route POST "/items" (body: [NewItem]) -> 201 [Item] {
+    return 201 sql "INSERT INTO items {body} RETURNING *"
+}
+
+route POST "/items/once" (body: NewItem) -> 201 Item | 409 str {
+    let r: Item? = sql "INSERT INTO items {body} ON CONFLICT DO NOTHING RETURNING *"
+    return 201 r ?? 409 "exists"
+}
+
+route PATCH "/items/{id}" (id: int, body: ItemPatch) -> Item | 404 {
+    return sql "UPDATE items SET {body} WHERE id = {id} RETURNING *"
+}
+
+route POST "/items/{id}/double" (id: int) -> int | 404 {
+    let price = tx {
+        let p: int = sql "SELECT price FROM items WHERE id = {id}"
+        sql "UPDATE items SET price = {p * 2} WHERE id = {id}"
+        p * 2
+    }
+    return price
+}

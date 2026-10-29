@@ -1,0 +1,12 @@
+// Статус без типа (| 409) уходит без тела: сообщение — только с | 409 str.
+// in: SKILL.md
+// rule: a bare `| 409` has no body
+store names: map[int, str]
+
+route POST "/items/{id}" (id: int, name: str) -> 201 | 409 {
+    if names.has(id) {
+        return 409 "taken"
+    }
+    names[id] = name
+    return 201
+}

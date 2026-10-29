@@ -1,0 +1,5 @@
+tests/skill/rules/pg_write_outside_tx.kh:13:5: error: this write runs outside tx and another statement runs before it: another request can change the data in between
+        sql "UPDATE accounts SET balance = balance - 10 WHERE id = {id}"
+        ^
+    hint: put the statements of this request in tx { ... }
+1 error

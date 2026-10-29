@@ -1,0 +1,21 @@
+// Тело call — литерал структуры: поле со значением none не уходит, так что
+// явное поле: none — ошибка с подсказкой, а не молча «не прислано» (R4
+// перепроверки части 2 этапа токенов).
+type P { name: str?, note: str? }
+
+store m: map[int, P]
+
+route PATCH "/p/{id}" (id: int, body: P) -> P {
+    let n = P { ...(m[id] ?? P {}), ...body }
+    m[id] = n
+    return n
+}
+
+test "explicit none in a call body" {
+    let x: str? = none
+    expect (call PATCH "/p/1" { name: "a", note: none }).status == 200
+    expect (call PATCH "/p/1" P {
+        note: none,
+        name: x
+    }).status == 200
+}

@@ -1,0 +1,5 @@
+tests/skill/rules/pg_optional.kh:9:77: error: {before} may be none, and a comparison with NULL is never true: rows would silently not match
+        return sql "SELECT * FROM items WHERE ({before}::bigint IS NULL OR id < {before}) ORDER BY id"
+                                                                                ^
+    hint: write ({before} IS NULL OR column = {before}), or unwrap it first: let v = before else { return 400 }
+1 error

@@ -1,0 +1,9 @@
+// Каждый возвращаемый статус объявлен у маршрута.
+// in: SKILL.md
+// rule: every status returned is listed
+route GET "/items/{id}" (id: int) -> str {
+    if id > 10 {
+        return 404
+    }
+    return "item {id}"
+}

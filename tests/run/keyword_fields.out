@@ -1,0 +1,10 @@
+text
+2 false 0
+fn
+{"type":"text","in":2,"match":null,"test":[],"call":{"type":"fn","id":1}}
+img 5 true a
+x
+text,image
+t
+o
+0

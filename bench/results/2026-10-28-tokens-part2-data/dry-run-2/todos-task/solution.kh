@@ -1,0 +1,61 @@
+type Kind = task | note
+type Todo { id: int, title: str, type: Kind, notes: str?, due: str?, priority: int?, done: bool }
+type NewTodo { title: str, type: Kind = task, notes: str?, due: str?, priority: int? }
+type TodoPatch { title: str?, type: Kind?, notes: str?, due: str?, priority: int?, done: bool? }
+
+store todos: map[int, Todo]
+store last_id: int
+
+fn valid(t: Todo) {
+    if t.title.trim() == "" {
+        fail(400, "title is blank")
+    }
+    if let d = t.due {
+        if parse_date(d) == none {
+            fail(400, "bad due date")
+        }
+    }
+    if let p = t.priority {
+        if p < 1 || p > 5 {
+            fail(400, "priority is 1..5")
+        }
+    }
+}
+
+route POST "/todos" (body: NewTodo) -> 201 Todo {
+    let t = Todo { id: last_id + 1, done: false, ...body }
+    valid(t)
+    last_id += 1
+    todos[t.id] = t
+    return 201 t
+}
+
+route GET "/todos/{id}" (id: int) -> Todo | 404 {
+    return todos[id] ?? 404
+}
+
+route PATCH "/todos/{id}" (id: int, body: TodoPatch) -> Todo | 404 {
+    let old = todos[id] ?? fail(404)
+    let t = Todo { ...old, ...body }
+    valid(t)
+    todos[id] = t
+    return t
+}
+
+route DELETE "/todos/{id}" (id: int) -> 204 | 404 {
+    todos.remove(id) else {
+        return 404
+    }
+    return 204
+}
+
+route GET "/todos" (done: bool?, type: Kind?, sort: str = "id") -> [Todo] | 400 str {
+    if sort != "id" && sort != "priority" {
+        return 400 "sort is id or priority"
+    }
+    let all = todos.values().filter(t => (done == none || t.done == done) && (type == none || t.type == type))
+    if sort == "priority" {
+        all.sort_by(t => t.priority ?? 6)
+    }
+    return all
+}

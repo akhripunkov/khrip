@@ -1,0 +1,11 @@
+// Константа — литерал int, float, str или bool.
+// in: SKILL.md
+// rule: const LIMIT = 10 // int, float, str or bool literal
+const LIMIT = 10
+const RATE = 1.5
+const NAME = "shop"
+const OPEN = true
+
+fn main() {
+    print("{LIMIT} {RATE * 2} {NAME} {OPEN}")
+}

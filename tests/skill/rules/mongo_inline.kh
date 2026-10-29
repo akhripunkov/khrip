@@ -1,0 +1,39 @@
+// Примеры из текста главы MongoDB компилируются (khc check без сервера):
+// $set по заплатке, вызовы с (client, db, coll, ...), документ вручную.
+// in: mongodb.md
+// rule: `mongo_update(db(), "app", "events", to_bson({ _id: id }), to_bson({ "$set": patch }))` sets only the sent fields.
+// rule: `mongo_create_indexes(..., [MongoIndex { keys, unique }])` (repeating is fine); `mongo_command(client, db, command)`.
+// rule: `document` is the reply (`bson_get_int(r.document, "n")`).
+// rule: By hand: `let b = bson_new()`, `bson_int(b, "n", 1)`, `bson_str`, `bson_doc`, ..., `bson_finish(b)`; `bson_get_int(doc, key)`, `bson_get_str`, ... give `T?`.
+// compiles
+type Event { _id: str, user: int, title: str }
+type EventPatch { title: str?, user: int? }
+
+fn db() -> Mongo {
+    return Mongo { uri: env("MONGODB_URI") ?? "mongodb://127.0.0.1:27017/?directConnection=true" }
+}
+
+route PATCH "/events/{id}" (id: str, body: EventPatch) -> int | 404 {
+    let patch = body
+    let r = mongo_update(db(), "app", "events", to_bson({ _id: id }), to_bson({ "$set": patch }))
+    if r.error != "" {
+        fail(500, r.error)
+    }
+    let n = bson_get_int(r.document, "n") ?? 0
+    if n == 0 {
+        return 404
+    }
+    return n
+}
+
+route DELETE "/events" (user: int) -> int {
+    let b = bson_new()
+    bson_int(b, "user", user)
+    bson_str(b, "kind", "event")
+    let filter = bson_finish(b)
+    let keys = bson_new()
+    bson_int(keys, "user", 1)
+    mongo_create_indexes(db(), "app", "events", [MongoIndex { keys: bson_finish(keys), unique: false }])
+    let r = mongo_delete(db(), "app", "events", filter, true)
+    return bson_get_int(r.document, "n") ?? 0
+}

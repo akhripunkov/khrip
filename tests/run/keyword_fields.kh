@@ -1,0 +1,41 @@
+// type, in, match, test и call — имена полей (JSON API: {"type": "text"}): в
+// объявлении типа, в литерале и после точки. Ключевыми словами они остаются
+// везде, где перед ними нет точки и за ними нет двоеточия в фигурных скобках.
+type Msg {
+    type: str
+    in: int = 0
+    match: bool?
+    test: [str] = []
+    call: { type: str, id: int }?
+}
+
+fn kinds(xs: [Msg]) -> str {
+    return xs.map(x => x.type).join(",")
+}
+
+fn main() {
+    let m = Msg { type: "text", in: 2, call: { type: "fn", id: 1 } }
+    print(m.type)
+    print("{m.in} {m.match ?? false} {m.test.len()}")
+    if let c = m.call {
+        print(c.type)
+    }
+    print(to_json(m))
+    let back: Msg? = from_json(`{"type":"img","in":5,"match":true,"test":["a"]}`)
+    if let b = back {
+        print("{b.type} {b.in} {b.match ?? false} {b.test[0]}")
+    }
+    let a = { type: "x", n: 1 }
+    print(a.type)
+    let xs = [m, Msg { type: "image" }]
+    print(kinds(xs))
+    for x in xs {
+        match x.type {
+            "text" => print("t")
+            _ => print("o")
+        }
+    }
+    for i in 0..1 {
+        print("{i}")
+    }
+}

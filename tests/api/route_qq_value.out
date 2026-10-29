@@ -1,0 +1,12 @@
+200 {"id":1,"title":"a"}
+404 {"error":"no todo 2"}
+404 no todo
+404 {"error":"no"}
+200 {"id":1,"title":"a"}
+200 0
+200 404 200 404
+ok    ?? status with a value
+{"a":2}
+{"type":"x!","in":2}
+ok    types named T and K, fields type and in
+2 tests: 2 passed, 0 failed

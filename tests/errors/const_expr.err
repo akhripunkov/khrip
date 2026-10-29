@@ -1,0 +1,9 @@
+tests/errors/const_expr.kh:4:13: error: a constant is a single literal
+    const N = 2 + 3
+                ^
+    hint: write the value: const N = ..., or a function for a computed one
+tests/errors/const_expr.kh:5:15: error: a constant is a single literal
+    const S = "a" + "b"
+                  ^
+    hint: write the value: const S = ..., or a function for a computed one
+2 errors

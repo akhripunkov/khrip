@@ -1,0 +1,11 @@
+// Сортировка без компаратора: по убыванию — минус ключа, по нескольким
+// ключам — устойчивые sort_by, последний ключ первым.
+// in: SKILL.md
+// rule: sorting with a comparator → `sort_by(x => -x.n)` (descending), stable `sort_by` calls for several keys (last key first).
+type Row { name: str, n: int }
+
+fn main() {
+    let rows = [Row { name: "b", n: 1 }, Row { name: "a", n: 2 }, Row { name: "c", n: 1 }, Row { name: "a", n: 1 }]
+    rows.sort_by(r => -r.n).sort_by(r => r.name)
+    print(rows.map(r => "{r.name}{r.n}").join(" "))
+}

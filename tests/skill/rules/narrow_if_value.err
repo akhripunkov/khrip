@@ -1,0 +1,9 @@
+tests/skill/rules/narrow_if_value.kh:8:16: error: if let cannot be used as a value
+        let y = if let v = x { v } else { 0 }
+                   ^
+    hint: write x ?? default, or unwrap first: let k = x else { ... }; or assign a var inside an if let statement
+tests/skill/rules/narrow_if_value.kh:9:29: error: operator + needs int operands, found int?
+        return if x != none { x + 1 } else { y }
+                                ^
+    hint: the value may be none; use x ?? default or let v = x else { return ... }
+2 errors

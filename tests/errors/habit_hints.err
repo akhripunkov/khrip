@@ -1,0 +1,53 @@
+tests/errors/habit_hints.kh:20:14: error: format specs like {f:.2f} are not supported
+        print("{f:.2f} {x:>4}")
+                 ^
+    hint: round the value first: {f.round_to(2)}
+tests/errors/habit_hints.kh:12:10: error: Khrip has no 'in' operator
+        if x in xs {
+             ^
+    hint: for a list write xs.contains(x)
+tests/errors/habit_hints.kh:15:19: error: Khrip has no 'in' operator
+        let has = "a" in m
+                      ^
+    hint: for a map write m.has("a")
+tests/errors/habit_hints.kh:16:18: error: Khrip has no 'in' operator
+        let miss = x not in xs
+                     ^
+    hint: for a list write !xs.contains(x)
+tests/errors/habit_hints.kh:17:22: error: .get() takes only the key
+        let v = m.get("b", 0)
+                         ^
+    hint: for a default write m["b"] ?? 0
+tests/errors/habit_hints.kh:18:8: error: .sort() takes no comparator
+        xs.sort((a, b) => a - b)
+           ^
+    hint: sort by a key: xs.sort_by(x => x.n); descending: xs.sort_by(x => -x.n); several keys: stable sort_by calls, last key first
+tests/errors/habit_hints.kh:21:13: error: unknown function 'sum'
+        let s = sum(xs)
+                ^
+    hint: sum is a method: write xs.sum()
+tests/errors/habit_hints.kh:22:15: error: unknown function 'max'
+        let big = max(x, 2)
+                  ^
+    hint: max is a method: write x.max(2)
+tests/errors/habit_hints.kh:23:13: error: unknown function 'trim'
+        let t = trim(" a ")
+                ^
+    hint: trim is a method: write " a ".trim()
+tests/errors/habit_hints.kh:24:16: error: [int] has no method 'to_json'
+        let j = xs.to_json()
+                   ^
+    hint: to_json is a function, not a method: write to_json(x)
+tests/errors/habit_hints.kh:26:11: error: cannot turn str? into text
+        print(p.name)
+              ^
+    hint: it may be none: write x ?? "default" ({x ?? 0} for a number), or unwrap it first with if let
+tests/errors/habit_hints.kh:27:15: error: operator * needs int operands, found float
+        print("{x * f}")
+                  ^
+    hint: int and float do not mix: convert the int with n.to_float(), or the float with x.round() or x.to_int()
+tests/errors/habit_hints.kh:29:16: error: if let cannot be used as a value
+        let w = if let k = o { k } else { 0 }
+                   ^
+    hint: write x ?? default, or unwrap first: let k = x else { ... }; or assign a var inside an if let statement
+13 errors

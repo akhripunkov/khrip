@@ -1,0 +1,43 @@
+// Распаковка в литерале структуры (H1 ревью части 2 этапа токенов):
+// значение того же типа (...old) копируется как есть, в том числе none;
+// значение другого типа (заплатка) даёт поле T? только если оно не none — и в
+// поле T, и в поле T?; стереть поле — явно: body: p.body.
+type Note { id: int, title: str, body: str?, tag: str?, qty: int = 5, cnt: int? }
+type Patch { title: str?, body: str?, tag: str?, qty: int?, cnt: int? }
+type Item { name: str, qty: int = 5, note: str? }
+
+fn show(n: Note) -> str {
+    return to_json(n)
+}
+
+fn main() {
+    let old = Note { id: 1, title: "a", body: "x", tag: "t", qty: 2, cnt: 7 }
+    let none_patch = Patch {}
+    let some = Patch { title: "b", body: "y", qty: 9, cnt: 0 }
+    // заплатка без полей ничего не стирает
+    print(show(Note { ...old, ...none_patch }))
+    // присланные поля заменяют, остальные остаются
+    print(show(Note { ...old, ...some }))
+    // тот же тип копируется как есть: none второго значения стирает
+    let cleared = Note { id: 1, title: "c" }
+    print(show(Note { ...old, ...cleared }))
+    // стереть явно
+    print(show(Note { ...old, ...none_patch, body: none_patch.body }))
+    // без прежнего значения: поле со значением по умолчанию и T? без значения
+    print(to_json(Item { name: "n", ...Patch {} }))
+    print(to_json(Item { name: "n", ...Patch { qty: 3, body: "z" } }))
+    // ожидаемый анонимный тип (A2)
+    let a: { title: str, body: str?, tag: str? } = { ...old, ...none_patch }
+    print(to_json(a))
+    // без ожидаемого типа (A3): значение того же типа, что литерал, — как есть
+    // (none стирает), другого типа (заплатка) — только не none
+    let x = { body: old.body, tag: old.tag }
+    let y = { body: none_patch.body, tag: some.title }
+    print(to_json({ ...x, ...y }))
+    print(to_json({ ...y }))
+    let z = { body: none_patch.body }
+    print(to_json({ ...x, ...z }))
+    // другой порядок полей — другой анонимный тип: тоже заплатка
+    let t = { tag: some.title, body: none_patch.body }
+    print(to_json({ ...x, ...t }))
+}

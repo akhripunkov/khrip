@@ -1,0 +1,9 @@
+Your program does not pass yet. It does not build or start:
+
+main.kh:104:198: error: {before} may be none, and a comparison with NULL is never true: rows would silently not match
+        let items: [Transfer] = sql "SELECT id, from_id AS \"from\", to_id AS \"to\", amount, created_at FROM transfers WHERE (from_id = {a.id} OR to_id = {a.id}) AND ({before}::bigint IS NULL OR id < {before}) ORDER BY id DESC LIMIT {limit}"
+                                                                                                                                                                                                         ^
+    hint: write ({before} IS NULL OR column = {before}), or unwrap it first: let v = before else { return 400 }
+1 error
+
+Fix it. Answer with the whole file only.

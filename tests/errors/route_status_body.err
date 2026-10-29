@@ -1,0 +1,13 @@
+tests/errors/route_status_body.kh:9:16: error: status 409 has no body here
+            return 409 "taken"
+                   ^
+    hint: declare | 409 str to send a message
+tests/errors/route_status_body.kh:12:16: error: status 404 has no body here
+            return 404 { why: "x" }
+                   ^
+    hint: declare | 404 { why: str } to send it
+tests/errors/route_status_body.kh:24:29: error: expected str, found int
+        let name = names[id] ?? 404
+                                ^
+    hint: ?? 404 answers 404 only in return; here write x ?? fail(404) or let v = x else { return 404 }
+3 errors

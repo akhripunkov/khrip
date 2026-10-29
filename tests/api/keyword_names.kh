@@ -1,0 +1,44 @@
+// type и test — ключевые слова только в начале объявлений верхнего уровня
+// (имя или строка — и на следующей строке); иначе имена: поле, параметр
+// запроса (?type=note), локальная (и как тело call), сокращение { type }.
+type Todo { id: int, type: str, test: bool = false }
+
+type
+Ev {
+    type: str
+    n: int
+}
+
+route POST "/ev" (body: Ev) -> Ev {
+    return body
+}
+
+store todos: map[int, Todo]
+
+route GET "/todos" (type: str?, test: bool = false) -> [Todo] {
+    return todos.values().filter(t => (type == none || t.type == type) && (!test || t.test))
+}
+
+route GET "/echo" (type: str = "all") -> { type: str, n: int } {
+    let n = type.len()
+    return { type, n }
+}
+
+test "query parameters named type and test" {
+    todos[1] = Todo { id: 1, type: "note", test: true }
+    todos[2] = { id: 2, type: "task" }
+    print((call GET "/todos?type=note").body)
+    print((call GET "/todos?test=true").body)
+    print((call GET "/todos").body)
+    print((call GET "/echo").body)
+}
+
+test
+"multi-line declarations, a local named type as a call body" {
+    let type = Ev {
+        type: "click",
+        n: 1
+    }
+    let r = call POST "/ev" type headers {"X-A": "1"}
+    print(r.body)
+}

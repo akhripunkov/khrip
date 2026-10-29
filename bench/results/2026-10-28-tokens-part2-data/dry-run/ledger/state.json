@@ -1,0 +1,64 @@
+{
+ "task": "ledger",
+ "lang": "khrip",
+ "model": "dry-run",
+ "db": true,
+ "attempts": 4,
+ "passed": true,
+ "done": true,
+ "chapters": [
+  "postgresql.md"
+ ],
+ "messages": [
+  {
+   "role": "user",
+   "kind": "task",
+   "file": "messages/01-user-task.txt"
+  },
+  {
+   "role": "assistant",
+   "kind": "read",
+   "file": "messages/02-assistant-read.txt"
+  },
+  {
+   "role": "user",
+   "kind": "chapter",
+   "file": "messages/03-user-chapter.txt"
+  },
+  {
+   "role": "assistant",
+   "kind": "answer",
+   "file": "messages/04-assistant-answer.txt"
+  },
+  {
+   "role": "user",
+   "kind": "feedback",
+   "file": "messages/05-user-feedback.txt"
+  },
+  {
+   "role": "assistant",
+   "kind": "answer",
+   "file": "messages/06-assistant-answer.txt"
+  },
+  {
+   "role": "user",
+   "kind": "feedback",
+   "file": "messages/07-user-feedback.txt"
+  },
+  {
+   "role": "assistant",
+   "kind": "answer",
+   "file": "messages/08-assistant-answer.txt"
+  },
+  {
+   "role": "user",
+   "kind": "feedback",
+   "file": "messages/09-user-feedback.txt"
+  },
+  {
+   "role": "assistant",
+   "kind": "answer",
+   "file": "messages/10-assistant-answer.txt"
+  }
+ ]
+}

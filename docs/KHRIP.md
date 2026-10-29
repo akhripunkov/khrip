@@ -36,7 +36,7 @@ Keep money in int cents. Conditions must be `bool`.
 ## Declarations
 
 ```khrip
-const LIMIT = 10            // int, str or bool literal
+const LIMIT = 10            // int, float, str or bool literal
 var count: int = 0          // global (not allowed in servers: use store)
 fn add(a: int, b: int = 1) -> int {   // defaults are literals
     return a + b
@@ -98,9 +98,10 @@ if q == none {
 }                                      // from here on q is a str
 ```
 
-Checks against `none` narrow a `let` or a parameter (not a `var`). `m[k]`,
-`.get(k)`, `.remove(k)`, `.find(s)`, `.to_int()`, `.index_of(x)`, `read_file`,
-`env`, `parse_time` and `from_json` return `T?`.
+Checks against `none` narrow a `let` or a parameter, not a `var` or a field:
+`if let t = body.title { }`. `m[k]`, `.get(k)`, `.remove(k)`, `.find(s)`,
+`.to_int()`, `.index_of(x)`, `read_file`, `env`, `parse_time`, `parse_date` and
+`from_json` return `T?`.
 
 ## Values
 
@@ -108,7 +109,7 @@ Checks against `none` narrow a `let` or a parameter (not a `var`). `m[k]`,
 let p = Point { x: 1, y: 2 }
 let q = Point { x, y }                 // field shorthand: x: x, y: y
 let n = Named { name: "a", ...p }      // spread fields of p
-let u = Product { ...old, ...patch }   // patch's T? fields: only if not none
+let u = Product { ...old, ...patch }   // patch's none fields are skipped
 let r: Point = { x, y: 0 }             // no name: the type expected here
 let zeros = [0] * 100
 var m: map[str, int] = {}
@@ -119,12 +120,19 @@ let ages = {"ann": 30, "bob": 41}
 `return`, list or field, else the type of its fields; `{"k": v}` and `{(k): v}`
 (key from a variable) are maps. At a statement start and in a match arm write
 `({ ... })`: `{` there is a block. Types can be inline: `-> { token: str }`; a
-named type takes such a value only as `T { ...x }`.
+named type takes such a value only as `T { ...x }`. A spread of the same type
+(`...old`) copies every field; of another type (a patch) it skips `none` fields,
+so clearing a field is explicit: `note: patch.note`. Field names may be `type`,
+`in`, `match`, `test` or `call` (JSON keys), except `type` in a variant; `type`
+and `test` are keywords only where a top-level declaration starts, so a query
+parameter or a local may be called `type` too.
 Structs, lists and maps are references: assigning shares, `.copy()` copies a list.
 
 ## Methods
 
-Any function is also a method of its first argument: `p.describe()`.
+A function you declare is also a method of its first argument: `p.describe()`.
+Built-ins are methods only (`xs.sum()`, `a.max(b)`), except `len(xs)`;
+`to_json`, `url_encode` and `print` are functions only.
 
 - `str`: `len contains starts_with ends_with find trim lower upper split
   replace repeat to_int`, `matches(regex)` (whole string; `[a-z] \d \w \s . * + ?
@@ -209,8 +217,10 @@ route DELETE "/users/{id}" (id: int) -> 204 | 404 {
   JSON strings ("Admin"), other variants objects with a "type" field. Bad input
   gets 400 with a message, a wrong method 405, an unknown path 404.
 - Results: `-> Type` (200), `-> 201 Type | 400 str | 404`; `return 201 user`,
-  `return 404`, `return x ?? 404`. `str` is sent as text, other types as JSON. No
-  `->`: 204.
+  `return 404`, `return x ?? 404`, `return x ?? 404 "no user"` (with `| 404
+  str`). A status declared without a type (`| 409`) has no body. In a route
+  that returns `int`, `return 404` and `x ?? 404` are statuses: write `(404)` for
+  the number. `str` is sent as text, other types as JSON. No `->`: 204.
 - `header(name) -> str?` reads a request header (any case); `set_header(name,
   value)` adds one to the response. `fail(status)` or `fail(status, message)`
   ends the request from any function: `let key = header("X-API-Key") else {
@@ -275,12 +285,12 @@ tx {
   (`const`, `if`, `match`).
 - The expected type picks the result: `T` one row, none → 404 (the route lists
   `| 404`, or answer yourself: `let r: T = sql "..." else { return 401 }`); `T?`
-  one row or none, more is an error (add `LIMIT 1`); `[T]` all rows; no type:
+  one row or none, more is a 500 (add `LIMIT 1`); `[T]` all rows; no type:
   rows changed. `T` is a struct (columns by name) or one column's type.
-  timestamptz/date → `str` (as `time_iso`) or `int`; jsonb → any type; a
-  nullable column needs `T?`.
+  timestamptz → `str` (as `time_iso`) or `int`; date → `"2026-01-02"` or `int`;
+  jsonb → any type; a nullable column needs `T?`.
 - `INSERT INTO t {v}` puts fields into columns of the same name (`none` → the
-  column default), `{[v]}` inserts a list in one statement; `SET {patch}` sets
+  column default), `{rows}` with a list inserts them all in one statement; `SET {patch}` sets
   only the fields the request sent. Duplicate allowed: `let r: T? = sql "INSERT
   ... ON CONFLICT DO NOTHING RETURNING *"`.
 - `migration N` runs once, in order, when the server starts (`DATABASE_URL`);
@@ -320,7 +330,10 @@ test "create user" {
 ```
 
 `call METHOD "path?query" [body] [headers map]` runs a request in-process and
-returns a `Response`. `expect cond` records a failure and continues; `a == b`
+returns a `Response`; a typed body leaves out `none` fields, as a client that
+did not send them (`note: none` written there is an error; `null` goes in a raw
+body: `` `{"note": null}` ``). `expect
+cond` records a failure and continues; `a == b`
 failures show both sides; `expect r != none` stops the test when `r` is none, and
 after it `r` is a value: `let u: User? = from_json(r.body)`, `expect u != none`,
 `expect u.name == "Ann"`. Tests run in order and share store and the database

@@ -1,0 +1,8 @@
+[{"id":1,"type":"note","test":true}]
+[{"id":1,"type":"note","test":true}]
+[{"id":1,"type":"note","test":true},{"id":2,"type":"task","test":false}]
+{"type":"all","n":3}
+ok    query parameters named type and test
+{"type":"click","n":1}
+ok    multi-line declarations, a local named type as a call body
+2 tests: 2 passed, 0 failed

@@ -1,0 +1,14 @@
+// Незакрытая { в функции: объявления ниже с первого столбца — по-прежнему
+// объявления (ошибка «only allowed at the top level»), а не имена type, и нет
+// ошибки из сгенерированного кода.
+fn f() -> int {
+    if true {
+        return 1
+    return 2
+}
+
+type P { x: int }
+
+fn main() {
+    print(to_json(P { x: f() }))
+}

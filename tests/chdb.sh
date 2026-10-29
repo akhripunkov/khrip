@@ -276,6 +276,8 @@ grep -qF 'tests/chdb/named.kh:3:12: error: clickhouse metrics = env("METRICS_CLI
 before=$(q default "SELECT count() FROM system.databases WHERE startsWith(name, 'khrip_test_')")
 KHRIP_TEST_CLICKHOUSE_URL="$base/default" KHRIP_TEST_CLICKHOUSE_USER="$ch_user" KHRIP_TEST_CLICKHOUSE_PASSWORD="$ch_pass" "$KHC" test tests/chdb/khc_test.kh >"$chdb_tmp/khc_test.out" 2>"$chdb_tmp/khc_test.err" || fail "khc test: $(cat "$chdb_tmp/khc_test.out" "$chdb_tmp/khc_test.err")"
 diff -u tests/chdb/khc_test.out "$chdb_tmp/khc_test.out" || fail "khc test output differs"
+# именованное соединение в сервере: маршруты и khc test (H2)
+KHRIP_TEST_CLICKHOUSE_URL="$base/default" KHRIP_TEST_CLICKHOUSE_USER="$ch_user" KHRIP_TEST_CLICKHOUSE_PASSWORD="$ch_pass" "$KHC" test tests/chdb/named_server.kh >"$chdb_tmp/named_server.out" 2>&1 || fail "named connection in a server: $(cat "$chdb_tmp/named_server.out")"
 after=$(q default "SELECT count() FROM system.databases WHERE startsWith(name, 'khrip_test_')")
 [[ $after == "$before" ]] || fail "khc test left its temporary database ($before before, $after after)"
 # проверки при запуске или миграция не прошли — временная база всё равно удалена

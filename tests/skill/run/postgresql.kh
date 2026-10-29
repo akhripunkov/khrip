@@ -1,0 +1,64 @@
+// Пример главы skill/khrip/postgresql.md на настоящем PostgreSQL
+// (tests/skill/check.py дописывает этот файл к нему).
+test "postgresql chapter" {
+    let a = call POST "/accounts" { owner: "ann" }
+    expect a.status == 201
+    let ann: Account? = from_json(a.body)
+    expect ann != none
+    expect ann.balance == 0
+    expect parse_time(ann.created_at) != none
+    let b = call POST "/accounts" { owner: "bob" }
+    let bob: Account? = from_json(b.body)
+    expect bob != none
+    sql "UPDATE accounts SET balance = 100 WHERE id = {ann.id}"
+    expect (call POST "/transfers" { from: ann.id, to: bob.id, amount: 30 }).status == 204
+    expect (call POST "/transfers" { from: ann.id, to: bob.id, amount: 71 }).status == 409
+    expect (call POST "/transfers" { from: ann.id, to: 999, amount: 1 }).status == 404
+    let left: int = sql "SELECT balance FROM accounts WHERE id = {ann.id}"
+    let got: int = sql "SELECT balance FROM accounts WHERE id = {bob.id}"
+    expect left == 70
+    expect got == 30
+}
+
+// Правила из текста главы на настоящей базе: {rows} со списком, ON CONFLICT в
+// T?, T? и больше одной строки, date, SET {patch}.
+migration 2 `
+CREATE TABLE tags (id bigserial PRIMARY KEY, name text NOT NULL UNIQUE, day date NOT NULL DEFAULT '2026-01-02', note text);
+`
+type Tag { id: int, name: str, day: str, note: str? }
+
+route POST "/tags" (body: [{ name: str, note: str? }]) -> 201 [Tag] {
+    return 201 sql "INSERT INTO tags {body} RETURNING *"
+}
+
+route POST "/tags/once" (body: { name: str }) -> 201 Tag | 409 str {
+    let r: Tag? = sql "INSERT INTO tags {body} ON CONFLICT DO NOTHING RETURNING *"
+    return 201 r ?? 409 "exists"
+}
+
+route GET "/tags/any" -> Tag | 404 {
+    let r: Tag? = sql "SELECT * FROM tags"
+    return r ?? 404
+}
+
+route PATCH "/tags/{id}" (id: int, body: { name: str?, note: str? }) -> Tag | 404 {
+    return sql "UPDATE tags SET {body} WHERE id = {id} RETURNING *"
+}
+
+test "postgresql chapter rules" {
+    let r = call POST "/tags" [{ name: "a", note: "x" }, { name: "b" }]
+    expect r.status == 201
+    let all: [Tag]? = from_json(r.body)
+    expect all != none
+    expect all.len() == 2
+    expect all[0].day == "2026-01-02"
+    expect (call POST "/tags/once" { name: "c" }).status == 201
+    let dup = call POST "/tags/once" { name: "c" }
+    expect dup.status == 409 && dup.body == "exists"
+    expect (call GET "/tags/any").status == 500
+    let p = call PATCH "/tags/{all[0].id}" { name: "a2" }
+    expect p.status == 200
+    let t: Tag? = from_json(p.body)
+    expect t != none
+    expect t.name == "a2" && t.note == "x"
+}

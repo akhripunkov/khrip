@@ -1,0 +1,9 @@
+tests/skill/rules/var_narrow.kh:9:19: error: operator + needs int operands, found int?
+            print("{x + 1}")
+                      ^
+    hint: the value may be none; use x ?? default or let v = x else { return ... }
+tests/skill/rules/var_narrow.kh:13:26: error: the value may be none; unwrap it before calling .upper()
+            print(body.title.upper())
+                             ^
+    hint: if let v = x { v.upper() } or (x ?? default).upper()
+2 errors

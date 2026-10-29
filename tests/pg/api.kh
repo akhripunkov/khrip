@@ -140,6 +140,15 @@ test "merge patch" {
     let v2: Person? = from_json(r2.body)
     expect v2 != none
     expect v2.name == "Robert" && v2.team_id == 1
+    // тело call с типом: поля со значением none не уходят — сервер видит их не
+    // присланными, как у JSON без них (иначе name: null — 400 «missing value»)
+    let r3 = call PATCH "/people/{bob.id}" PersonPatch { nick: "rob" }
+    expect r3.status == 200
+    let v3: Person? = from_json(r3.body)
+    expect v3 != none
+    expect v3.nick == "rob" && v3.name == "Robert" && v3.team_id == 1 && v3.role == lead
+    let r4 = call PATCH "/people/{bob.id}" { nick: "bob" }
+    expect r4.status == 200 && r4.body.contains("\"name\":\"Robert\"")
     expect (call PATCH "/people/{bob.id}" "\{\"name\": null}").status == 400
     expect (call PATCH "/people/999" "\{}").status == 404
 }

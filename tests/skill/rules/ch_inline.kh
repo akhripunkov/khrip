@@ -1,0 +1,37 @@
+// Примеры из текста главы ClickHouse компилируются (khc check без сервера):
+// другой сервер в маршруте и в every, DbResult, IN {xs}, ORDER BY {o}.
+// in: clickhouse.md
+// rule: Other servers: `clickhouse metrics = env("METRICS_URL")`; `table hits: Hit in metrics`, `migration metrics 1`, `ch metrics "..."`.
+// rule: `let r: DbResult = events.insert(rows)` returns the outcome instead (`r.ok`, `r.error`, `r.unknown_outcome`; it must be checked).
+// rule: `[T]` Array (`x IN {xs}`).
+// compiles
+migration ch 1 `CREATE TABLE events (ts DateTime, page String) ENGINE = MergeTree ORDER BY ts`
+
+clickhouse metrics = env("METRICS_URL")
+
+migration metrics 1 `CREATE TABLE hits (ts DateTime, path String) ENGINE = MergeTree ORDER BY ts`
+
+type Event { ts: int, page: str }
+type Hit { ts: int, path: str }
+
+table events: Event
+table hits: Hit in metrics
+
+route POST "/events" (body: [Event]) -> 202 str | 503 str {
+    let r: DbResult = events.insert(body)
+    if !r.ok {
+        return 503 r.error
+    }
+    return 202 "ok"
+}
+
+route GET "/hits" (paths: [str], desc: bool = false) -> int {
+    let o = if desc { "ts DESC" } else { "ts" }
+    let n: int = ch metrics "SELECT count() FROM hits WHERE path IN {paths}"
+    let last: [Hit] = ch metrics "SELECT * FROM hits ORDER BY {o} LIMIT 1"
+    return n + last.len()
+}
+
+every 1 min {
+    hits.insert([Hit { ts: now(), path: "/tick" }])
+}

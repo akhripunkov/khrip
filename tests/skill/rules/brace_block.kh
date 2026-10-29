@@ -1,0 +1,11 @@
+// { в начале оператора и в ветке match — блок, литерал пишется в скобках.
+// in: SKILL.md
+// rule: At a statement start and in a `match` arm `{` opens a block: write `({ ... })`.
+fn main() {
+    let s = "a"
+    let p = match s {
+        "a" => { x: 1 }
+        _ => ({ x: 2 })
+    }
+    { x: 1 }
+}

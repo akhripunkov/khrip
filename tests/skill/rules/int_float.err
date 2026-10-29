@@ -1,0 +1,5 @@
+tests/skill/rules/int_float.kh:7:15: error: operator * needs int operands, found float
+        print("{a * t}")
+                  ^
+    hint: int and float do not mix: convert the int with n.to_float(), or the float with x.round() or x.to_int()
+1 error

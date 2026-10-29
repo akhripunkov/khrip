@@ -1,0 +1,4 @@
+tests/errors/recover_eof.kh:7:6: error: expected '}', found end of file
+        }
+         ^
+1 error

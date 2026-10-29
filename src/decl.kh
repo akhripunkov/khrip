@@ -125,6 +125,12 @@ fn expect_tok(k: int) -> bool {
         advance()
         return true
     }
+    if pos > 0 && kind() != T_EOF && tok().file != toks[pos - 1].file {
+        // файл кончился: ошибка — у конца этого файла, а не в начале следующего
+        let last = toks[pos - 1]
+        syntax_error(Token { kind: T_EOF, val: 0, text: "", line: last.line, col: last.col + last.text.byte_len(), file: last.file }, "expected " + tok_desc(k) + ", found end of file", "")
+        return false
+    }
     var hint = ""
     let found = tok().text
     if k == '{' && kind() == ':' {
@@ -218,8 +224,14 @@ fn rt_func(name: str) -> int {
 
 // ---- Типы в объявлениях ----
 
-fn generic_ok() -> bool {
-    return files[tok().file].is_lib
+fn generic_ok(at: Token) -> bool {
+    let f = files[at.file]
+    if f.path == "<generated>" {
+        // сгенерированный код (разбор маршрутов) пишет типы программы: тип
+        // программы T, K или V — её тип, а не параметр обобщённой функции
+        return struct_find(at.text) < 0 && sum_find(at.text) < 0
+    }
+    return f.is_lib
 }
 
 // int | bool | str | Имя | [T] | map[K, V] | T? | { поле: T, ... }
@@ -255,7 +267,7 @@ fn parse_type() -> int {
                 }
                 t = ty_map(k, v)
             }
-        } else if (name == "T" || name == "K" || name == "V") && generic_ok() {
+        } else if (name == "T" || name == "K" || name == "V") && generic_ok(start) {
             t = ty_make(K_GEN, name.byte(0), 0)
         } else {
             let s = struct_find(name)
@@ -801,6 +813,10 @@ fn add_field(s: int, name: str, t: int, at: Token, def: int) {
         error_tok(at, "field '" + name + "' is declared twice in '" + structs[s].name + "'", "")
         return
     }
+    if name == "type" && structs[s].sum >= 0 {
+        // JSON варианта: {"type": "Circle", ...} — поле type спорило бы с именем
+        error_tok(at, "a variant cannot have a field named type", "JSON names the variant in \"type\": rename the field, or make " + structs[s].name + " a separate type")
+    }
     structs[s].fields.push(Field { name: name, ty: t, def: def })
 }
 
@@ -981,6 +997,12 @@ fn prescan_const() {
         if neg {
             val = -val
         }
+    } else if v.kind == T_FLOAT {
+        t = ty_float
+        if neg {
+            // знаковый бит: у литерала его нет
+            val = val - 9223372036854775807 - 1
+        }
     } else if v.kind == T_STR && !neg {
         t = ty_str
         val = strlit(v.val)
@@ -1001,10 +1023,14 @@ fn prescan_const() {
             val = 1
         }
     } else {
-        error_tok(v, "a constant must be a number, string or boolean literal", "use a global var for computed values")
+        error_tok(v, "a constant must be an int, float, str or bool literal", "for a computed value write a function: fn name() -> T \{ return ... }")
         return
     }
     advance()
+    if !ends_stmt(pos) && toks[pos].file == v.file {
+        // const N = 2 + 3: без ошибки осталось бы молча 2
+        error_tok(tok(), "a constant is a single literal", "write the value: const " + name.text + " = ..., or a function for a computed one")
+    }
     consts.push(Const { name: name.text, ty: t, val: val, lit: lit })
     sym_add(name.text, SK_CONST, consts.len() - 1, name)
 }
@@ -1033,9 +1059,16 @@ fn prescan(pass: int) {
 fn prescan_from(pass: int, from: int) {
     var i = from
     var depth = 0
+    var file = toks[from].file
     // незакрытая { объявления type доходит до конца файла: за ним — конец
     while i < toks.len() && toks[i].kind != T_EOF {
         let k = toks[i].kind
+        if toks[i].file != file {
+            // новый файл начинается на верхнем уровне, даже если в прошлом
+            // осталась незакрытая скобка
+            file = toks[i].file
+            depth = 0
+        }
         if depth == 0 && k == T_TYPE {
             pos = i
             panic_mode = false

@@ -1,0 +1,14 @@
+// Именованное соединение в программе только с every (H2 ревью части 2).
+clickhouse metrics = env("METRICS_CLICKHOUSE_URL")
+
+migration metrics 1 `CREATE TABLE ticks (ts DateTime) ENGINE = MergeTree ORDER BY ts`
+
+type Tick { ts: int }
+
+table ticks: Tick in metrics
+
+every 1 min {
+    ticks.insert(Tick { ts: now() })
+    let n: int = ch metrics "SELECT count() FROM ticks"
+    print("{n}")
+}

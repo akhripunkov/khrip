@@ -1,0 +1,31 @@
+// Примеры из текста главы production работают: программа без маршрутов,
+// файлы, битовые операторы, повтор списка, \u{...}, деление float на ноль.
+// in: production.md
+// rule: `fn main()` (or `fn main() -> int` for the exit code) runs once. `args()` is the command line, `write(s)` prints without a newline, `read_file(path) -> str?`, `write_file(path, text, executable) -> bool`, `exit(code)`.
+// rule: Bit operators `& | ^ ~ << >>`; `[0] * 100` repeats a list.
+// rule: `s.byte_len()` counts UTF-8 bytes; `"\u{48}"` is a code point. `json_error()` says why the last `from_json` gave none.
+// rule: Float division by zero gives Infinity or NaN (`null` in JSON).
+type P { n: int }
+
+fn main() -> int {
+    write("args {args().len() > 0} ")
+    let path = (env("TMPDIR") ?? "/tmp") + "/khrip_skill_production_inline.txt"
+    expect_true(write_file(path, "hé", false))
+    let text = read_file(path) ?? ""
+    print("{text} {text.len()} {text.byte_len()}")
+    print("{6 & 3} {6 | 3} {6 ^ 3} {~0} {1 << 4} {256 >> 2}")
+    print("{([0] * 100).len()} \u{48}")
+    let p: P? = from_json(`{"n": "x"}`)
+    if p == none {
+        print(json_error())
+    }
+    let z = 0.0
+    print("{1.0 / z} {z / z} {to_json({ x: 1.0 / z })}")
+    return 0
+}
+
+fn expect_true(b: bool) {
+    if !b {
+        exit(3)
+    }
+}

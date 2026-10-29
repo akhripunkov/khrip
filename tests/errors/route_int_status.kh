@@ -1,0 +1,18 @@
+// В маршруте, который возвращает int, число 100–599 сразу после return или ??
+// в return — статус: необъявленный — ошибка с подсказкой, а не молча число
+// (R1 перепроверки части 2 этапа токенов). 0 и 1000 — числа.
+store counts: map[str, int]
+
+route GET "/count/{k}" (k: str) -> int {
+    return counts[k] ?? 404
+}
+
+route GET "/n/{k}" (k: str) -> int {
+    if k == "x" {
+        return 404
+    }
+    if k == "y" {
+        return 1000
+    }
+    return counts[k] ?? 0
+}

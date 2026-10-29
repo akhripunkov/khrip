@@ -1,0 +1,5 @@
+tests/errors/format_spec_resume.kh:8:16: error: format specs like {f:.2f} are not supported
+        print("a {f:.2f} b {h}")
+                   ^
+    hint: round the value first: {f.round_to(2)}
+1 error

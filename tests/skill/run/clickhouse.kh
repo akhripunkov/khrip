@@ -1,0 +1,19 @@
+// Пример главы skill/khrip/clickhouse.md на настоящем ClickHouse (khc test
+// работает во временной базе).
+test "clickhouse chapter" {
+    let r = call POST "/events" [{ ts: 100, user_id: 1, page: "/a", ms: 1.5 }, { ts: 101, user_id: 2, page: "/a", ms: 2.5 }, { ts: 102, user_id: 1, page: "/b", ms: 3.0 }]
+    expect r.status == 202
+    expect r.body == `{"inserted":3}`
+    let all: [PageStat]? = from_json((call GET "/stats/pages?from=0&to=1000").body)
+    expect all != none
+    expect all.len() == 2
+    expect all[0].page == "/a"
+    expect all[0].views == 2
+    expect all[0].users == 2
+    let b: [PageStat]? = from_json((call GET "/stats/pages?from=0&to=1000&page=/b").body)
+    expect b != none
+    expect b.len() == 1
+    let bad = call POST "/events" [{ ts: 100, user_id: -1, page: "/a", ms: 1.5 }]
+    expect bad.status == 400
+    expect bad.body.contains("out of range for UInt64")
+}

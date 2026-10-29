@@ -1,0 +1,9 @@
+tests/errors/route_int_status.kh:7:25: error: status 404 is not declared by this route
+        return counts[k] ?? 404
+                            ^
+    hint: declare | 404 to answer with that status, or write (404) for the number
+tests/errors/route_int_status.kh:12:16: error: status 404 is not declared by this route
+            return 404
+                   ^
+    hint: declare | 404 to answer with that status, or write (404) for the number
+2 errors

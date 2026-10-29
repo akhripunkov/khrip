@@ -1,0 +1,19 @@
+// Тело call с типом не отправляет поля none, поэтому явное поле: none —
+// ошибка с подсказкой.
+// in: SKILL.md
+// rule: a typed body leaves `none` fields unsent (`f: none` is an error; for `null` send a raw string).
+type Note { title: str, note: str? }
+
+store notes: map[int, Note]
+
+route PATCH "/notes/{id}" (id: int, body: { title: str?, note: str? }) -> Note | 404 {
+    let old = notes[id] ?? fail(404)
+    let n = Note { ...old, ...body }
+    notes[id] = n
+    return n
+}
+
+test "explicit none" {
+    notes[1] = { title: "a", note: "keep" }
+    expect (call PATCH "/notes/1" { title: "b", note: none }).status == 200
+}

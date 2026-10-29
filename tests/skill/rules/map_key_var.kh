@@ -1,0 +1,9 @@
+// {k: v} — структура с полем k; с переменной k это ошибка, а не словарь.
+// in: SKILL.md
+// rule: `{k: v}` with a local `k` is an error: give it a type or rename `k`.
+// rule: let ages = {"ann": 30, (key): 41} // map keys: "text" or (expression)
+fn main() {
+    let k = "a"
+    let m = {k: 1}
+    print(to_json(m))
+}

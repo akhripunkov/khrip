@@ -23,4 +23,7 @@ echo "### Задачи бэкенда (eval/): Khrip, Python, C#, Go"
 node eval.mjs
 echo
 echo "### Спецификация для промпта"
-node spec_tokens.mjs ../../docs/KHRIP.md
+node spec_tokens.mjs ../../docs/KHRIP.md ../../skill/khrip/*.md
+echo
+echo "### Стоимость задачи со скиллом (eval/results/tokens.md)"
+node skill.mjs

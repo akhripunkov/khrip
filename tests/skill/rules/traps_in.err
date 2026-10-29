@@ -1,0 +1,17 @@
+tests/skill/rules/traps_in.kh:16:18: error: format specs like {price:.2f} are not supported
+        print("{price:.2f}")
+                     ^
+    hint: round the value first: {price.round_to(2)}
+tests/skill/rules/traps_in.kh:11:10: error: Khrip has no 'in' operator
+        if x in xs {
+             ^
+    hint: for a list write xs.contains(x)
+tests/skill/rules/traps_in.kh:14:19: error: Khrip has no 'in' operator
+        let has = "a" in m
+                      ^
+    hint: for a map write m.has("a")
+tests/skill/rules/traps_in.kh:15:22: error: .get() takes only the key
+        let v = m.get("b", 0)
+                         ^
+    hint: for a default write m["b"] ?? 0
+4 errors

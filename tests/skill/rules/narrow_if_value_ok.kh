@@ -1,0 +1,18 @@
+// Правильная половина: в операторе if сужение и if let работают; перед if,
+// который даёт значение, значение разворачивается.
+// in: SKILL.md
+// rule: Narrowing and `if let` work in `if` statements, not in an `if` used as a value: unwrap before it.
+fn next(x: int?) -> int {
+    if x != none {
+        return x + 1
+    }
+    if let v = x {
+        return v
+    }
+    let y = x ?? 0
+    return if y > 0 { y + 1 } else { y }
+}
+
+fn main() {
+    print("{next(1)} {next(none)}")
+}

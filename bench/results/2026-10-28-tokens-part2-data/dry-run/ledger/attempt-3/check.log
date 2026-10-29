@@ -1,0 +1,9 @@
+main.kh:68:21: error: the value may be none; unwrap it before reading .body
+                if prev.body != sig {
+                        ^
+    hint: if let v = x { v.body } or let v = x else { return ... }
+main.kh:71:138: error: the value may be none; unwrap it before reading .transfer_id
+                let old: Transfer = sql "SELECT id, from_id AS \"from\", to_id AS \"to\", amount, created_at FROM transfers WHERE id = {prev.transfer_id}"
+                                                                                                                                             ^
+    hint: if let v = x { v.transfer_id } or let v = x else { return ... }
+2 errors

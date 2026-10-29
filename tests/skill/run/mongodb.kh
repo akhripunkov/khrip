@@ -1,0 +1,33 @@
+// Пример главы skill/khrip/mongodb.md на настоящем MongoDB. tests/skill/check.py
+// заменяет базу "app" примера на khrip_skill_test: коллекция events
+// удаляется в начале, база — в конце, и чужая база app не трогается.
+type EventsDrop { drop: str }
+type DatabaseDrop { dropDatabase: int }
+
+test "mongodb chapter" {
+    mongo_command(db(), "app", to_bson(EventsDrop { drop: "events" }))
+    for i in 0..120 {
+        expect (call POST "/events" { user: 7, title: "t{i}" }).status == 201
+    }
+    let r = call POST "/events" { user: 8, title: "x" }
+    expect r.status == 201
+    let e: Event? = from_json(r.body)
+    expect e != none
+    let all: [Event]? = from_json((call GET "/events?user=7").body)
+    expect all != none
+    expect all.len() == 50
+    expect all.all(x => x.user == 7)
+    let dup = mongo_insert(db(), "app", "events", [to_bson(e)])
+    expect dup.code == 11000
+    // правило главы: none-поля не пишутся, $set меняет только присланные
+    let patch: { title: str?, ts: int? } = { title: "new", ts: none }
+    let u = mongo_update(db(), "app", "events", to_bson({ _id: e._id }), to_bson({ "$set": patch }))
+    expect u.error == ""
+    expect bson_get_int(u.document, "n") == 1
+    let one: [Event]? = from_json((call GET "/events?user=8").body)
+    expect one != none
+    expect one.len() == 1
+    expect one[0].title == "new"
+    expect one[0].ts == e.ts
+    mongo_command(db(), "app", to_bson(DatabaseDrop { dropDatabase: 1 }))
+}

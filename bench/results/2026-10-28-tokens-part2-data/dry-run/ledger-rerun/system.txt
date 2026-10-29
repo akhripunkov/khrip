@@ -1,0 +1,223 @@
+You write Khrip with the skill below: its core, SKILL.md, follows. Its chapters are not included. To read one, answer with the single line `READ <file>` (for example `READ postgresql.md`) and nothing else; the file comes in the next message. Read a chapter only when the task needs it.
+
+---
+name: khrip
+description: Khrip, a compiled language for HTTP JSON backends (.kh files, khc). Use it for any Khrip code.
+---
+
+# Khrip
+
+A compiled, strictly typed language for HTTP APIs. A program is one namespace:
+no imports, declarations in any order. `khc run|test|check app.kh` runs it, runs
+its tests, lists all errors with fixes.
+
+Chapters next to this file; read one only when the task needs it:
+- `postgresql.md`: PostgreSQL (`sql "..."`, `tx`, migrations).
+- `mongodb.md`: MongoDB.
+- `clickhouse.md`: ClickHouse (`ch "..."`, `table`).
+- `production.md`: environment, `KHRIP_DATA`, threads, memory, limits, CLI.
+
+## Types and declarations
+
+`int` (64-bit, overflow panics), `float`, `bool`, `str` (immutable UTF-8), `[T]`,
+`map[K, V]` (K is int or str), `T?` (optional), `{ id: int, name: str }`
+(anonymous struct, usable as any type) and named types. In a type, `...Point`
+copies Point's fields, `tags: [str] = []` has a default (a literal, `[]`, `{}` or
+an enum value), and `note: str?` defaults to none.
+
+```khrip top
+type Point { x: int, y: int }
+type Role = Admin | Member | Guest                     // enum
+type Shape = Circle { r: int } | Rect { w: int, h: int } | Empty
+
+const LIMIT = 10                       // int, str or bool literal
+fn add(a: int, b: int = 1) -> int {    // defaults are literals; no result: no ->
+    return a + b
+}
+```
+
+`let s: Shape = Circle { r: 2 }`, `let r = Admin`; enum values compare with `==`,
+variant fields are read with `match`. No null (`T?` and `none`), classes,
+generics or exceptions. Implicit conversions: `T` → `T?`, variant → its type, int
+*literal* → float (`t * 2`); otherwise `n.to_float()`, `x.to_int()`, `x.round()`:
+int and float never mix, `7 / 2` is 3. Parameters are read-only, `let` is
+immutable, `var` mutable; local types are inferred. A global `var` is not allowed
+in servers: use `store`.
+
+## Statements
+
+`if a { } else if b { } else { }`; `if` and `match` are values too: `let v =
+if c { let a = f(); a + 1 } else { 0 }` (a block's value is its last line).
+`while i < n { i += 1 }` (`-= *= /= %=` too, no `++`), `break`, `continue`; `for x
+in xs` (items, characters), `for i, x in xs`, `for k, v in m`, `for i in 0..n`
+(`0..=n` includes n).
+
+```khrip body
+let area = match s {        // every case, or _ =>
+    Circle c => 3 * c.r * c.r
+    Rect r => r.w * r.h
+    Empty => 0
+}
+```
+
+`match` also takes int, str and bool; arms may be `200 | 201 => ...`, blocks or
+`return ...`. Operators: `&& || !`; `+` also joins strings; comparisons do not
+chain.
+
+`"Hi, {user.name}!"` interpolates an expression that does not start with a quote
+(`{2,5}` stays text). Escapes: `\n \t \r \0 \\ \" \' \{`. Raw strings in
+backticks have neither and may span lines; JSON and regexes go there:
+`` `{"id": 1}` ``, `` `\d{4}` ``. `len`, `s[i]` (a str), slices and `find` count
+characters. Slices `s[a..b]`, `xs[a..]`, `xs[..b]` are clamped to the bounds.
+
+## Optionals
+
+```khrip body
+let name = find(id) ?? "nobody"
+let user = users[id] else {            // unwrap or leave the scope
+    return 404
+}
+if let u = users[id] { }
+if role == Admin { }                   // role: Role? compares directly
+if limit != none && n > limit { }      // after the check, limit is an int
+if q == none {
+    return 400
+}                                      // from here on q is a str
+```
+
+Checks against `none` narrow a `let` or a parameter (not a `var`). Narrowing and
+`if let` work in `if` statements, not in an `if` used as a value: unwrap before
+it. `m[k]`, `.get(k)`, `.remove(k)`, `.find(s)`, `.to_int()`, `.to_float()`,
+`.index_of(x)`, `env`, `header`, `parse_time` and `from_json` return `T?`.
+
+## Values
+
+```khrip body
+let p = Point { x: 1, y: 2 }
+let q = Point { x, y }                 // x: x, y: y
+let u = Product { ...old, ...patch }   // patch's T? fields: only if not none
+let r: Point = { x, y: 0 }             // the type expected here
+let t = { id: 1, tags: ["a"] }         // else its fields' type
+var m: map[str, int] = {}
+let ages = {"ann": 30, (key): 41}      // map keys: "text" or (expression)
+```
+
+A type is expected by a typed `let`, assignment, argument, `return`, list item
+or field. `{k: v}` with a variable `k` is an error. At a statement start and in a
+`match` arm `{` opens a block: write `({ ... })`. A named type takes an anonymous
+value only as `T { ...x }`. Structs, lists and maps are references: assigning
+shares (a field changed through `let u = users[id] else {...}` changes the
+store); `.copy()` copies a list.
+
+## Methods and functions
+
+Any `f(x, y)` can be written `x.f(y)`: `len(xs)` is `xs.len()`.
+
+- `str`: `len contains starts_with ends_with find trim lower upper split replace
+  repeat to_int to_float`, `matches(regex)` (whole string; `[a-z] \d \w \s . * +
+  ? {n,m} ( | )`)
+- `int`: `to_str to_float abs min max`; `bool`: `to_str`; `float`: `to_str to_int
+  round floor ceil` (→ int) `round_to(digits) abs sqrt min max`
+- `[T]`: `len push pop last insert remove_at clear truncate copy contains
+  index_of`, `sort reverse` (in place, return the list; sort: int or str), `join`
+  ([str]), `sum` ([int], [float])
+- lambdas `x => expr` in list methods: `map filter find` (T?) `any all count
+  sort_by` (int, float or str key; stable, in place); they see locals
+- `map[K, V]`: `len has get remove keys values clear`, `m[k]` (V?), `m[k] = v`;
+  insertion order
+
+`print(s)`, `eprint(s)`, `env(name)`, `sleep(ms)`, `now()` (unix seconds),
+`now_ms()`, `time_iso(t)` → `"2026-10-19T15:04:05Z"`, `parse_time(s)` (ISO 8601),
+`parse_date("2026-10-19")`, `random_str(n)` (A-Za-z0-9), `sha256(s)` (hex),
+`hash_password(p)`, `check_password(p, hash)`, `url_encode(s)`, `to_json(x)`,
+`from_json(text)` (type from the annotation: `let u: User? = from_json(t)`).
+
+## HTTP API
+
+A program with `route` or `every` runs by itself (no `fn main`) on `PORT` (8080).
+
+```khrip
+type NewUser { name: str, email: str, age: int }
+type User { id: int, ...NewUser }
+
+store users: map[int, User]
+store last_id: int
+
+route POST "/users" (body: NewUser) -> 201 User | 400 str {
+    if !body.email.matches(`[^@\s]+@[^@\s]+`) {
+        return 400 "email is invalid"
+    }
+    last_id += 1
+    let user = User { id: last_id, ...body }
+    users[user.id] = user
+    return 201 user
+}
+
+route GET "/users" (min_age: int?, page: int = 1) -> { items: [User], total: int } {
+    let all = users.values()
+        .filter(u => min_age == none || u.age >= min_age)
+        .sort_by(u => u.name)
+    return { items: all[(page - 1) * 20..page * 20], total: all.len() }
+}
+
+route DELETE "/users/{id}" (id: int) -> 204 | 404 {
+    let key = header("X-Key") ?? fail(401, "no key")
+    users.remove(id) else {
+        return 404
+    }
+    return 204
+}
+
+test "create and delete" {
+    let r = call POST "/users" { name: "Ann", email: "a@x.io", age: 30 }
+    expect r.status == 201
+    expect (call DELETE "/users/1" headers {"X-Key": "k"}).status == 204
+}
+```
+
+- Methods `GET POST PUT PATCH DELETE`; path parameters `{id}` are declared too. A
+  struct, list or map parameter is the JSON body; others come from the query.
+  Missing body fields take their defaults; enums are JSON strings ("Admin"),
+  other variants objects with a "type" field; `none` is `null`. Bad input gets
+  400 with a message, a wrong method 405, an unknown path 404.
+- `-> Type` is 200, no `->` is 204; every status returned is listed: `return
+  users[id] ?? 404`. `str` is sent as text, other types as JSON.
+- `header(name)` reads a request header (any case), `set_header(name, value)` adds
+  one to the response. `fail(status)` or `fail(status, message)` ends the request
+  from any function.
+- `store name: T` (or `= value`) outlives requests; handlers see it as if requests
+  ran one at a time, so no locks.
+- Tests run in order and share the store. `call METHOD "path?query" [body]
+  [headers map]` returns `Response { status, body, headers }`; `expect` records a
+  failure and goes on, `expect x != none` stops on none and narrows `x`.
+
+## Other services, background tasks
+
+```khrip top
+every 10 min {
+    let r = fetch GET "https://api.example.com/items?q={url_encode(q)}"
+    let items: [Item]? = from_json(r.body)
+    fetch POST hook { text: "done" } headers {"Authorization": "Bearer {key}"}
+}
+```
+
+`fetch METHOD url [body] [headers map]` returns a `Response` (header names lower
+case); `status` 0 means unreachable or a TLS error (`body` says why). A body
+value is sent as JSON, a str as text. `fetch`, `sql` and `sleep` are plain calls
+(no async/await): while a request waits, the server runs others, which may change
+the store (so may `hash_password`): read it again after.
+`every N ms|s|min|h|d` runs a block in a background thread.
+
+## Traps from other languages
+
+- `null nil None` → `none`; `c ? a : b` → `if c { a } else { b }`; `switch` →
+  `match`; `enum E { A, B }` → `type E = A | B`; `range(n)` → `0..n`; `if xs`
+  → `if xs.len() > 0` (conditions are `bool`).
+- `str(n)` → `"{n}"` or `n.to_str()`; `int(s)`, `parseInt` → `s.to_int()`
+  (`int?`); `f"{x}"`, `${x}` → `"{x}"`; `"n=" + n` is an error.
+- `try/catch`, `throw`, `raise HTTPException` → optionals, `else`, `fail`;
+  `return 400, "msg"` → `return 400 "msg"`.
+- `lambda x:`, `(x) => {...}` → `x => expr`; sorting with a comparator →
+  `sort_by(x => -x.n)` (descending), stable `sort_by` calls for several keys
+  (last key first).
+- Printing a list, map or struct: `to_json(x)`.

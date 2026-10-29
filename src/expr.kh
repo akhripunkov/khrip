@@ -988,6 +988,8 @@ fn check_int(t: int, at: Token, op: int) {
         if t == ty_str {
             // c - '0': символ — str из одного символа
             hint = "c.to_int() ?? 0 gives the digit"
+        } else if t == ty_float {
+            hint = "int and float do not mix: convert the int with n.to_float(), or the float with x.round() or x.to_int()"
         }
         error_tok(at, "operator " + op_text(op) + " needs int operands, found " + ty_name(t), hint)
     }
@@ -1029,10 +1031,14 @@ fn parse_coalesce() -> int {
     if tkind(w) == K_OPT {
         want = w
     }
+    let rtok = tok()
     let rt = parse_coalesce()
     var result = inner
     if rt == lt {
         result = lt
+    } else if rt == ty_int && inner != ty_int && rtok.kind == T_INT && route_ctx >= 0 && find_variant(routes[route_ctx], rtok.val) >= 0 {
+        // let t = todos[id] ?? 404: статус ответа — только в return
+        error_tok(rtok, "expected " + ty_name(inner) + ", found int", "?? " + rtok.val.to_str() + " answers " + rtok.val.to_str() + " only in return; here write x ?? fail(" + rtok.val.to_str() + ") or let v = x else \{ return " + rtok.val.to_str() + " }")
     } else {
         coerce(rt, inner, at)
     }
@@ -1398,7 +1404,11 @@ fn str_lit_compare(op: int, ordered: bool) -> int {
 }
 
 fn parse_cmp() -> int {
+    let from = pos
     let lt = parse_add()
+    if kind() == T_IN || (kind() == T_IDENT && tok().text == "not" && kind_at(pos + 1) == T_IN) {
+        return in_operator(from)
+    }
     if !is_cmp_op(kind()) {
         return lt
     }
@@ -1411,6 +1421,48 @@ fn parse_cmp() -> int {
         error_tok(tok(), "comparisons cannot be chained", "write a < b && b < c")
     }
     return ty_bool
+}
+
+// x in xs, k in m, x not in xs из Python: оператора in нет. Правая часть
+// разбирается, чтобы подсказать по её типу и не плодить ошибок дальше.
+fn in_operator(from: int) -> int {
+    let at = tok()
+    let at_pos = pos
+    var neg = ""
+    if kind() == T_IDENT {
+        neg = "!"
+        advance()
+    }
+    advance()
+    let rfrom = pos
+    want = ty_err
+    let rt = parse_add()
+    // простые операнды (одна лексема) — в подсказку как есть
+    var x = "x"
+    if at_pos == from + 1 {
+        x = toks[from].text
+    }
+    var c = ""
+    if pos == rfrom + 1 {
+        c = toks[rfrom].text
+    }
+    var hint = "for a list write " + neg + "xs.contains(x), for a map " + neg + "m.has(k), for a str " + neg + "s.contains(part)"
+    if tkind(rt) == K_MAP {
+        hint = "for a map write " + neg + or_name(c, "m") + ".has(" + x + ")"
+    } else if tkind(rt) == K_LIST {
+        hint = "for a list write " + neg + or_name(c, "xs") + ".contains(" + x + ")"
+    } else if rt == ty_str {
+        hint = "for a str write " + neg + or_name(c, "s") + ".contains(" + x + ")"
+    }
+    error_tok(at, "Khrip has no 'in' operator", hint)
+    return ty_bool
+}
+
+fn or_name(text: str, name: str) -> str {
+    if text.byte_len() > 0 {
+        return text
+    }
+    return name
 }
 
 fn is_add_op(k: int) -> bool {

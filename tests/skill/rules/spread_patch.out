@@ -1,0 +1,3 @@
+{"name":"pen","price":120,"note":"blue"}
+{"name":"pen","price":120,"note":null}
+{"name":"ink","price":5,"note":null}

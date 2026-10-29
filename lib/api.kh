@@ -640,6 +640,7 @@ fn __json_begin() {
     let c = __ctx()
     store64(c + CTX_JDEPTH, 0)
     store64(c + CTX_JPATH, 0)
+    store64(c + CTX_JOMIT, 0)
 }
 
 fn __json_in(v: int, d: int) {
@@ -823,6 +824,10 @@ fn __json_enc_fields(b: Buf, v: int, d: int, comma: bool) {
         if load64(f + 24) == 4 {
             continue
         }
+        if load64(v + i * 8) == 0 && load64(load64(f + 16)) == D_OPT && load64(__ctx() + CTX_JOMIT) != 0 {
+            // тело call: none — поле не прислано
+            continue
+        }
         if sep {
             buf_byte(b, ',')
         }
@@ -917,6 +922,19 @@ fn __json_encode(v: int, d: int) -> str {
     let b = buf_new(64)
     __json_begin()
     __json_enc(b, v, d)
+    return __str_new(b.data, b.len)
+}
+
+// Тело call METHOD "путь" значение: поля T? со значением none не пишутся —
+// сервер видит их «не присланными», как у клиента с JSON без этих полей (SET
+// \{patch}, spread). Явный null — телом-строкой: call PATCH "/x" `{"a": null}`.
+fn __json_encode_sent(v: int, d: int) -> str {
+    let b = buf_new(64)
+    __json_begin()
+    let c = __ctx()
+    store64(c + CTX_JOMIT, 1)
+    __json_enc(b, v, d)
+    store64(c + CTX_JOMIT, 0)
     return __str_new(b.data, b.len)
 }
 
@@ -2067,7 +2085,7 @@ fn __call(method: str, target: str, body: int, d: int, headers: int) -> Response
         if load64(d) == D_STR {
             text = __cast(body)
         } else {
-            text = __json_encode(body, d)
+            text = __json_encode_sent(body, d)
         }
     }
     let req = __Req { method: method, path: path, query: query, body: text, headers: htext }

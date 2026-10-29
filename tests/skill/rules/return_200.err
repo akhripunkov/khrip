@@ -1,0 +1,5 @@
+tests/skill/rules/return_200.kh:11:12: error: this route returns Todo | 404 Err: a struct literal here needs the name of its type
+        return { id, title: "t" }
+               ^
+    hint: return Todo { ... } or return Err { ... }, or give the status: return 200 { ... }
+1 error

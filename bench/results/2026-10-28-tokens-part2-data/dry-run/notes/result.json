@@ -1,0 +1,18 @@
+{
+ "task": "notes",
+ "lang": "khrip",
+ "model": "dry-run",
+ "passed": true,
+ "attempts": 1,
+ "calls": 1,
+ "chapters_read": [],
+ "tokens": {
+  "system": 3029,
+  "task": 438,
+  "chapters": 0,
+  "answers": 766,
+  "feedback": 0
+ },
+ "cost_w0.02": 826.6,
+ "cost_w0.2": 1371.8
+}

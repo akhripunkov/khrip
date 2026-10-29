@@ -1,0 +1,5 @@
+tests/skill/rules/map_key_var.kh:7:14: error: ambiguous literal: 'k' is a field name here and also a variable
+        let m = {k: 1}
+                 ^
+    hint: for the struct, give it a type (let r: { k: T } = ..., or Name { k: v }) or rename the variable; for a map write {(k): v} (keyed by its value) or {"k": v}
+1 error
